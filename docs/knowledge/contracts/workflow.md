@@ -2340,11 +2340,15 @@ applicable separately activated diagnostic before a counted run.
 
 The [cooperative qualification acceptance contract](cooperative-qualification.md)
 is the adopted prospective acceptance target for future 309 briefs (Tom decision
-`ea8ee47f` v2). One independently reviewed Nucleus-owned route proposal is
-scoped; no route, implementation, readiness or proof is established or
-activated. Existing 309/061/304 briefs and holds require prospective amendment
-before later activation. Current instructions, qualified source pins and
-historical evidence remain unchanged.
+`ea8ee47f` v2). Tom's later `5639bd34` v2 ruling records the future
+retained-and-counted image-evidence policy and whole-attachment-absence gate
+in that contract; the earlier entire-backing-object absence rule is
+superseded prospectively only. Nucleus Spec 064 (nucleus#1283 / PR 177) is
+the accepted conditional route design. No route, implementation, qualified
+provider, readiness or proof is established or activated. Existing 309/061/304
+briefs and holds require prospective amendment before later activation.
+Current instructions, qualified source pins and historical evidence remain
+unchanged.
 
 **Interim admission allowance (Tom, 2026-10-22).** Until Queue #381's
 admission-hook adapter lands, Oxide native proofs may use Effigy `heavy`

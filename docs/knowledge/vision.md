@@ -321,10 +321,18 @@ Tom decision `ea8ee47f-adc0-4cd3-b420-aaa30642d623` v2 (2026-11-16)
 adopts the reviewed [cooperative qualification contract](contracts/cooperative-qualification.md)
 as the acceptance target for future 309 work and scopes one independently
 reviewed Nucleus-owned route proposal, without implementation or proof runs.
-The earlier `57374e05` v2 decision authorized drafting and review only. The
-adoption establishes no route, readiness or qualification and changes no
-existing execution instruction. Existing 309/061/304 briefs and dispatch and
-merge holds remain binding; later activation requires prospective amendment.
+The earlier `57374e05` v2 decision authorized drafting and review only. Those
+drafting and adoption facts remain accurate at their own time. Tom's later
+decision `5639bd34-635f-49b4-8261-92903d1013b4` v2 (2026-11-16, "Retain and
+count image evidence") records the future image-backing policy in that same
+contract: retain and count image files as evidence, and require positive
+ordinary provider evidence that every mount and attached entity of each exact
+owned image is absent. The earlier literal entire-backing-object absence gate
+is superseded prospectively only. The adoption and the 5639v2 ruling
+establish no route, readiness, qualified provider or proof activation and
+change no existing execution instruction. Existing 309/061/304 briefs and
+dispatch and merge holds remain binding; later activation requires
+prospective amendment.
 
 Tom decision `c6e3e9c8` v2 (2026-11-04) separates capture delivery from
 private launcher qualification for the bounded O2 capture tasks. Their named

@@ -4,7 +4,21 @@ Tom's decision `ea8ee47f-adc0-4cd3-b420-aaa30642d623` v2
 (2026-11-16) adopts this reviewed contract as the acceptance target for future
 309 work and scopes one independently reviewed Nucleus-owned execution-route
 proposal, with no implementation or proof runs. Earlier decision `57374e05`
-v2 authorized drafting and independent review only.
+v2 authorized drafting and independent review only. Those drafting and
+adoption facts remain accurate at their own time.
+
+Tom's later decision `5639bd34-635f-49b4-8261-92903d1013b4` v2
+(2026-11-16, selected "Retain and count image evidence") is the prospective
+image-backing ruling. It replaces the earlier literal entire-backing-object
+and residual-allocation absence gate for future qualification only. Nucleus
+[Spec 064](https://github.com/inflatable-cookie/nucleus/blob/4ba6ed5899fee67abde2674cd42aad1e0fe2eef5/docs/knowledge/specs/064-proof-execution-cooperative-route.md)
+(nucleus#1283 / PR 177, reviewed `dbaf288bc7fd259cffadcd27e7963147d6721039`,
+merged `4ba6ed5899fee67abde2674cd42aad1e0fe2eef5`; independent review
+`5926564116`) is the accepted **conditional** route design, including one
+NQRAW001 combined raw artifact and explicit independent obligations. Spec 064
+recorded the image-backing conflict as unresolved owner policy; 5639v2 is
+that ruling. Neither the spec nor the ruling implements a provider, qualifies
+a route, or activates proof.
 
 Adoption is prospective: it establishes no implemented or qualified route,
 source acceptance, resource fit, backing capability, runtime readiness or proof
@@ -41,7 +55,12 @@ Inventory every actual root, capture, source, index, manifest, copy, log,
 temporary publication, finalization and retained footprint across all providers,
 including Nucleus DB/WAL/journal/results/output/evidence copies. Account
 coexisting originals and copies and failure remnants. Retained evidence on
-another backing remains charged after process closure.
+another backing remains charged after process closure. Under 5639v2 a
+retained owned-image file is expected evidence, not failed attachment
+closure; its bytes, metadata, copies and residual or unknown physical costs
+remain accounted and disclosed. No physical reclamation, zero residual
+allocation, physical-peak guarantee, free evidence backing or deletion
+authority is claimed.
 
 Record measurement scope, device, method, units, freshness, missing coverage
 and sampled high-water marks. Samples establish observations at those times;
@@ -88,20 +107,35 @@ custodian. Owner loss cannot invent a controller, subreaper or successor.
 
 Require separately and conjunctively:
 
-- qualified, completed, custodian-bound **DECIDING** census and completed join;
+- actual surviving creator-owned positive waits and reaps of every required
+  direct child;
+- qualified, completed, JOINED, custodian-bound **DECIDING** census;
 - a separate **FINAL** certain-empty census for the exact closure group;
-- separate ordinary provider evidence, where the proof owns an image, that
-  the **entire owned backing and its residual allocations are absent**.
+- complete raw capture with real EOF, drain, successful fsync, source
+  binding, in-window durable acknowledgement and publisher wait;
+- genuine actual Effigy admission on the actual selector;
+- where the proof owns an image, separate ordinary provider evidence that
+  **every mount and attached entity or device of each exact owned image is
+  absent**, while the retained image file remains expected counted evidence.
 
-None replaces actual waits or another predicate. Directory deletion,
-removed-container flags, empty groups and a detached or unmounted image do not
-prove whole-backing absence. That absence never authorizes erasing evidence
-retained on another backing; its storage remains accounted.
+None replaces actual waits or another predicate. A successful detach command
+or an absent mount alone is insufficient. A leftover unmounted, container or
+synthesized entity, an incomplete inventory, an unreadable binding or an
+unknown provider result cannot pass. This is a required future provider
+contract, not a claim that current code supplies it; no provider, scan,
+cleanup controller or capability is invented here.
+
+5639v2 prospectively supersedes the earlier literal entire-backing-object
+and residual-allocation absence gate. Directory deletion, removed-container
+flags and empty groups still prove neither attachment absence nor storage
+reclamation. The retained file never authorizes erasing other evidence; all
+retained storage stays accounted.
 
 PASS requires every applicable source, **445-case**, oracle, admission,
 capture, EOF, drain, successful fsync, binding, acknowledgement, publisher-wait,
-deciding-join, final-census and backing obligation, with no missing, partial,
-timed-out or late required evidence. Report time-budget outcome, workload
+deciding-join, final-census, whole-attachment-absence and retained-and-counted
+image-evidence obligation, with no missing, partial, timed-out or late
+required evidence. Report time-budget outcome, workload
 outcome, evidence completeness, measured resources and closure separately.
 FAILED/SPENT/unknown and the original first fault remain permanent even after
 later cleanup. Unknown or retained work blocks dependent occurrences and
@@ -128,7 +162,7 @@ unproved custody/closure obligations; cleanup can later settle closure only.
 | Known scratch breach/overflow | R or F; stop through supported route, retain breach and all unresolved bytes. |
 | External total physical peak unknown | Disclosed unguaranteed observation; alone no failure/PASS. R/U if a required safety input is unknown; all independent gates still apply. |
 | Metadata/COW exceeds measured logical bytes | Disclose actual/unknown physical costs; no physical-ceiling claim. R/F for known monitored breach, R/U for unknown required safety input. |
-| Missing image whole-backing absence evidence | U; provider must prove the entire owned backing and residual allocations absent. Keep backing, residuals and evidence held/accounted; detach, unmount, unlink and group facts do not suffice. |
+| Missing image whole-attachment absence evidence | U; provider must prove every mount and attached entity/device of each exact owned image absent. The retained image file is expected counted evidence. A successful detach, absent mount, leftover unmounted/container/synthesized entity, incomplete inventory, unreadable binding or unknown provider result cannot pass. File bytes, metadata, copies and residual/unknown physical costs stay held/accounted. The earlier entire-backing-object/residual-allocation absence gate is superseded prospectively only. |
 | Report/turn/owner loss | U unless all required evidence was already durably accepted in target; prove surviving actual-parent custody or retain unknown. No replay/new occurrence. |
 | Complete evidence only after target | F permanently; late evidence may reconcile closure, never acquire PASS or refund. |
 
@@ -146,12 +180,21 @@ Paths below are relative to the named repository/head. The target does not
 establish a supported route; readiness remaining false is this contract's
 inference.
 
+[Nucleus Spec 064](https://github.com/inflatable-cookie/nucleus/blob/4ba6ed5899fee67abde2674cd42aad1e0fe2eef5/docs/knowledge/specs/064-proof-execution-cooperative-route.md)
+is the accepted conditional design for one later route, including one
+NQRAW001 combined raw artifact. Independent review `5926564116` passed at
+reviewed head `dbaf288bc7fd259cffadcd27e7963147d6721039` (merged
+`4ba6ed5899fee67abde2674cd42aad1e0fe2eef5`). Spec 064 recorded the
+image-backing conflict as unresolved owner policy and supplies no
+implementation or qualification. Spec 063's whole-backing-absence wording
+is historical at its own audit; 5639v2 is the later prospective ruling.
+
 | Predicate/promise | Existing supported source behavior; later gap |
 | --- | --- |
 | Exact source, admission, all 445 cases unchanged | Nucleus N `core/qa/proof-source.ts:21–59` binds published source; Effigy E `src/runner/task_engine/run/foreground.rs:181–225` supplies actual admission (reported). No proof-to-host-run integration selected; actual end-to-end binding remains required. |
 | Resource promises changed only as above | Nucleus N `core/machine/process-exec.ts:252–262` starts its timer at spawn; Effigy E `src/runner/run_control.rs:95–147` prepares separately (reported). Later design must cover original effects and all monitored footprints; neither launch timers nor logical limits suffice. Hard blocked-I/O/physical guarantees are no longer proposed. |
 | Actual parents and positive waits unchanged | Nucleus N `core/qa/supervisor-process.ts:46–55` returns PID, not a retained parent handle; Effigy E `crates/effigy-kernel/src/custody/spawn.rs:741–787` waits its own leader (reported). Surviving application graph/provider remains unsupported. |
-| DECIDING/join, FINAL, whole-backing absence unchanged | Nucleus N `shared/schema/host-runs.ts:48–92` lacks these receipts (reported Spec 063). Separate qualified providers/evidence remain required, including absence of the entire owned backing and its residual allocations. |
+| DECIDING/join, FINAL unchanged; image whole-attachment absence plus retained-and-counted evidence | Nucleus N `shared/schema/host-runs.ts:48–92` lacks these receipts (reported Spec 063, whose whole-backing-absence wording is historical). Separate qualified providers/evidence remain required: JOINED custodian-bound DECIDING, a separate FINAL certain-empty census, and ordinary provider evidence that every mount and attached entity/device of each exact owned image is absent while the retained image file and all retained storage stay counted. Spec 064 names the future receipts as a conditional design only. Neither current source supplies the required provider evidence. |
 | Complete capture/delivery unchanged | Nucleus N `core/host-runs/host-run-retained-output.ts:35–85` truncates/redacts and swallows sync faults; `core/machine/process-exec.ts:219–246` can settle without pipe closure. Complete durable raw delivery/ack/publisher-wait support remains unresolved. |
 | Permanent failure/retention unchanged | Nucleus N `core/qa/proof-admission.ts:28–45`, `core/intake/proof-settlement.ts:45–62` preserve spent proofs (reported). No complete Oxide lifecycle/accounting implementation is established. |
 
@@ -164,9 +207,11 @@ counted author, distinct retained reviewer and final exact-head disposition,
 before 309 publication → 061 → 304. No ladder step is waived or activated.
 Old receipts, grants, failures and clocks stay bound to their original bytes.
 Unpublished/unvalidated local 309 source is ineligible. Ordinary guard `fcfda`,
-parked 233 `c578`, candidate `4aba` and suite `b8d445` stay unchanged. All three
-Barge and seven Oxide historical OPEN/UNCLOSED image resources remain untouched;
-Rust 1.100 stays unqualified and 083 negative-only.
+parked 233 `c578`, candidate `4aba` and suite `b8d445` stay unchanged, including
+the published 309 `fc6` suite's positive detach oracle that the 8 MiB image
+file remain (`scripts/test_supervisor_ceiling_qualification.py:10585–10596`).
+All three Barge and seven Oxide historical OPEN/UNCLOSED image resources remain
+untouched; Rust 1.100 stays unqualified and 083 negative-only.
 
 All nine [workflow premises](workflow.md#proof-authoring-premise-checklist)
 are **not-executable-docs** here: (1) private HOME/rustup, (2) account-home
