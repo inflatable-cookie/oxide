@@ -968,15 +968,6 @@ fn persist_private_file(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
         let _ = fs::remove_file(&temp_path);
         return Err(io_error(error));
     }
-    // oxide#196: an injected failure after the replacement but before the
-    // parent-directory sync leaves the new ledger visible while the write
-    // errors, so callers must classify the commit boundary conservatively.
-    #[cfg(test)]
-    if crate::test_fs::take_ledger_dir_sync_failure() {
-        return Err(io_error(std::io::Error::other(
-            "injected ledger directory sync failure",
-        )));
-    }
     File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(io_error)
@@ -1141,15 +1132,6 @@ fn persist_control_state(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
     if let Err(error) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(io_error(error));
-    }
-    // oxide#196: an injected failure after the replacement but before the
-    // parent-directory sync leaves the new ledger visible while the write
-    // errors, so callers must classify the commit boundary conservatively.
-    #[cfg(test)]
-    if crate::test_fs::take_ledger_dir_sync_failure() {
-        return Err(io_error(std::io::Error::other(
-            "injected ledger directory sync failure",
-        )));
     }
     File::open(parent)
         .and_then(|directory| directory.sync_all())

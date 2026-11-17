@@ -6,8 +6,8 @@
 //! temp and removes it.
 
 use super::super::pool::{
-    create_injected, lease_injected, mark_evicting_for_test, release_injected,
-    rewrite_removable_backend_injected, slot_state_injected, tamper_idle_generations_injected,
+    create_injected, lease_injected, release_injected, rewrite_removable_backend_injected,
+    tamper_idle_generations_injected,
 };
 use super::super::{
     AdmissionClass, LeaseError, LeaseGrant, LeaseRequest, Profile, SlotLayout, VictimPolicy,
@@ -387,22 +387,6 @@ impl Rig {
         self.lease_full(label, holder, project, None)
     }
 
-    /// A lease whose slot goes into its own project-named folder, so the
-    /// `slots/<folder>/<leaf>` intermediate components are exercised.
-    fn lease_layout(&self, label: &str, holder: &str, folder: &str) -> LeaseGrant {
-        let project = self.fx.dir(&format!("project-{label}"));
-        self.lease_full(
-            label,
-            holder,
-            project,
-            Some(SlotLayout {
-                folders: vec![folder.to_owned()],
-                same_repository: Vec::new(),
-                profile: "quick".to_owned(),
-            }),
-        )
-    }
-
     fn lease_full(
         &self,
         label: &str,
@@ -729,17 +713,6 @@ fn make_donor_with(
     make_donor_in(rig, label, None, files, targets, inputs)
 }
 
-fn make_donor_in_folder(rig: &Rig, label: &str, folder: &str) -> Donor {
-    make_donor_in(
-        rig,
-        label,
-        Some(folder),
-        default_files(),
-        &dep_targets(),
-        &dep_inputs(),
-    )
-}
-
 fn make_donor_in(
     rig: &Rig,
     label: &str,
@@ -809,16 +782,6 @@ fn lease_recipient(rig: &Rig, label: &str) -> (LeaseGrant, SeedRecipient) {
     // One holder holds one lease at a time, so each recipient fixture has its
     // own holder identity.
     let grant = rig.lease(&format!("recipient-{label}"), &format!("recipient-{label}"));
-    let recipient = seed_recipient(&grant);
-    (grant, recipient)
-}
-
-fn lease_recipient_in_folder(rig: &Rig, label: &str, folder: &str) -> (LeaseGrant, SeedRecipient) {
-    let grant = rig.lease_layout(
-        &format!("recipient-{label}"),
-        &format!("recipient-{label}"),
-        folder,
-    );
     let recipient = seed_recipient(&grant);
     (grant, recipient)
 }

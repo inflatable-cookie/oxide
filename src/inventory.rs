@@ -373,15 +373,15 @@ fn full_path_limit() -> usize {
 
 /// Metadata for one enumerated regular file: the live directory entry when the
 /// path name fits the platform limit, otherwise the former full-path no-follow
-/// operation. Both keep the path-keyed test seam the file read had before.
+/// operation. Both keep the ordinary directory-boundary fault seam.
 fn enumerated_file_metadata(entry: &fs::DirEntry, path: &Path) -> std::io::Result<fs::Metadata> {
     if let Some(error) = boundary_fault(path, BoundaryPoint::Entry) {
         return Err(error);
     }
     if path.as_os_str().as_bytes().len() < full_path_limit() {
-        entry_relative_metadata(entry, path, true)
+        entry_relative_metadata(entry)
     } else {
-        full_path_metadata(path, true)
+        full_path_metadata(path)
     }
 }
 
@@ -397,42 +397,21 @@ fn enumerated_directory_metadata(
         return Err(error);
     }
     if path.as_os_str().as_bytes().len() < full_path_limit() {
-        entry_relative_metadata(entry, path, false)
+        entry_relative_metadata(entry)
     } else {
-        full_path_metadata(path, false)
+        full_path_metadata(path)
     }
 }
 
-#[cfg(test)]
-fn observe_metadata_result(site: &str, path: &Path, result: &std::io::Result<fs::Metadata>) {
-    match result {
-        Ok(metadata) => {}
-        Err(_) => {}
-    }
-}
-
-fn entry_relative_metadata(
-    entry: &fs::DirEntry,
-    path: &Path,
-    injected: bool,
-) -> std::io::Result<fs::Metadata> {
+fn entry_relative_metadata(entry: &fs::DirEntry) -> std::io::Result<fs::Metadata> {
     #[cfg(test)]
     crate::test_fs::note_metadata_source(MetadataSource::EntryRelative);
-    if injected {
-        #[cfg(test)]
-        return crate::test_fs::entry_metadata(entry, path);
-    }
-    let _ = path;
     entry.metadata()
 }
 
-fn full_path_metadata(path: &Path, injected: bool) -> std::io::Result<fs::Metadata> {
+fn full_path_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
     #[cfg(test)]
     crate::test_fs::note_metadata_source(MetadataSource::FullPath);
-    if injected {
-        #[cfg(test)]
-        return crate::test_fs::symlink_metadata(path);
-    }
     fs::symlink_metadata(path)
 }
 
@@ -485,7 +464,6 @@ pub(crate) fn inventory_with(
     isolated: &[PathBuf],
 ) -> Result<InventoryReport, InventoryError> {
     limits.validate()?;
-    #[cfg(not(test))]
     let canonical = fs::canonicalize(root).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => InventoryError::RootMissing(root.to_path_buf()),
         _ => InventoryError::RootUnreadable {
@@ -493,22 +471,6 @@ pub(crate) fn inventory_with(
             reason: error.to_string(),
         },
     })?;
-    #[cfg(test)]
-    let canonical = {
-        let result = fs::canonicalize(root);
-        let outcome = match &result {
-            Ok(path) => {}
-            Err(_) => {}
-        };
-        result.map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => InventoryError::RootMissing(root.to_path_buf()),
-            _ => InventoryError::RootUnreadable {
-                root: root.to_path_buf(),
-                reason: error.to_string(),
-            },
-        })?
-    };
-    #[cfg(not(test))]
     let root_metadata = fs::metadata(&canonical).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             InventoryError::RootMissing(canonical.clone())
@@ -519,24 +481,6 @@ pub(crate) fn inventory_with(
             }
         }
     })?;
-    #[cfg(test)]
-    let root_metadata = {
-        let result = fs::metadata(&canonical);
-        match &result {
-            Ok(metadata) => {}
-            Err(_) => {}
-        }
-        result.map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                InventoryError::RootMissing(canonical.clone())
-            } else {
-                InventoryError::RootUnreadable {
-                    root: canonical.clone(),
-                    reason: error.to_string(),
-                }
-            }
-        })?
-    };
     if !root_metadata.is_dir() {
         return Err(InventoryError::RootNotDirectory(canonical));
     }
@@ -848,20 +792,10 @@ impl<'a> Walker<'a> {
         if self.deadline_exceeded {
             return true;
         }
-        #[cfg(not(test))]
         if Instant::now() >= self.deadline {
             self.deadline_exceeded = true;
             self.gap(GapKind::ElapsedDeadline);
             return true;
-        }
-        #[cfg(test)]
-        {
-            let now = Instant::now();
-            if now >= self.deadline {
-                self.deadline_exceeded = true;
-                self.gap(GapKind::ElapsedDeadline);
-                return true;
-            }
         }
         false
     }
@@ -913,13 +847,6 @@ impl<'a> Walker<'a> {
                     },
                     Err,
                 );
-            #[cfg(test)]
-            {
-                let outcome = match &read_dir {
-                    Ok(_) => {}
-                    Err(_) => {}
-                };
-            }
             let entries = match read_dir {
                 Ok(entries) => entries,
                 Err(error)
@@ -956,13 +883,6 @@ impl<'a> Walker<'a> {
                 if self.check_deadline() {
                     return Ok(());
                 }
-                #[cfg(test)]
-                {
-                    match &entry {
-                        Ok(entry) => {}
-                        Err(_) => {}
-                    }
-                }
                 let Ok(entry) = entry else {
                     self.gap(GapKind::UnreadableEntry);
                     continue;
@@ -977,13 +897,6 @@ impl<'a> Walker<'a> {
                 let file_type_result = self
                     .test_hook_error(&path, WalkPoint::BeforeFileType)
                     .map_or_else(|| entry.file_type(), Err);
-                #[cfg(test)]
-                {
-                    let outcome = match &file_type_result {
-                        Ok(kind) => {}
-                        Err(_) => {}
-                    };
-                }
                 let file_type = match file_type_result {
                     Ok(file_type) => file_type,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1013,8 +926,6 @@ impl<'a> Walker<'a> {
                     let metadata = self
                         .test_hook_error(&path, WalkPoint::BeforeSymlinkMetadata)
                         .map_or_else(|| enumerated_directory_metadata(&entry, &path), Err);
-                    #[cfg(test)]
-                    observe_metadata_result("inventory:directory-metadata", &path, &metadata);
                     let metadata = match metadata {
                         // A kind that contradicts the enumerated kind is never
                         // counted, queued or unioned as its replacement.
@@ -1052,8 +963,6 @@ impl<'a> Walker<'a> {
                     self.other[index] += 1;
                 }
             }
-            #[cfg(test)]
-            {}
             // A second sample of the same pathname after enumeration. A
             // mismatch discards this directory's newly queued children only;
             // observed entries and bytes are kept and no vanished event is
@@ -1089,8 +998,6 @@ impl<'a> Walker<'a> {
         // keep their existing debug walk hook and the test-only boundary
         // control rather than the file metadata seam.
         let metadata = fs::symlink_metadata(path);
-        #[cfg(test)]
-        observe_metadata_result("inventory:directory-guard", path, &metadata);
         match metadata {
             Ok(metadata) => {
                 if !metadata.is_dir() {
@@ -1154,8 +1061,6 @@ impl<'a> Walker<'a> {
         let metadata = self
             .test_hook_error(path, WalkPoint::BeforeSymlinkMetadata)
             .map_or_else(|| enumerated_file_metadata(entry, path), Err);
-        #[cfg(test)]
-        observe_metadata_result("inventory:file-metadata", path, &metadata);
         let metadata = match metadata {
             // A kind that contradicts the enumerated kind is never counted or
             // unioned as its replacement.
@@ -1210,7 +1115,6 @@ impl<'a> Walker<'a> {
     }
 
     fn verify_root(&self) -> Result<(), InventoryError> {
-        #[cfg(not(test))]
         let metadata = fs::symlink_metadata(self.root).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 InventoryError::RootMissing(self.root.to_path_buf())
@@ -1221,21 +1125,6 @@ impl<'a> Walker<'a> {
                 }
             }
         })?;
-        #[cfg(test)]
-        let metadata = {
-            let result = fs::symlink_metadata(self.root);
-            observe_metadata_result("inventory:verify-root", self.root, &result);
-            result.map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    InventoryError::RootMissing(self.root.to_path_buf())
-                } else {
-                    InventoryError::RootUnreadable {
-                        root: self.root.to_path_buf(),
-                        reason: error.to_string(),
-                    }
-                }
-            })?
-        };
         if !metadata.is_dir() {
             return Err(InventoryError::RootNotDirectory(self.root.to_path_buf()));
         }
@@ -1523,8 +1412,6 @@ fn probe_filesystem_free(root: &Path, device: u64) -> FilesystemFree {
     // SAFETY: `path` is a valid NUL-terminated C string and `stat` points to
     // writable storage for exactly one `statvfs` value.
     let status = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
-    #[cfg(test)]
-    if status != 0 {}
     if status != 0 {
         return FilesystemFree::Unavailable {
             reason: std::io::Error::last_os_error().to_string(),
@@ -1532,8 +1419,6 @@ fn probe_filesystem_free(root: &Path, device: u64) -> FilesystemFree {
     }
     // SAFETY: a zero return status means `statvfs` initialized the structure.
     let stat = unsafe { stat.assume_init() };
-    #[cfg(test)]
-    {}
     let block_size = u64::from(stat.f_frsize);
     let multiply =
         |blocks: libc::fsblkcnt_t| -> Option<u64> { u64::from(blocks).checked_mul(block_size) };
@@ -1788,10 +1673,7 @@ pub mod walk_observer {
         pub(crate) fn from_environment() -> Option<Self> {
             #[cfg(test)]
             let test_value = TEST_MUTATIONS.with(|cell| cell.borrow().clone());
-            #[cfg(not(test))]
             let test_value: Option<String> = None;
-            #[cfg(test)]
-            let value = test_value.clone()?;
             #[cfg(not(test))]
             let value = {
                 std::env::var("OXIDE_PROOF_DEADLINE_NS")

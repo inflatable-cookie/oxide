@@ -173,8 +173,6 @@ fn release_marks_the_slot_idle_and_a_replay_is_idempotent() {
 fn byte_pressure_evicts_one_idle_slot_whole_and_keeps_a_held_one() {
     let fixture = Fixture::new("pressure");
     let pool = fixture.pool();
-    let project = fixture.dir("project");
-    let workspace = fixture.dir("workspace");
     let store = managed::status(&pool).unwrap().store_id;
     let held = managed::lease_measured(request(
         &pool,

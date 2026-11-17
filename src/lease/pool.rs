@@ -653,17 +653,6 @@ pub(super) struct Pool {
     /// A bounded note the caller prints when admission had to report a policy
     /// decision (for example a fallback or a warning).
     admission_note: Option<String>,
-    /// Debug proof observation (oxide#190): the instant this mutating open took
-    /// the pool lock. An eviction's recorded figure is the elapsed interval from
-    /// here to its row write, so it measures the **whole eviction-deciding
-    /// pool-lock interval** — fence, ledger read, reconciliation, admission
-    /// bookkeeping, the byte-pressure decision and the recorded-total walks that
-    /// feed it, victim selection, the intent write, the identity-verified rename
-    /// and the row write — and not only the rename transaction. A command that
-    /// evicts more than once under one lock records a figure that also covers
-    /// the evictions before it. Absent from release builds.
-    #[cfg(debug_assertions)]
-    lock_taken: Option<Instant>,
 }
 
 /// Entry points for the `oxide` front door. They open a budget-only
@@ -1037,9 +1026,6 @@ pub mod managed {
         let root = canonical_existing_dir(pool, true)?;
         for name in [CONFIG_NAME, LEDGER_NAME] {
             let path = root.join(name);
-            #[cfg(test)]
-            let metadata = crate::test_fs::symlink_metadata(&path);
-            #[cfg(not(test))]
             let metadata = path.symlink_metadata();
             match metadata {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1127,71 +1113,10 @@ fn drop_injected_hold(lease_id: &str) {
         .map(|mut holds| holds.remove(lease_id));
 }
 
-/// Test-only: [`lease_injected`] with the holding entries that admission
-/// created (oxide#190), so a test can assert the publishing contract.
-#[cfg(test)]
-pub(super) fn lease_holding_injected(
-    request: LeaseRequest,
-) -> Result<(LeaseGrant, Vec<String>), LeaseError> {
-    managed::lease_measured(request).map(|leased| (leased.grant, leased.holding))
-}
-
 #[cfg(test)]
 pub(super) fn release_injected(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
     drop_injected_hold(lease_id);
     managed::release(pool, lease_id)
-}
-
-#[cfg(test)]
-pub(super) fn recover_injected(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
-    drop_injected_hold(lease_id);
-    managed::recover(pool, lease_id)
-}
-
-#[cfg(test)]
-pub(super) fn evict_idle_slot_injected(
-    pool: &Path,
-    slot_id: &str,
-) -> Result<Vec<String>, LeaseError> {
-    managed::evict_idle_slot(pool, slot_id)
-}
-
-#[cfg(test)]
-pub(super) fn evict_held_slot_injected(
-    pool: &Path,
-    slot_id: &str,
-    lease_id: &str,
-) -> Result<Vec<String>, HeldEvictionFailure> {
-    managed::evict_held_slot(pool, slot_id, lease_id)
-}
-
-#[cfg(test)]
-pub(super) fn status_injected(pool: &Path) -> Result<PoolStatus, LeaseError> {
-    managed::status(pool)
-}
-
-#[cfg(test)]
-pub(super) fn snapshot_injected(pool: &Path) -> Result<super::PassiveSnapshot, LeaseError> {
-    managed::snapshot(pool)
-}
-
-#[cfg(test)]
-pub(super) fn lock_injected(pool: &Path) -> Result<File, LeaseError> {
-    lock_pool(pool)
-}
-
-/// A ledger whose store identity no longer matches its config, to prove a
-/// passive snapshot refuses a mismatched pair instead of repairing it.
-#[cfg(test)]
-pub(super) fn mismatched_store_id_injected(pool: &Path) -> Result<(), LeaseError> {
-    let mut ledger = read_ledger(pool)?;
-    ledger.store_id = "0".repeat(32);
-    write_ledger(pool, &ledger)
-}
-
-#[cfg(test)]
-pub(super) fn measure_injected(pool: &Path) -> Result<super::MeasuredPool, LeaseError> {
-    managed::measure(pool)
 }
 
 /// Test-only: record a removable `apfs-volume-v1` backend with a deliberately
@@ -1224,58 +1149,6 @@ pub(super) fn tamper_idle_generations_injected(pool: &Path) -> Result<(), LeaseE
         }
     }
     write_ledger(pool, &ledger)
-}
-
-/// Test-only: one slot's ledger state as the ledger file records it, read
-/// without opening (and therefore without reconciling) the pool.
-#[cfg(test)]
-pub(super) fn slot_state_injected(pool: &Path, slot_id: &str) -> Option<String> {
-    let ledger = read_ledger(pool).ok()?;
-    let id = slot_id.parse::<u64>().ok()?;
-    ledger
-        .slots
-        .iter()
-        .find(|slot| slot.id == id)
-        .map(|slot| match slot.state {
-            SlotPersistState::Held => "held".to_owned(),
-            SlotPersistState::Idle => "idle".to_owned(),
-            SlotPersistState::Evicting => "evicting".to_owned(),
-        })
-}
-
-/// Test-only: open a passive measurement, wait, then walk, returning each
-/// scan's recorded elapsed bound so the shared deadline can be observed.
-#[cfg(test)]
-pub(super) fn measure_after_delay_injected(
-    pool: &Path,
-    bound_ms: u64,
-    delay_ms: u64,
-) -> Result<Vec<u64>, LeaseError> {
-    let opened = Pool::open_passive(pool, bound_ms)?;
-    std::thread::sleep(Duration::from_millis(delay_ms));
-    let status = opened.accounted()?;
-    let mut bounds = vec![status.payload_accounting.max_elapsed_ms];
-    bounds.extend(
-        status
-            .slots
-            .iter()
-            .map(|slot| slot.accounting.max_elapsed_ms),
-    );
-    Ok(bounds)
-}
-
-#[cfg(test)]
-pub(super) fn mark_evicting_for_test(pool: &Path, slot_id: u64) -> Result<(), LeaseError> {
-    let mut opened = Pool::open(pool)?;
-    let slot = opened
-        .slot_mut(slot_id)
-        .ok_or(LeaseError::UnknownAccounting)?;
-    if slot.state != SlotPersistState::Idle || slot.lease_id.is_some() {
-        return Err(LeaseError::UnknownAccounting);
-    }
-    slot.state = SlotPersistState::Evicting;
-    slot.capture = None;
-    opened.persist()
 }
 
 impl Pool {
@@ -1313,11 +1186,6 @@ impl Pool {
         } else {
             lock_pool(&root)?
         };
-        // Debug proof observation (oxide#190): an eviction's reported interval
-        // starts at this lock acquisition, so it covers every decision this lock
-        // hold makes instead of only the rename transaction.
-        #[cfg(debug_assertions)]
-        let lock_taken = Some(Instant::now());
         // Fence first (oxide#177, ruling 4c9984a1): a managed pool's control
         // state reaches the current fence version before this open can start a
         // recovery journal or finish a recorded deletion. A library fixture
@@ -1360,8 +1228,6 @@ impl Pool {
             ledger,
             reserve: None,
             admission_note: None,
-            #[cfg(debug_assertions)]
-            lock_taken,
         };
         // A Barge-owned slot's hold is the authority: a held row whose root
         // can be held again has no live holder, so it returns to idle before
@@ -1401,8 +1267,6 @@ impl Pool {
             ledger,
             reserve: None,
             admission_note: None,
-            #[cfg(debug_assertions)]
-            lock_taken: None,
         })
     }
 
@@ -2471,12 +2335,6 @@ fn pool_storage(
     config: &PoolConfig,
 ) -> Result<Option<crate::storage::PoolStorage>, LeaseError> {
     use crate::storage::PoolBacking;
-    // A fixture that fakes the volume identity has no real mount to register
-    // in the pool's Barge account; it keeps the pre-adoption slot path.
-    #[cfg(test)]
-    if crate::volume::verified_facts::armed() {
-        return Ok(None);
-    }
     let control = root.join(MANAGED_NAME);
     let backing = match config.backend.as_str() {
         BUDGET_BACKEND_DIRECTORY_V1 => PoolBacking::budget(root, config.cap_bytes),
@@ -3015,19 +2873,6 @@ fn read_ledger(pool: &Path) -> Result<Ledger, LeaseError> {
     Ok(ledger)
 }
 
-#[cfg(test)]
-pub(super) fn write_ledger_bytes_injected(
-    pool: &Path,
-    bytes: &[u8],
-) -> Result<Vec<u8>, LeaseError> {
-    let ledger: Ledger =
-        serde_json::from_slice(bytes).map_err(|_| LeaseError::UnknownAccounting)?;
-    validate_ledger_write(&ledger)?;
-    write_ledger(pool, &ledger)?;
-    let stored = read_ledger(pool)?;
-    serde_json::to_vec(&stored).map_err(|error| LeaseError::Io(error.to_string()))
-}
-
 /// Read-only, before the pool lock is created or taken: a pool holding the
 /// retired image or receipt, or whose config records any backend but the
 /// two current ones, refuses untouched. A missing config is left to the
@@ -3053,9 +2898,6 @@ fn refuse_retired_image_pool(pool: &Path) -> Result<(), LeaseError> {
 /// renames its `ledger.tmp-*` onto `ledger.json`, and Finder removes its
 /// metadata files. The caller skips such an entry. Every other error refuses.
 fn listed_control_entry(path: &Path) -> Result<Option<fs::Metadata>, LeaseError> {
-    #[cfg(test)]
-    let metadata = crate::test_fs::symlink_metadata(path);
-    #[cfg(not(test))]
     let metadata = fs::symlink_metadata(path);
     match metadata {
         Ok(metadata) => Ok(Some(metadata)),
@@ -3101,177 +2943,4 @@ fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
         }
     }
     Ok(())
-}
-
-/// Build a removable-backed `Pool` over an owned fixture payload directory.
-///
-/// Test-only. The backing is `Payload::Volume` (so every production branch for
-/// a removable pool is taken) with a descriptor over the fixture directory, and
-/// the verification result comes from [`crate::volume::verified_facts`]: while
-/// that adapter is installed `Binding::verify()` returns those modelled facts
-/// and therefore skips `observe()`, the mount-root rule, the device comparison
-/// and the mount-point path re-check. Nothing here is a public or environment
-/// interface, and it is never native verification of a real volume.
-#[cfg(test)]
-pub(super) fn volume_pool_for_test(
-    pool_root: &Path,
-    payload: &Path,
-    budget: u64,
-    reserve: Option<u64>,
-) -> Result<Pool, LeaseError> {
-    let store_id = "b".repeat(32);
-    let binding = crate::volume::binding_for_test(payload, &"1".repeat(36))
-        .map_err(|_| LeaseError::BackingMismatch)?;
-    let fd = binding
-        .fd()
-        .try_clone_to_owned()
-        .map_err(|error| LeaseError::Io(error.to_string()))?;
-    let config = PoolConfig {
-        version: LEASE_VERSION,
-        backend: VOLUME_BACKEND_APFS_V1.to_owned(),
-        store_id: store_id.clone(),
-        cap_bytes: budget,
-        image_bytes: 0,
-        volume: Some(VolumeConfig {
-            mount_point: payload.to_path_buf(),
-            volume_uuid: "1".repeat(36),
-            payload_dir: "payload".to_owned(),
-        }),
-    };
-    let ledger = Ledger {
-        version: LEASE_VERSION,
-        store_id,
-        cap_bytes: budget,
-        next_slot: 1,
-        next_lease: 1,
-        capacity_policy: None,
-        next_rank: None,
-        holding: Vec::new(),
-        slots: Vec::new(),
-    };
-    Ok(Pool {
-        _lock: None,
-        root: pool_root.to_path_buf(),
-        config,
-        backing: Payload::Volume {
-            binding,
-            root: payload.to_path_buf(),
-            fd,
-        },
-        // A test fixture's fake volume identity owns no Barge account; its
-        // slots keep the pre-adoption directory path.
-        storage: None,
-        pending_hold: None,
-        deadline: None,
-        budget,
-        ledger,
-        reserve,
-        admission_note: None,
-        #[cfg(debug_assertions)]
-        lock_taken: None,
-    })
-}
-
-/// Test-only: one revised write that fills the whole slot table with **held**
-/// slots, so an admission at the ceiling has no evictable idle victim. Returns
-/// the last slot's ID and lease ID, which a caller can release to create the
-/// only idle slot (oxide#186 ceiling fixtures). No payload is written.
-#[cfg(test)]
-pub(super) fn fill_held_slot_table_for_test(pool: &Path) -> Result<(u64, String), LeaseError> {
-    let mut opened = Pool::open(pool)?;
-    for id in 1..=MAX_SLOTS as u64 {
-        add_idle_slot_for_test(&mut opened, id, id, 0, 0)?;
-        let slot = opened.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
-        slot.state = SlotPersistState::Held;
-        slot.holder = format!("holder-{id}");
-        slot.lease_id = Some(slot.last_lease_id.clone());
-        slot.recorded = None;
-    }
-    opened.persist_revised()?;
-    let last = opened
-        .ledger
-        .slots
-        .last()
-        .map(|slot| (slot.id, slot.last_lease_id.clone()))
-        .ok_or(LeaseError::UnknownAccounting)?;
-    Ok(last)
-}
-
-/// Test-only: give this pool an idle whole slot with a closed observation.
-#[cfg(test)]
-pub(super) fn add_idle_slot_for_test(
-    pool: &mut Pool,
-    id: u64,
-    rank: u64,
-    recorded_bytes: u64,
-    payload_files: usize,
-) -> Result<PathBuf, LeaseError> {
-    let slot_path = pool.slot_path_in(id, None)?;
-    fs::create_dir_all(slot_path.join("build")).map_err(io_error)?;
-    // The product's slots are owner-only; a fixture slot must be too, or the
-    // idle-scope and holding checks correctly refuse it.
-    for path in [slot_path.join("build"), slot_path.clone()] {
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(io_error)?;
-    }
-    for index in 0..payload_files {
-        fs::write(
-            slot_path.join("build").join(format!("blob-{index}")),
-            vec![b'x'; 64 * 1024],
-        )
-        .map_err(io_error)?;
-    }
-    let last_lease_id = format!("v1.{}.{id}.1.{id}", pool.config.store_id);
-    pool.ledger.slots.push(SlotRecord {
-        id,
-        incarnation: 1,
-        state: SlotPersistState::Idle,
-        project: PathBuf::from("/fixture/project"),
-        workspace: PathBuf::from("/fixture/workspace"),
-        profile: Profile::Dev,
-        holder: "fixture".to_owned(),
-        lease_id: None,
-        last_lease_id: last_lease_id.clone(),
-        dir: None,
-        root: None,
-        owned: false,
-        rank,
-        recorded: None,
-        capture: None,
-        hold_intent: None,
-    });
-    pool.ledger.next_slot = id + 1;
-    pool.ledger.next_rank = Some(rank + 1);
-    Ok(slot_path)
-}
-
-/// Test-only: the pool's slot IDs in ledger order.
-#[cfg(test)]
-pub(super) fn slot_ids_for_test(pool: &Pool) -> Vec<u64> {
-    pool.ledger.slots.iter().map(|slot| slot.id).collect()
-}
-
-/// Test-only: mark a slot held, for victim-safety checks.
-#[cfg(test)]
-pub(super) fn hold_slot_for_test(pool: &mut Pool, id: u64, holder: &str) {
-    let lease = format!("v1.{}.{id}.1.{}", pool.config.store_id, id + 100);
-    if let Some(slot) = pool.slot_mut(id) {
-        slot.state = SlotPersistState::Held;
-        slot.lease_id = Some(lease);
-        slot.holder = holder.to_owned();
-        // The product clears the observation in the same write that records
-        // `Held`; a held slot never carries an idle record.
-        slot.recorded = None;
-    }
-}
-
-/// Test-only: drop one idle slot's closed observation, producing the
-/// legacy-shaped state a pool that never released under this version has.
-#[cfg(test)]
-pub(super) fn drop_record_for_test(pool: &Path, slot_id: u64) -> Result<(), LeaseError> {
-    let mut opened = Pool::open(pool)?;
-    let slot = opened
-        .slot_mut(slot_id)
-        .ok_or(LeaseError::UnknownAccounting)?;
-    slot.recorded = None;
-    opened.persist()
 }
