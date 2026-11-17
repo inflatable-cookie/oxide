@@ -630,10 +630,15 @@ impl PoolStorage {
     }
 
     /// Pin a root in one project area, protecting it from prune and eviction.
-    pub fn pin_in(&self, project_folder: Option<&str>, id: &str, reason: &str) {
-        if let Ok(area) = self.area_for(project_folder) {
-            let _ = area.pin(id, reason);
-        }
+    pub fn pin_in(
+        &self,
+        project_folder: Option<&str>,
+        id: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        self.area_for(project_folder)?
+            .pin(id, reason)
+            .map_err(|error| format!("cannot pin root {id}: {error}"))
     }
 
     /// Remove a root's pin in one project area.

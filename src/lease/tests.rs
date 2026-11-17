@@ -403,19 +403,17 @@ fn an_evicted_legacy_root_gets_a_fresh_successor_path() {
     let dir = slot_dir(&pool, "44");
     let project = fixture.dir("project");
     write_legacy_ledger(&pool, "idle", None, 44, project.to_str().unwrap());
-    // Adopt, then settle the legacy generation and evict the idle root. Its
-    // protection pin keeps it out of automatic prune until it is removed.
+    // Adopt, then settle the legacy generation with a real held grant before
+    // evicting it. Opening alone must keep its protection pin in place.
     managed::status(&pool).unwrap();
-    let area = crate::storage::PoolStorage::open(
-        &pool.join("oxide-managed"),
-        &crate::storage::PoolBacking::budget(&pool, 8 << 20),
-    )
-    .expect("area");
-    let (_, info) = area.all_roots().unwrap().first().expect("adopted").clone();
-    area.unpin_in(None, &info.id).expect("settled");
+    let workspace = fixture.dir("workspace");
+    let settled = managed::lease_measured(request(&pool, &project, &workspace, "settle"))
+        .expect("settle legacy generation");
+    let lease = settled.grant.lease_id.clone();
+    drop(settled);
+    managed::release(&pool, &lease).expect("release settled generation");
     managed::evict_idle_slot(&pool, "44").expect("evicted");
     assert!(!dir.exists(), "the recorded legacy root is deleted whole");
-    let workspace = fixture.dir("workspace");
     let fresh =
         managed::lease_measured(request(&pool, &project, &workspace, "new")).expect("admit");
     assert!(!fresh.grant.reused_slot, "the successor is a new slot");
@@ -542,6 +540,85 @@ fn an_adopted_idle_legacy_root_is_pinned_out_of_prune_and_eviction() {
         "the pinned legacy root cannot be evicted"
     );
     assert!(dir.join("artifact").is_file());
+
+    // A supported transition can already name the Barge root while its old
+    // generation never acquired a hold. Every open restores its durable pin.
+    area.unpin_in(None, &info.id)
+        .expect("remove pin in fixture");
+    managed::status(&pool).expect("protect already-adopted legacy root");
+    assert!(area.all_roots().unwrap()[0].1.pinned);
+    assert!(area.evict_any(&info.id).is_err());
+}
+
+#[test]
+fn a_failed_legacy_pin_publication_refuses_before_pruning_and_can_retry() {
+    let fixture = Fixture::new("legacy-pin-failure");
+    let pool = fixture.pool();
+    let dir = slot_dir(&pool, "62");
+    fs::write(dir.join("artifact"), b"keep").unwrap();
+    let project = fixture.dir("project");
+    write_legacy_ledger(&pool, "idle", None, 62, project.to_str().unwrap());
+    managed::status(&pool).expect("adopt legacy root");
+    let storage = crate::storage::PoolStorage::open(
+        &pool.join("oxide-managed"),
+        &crate::storage::PoolBacking::budget(&pool, 8 << 20),
+    )
+    .unwrap();
+    let (_, root) = storage.all_roots().unwrap().remove(0);
+    storage.unpin_in(None, &root.id).unwrap();
+    let pin = dir
+        .parent()
+        .unwrap()
+        .join(".barge/pins")
+        .join(format!("{}.json", root.id));
+    fs::create_dir(&pin).unwrap();
+    assert!(matches!(
+        managed::status(&pool),
+        Err(LeaseError::UnknownAccounting)
+    ));
+    assert_eq!(fs::read(dir.join("artifact")).unwrap(), b"keep");
+    fs::remove_dir(&pin).unwrap();
+    managed::status(&pool).expect("retry publishes the required pin");
+    assert!(storage.all_roots().unwrap()[0].1.pinned);
+}
+
+#[test]
+fn barge_pruning_retires_workflow_rows_and_uses_fresh_successor_paths() {
+    for ledger_write_completed in [true, false] {
+        let fixture = Fixture::new(if ledger_write_completed {
+            "prune-row"
+        } else {
+            "prune-gap"
+        });
+        let pool = fixture.pool();
+        let project = fixture.dir("project");
+        let workspace = fixture.dir("workspace");
+        let first = managed::lease_measured(request(&pool, &project, &workspace, "first")).unwrap();
+        fill(&first, 9 << 20);
+        let old_path = first.grant.env.cargo_build_build_dir.clone();
+        let old_lease = first.grant.lease_id.clone();
+        drop(first);
+        managed::release(&pool, &old_lease).unwrap();
+        if ledger_write_completed {
+            super::pool::prune_injected(&pool).expect("ordinary Barge prune and ledger update");
+        } else {
+            let storage = crate::storage::PoolStorage::open(
+                &pool.join("oxide-managed"),
+                &crate::storage::PoolBacking::budget(&pool, 8 << 20),
+            )
+            .unwrap();
+            let report = storage
+                .prune(false)
+                .expect("Barge completed before ledger write");
+            assert_eq!(report.evicted.len(), 1);
+        }
+        assert!(!old_path.exists());
+        let fresh = managed::lease_measured(request(&pool, &project, &workspace, "fresh"))
+            .expect("admit a successor after prune");
+        assert!(!fresh.grant.reused_slot);
+        assert_ne!(fresh.grant.env.cargo_build_build_dir, old_path);
+        assert_eq!(managed::status(&pool).unwrap().slots.len(), 1);
+    }
 }
 
 #[test]

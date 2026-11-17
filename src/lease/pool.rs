@@ -1119,6 +1119,11 @@ pub(super) fn release_injected(pool: &Path, lease_id: &str) -> Result<ReleaseRec
     managed::release(pool, lease_id)
 }
 
+#[cfg(test)]
+pub(super) fn prune_injected(pool: &Path) -> Result<(), LeaseError> {
+    Pool::open(pool)?.prune_storage()
+}
+
 /// Test-only: record a removable `apfs-volume-v1` backend with a deliberately
 /// absent mount point, so a seeding call can be shown to gate the removable
 /// path from the backend alone without opening or probing any volume.
@@ -1235,6 +1240,7 @@ impl Pool {
         // place first, keeping their path and bytes.
         pool.adopt_legacy_roots()?;
         pool.recover_abandoned_holds()?;
+        pool.retire_missing_idle_roots()?;
         pool.sweep_trash()?;
         Ok(pool)
     }
@@ -1428,10 +1434,20 @@ impl Pool {
         };
         let mut changed = false;
         for slot in &mut self.ledger.slots {
-            if slot.root.is_some()
-                || slot.state != SlotPersistState::Idle
-                || slot.lease_id.is_some()
-            {
+            if let Some(root) = slot.root.as_deref() {
+                if !slot.owned {
+                    let project = slot
+                        .dir
+                        .as_deref()
+                        .and_then(|dir| dir.split_once('/'))
+                        .map(|(folder, _)| folder);
+                    storage
+                        .pin_in(project, root, "legacy generation")
+                        .map_err(|_| LeaseError::UnknownAccounting)?;
+                }
+                continue;
+            }
+            if slot.state != SlotPersistState::Idle || slot.lease_id.is_some() {
                 // A held legacy generation is never adopted: its writer predates
                 // the Barge lock, and adopting it would put an in-use directory
                 // under Barge's prune authority.
@@ -1450,7 +1466,9 @@ impl Pool {
                     // so no prune or eviction can delete a directory an older
                     // writer may still use. The pin is removed when a grant
                     // takes the root.
-                    storage.pin_in(project_folder.as_deref(), &root.id, "legacy generation");
+                    storage
+                        .pin_in(project_folder.as_deref(), &root.id, "legacy generation")
+                        .map_err(|_| LeaseError::UnknownAccounting)?;
                     slot.root = Some(root.id);
                     changed = true;
                 }
@@ -1463,6 +1481,56 @@ impl Pool {
         }
         if changed {
             self.persist()?;
+        }
+        Ok(())
+    }
+
+    /// A completed Barge rename may precede the workflow ledger write. Only a
+    /// positively absent, previously held Barge root can retire its idle row;
+    /// existing or unreadable paths stay recorded and are never re-adopted.
+    fn retire_missing_idle_roots(&mut self) -> Result<(), LeaseError> {
+        let mut missing = Vec::new();
+        for slot in &self.ledger.slots {
+            if slot.owned
+                && slot.root.is_some()
+                && slot.state == SlotPersistState::Idle
+                && slot.lease_id.is_none()
+                && fs::symlink_metadata(self.slot_path(slot.id)?)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                missing.push(slot.id);
+            }
+        }
+        if !missing.is_empty() {
+            self.ledger.slots.retain(|slot| !missing.contains(&slot.id));
+            self.persist_revised()?;
+        }
+        Ok(())
+    }
+
+    /// Commit Barge's completed evictions to workflow membership before the
+    /// next compatible-root lookup. Barge still owns all deletion decisions.
+    fn prune_storage(&mut self) -> Result<(), LeaseError> {
+        let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
+        let report = storage
+            .prune(false)
+            .map_err(|_| LeaseError::UnknownAccounting)?;
+        let mut retired = Vec::new();
+        for slot in &self.ledger.slots {
+            if let Some(id) = slot.root.as_deref() {
+                let path = self.slot_path(slot.id)?;
+                if report
+                    .evicted
+                    .iter()
+                    .any(|root| root.id == id && root.path == path)
+                {
+                    retired.push(slot.id);
+                }
+            }
+        }
+        if !retired.is_empty() {
+            self.ledger.slots.retain(|slot| !retired.contains(&slot.id));
+            self.persist_revised()?;
         }
         Ok(())
     }
@@ -1512,6 +1580,16 @@ impl Pool {
         {
             if held.holder != request.holder {
                 return Err(LeaseError::Busy);
+            }
+        }
+        // The volume's reserve and floor apply to warm reuse as well as a new
+        // slot. Reconcile completed Barge evictions before selecting a root.
+        if self.is_removable() {
+            self.prune_storage()?;
+            let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
+            let space = storage.space().map_err(|_| LeaseError::UnknownAccounting)?;
+            if space.floor_bytes > 0 && space.free_bytes < space.floor_bytes {
+                return Err(LeaseError::Full);
             }
         }
         let candidate = self.idle_compatible(&project, request.profile);
@@ -1586,6 +1664,7 @@ impl Pool {
             // never established, so a writer could still be inside it.
             return Err(LeaseError::Busy);
         };
+        let legacy = !slot.owned;
         let area = slot
             .dir
             .as_deref()
@@ -1601,7 +1680,11 @@ impl Pool {
                 let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
                 // This generation now owns the root through its hold; the
                 // legacy protection pin is no longer needed.
-                let _ = storage.unpin_in(area.as_deref(), &root);
+                if legacy {
+                    storage
+                        .unpin_in(area.as_deref(), &root)
+                        .map_err(|_| LeaseError::UnknownAccounting)?;
+                }
                 if let Some(slot) = self.slot_mut(slot_id) {
                     slot.owned = true;
                 }
@@ -1668,16 +1751,6 @@ impl Pool {
                 used = storage
                     .total_bytes()
                     .map_err(|_| LeaseError::UnknownAccounting)?;
-            }
-            if self.is_removable() {
-                if storage.prune(false).is_err() {
-                    return Err(LeaseError::UnknownAccounting);
-                }
-                if let Ok(space) = storage.space() {
-                    if space.floor_bytes > 0 && space.free_bytes < space.floor_bytes {
-                        return Err(LeaseError::Full);
-                    }
-                }
             }
         }
         let slot_id = self.ledger.next_slot;
