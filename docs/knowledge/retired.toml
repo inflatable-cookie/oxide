@@ -84,3 +84,11 @@ allow = [
   "docs/knowledge/vision.md",
   "scripts/test-oxide-cli.py",
 ]
+
+[[retired]]
+id = "cooperative-qualification-supplier-contract"
+retired = "2026-11-17"
+replacement = "Task 309 uses ordinary Effigy execution and exact-source review; historical outcomes remain in Queue."
+owner = "docs/knowledge/vision.md"
+paths = ["docs/knowledge/contracts/cooperative-qualification.md"]
+terms = ["proof:qualification-suppliers:plan"]

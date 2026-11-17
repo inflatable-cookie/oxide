@@ -2327,118 +2327,15 @@ applicable separately activated diagnostic before a counted run.
 
 ## Shared proof supervisor
 
-An isolated, unqualified ceiling candidate lives at `scripts/bounded-test-ceiling.py`
-(oxide#309). Its `--ceiling-uptime-ns` option takes an absolute integer in the
-local `CLOCK_UPTIME_RAW` domain and caps the initial and admission-extended
-deadline. It retains the 20-second stop reserve and two-second exit margin.
-`proof:supervisor:ceiling:plan` and `proof:supervisor:ceiling:test` cover
-synthetic source controls only; neither qualifies a runner. The ordinary
-`scripts/bounded-test.py` and the separate oxide#233 candidate remain unchanged.
-Source review, an independently scoped diagnostic and separate author and
-reviewer native qualifications precede any promotion or consumer adoption.
-
-The proposed oxide#309 qualification apparatus is isolated in
-`scripts/test_supervisor_ceiling_qualification.py` and
-`scripts/qualify-supervisor-ceiling.py`. It derives from oxide#195 head
-`b29ef6ca` (382 pure and 57 real cases), adds six ceiling real cases and
-retains the fixed 600/560/530-second outer/guard/suite bounds and 512 MiB
-all-owned budget. The proposed guard share is 384 MiB, with 128 MiB shared
-outside it, including the bootstrap base, complete capture and delivery. The
-bootstrap's two result documents are each capped at 1 MiB and the base is
-measured before finalization. `ceiling-qualification-pins.json` binds the ordinary guard, ceiling
-candidate, suite and bootstrap; the qualification routes supply its digest.
-The effect-free `proof:supervisor:ceiling:qualification:plan` collects case
-names only; `proof:supervisor:ceiling:qualification:compat` checks the retained
-monitor stubs with substituted I/O. No apparatus execution, qualification or adoption follows from this
-source. Tom's `775190c6` ceiling and separate `a833` guest-clock rulings remain
-distinct; native occurrences require the separate owner activations.
-The candidate digest is `4aba8be3120abc67a0a9b4df6793bbc2b74ece79199f56bbfa355fed368231e0`;
-the pin manifest digest is `adc09837bbac2c5daf0a5d9f8bc10f21bce668f35e70c78e8bfcb3f6dd29c03f`.
-The bootstrap digest is `0405db397d05dc423c83f4088ac8ca4a8e4998ce620e6c2a1b16a584bdfc6831`. The manifest records the full suite digest
-alongside the unchanged `fcfda2b0` ordinary guard.
-For a future separately activated diagnostic, the proposed capture argv is
-`effigy proof:supervisor:ceiling:qualify:diagnostic` with stdout and stderr
-redirected together to one new task-owned `raw.log`. No archive or second raw
-log is assumed. Copy each of the eight named source inputs, the raw Git index
-and its entry listing once before and once after; retain the original bounded
-bootstrap base, one producer, a source/case manifest and one bounded receipt
-copy. A single bounded proofFiles manifest has its own and one delivered copy;
-it names the immutable raw log by exact path, length and digest. The receipt
-inside the guard stays counted in the guard share. The pure `capture_fit`
-model counts every representation, allocation rounding, a separate filesystem
-reserve and closeout reserve simultaneously, without compression. It refuses
-unknown route output, extra raw-log copies, invalid source inventory and any
-combined total above 128 MiB. The proposed 1 MiB allowance for all guard,
-actor, Effigy and admission output beyond the 64 MiB forwarding and 2 MiB
-bootstrap output is not yet established for the actual admitted route: the
-owner must bind a real finite route bound, actual index/source sizes and
-allocation unit before effects. A failed or unknown bound is not native
-readiness or permission to truncate output.
-
-The prospective capture implementation also reserves 8 MiB for the separate
-qualified outer group's scratch and 3 MiB for its bounded metadata output. Its
-two snapshots cover the eight Oxide inputs, nineteen pinned Effigy source inputs,
-and the index and entries within a 5 MiB source-copy reservation; an oversized
-inventory refuses. The outer group's own output logs are metadata, not a second
-copy of the raw diagnostic stream. A provisional receipt alone never establishes
-completeness: a late publication or a worker without an in-window actor
-acknowledgment and positive reap is unqualified. The source-command route now
-refuses before spawning: the present actor pins its worker, but cannot retain
-that worker's unreaped subprocess handles if it must stop the worker. A
-qualified custodian that survives through child and joined-group closure is
-still needed; the ordinary guard's relative deadline and admission extensions
-do not by themselves enforce the original absolute window. These prospective
-controls are not native readiness or evidence that physical allocation fits.
-
-The installed Effigy `e6d7ac3` deadline samples `Instant` at its own entry and
-reads a separately sampled `CLOCK_MONOTONIC` value for helper custody. Its text
-readback reports its configured duration, elapsed time and phase allowance;
-it does not name Oxide's earlier `CLOCK_UPTIME_RAW` start. Sampling a remaining
-duration before launch leaves launch delay unbounded, and the helper's later
-clock sample adds an unmeasured residual. The capture plan therefore keeps the
-original-window binding unproven. Its parser and arithmetic are source controls,
-not a clock conversion, settlement receipt or permission to launch. The
-`docs:check` selector also starts nested Effigy commands; each receives a
-sampled remaining duration and starts its own clock, so that route requires
-an independently established original-window bound as well. The observed
-admission protocol is preserved and bound, not forced to a synthetic value.
-
-The pinned `4aba8be3` guard has five summary call sites: two in
-`finish_monitor` and three in `Monitor.run`, each ending in a return or stop.
-A summary has at most seven base/optional rows, one grant, one late, one
-pairs, three unpaired, one boundary and one rejected row: 15 reports. Six
-other report call sites cover setup, monitor refusal/exception, launch refusal,
-finish failure and main error. Charging all five summary sites gives at most
-81 reports; each `report` writes at most `PIPE_BUF` bytes. Three bootstrap
-actor/exception writes reserve 1,024 bytes each. With a verified `PIPE_BUF` at
-most 4,096, the source arithmetic reserves 334,848 direct bytes; an Effigy cap
-of 524,288 bytes includes its marker and footer and yields 859,136 bytes of
-the 1 MiB route-extra allowance. `derived_route_extra` rejects candidate source
-drift, a larger or unknown `PIPE_BUF`, and any other cap. This is source
-arithmetic, not evidence that the actual runtime branch, capture or storage fit.
-
-The installed `97495472` strict route keeps a 16,448-byte logical ring and
-writes a 1,023-byte body followed by a one-byte marker, flushing each. At most
-two gate bodies have 4,096 bytes each; physical allocation, copy-on-write,
-metadata and separately scoped `effigy run prepare` remain unbounded inputs,
-not zero-cost facts. `strict_route_plan` is an effect-free refusal proposal;
-it does not read or prepare a ring, change an admission protocol, or authorize
-a native run. The supported `effigy run prepare` has a 30-second busy-store
-wait, but no total elapsed-time or physical-write bound is established here;
-it requires its own prospectively activated scope and accounting. `capture_fit` refuses missing physical bounds and counts the
-separate preparation reservation. The pure finalization control refuses
-missing or partial footer, unknown attribution, capture EOF, terminal settlement,
-joined census or final receipt; it deliberately cannot grant completeness or
-qualification from synthetic inputs. A concrete capture/finalization producer,
-source-bound footer attribution, physical allocation guarantees and owner
-activation remain outstanding. The installed source receipt is attribution,
-not runtime self-attestation or an independent qualification. The effect-free
-installed-route comparison rejects changed launcher, receipt, source or binary
-and the stable branch; comparing supplied values grants no native authority.
-
-The candidate records whether an accepted admission grant was handled inside
-the stop-boundary drain; that observation grants no authority and is required
-to distinguish the real boundary case from an earlier ordinary poll.
+The isolated ceiling candidate `scripts/bounded-test-ceiling.py` accepts an
+absolute `CLOCK_UPTIME_RAW` ceiling. It retains the ordinary stop reserve,
+exit margin, process custody and image behavior. The ordinary Effigy task
+`proof:supervisor:ceiling:qualify` runs its complete remaining behavior suite
+in fresh Stash scratch under a 600-second Effigy deadline; the candidate has a
+560-second limit and 384 MiB monitored scratch. The full proof budget is
+512 MiB and the free-space threshold is 22 GiB. The candidate is not adopted
+by ordinary consumers. Removed orchestration cases are listed in
+`scripts/ceiling-retired-cases.txt`.
 
 **Interim admission allowance (Tom, 2026-10-22).** Until Queue #381's
 admission-hook adapter lands, Oxide native proofs may use Effigy `heavy`
