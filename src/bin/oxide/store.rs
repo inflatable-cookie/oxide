@@ -1869,14 +1869,21 @@ impl Store {
         let settings = settings()?;
         let path = settings.pool.clone();
         let source = settings.pool_source;
-        let scratch = crate::handoff_trace::phase("scratch-evaluate", || {
-            crate::scratch_io::evaluate(&settings, false)
-        })?;
         // A pasted `oxide status` annotation is not part of a path, so it
         // refuses for every pool state: an absent path and an existing
         // ordinary directory both get the hint instead of the generic open
         // error (oxide#182).
         config::pool_annotation_refused(&path, source)?;
+        let scratch = crate::handoff_trace::phase("scratch-evaluate", || {
+            crate::scratch_io::evaluate(&settings, false)
+        })
+        .map_err(|error| {
+            if matches!(source, config::Source::Environment("OXIDE_POOL")) {
+                format!("OXIDE_POOL names {}: {error}", path.display())
+            } else {
+                error
+            }
+        })?;
         match config::inspect(&path) {
             Found::Absent => {
                 config::pool_creation_allowed(
