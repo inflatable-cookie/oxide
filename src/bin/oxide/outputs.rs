@@ -17608,7 +17608,7 @@ mod tests {
         checkout_root: PathBuf,
         checkout: PathBuf,
         store: Store,
-        _candidates: one_use::CandidateScope,
+        _candidates: crate::one_use::CandidateScope,
     }
 
     impl GuardFixture {
@@ -17627,7 +17627,7 @@ mod tests {
             let checkout = checkout_root.join("checkout");
             fs::create_dir(&checkout).unwrap();
             let store = pool_store(&root);
-            let candidates = one_use::candidate_scope(&checkout_root);
+            let candidates = crate::one_use::candidate_scope(&checkout_root);
             Self {
                 root,
                 checkout_root,
