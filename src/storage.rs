@@ -1,7 +1,7 @@
 //! Oxide's storage authority: the lean Barge library.
 //!
 //! Barge owns registered volumes and their identity, declared areas, marked
-//! roots, coopertive holds, durable pins, byte-pressure pruning, idle
+//! roots, cooperative holds, durable pins, byte-pressure pruning, idle
 //! least-recently-used eviction, marker-checked trash and scratch. Oxide keeps
 //! its Cargo front door, slot compatibility and freshness, lease workflow
 //! state, recipes, seeding policy, output member links and `exec`.
@@ -339,6 +339,193 @@ impl Storage {
     }
 }
 
+/// One pool's storage: its own Barge account, its volume and its
+/// `oxide/pool` area.
+///
+/// A pool owns its account so the literal `oxide/pool` declaration is
+/// unambiguous even while a removable pool, an internal pool and a one-use
+/// pool coexist: each has its own account, volume and area under its own
+/// control directory. The area's folder keeps the existing slot parent, so
+/// adoption moves no path.
+#[derive(Debug, Clone)]
+pub struct PoolStorage {
+    storage: Storage,
+    area: Area,
+    location: Location,
+}
+
+/// The facts a pool's storage declaration needs.
+#[derive(Clone, Debug)]
+pub struct PoolBacking {
+    /// The volume base: the removable drive's mount point, or the pool
+    /// directory itself for a budget pool.
+    pub mount: PathBuf,
+    /// The folder inside the mount that holds this pool's slot roots.
+    pub folder: String,
+    /// The identity of a removable drive as Oxide recorded it.
+    pub uuid: Option<String>,
+    /// The pool's soft cap.
+    pub soft_cap_bytes: Option<u64>,
+    /// The drive's prune trigger; zero disables the reserve route.
+    pub reserve_bytes: u64,
+    /// Below this an admission refuses once nothing idle is left.
+    pub floor_bytes: u64,
+    /// True when the backing is a removable volume (a reserve participant).
+    pub removable: bool,
+}
+
+impl PoolBacking {
+    /// A budget-only directory pool at `root`: the area folder is the
+    /// existing `payload/slots`, and admission is bounded by the soft cap.
+    pub fn budget(root: &Path, soft_cap_bytes: u64) -> Self {
+        Self {
+            mount: root.to_path_buf(),
+            folder: format!("{PAYLOAD_FOLDER}/{POOL_FOLDER}"),
+            uuid: None,
+            soft_cap_bytes: Some(soft_cap_bytes),
+            reserve_bytes: 0,
+            floor_bytes: 0,
+            removable: false,
+        }
+    }
+
+    /// A pool whose slot roots live on a removable volume.
+    pub fn volume(
+        mount: &Path,
+        uuid: &str,
+        payload_dir: &str,
+        soft_cap_bytes: u64,
+        reserve_bytes: u64,
+        floor_bytes: u64,
+    ) -> Self {
+        Self {
+            mount: mount.to_path_buf(),
+            folder: format!("{payload_dir}/{POOL_FOLDER}"),
+            uuid: Some(uuid.to_owned()),
+            soft_cap_bytes: Some(soft_cap_bytes),
+            reserve_bytes,
+            floor_bytes,
+            removable: true,
+        }
+    }
+}
+
+impl PoolStorage {
+    /// Open (and declare) one pool's storage under its control directory.
+    pub fn open(control: &Path, backing: &PoolBacking) -> Result<Self, String> {
+        let storage = Storage::open(control)?;
+        let config = AreaConfig::new("pool", backing.mount.clone(), POOL_AREA)
+            .uuid(backing.uuid.clone())
+            .folder(backing.folder.clone())
+            .soft_cap_bytes(backing.soft_cap_bytes)
+            .reserve_bytes(backing.reserve_bytes)
+            .floor_bytes(backing.floor_bytes);
+        let area = storage.declare(&config)?;
+        let location = area
+            .location()
+            .map_err(|error| format!("pool area: {error}"))?;
+        Ok(Self {
+            storage,
+            area,
+            location,
+        })
+    }
+
+    /// Where the pool's new slot roots go right now, or why there is nowhere.
+    pub fn location(&self) -> &Location {
+        &self.location
+    }
+
+    /// The storage account behind this pool.
+    pub fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
+    /// The declared area.
+    pub fn area(&self) -> &Area {
+        &self.area
+    }
+
+    /// Whether the pool's roots are on a removable volume.
+    pub fn is_removable(&self) -> bool {
+        self.location.on_volume()
+    }
+
+    /// Create one root for a slot (a fresh id and path).
+    pub fn create(&self, label: &str) -> Result<barge::Root, String> {
+        self.area
+            .create_root(label)
+            .map_err(|error| format!("cannot create a slot root: {error}"))
+    }
+
+    /// Find a root by its id.
+    pub fn resolve(&self, id: &str) -> Result<barge::Root, String> {
+        self.area
+            .resolve(id)
+            .map_err(|error| format!("cannot resolve slot root {id}: {error}"))
+    }
+
+    /// Take a waiting exclusive hold on a root.
+    pub fn hold(&self, id: &str) -> Result<Hold, String> {
+        self.area
+            .hold(id, Mode::Exclusive)
+            .map_err(|error| format!("cannot hold slot root {id}: {error}"))
+    }
+
+    /// Try to take an exclusive hold without waiting. `None` means another
+    /// holder is still using the root, so it is not idle.
+    pub fn try_hold(&self, id: &str) -> Result<Option<Hold>, String> {
+        self.area
+            .try_hold(id, Mode::Exclusive)
+            .map_err(|error| format!("cannot test slot root {id}: {error}"))
+    }
+
+    /// Every owned root, with held/pinned/bytes facts.
+    pub fn list(&self) -> Result<barge::Listing, String> {
+        self.area
+            .list()
+            .map_err(|error| format!("cannot list the pool area: {error}"))
+    }
+
+    /// Evict one root: refused while it is held or pinned, otherwise renamed
+    /// into the area's trash and deleted there.
+    pub fn evict(&self, id: &str) -> Result<barge::area::Eviction, String> {
+        self.area
+            .evict(id)
+            .map_err(|error| format!("cannot evict slot root {id}: {error}"))
+    }
+
+    /// The bytes the area's owned roots hold.
+    pub fn bytes(&self) -> Result<u64, String> {
+        self.area
+            .bytes()
+            .map_err(|error| format!("cannot account the pool area: {error}"))
+    }
+
+    /// Delete owned trash a crash left behind.
+    pub fn sweep_trash(&self) -> Result<barge::SweepReport, String> {
+        self.area
+            .sweep_trash()
+            .map_err(|error| format!("cannot sweep the pool trash: {error}"))
+    }
+
+    /// The volume's space policy, or why it is unavailable.
+    pub fn space(&self) -> Result<Space, String> {
+        self.storage.space("pool")
+    }
+
+    /// Prune: soft cap first, then least-recently-used idle unpinned roots
+    /// until free space is back above the reserve.
+    pub fn prune(&self, dry_run: bool) -> Result<PruneReport, String> {
+        self.storage.prune("pool", dry_run)
+    }
+
+    /// Admit work: prune, then refuse only below the floor.
+    pub fn admit(&self) -> Result<PruneReport, String> {
+        self.storage.admit("pool")
+    }
+}
+
 /// Read a root's hold without waiting. `None` means something else holds it.
 pub fn try_hold(area: &Area, id: &str, mode: Mode) -> Result<Option<Hold>, String> {
     area.try_hold(id, mode)
@@ -593,6 +780,71 @@ mod tests {
         assert!(report.deleted.is_empty());
         assert_eq!(report.kept.len(), 1);
         assert!(foreign.join("keep").exists());
+    }
+
+    fn pool_storage(fixture: &Fixture, label: &str) -> PoolStorage {
+        let control = fixture._temp.path().join(format!("pool-{label}"));
+        std::fs::create_dir_all(control.join("oxide-managed")).expect("control");
+        fixture
+            .os
+            .add_volume(&control, Some(UUID), 100 << 30);
+        PoolStorage::open(&control.join("oxide-managed"), &PoolBacking::budget(&control, 1 << 30))
+            .expect("pool storage")
+    }
+
+    #[test]
+    fn a_pool_creation_records_a_root_in_the_existing_slot_parent() {
+        let fixture = Fixture::new("storage-pool-create");
+        let pool = pool_storage(&fixture, "create");
+        let root = pool.create("quick").expect("root");
+        assert!(root
+            .path
+            .starts_with(fixture._temp.path().join("pool-create/payload/slots")));
+        assert!(root.path.join(".barge-root.json").is_file());
+        let listing = pool.list().expect("list");
+        assert_eq!(listing.roots.len(), 1);
+        assert!(pool.bytes().expect("bytes") > 0);
+    }
+
+    #[test]
+    fn a_pool_hold_is_released_by_dropping_it_and_an_eviction_refuses_while_held() {
+        let fixture = Fixture::new("storage-pool-hold");
+        let pool = pool_storage(&fixture, "hold");
+        let root = pool.create("quick").expect("root");
+        let hold = pool.hold(&root.id).expect("hold");
+        assert!(
+            pool.try_hold(&root.id).expect("try").is_none(),
+            "a held root is not idle"
+        );
+        assert!(pool.evict(&root.id).is_err());
+        drop(hold);
+        assert!(pool.try_hold(&root.id).expect("try").is_some());
+        pool.evict(&root.id).expect("evicted");
+        assert!(!root.path.exists());
+        assert!(pool.list().expect("list").roots.is_empty());
+    }
+
+    #[test]
+    fn a_pool_space_policy_reports_its_cap_and_refuses_below_the_floor() {
+        let fixture = Fixture::new("storage-pool-space");
+        let control = fixture._temp.path().join("pool-space");
+        std::fs::create_dir_all(control.join("oxide-managed")).expect("control");
+        fixture.os.add_volume(&control, Some(UUID), 1 << 30);
+        let pool = PoolStorage::open(
+            &control.join("oxide-managed"),
+            &PoolBacking {
+                mount: control.clone(),
+                folder: "payload/slots".to_owned(),
+                uuid: None,
+                soft_cap_bytes: Some(1 << 30),
+                reserve_bytes: 2 << 30,
+                floor_bytes: 10 << 20,
+                removable: false,
+            },
+        )
+        .expect("pool storage");
+        assert_eq!(pool.space().expect("space").floor_bytes, 10 << 20);
+        assert!(matches!(pool.location(), Location::Volume(_)));
     }
 
     #[test]
