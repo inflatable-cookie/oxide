@@ -1242,6 +1242,25 @@ class Census:
         # start of every round, are never added to the round's returned object
         # and never influence a classification, count, read, pause or budget.
         self.stats = {}
+        self.operation_trace = None
+
+    def observed(self, site, operation, function, *args, identity=None):
+        """Optional fixed-size test observation; never participates in a decision."""
+        trace = self.operation_trace
+        if trace is None:
+            return function(*args)
+        pid, start = identity if identity is not None else (None, None)
+        event = {"site": site, "operation": operation,
+                 "pid": pid if type(pid) is int and 0 < pid <= 0xffffffff else None,
+                 "start": start if type(start) is int and 0 <= start <= (1 << 64) - 1 else None}
+        trace["entered"] = event
+        try:
+            value = function(*args)
+        except BaseException:
+            trace["returned"] = dict(event, outcome="raised")
+            raise
+        trace["returned"] = dict(event, outcome="returned")
+        return value
 
     def reset_stats(self):
         """Start this round's observation-only counters. Never raises."""
@@ -1273,7 +1292,8 @@ class Census:
             pass
         first = state["first_row"] == "unset"
         try:
-            again = self.reread(row["pid"])
+            again = self.observed("confirmation_attempt", "identity_reread", self.reread,
+                                  row["pid"], identity=(row["pid"], row["start"]))
         except Exception as error:
             if first:
                 state["first_error"] = error
@@ -1341,7 +1361,7 @@ class Census:
         rather than to the older snapshot. Pure observation: one read, no
         bookkeeping, never raises."""
         try:
-            again = self.reread(identity[0])
+            again = self.observed("identity_stable", "identity_reread", self.reread, identity[0], identity=identity)
             if not (isinstance(again, dict) and again.get("pid") == identity[0]
                     and again.get("start") == identity[1]):
                 return False
@@ -1363,7 +1383,7 @@ class Census:
         try:
             if not self.identity_stable(identity):
                 return "ambiguous"
-            session = self.getsid(identity[0])
+            session = self.observed("exclusion_session", "getsid", self.getsid, identity[0], identity=identity)
             if session is None:
                 return "ambiguous"
             if not self.identity_stable(identity):
@@ -1401,8 +1421,8 @@ class Census:
                 return "ambiguous"
             if not self.identity_stable(identity, parent_pid=ppid):
                 return "ambiguous"
-            session = self.getsid(identity[0])
-            group = self.getpgid(identity[0])
+            session = self.observed("exclusion_parent", "getsid", self.getsid, identity[0], identity=identity)
+            group = self.observed("exclusion_parent", "getpgid", self.getpgid, identity[0], identity=identity)
             if session is None or group is None:
                 return "ambiguous"
             if not self.identity_stable(identity, parent_pid=ppid):
@@ -1468,7 +1488,7 @@ class Census:
         self.reset_stats()
         begun = now_ns()
         try:
-            rows = self.snapshot()
+            rows = self.observed("round", "snapshot_sysctl", self.snapshot)
         except Exception as error:
             try:
                 self.stats["snapshot_ns"] = now_ns() - begun
@@ -1536,7 +1556,7 @@ class Census:
                 continue
             failure, getsid_error = None, None
             try:
-                session = self.getsid(row["pid"])
+                session = self.observed("round", "getsid", self.getsid, row["pid"], identity=identity)
             except ProcessLookupError as error:
                 try:
                     actual_esrch = _ERRNO.__get__(error) == errno.ESRCH
@@ -1571,7 +1591,7 @@ class Census:
                 records[index] = {"esrch": True, "row": row, "identity": identity, "state": state}
                 continue
             try:
-                again = self.reread(row["pid"])
+                again = self.observed("round", "identity_reread", self.reread, row["pid"], identity=identity)
             except Exception as error:
                 again, failure = None, f"reread: {error}" if failure in (None, "gone") else failure
             stable = again is not None and again["start"] == row["start"]
@@ -1596,7 +1616,7 @@ class Census:
         further = 0
         while pending and further < CONFIRM_TRIES - 1:
             further += 1
-            self.pause(CONFIRM_PAUSE)
+            self.observed("confirmation", "pause", self.pause, CONFIRM_PAUSE)
             try:
                 self.stats["pause_calls"] += 1  # observation only: this round's shared pauses
             except BaseException:
@@ -1626,7 +1646,8 @@ class Census:
             tries, confirm_outcome = state["tries"], state["outcome"]
             failure = "getsid ESRCH, absence not confirmed"
             try:
-                again = self.reread(row["pid"])
+                again = self.observed("final_confirmation", "identity_reread", self.reread,
+                                      row["pid"], identity=identity)
             except Exception as error:
                 # The serial algorithm also reached its ordinary tail here, so
                 # a tracked identity keeps its retained attribution as a member
@@ -4644,6 +4665,9 @@ class Monitor:
                   "waited_ns": now_ns() - started, "rows": 0,
                   "deciding": census_summary(self.receipt.get("deciding_census")),
                   "final": census_summary(getattr(self, "census_last", None))}
+        trace = getattr(self, "census_operation_trace", None)
+        if trace is not None:
+            record["operation_trace"] = dict(trace)
         try:
             with self.lock:
                 if not joined:
@@ -4718,6 +4742,10 @@ class Monitor:
         census = Census(self.leader[0], terminal_allowed=(
             self.ctx.get("terminal_mode", {}).get("mode") == "allowlisted"),
             ancestors=record.get("identities") or ())
+        if os.environ.get("OXIDE_CENSUS_DIAGNOSTIC") == "1":
+            trace = {"entered": None, "returned": None}
+            self.census_operation_trace = trace
+            census.operation_trace = trace
         self.note(census_built_ns=now_ns())
         while not self.census_stop.is_set():
             if self.ctx.get("ceiling_ns") is not None and monitor_remaining(self.ctx) <= 0:
@@ -4917,7 +4945,10 @@ class Monitor:
         for target in (self.sample_reserve, self.sample_owned, self.sample_admission):
             if ctx.get("ceiling_ns") is not None and now_ns() >= ctx["setup_at_ns"]:
                 raise SetupRefused("ceiling setup window exhausted")
-            threading.Thread(target=target, daemon=True).start()
+            thread = threading.Thread(target=target, daemon=True)
+            if hasattr(self, "fixture_threads"):
+                self.fixture_threads.append(thread)
+            thread.start()
         for fd, name, sink in self.pipes:
             if ctx.get("ceiling_ns") is not None and now_ns() >= ctx["setup_at_ns"]:
                 raise SetupRefused("ceiling setup window exhausted")

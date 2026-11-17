@@ -149,6 +149,30 @@ class FailureReporting(unittest.TestCase):
 
 
 class CensusStageControls(unittest.TestCase):
+    def test_trace_does_not_change_census_result(self):
+        row = {"pid": 42, "start": 7, "zombie": False}
+        def census():
+            return guard.Census(1, snapshot=lambda: [row], getsid=lambda pid: 9,
+                                reread=lambda pid: row)
+        baseline = census().round()
+        instrumented = census()
+        instrumented.operation_trace = {"entered": None, "returned": None}
+        self.assertEqual(instrumented.round(), baseline)
+        self.assertEqual(instrumented.operation_trace["entered"]["operation"], "identity_reread")
+        self.assertEqual(instrumented.operation_trace["returned"]["outcome"], "returned")
+
+    def test_trace_preserves_last_entered_when_read_is_interrupted(self):
+        class Interrupted(BaseException):
+            pass
+        row = {"pid": 42, "start": 7, "zombie": False}
+        census = guard.Census(1, snapshot=lambda: [row], getsid=mock.Mock(side_effect=Interrupted()))
+        census.operation_trace = {"entered": None, "returned": None}
+        with self.assertRaises(Interrupted):
+            census.round()
+        self.assertEqual(census.operation_trace["entered"],
+                         {"site": "round", "operation": "getsid", "pid": 42, "start": 7})
+        self.assertEqual(census.operation_trace["returned"]["outcome"], "raised")
+
     def test_interruption_before_round_return_can_occur_in_distinct_stages(self):
         class Interrupted(BaseException):
             pass

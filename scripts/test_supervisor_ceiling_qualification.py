@@ -7229,6 +7229,7 @@ class PureDetach(unittest.TestCase):
         monitor.send = self.start_census_then(
             monitor, cmd_w, "absent-child",
             {"type": "cleanup", "outcome": {"closure": "closed", "status": 0}}, sent)
+        monitor.fixture_threads = []
 
         class Handle:
             pid = 0
@@ -7250,7 +7251,13 @@ class PureDetach(unittest.TestCase):
         bounded.cleanup_safety = lambda ctx, **k: None
         try:
             with self.settled_census():
-                monitor.run()
+                try:
+                    monitor.run()
+                finally:
+                    monitor.stop.set()
+                    for thread in monitor.fixture_threads:
+                        thread.join(5)
+                        self.assertFalse(thread.is_alive(), "fixture sampler did not stop")
         finally:
             (bounded.post_census_detach, bounded.process_row, bounded.reap_own_child,
              bounded.cleanup_safety) = saved
@@ -8915,6 +8922,9 @@ class Real(unittest.TestCase):
         self.verdict_ns = now_ns()
         self.assertLess(self.verdict_ns, self.started + FALLBACK_S * NS, "verdict after the fixture fallback")
         self.receipt = json.loads((self.dir / "evidence" / "receipt.json").read_text())
+        if os.environ.get("OXIDE_CENSUS_DIAGNOSTIC") == "1":
+            print("census diagnostic:", self.id(),
+                  json.dumps(self.receipt.get("census_join", {}).get("operation_trace")), flush=True)
         signals = [r for r in self.receipt["custodian"] if r["event"] == "signal"]
         closure = (self.receipt["outcome"] or {}).get("closure")
         CASES.append({"case": self.id().rsplit(".", 1)[-1], "exit": self.code, "phase": self.receipt["phase"],
