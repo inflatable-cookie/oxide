@@ -162,6 +162,36 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   in #089's closed task and its committee contract.
 - **Deferred:** remote builds. The executor seam stays local-only.
 
+### Current storage direction (2026-11-17)
+
+Tom's later ruling is to remove the old qualification machinery and "just get
+it working without all the ceremony". Barge now has its own project and
+planner. Oxide uses Barge as a linked Rust library: installing Oxide needs no
+Barge daemon or separate Barge installation.
+
+The selected replacement uses generic areas, owned roots, cooperative file-lock
+holds, durable pins and rename-to-trash deletion. Oxide retains Cargo,
+compatibility and freshness, slots, recipes, seeding, output member links and
+`exec`. Preserve warm root reuse, warned absent-volume fallback, soft budgets,
+idle eviction, selected-output protection, `init`/`new` and older-binary handling.
+An evicted root's successor gets a fresh path; importing a legacy directory
+must not silently reclaim a stray at a retired path. Barge's
+[architecture](https://github.com/inflatable-cookie/barge/blob/main/docs/knowledge/architecture.md)
+owns the generic library boundary.
+
+One Oxide adoption PR replaces the duplicated storage internals and removes the
+capture, comparison, descriptor-census and qualification apparatus. Ordinary
+temporary-directory unit and integration tests, including Oxide's real child
+launch inheriting the hold, plus independent exact-head source/evidence review
+replace the old native proof ladders for this work. Earlier journal, supplier,
+common-clock and supervisor-ceiling scopes recorded below are history, not
+current adoption prerequisites. Their failures and evidence are not rewritten.
+
+The existing installed Oxide remains authoritative until the replacement is
+reviewed and installed separately. Source work authorizes no live data
+migration, registration or cleanup. Retained fixture cleanup needs its own
+operator instruction; the general lean reset is not deletion authority.
+
 ### Storage
 
 - **Barge owns drive management** (approved, staged): volume registration and selection, placement and fallback, owned roots, pruning and scratch move to the separate Barge product ([inflatable-cookie/barge](https://github.com/inflatable-cookie/barge)), which Oxide will use as a library. Oxide keeps Cargo, slots, leases, recipes, freshness and `exec`. Until each part moves, Oxide's current implementation stays authoritative.
