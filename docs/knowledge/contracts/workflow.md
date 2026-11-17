@@ -1060,7 +1060,9 @@ leases taken by `oxide` commands only:
   dies for any reason; the descriptor is close-on-exec, so Cargo does not
   inherit it. The record names the holder (PID, process start time and the
   unique lease holder string), the lease ID once granted, the command phase
-  and Cargo's process-group ID. The lease ledger is unchanged.
+  and Cargo's process-group ID. Separately, the lease carries its Barge root
+  hold through the actual child exec; the control-record lock is not storage
+  ownership. Recovery also respects the root hold and uncertain legacy state.
 - Ctrl-C and termination signals are forwarded to the group. Oxide waits for
   the group to empty, then releases normally. A clean exit or Ctrl-C is
   never logged as a recovery.
@@ -1110,100 +1112,34 @@ explicit `recover` unless they adopt it.
 
 ## Storage and space management
 
-- One per-user host pool: the budget-only
-  [directory backend](#budget-only-default-pool-and-user-configuration) on
-  every platform. Its soft budget is checked at admission; a running build
-  may grow past it while real free space holds. Only whole idle slots are
-  evicted. The APFS sparse-image backend is retired (oxide#102).
-- The first command creates the pool automatically ([W-1](#open-decisions))
-  for the built-in default and a config-file path. An absent pool named by
-  `OXIDE_POOL` is an explicit path and refuses instead of being created
-  silently, naming the path (oxide#182); `OXIDE_POOL_CREATE=1` or a path
-  strictly inside the caller's canonical `OXIDE_TASK_SCRATCH_ROOT` opts in
-  (proof fixtures), and a value ending in a `status` display annotation
-  (`<path> (from …)`) refuses with a hint that the annotation is not part of
-  the path, for an absent path and for an existing directory that holds no
-  Oxide pool alike. An existing valid pool at a normal path and the
-  config-file path are unchanged.
-- Slot headroom (oxide#118, oxide#177): up to 256 slots per pool and twelve
-  per project identity, with compatible reuse first and the oldest eligible
-  idle whole slot replaced under count or byte pressure
-  ([local lease](local-lease.md#slot-headroom-and-ranked-idle-replacement-oxide118)).
-  A host-wide limit still bounds concurrent Cargo invocations
-  ([W-2](#open-decisions)). Queue/Nucleus still decide which tasks run. Oxide
-  only orders the Rust work they launch.
-- `oxide status` is diagnostic and read-only (oxide#128). By default it
-  reports recorded facts only: the pool config and ledger, the ledger's
-  recorded slot directories, the control state's holders, waiting tickets,
-  clean marks, latest use and flushes, and the registration's drive mode. It
-  takes no pool lock, creates no lock, reconciles no recorded deletion, runs
-  no accounting walk, invokes no Cargo, `tmutil` or `diskutil`, and writes
-  nothing. It reports two **separately labelled** recorded sources that are
-  never added together: the ledger's closed per-slot observations
-  (oxide#146), shown as one `recorded slot sizes (ledger)` total over
-  `recorded n of m idle slots` with its unrecorded count as a stated lower
-  bound — this one *is* the admission basis — and, per slot, an oxide#128
-  sidecar fact from a previous acquiring command's reuse walk, labelled with
-  its age, source and lease, or `not measured`. Neither is free space, and a
-  recorded figure never itself establishes admission. A recorded `Evicting` slot is reported
-  as a pending reconciliation, distinct from idle and held, and is left in
-  place. Cargo-home and stray-output lines say not measured.
-- `oxide status --measure` runs the existing bounded walks once: the
-  whole-payload union and each slot's own walk (the same entry, depth and
-  elapsed bounds admission uses), then the checkout stray-output scan and
-  the Cargo home, all under one cumulative 60 s command budget. It shows
-  current bytes and coverage, still without the pool lock, reconciliation or
-  any write, so a recorded deletion stays pending and lowers coverage to
-  unknown. It does not refresh the recorded observations. Both modes reuse
-  the read-only [storage inventory](storage-inventory.md) bounds; each slot's
-  file names, distinct inodes and allocation are counted once per inode. Stray
-  output means a checkout `target/` holding `deps/` or `incremental/` was
-  built by plain Cargo; finding none reads `none` only under a
-  [verified Cargo release](#cargo-version-matrix), otherwise `unknown`.
-  Reclaiming space is an explicit command; live cleanup still needs scoped
-  approval. Nothing inside a slot is ever deleted.
-- Recorded observations live in the auxiliary
-  `<pool>/oxide-managed/status-observations.json` sidecar (schema
-  `oxide.status-observations/1`, at most 512 KiB and 256 retained recent
-  facts). It is diagnostic, not pool, ledger, registration or receipt format:
-  an older binary may ignore it. Each fact binds `store_id`, slot ID,
-  incarnation, the exact recorded directory, wall-clock time, allocated
-  bytes, source and the measuring lease. Only walks an acquiring command
-  already made are recorded, atomically and with no extra walk: the reuse walk
-  with its figure, and an admission walk that stopped partial with no figure at
-  all (source `admission-walk-incomplete`, whose `allocated_bytes` is written
-  as 0 and read by nothing; oxide#186), which status reports as `not measured
-  (walk incomplete)`. A release's ledger record is reported before any of these
-  facts, so a later complete walk supersedes them. Persistence failure changes
-  no admission, ownership or exit status. A
-  missing, unreadable, foreign, corrupt, unknown-version or
-  generation-mismatched sidecar reads as not measured and never falls back
-  to a scan. A same-generation fact stays a historical observation that may
-  have changed since measurement; a future timestamp is an unknown age. The
-  retention cap is at least the slot ceiling and never lowers it.
-- Capacity refusals may add bounded, read-only macOS figures (oxide#130).
-  After a pool-creation reserve refusal, and after a host-reserve stop once
-  every writer in Cargo's group has positively closed, Oxide runs its own
-  executing artifact as the hidden `oxide __oxide-capacity-probe
-  <absolute-path>` child: a separate process group, one 2 s budget taken
-  before the spawn and shared by the answer, a bounded KILL, its positive reap
-  and the pipe drain (the reap reserve is carved out of that budget, never
-  added to it), at most 8 KiB of combined stdout and stderr, and one typed
-  JSON answer. The child reads CoreFoundation URL resource values
-  (`CFURLCopyResourcePropertyForKey` with the public
-  `NSURLVolumeAvailableCapacityForImportantUsageKey` and
-  `NSURLVolumeAvailableCapacityForOpportunisticUsageKey` keys) and reports
-  each as optional bytes or `unknown`. An explicit error class, a timeout, an
-  oversized or malformed answer, and an absent, negative or wrongly typed
-  value are all `unknown`. The figures overlap and are not guaranteed free
-  space: the line is labelled informational, nothing is purged, no user-data
-  deletion is suggested, and no decision reads it. The raw 20 GiB start,
-  abort and reserve decisions are unchanged; no probe runs on plain `oxide
-  status`, on a watchdog sample, during polling, or without confirmed writer
-  closure. Linux keeps its raw refusal text.
-- `OXIDE_POOL_CAP` or the config file sets the soft budget for the next
-  admission; `oxide clean --cargo-cache` asks
-  Cargo for its own home cleanup ([Cargo home hygiene](#cargo-home-hygiene)).
+The default per-user pool is a configurable budget-only directory. A registered
+removable pool keeps its own Rust state and Barge account. Soft budgets guide
+admission and idle eviction; a running build may exceed them. The filesystem
+and existing host-reserve watchdog still bound actual writes.
+
+Oxide selects compatible slots, keeps project/pool count headroom and retains
+its Rust lease state. Barge owns roots, bytes, holds, pins, LRU eviction and
+trash. A compatible idle root keeps its path and bytes. Before removable
+admission, including warm reuse, Barge prunes to the configured policy and the
+floor refuses when free space remains insufficient. Low space never switches
+volumes. Prune results retire their matching workflow rows; missing owned idle
+roots recover the rename/ledger publication gap conservatively, while existing
+strays and uncertain legacy roots remain untouched.
+
+`oxide status` is read-only. Default status reports recorded workflow facts;
+explicit measurement uses the caller's remaining deadline, labels logical and
+allocated quantities separately and reports incomplete totals as unknown. It
+does not create storage declarations or grant deletion authority. Recorded
+observations are diagnostic; Barge's area accounting supplies storage pressure.
+See the [lease library](local-lease.md) and [adoption
+contract](barge-adoption.md).
+
+Whole-root eviction takes Barge's exclusive lock and atomically rechecks its
+pin before rename. Trash requires matching markers and never follows symlinks
+or crosses filesystems. Oxide's old per-entry journals, holding-area deleter,
+Finder capture and descriptor census are removed. Selected output pins survive
+idle periods independently of command holds. Unknown or unsupported legacy
+roots are retained, not relabelled or deleted.
 
 ### Child temporary files (oxide#136)
 
@@ -4877,136 +4813,25 @@ Rules:
 
 ### `directory-budget-v1` as shipped
 
-- **Shape.** `<pool>/payload/slots/` is a plain owner-only directory on the
-  pool's own device, holding legacy `<id>` slots and
-  [project-named](#project-named-slots-and-pool-status) `<folder>/<profile>-<id>` slots; config, ledger and lock sit beside it as for APFS, with
-  no image or receipt. The config records the backend, store ID and budget
-  recorded at creation (`cap_bytes`, default 100 GB; `image_bytes` 0). An
-  image or receipt file, any payload entry but `slots` and
-  [Finder metadata](#finder-metadata-in-pools), or a payload on another
-  device refuses.
-- **Admission.** The ledger's rules with this command's soft budget
-  (`LeaseRequest.budget_bytes`, else the recorded one) as the cap, and the
-  raised `MAX_SLOTS` 256 / 8 MiB ledger representation (oxide#177;
-  [local lease](local-lease.md#slot-headroom-and-ranked-idle-replacement-oxide118)).
-  A compatible idle slot is reused first and kept warm; the half-budget
-  recycling rule is retired. A new slot replaces the least-recently-used
-  eligible idle whole slot in two distinct cases: **count** pressure at the
-  256-slot pool ceiling or the twelve-slot project ceiling, authorised on a
-  complete pool figure or a removable pool's bound-only unknown; and
-  **recorded byte** pressure, when the attributable pool sum — never the
-  shared volume's total — is at or above the budget. A ledger whose slot
-  table exceeds 128 carries the forward-only `capacity_policy: 4` fence; every
-  mutating command's admission gate makes the version-8 `oxide.slots/256`
-  control fence durable as its first write, before any locked pool open or
-  ledger write, and a locked `Pool::open` raises the same fence itself under
-  the pool lock before reconciliation, so pre-Store entries and direct library
-  opens cannot journal first. An older binary meets version 8 and hands off or
-  refuses before reading a policy-4 ledger or a multi-journal recovery ledger. It remeasures
-  after each deletion and refuses `Full` when only held slots remain. A
-  removable pool whose own size is unknown takes the reserve/floor route
-  instead of a byte-cap comparison. Held, uncertain, foreign and unmeasurable
-  slots are never eligible, a safety failure stops admission instead of
-  skipping, and the audit walks behind `status --measure` are not admission
-  input. Nothing enforces the budget while a build writes; a build can pass
-  it, and the next new slot evicts.
-  A deletion that cannot reconcile stays `Evicting` and is excluded from
-  reuse and victim choice. Admission charges the maximum of its recorded size
-  and the largest recorded slot: these pools have no per-slot byte ceiling and
-  no descriptor-relative observed-byte inventory is available. A journaled
-  root's recorded modes are restored through verified descriptors before its
-  completeness preflight. If identity or completeness cannot be established,
-  the root remains isolated and no deletion occurs. The soft-budget and replacement limitation is described in
-  [local lease](local-lease.md#capacity-and-eviction). Independent incomplete
-  scope remains an accounting error.
-  Status names pending slot IDs, and the read-only drive description names them
-  in its pending-reconciliation detail. Other independently owned bytes still
-  count, and count ceilings still include the pending slot. The admission
-  lock and the lease library's pool lock retain their existing blocking behavior
-  for unbudgeted commands. Reconciliation runs under the pool lock, so a very
-  large eviction can delay another admission until the lock is released.
-  Before writing this new ledger shape, the mutating front door publishes the
-  version-8 control fence (recorded accounting, eviction accounting and the
-  raised ceiling) as its first write; the library uses capacity-policy
-  version 3 or, above 128 slots, version 4, so older readers refuse or hand
-  off before interpreting an `Evicting` size or a raised slot table.
-- **Watchdog.** Only on a directory pool, only while Oxide supervises a
-  leased Cargo group (build and `run` build, `test` execution, building
-  passthrough). It samples `statfs` `f_bavail` of the payload directory
-  (`f_bsize` on macOS, `f_frsize` elsewhere) at the first poll and then
-  once a second, with no slot walk. Below 22 GiB, or when a sample fails, it
-  sends TERM to the group, then KILL after 2 s, and keeps sampling on every
-  20 ms poll so the minimum is recorded. It prints one `oxide: reserve stop`
-  line: the triggering sample, trigger, signals and KILL delay, sampled
-  minimum, overshoot past the trigger and stop latency (triggering sample to
-  observed group closure). The command fails with Cargo's code, never 0. It
-  samples only the pool filesystem; `<checkout>/target` elsewhere is not
-  watched.
-- **Closure.** After a stop the slot is released through the normal path
-  only once `killpg(pgid, 0)` reports `ESRCH`. If the leader or the group
-  outlives KILL by 10 s, Oxide prints that closure is unconfirmed and exits
-  1 without releasing: the ledger lease stays held, the record keeps
-  Cargo's group, and [crash recovery](#crash-recovery) releases it once the
-  group is empty.
-- **Test hooks.** Debug builds only: `OXIDE_TEST_WATCHDOG_READINGS` names a
-  file holding the available-bytes reading, and `OXIDE_TEST_BUDGET_BYTES`
-  overrides the soft budget above every other source. Release builds ignore
-  both. The reserve and
-  margin have no override.
-- **Slot headroom proof (oxide#118, oxide#177).** `effigy rust:slot-headroom`
-  under the shared proof supervisor, with fixture pools under a private
-  `OXIDE_SCRATCH_ROOT` inside the selected volume's monitored run root, stages
-  `oxide` offline with 1.97.1
-  and proves the permanent ledger/control fences, a legacy read
-  without migration, rank exhaustion before any transition, a 256-slot pool
-  whose 257th and 258th admissions replace the rank-LRU idle whole slot
-  without churn, the twelve-slot project cap with a specific held-slot wait
-  and one LRU idle replacement, compatible reuse first, no eviction below
-  both ceilings, byte-pressure LRU with a held slot excluded, and a foreign
-  payload-entry refusal. With every slot's record current it also checks
-  oxide#177's accounting-cost gate: a new-slot admission at 256 walks no
-  inventory, the evicted slot is never walked, a release walks only its own
-  slot, and default `status` at 256 walks nothing; it also crosses the legacy
-  128-slot ceiling natively and requires `capacity_policy: 4` plus the
-  version-9 control fence carrying `oxide.slots/256` and `oxide.holding/1`, which the admission gate writes
-  as the command's first durable effect and a locked `Pool::open` raises
-  itself before reconciliation, before any journal start or ledger write, so
-  an older binary meets version 9 and hands off or refuses before reading the
-  ledger.
-  Worst-valid ledger/control serialization — including the reachable
-  one-journal `Evicting` state — round-trip and oversized-field refusals are
-  unit tests. `effigy rust:slot-headroom:diagnostic` is the same fixed guard
-  and limits with `--diagnostic` (uncounted, keep-going, a bounded
-  `qualified: false` receipt, aborting on an unknown outcome or unclosed
-  proof child), and `effigy proof:slot-headroom:test` is its pure
-  `--self-check`. The thirteen-grant freshness bound is a bounded-loop
-  inspection, not a separately induced native case. The earlier internal-root
-  recipe passed 50/50 cases at `4b0a485` (#177); that evidence does not carry
-  forward to the migrated recipe.
-- **Proof.** Current: `effigy rust:oxide-budget-default`
-  ([above](#budget-only-default-pool-and-user-configuration)). Historical,
-  before the CLI's retirement: `effigy rust:oxide-cli` added a macOS case on two scratch
-  directory pools after the APFS image is detached: creation, summary and
-  `status` labelling; standalone refusal; a reserve stop on injected
-  readings where a bounded writer that ignores TERM lowers the reading by
-  its own fsynced writes (1 MiB per ~50 ms, at most 48 MiB, starting 8 MiB
-  above the trigger), with KILL, positive closure and normal release; an
-  unreaped group member that keeps closure unconfirmed, so the slot stays
-  held until it is reaped and the next command recovers it; and a 1 MiB
-  budget whose idle slot is evicted whole for a new key. The proof prints the
-  sampled minimum, overshoot and latency it observed. Readings are
-  injected: this shows the stop and closure semantics and the overshoot of
-  that one writer at the sampling interval, not margin adequacy for real
-  write rates. The authoring run at the oxide#077 head observed: triggering
-  sample 10 MiB below the trigger, sampled minimum 40 MiB below it (the
-  writer reached its 48 MiB bound during the 2 s grace), KILL after 2017 ms,
-  closure 2042 ms after the triggering sample; the held case confirmed no
-  closure after KILL plus 10 s and was recovered once its member was
-  reaped. Rust tests cover the real `statfs` sample, TERM-then-KILL on
-  a group that ignores TERM, a failed sample, and budget admission and
-  refusals in the library. `effigy rust:compile-linux` checks that the crate
-  compiles for the installed `x86_64-unknown-linux-gnu` target; no Linux
-  runtime behaviour is validated.
+The pool retains its owner-only config, ledger and control state beside
+`payload/slots`. Barge declares that existing slot parent as `oxide/pool`.
+Validated legacy flat or project-named roots are adopted in place; new roots
+and successors use Barge-created IDs/paths. An evicted old path is never
+blindly re-adopted from a stale ledger row.
+
+The configured budget remains soft. Oxide retains compatibility and the
+256-slot pool/twelve-slot project headroom; Barge handles byte pressure,
+protected roots and storage eviction. Only positively idle, eligible roots can
+be evicted. Legacy generations that never held a Barge lock remain protected
+until a supported transition establishes ownership. Pin failures refuse before
+prune; a grant removes only the legacy transition pin, not an ordinary durable
+root pin.
+
+The existing control-format forward fences and older-binary handoff remain.
+There is no storage operation journal, `Evicting` recovery engine or
+per-entry mode/custody restoration path. A crash after Barge rename leaves
+marker-checked trash. The [lease contract](local-lease.md) owns the Rust
+workflow and [Barge adoption](barge-adoption.md) owns storage and migration.
 
 ### Finder metadata in pools
 
