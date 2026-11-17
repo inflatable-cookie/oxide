@@ -1,0 +1,1 @@
+Reconcile the qualification supplier contract with Effigy's reviewed 038: withdraw the provisional duration handoff, record unsupported original-clock coverage and missing wait receipts, and preserve all implementation and qualification gates.

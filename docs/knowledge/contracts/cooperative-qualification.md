@@ -202,10 +202,11 @@ is historical at its own audit; 5639v2 is the later prospective ruling.
 
 Tom's decision `afae2fc0-f0e2-4ad7-9186-0439d6889715` v2 (2026-11-17)
 selected two bounded source-only design PRs to scope the remaining supplier
-implementation. This Oxide design is one half; the Effigy owner scopes prepare
-custody, common timing and exact-selector admission/completion in parallel. No
-other order is implied, and every cross-owner item below is an **unresolved
-interface** until its owner supports it. Nucleus's accepted foundation is
+implementation. This Oxide design is one half; Effigy's reconciled
+[038 design](https://github.com/inflatable-cookie/effigy/blob/1123a11731b30d71dfa0c5967a3bfc7b1d30afaa/docs/knowledge/architecture/038-prepare-actor-custody-boundaries.md)
+records prepare custody, timing and exact-selector admission/completion
+(effigy#1023, reviewed `e48bbabe`, review `5935419985`). Its source-bound gaps
+remain **unresolved interfaces**, not implemented suppliers. Nucleus's accepted foundation is
 Spec 064 at merged `2ce2ed9c03b54fee7b47c66ec33e31cb3c27c48c`, whose final
 review `5933347812` accepted **source only** at
 `9366a1a0ce191b6e885b679ae6e0536c9372b654`. That source refuses all nine
@@ -232,7 +233,7 @@ supplier.
 | --- | --- | --- | --- | --- | --- |
 | `effigy_prepare_custody` | Effigy runtime (`effigy run prepare` and its state/gate/ring writers, owning contract 049 §`run prepare` scope) | No surviving prepare parent: prepare is a synchronous phase of the invoking run, and `run prepare` only writes state | An actual surviving prepare parent that holds and positively waits each prepare child it creates, bound to the same origin, with prepare storage inventoried | Effigy-owned effective control plus its observed wait identities | `missing` today → **R** before effects; after effects unknown/SPENT. **Unresolved Effigy interface.** |
 | `effigy_admission` | Effigy heavy admission (`EFFIGY_ADMISSION_HOOK`, `effigy.admission-request.v1`, `Admitted` record, `effigy.admission.v1` decisions) and the v2 reported-custody protocol | A genuine hook admission decision and an attributable terminal record (`foreground_terminals`: outcome, exit/signal, `cleanup`, acknowledged `workload_groups`), readable through `effigy run status --json` (`effigy.run.v1`, `evidence_source: foreground-terminal-record.v1`) | One receipt binding *this exact selector's* admission and completion to the qualification subject, with no maintenance or later-admission substitution and no token standing in for admission | Effigy-owned control at the hook and settle paths; subject-bound receipt digest | **R** before effects when absent; a substitution or a maintenance-as-admission claim is **F**. Effigy implements no scheduler (049 §Retired), so Nucleus capacity is never admission. **Unresolved Effigy interface.** |
-| `common_elapsed_clock` | One origin owner (Nucleus dispatch, `DispatchLaunch.proofExecution` → `qualificationFirstEffectClockSchema`), propagated per edge; each participant's own monotonic phase readback (Effigy `EFFIGY_RUN_DEADLINE_MS`/`run_deadline`, Oxide `CLOCK_UPTIME_RAW`) | Two independent clocks: Nucleus's local first-effect tick and Effigy's process-start deadline with a 10 s settlement allowance | The single-origin duration-chained binding in "One 600-second origin" below: one `clockId`, one origin, per-edge elapsed-at-spawn alignment and per-participant since-start durations | Written arithmetic per edge, then a clock control (see controls) | `missing` → **R** before effects. A restarted or fresh inner clock, an invented RAW/cross-domain conversion or a `Date.now` bookkeeping tick is **F**/**U**, never a substitute. **Unresolved Effigy interface.** |
+| `common_elapsed_clock` | One origin owner (Nucleus dispatch, `DispatchLaunch.proofExecution` → `qualificationFirstEffectClockSchema`), propagated per edge; each participant's own phase readback | Nucleus's local first-effect tick; Effigy's process-start duration and internal `deadline_nanos` on `CLOCK_MONOTONIC`, with no origin identity | One original-origin binding covering predecessor effects and every later phase; neither owner currently supplies it | An owner-supported same-timebase control and source-bound interface, still missing | **UNSUPPORTED, refuse** before effects. The former duration-chain proposal is not agreed; no fresh clock, RAW conversion or `Date.now` substitution. |
 | `creator_waits` | Each actual creator in the graph below: Nucleus service→S, S→E, E→K, K→M, K→L, and each proof helper→its own fixtures | Nucleus retains S's child exit and S records `directChildWait` (P2); Effigy waits its leader but its terminal record deliberately carries no identity; the guard positively reaps its two pins but records only the leader's start identity | One `hostRunQualificationWait` per required edge (`shared/schema/host-runs.ts:171`): parent/child PID, both start identities, `observed`/`unknown`, code/signal, tick, source | Independent exact-head review of each receipt plus the effect-free control that rejects a receipt missing an identity | Any missing edge is **U**/**F**; a PID, EOF, empty group, capacity hold or advisory sweep is never a wait. **Unresolved Effigy and Oxide gaps** (see graph). |
 | `deciding_census` | Oxide's qualified shared guard, `scripts/bounded-test.py` (ordinary, `fcfda2b0…`): monitor census message bound to the custodian's echoed decision (`bind_deciding_census`, `census_summary`) | The qualified DECIDING fact: the exact monitor-sent `{certain, members, uncertain}` message the custodian's own decision named, with its sequence | Receipt bytes/digest, producer source, custodian and attempt binding, exact closure group | The guard's own `census_settled` conjunct plus digest binding | Missing, non-empty or wrongly bound DECIDING is **U**/**F**; the parked `c578…` candidate and the unpublished ceiling candidate are not substitutes. |
 | `final_census` | Same qualified guard: the last completed round after the stop (`census_last` in `join_census`) | A certain-empty FINAL round recorded separately from the deciding message | Its own round summary and tick, bound to the same group, recorded after the deciding message | Same guard control; the FINAL conjunct is evaluated independently of DECIDING, join and waits | Missing/uncertain/nonempty FINAL is **U**/**F**; a frozen prefix (`joined: false`) refuses closure. Residual: both facts are produced by one monitor thread (see below). |
@@ -303,28 +304,39 @@ allocation is summed with another. Blocked syscalls, scheduling, fsync, waits,
 reaps and delivery may outlast the target; hitting it permanently fails
 qualification and leaves the surviving parents' obligations with them.
 
-**The clock interface owed by Effigy and Nucleus (no conversion invented).**
-Each edge carries only durations on one declared monotonic timebase:
+**Current clock interface: consumer binding unsupported.** The former proposal
+`{originId, elapsedAtSpawnMs, remainingMs}` plus `sinceStartMs` is withdrawn as
+an agreed interface: Effigy's reconciled 038 explicitly refuses duration-chain
+reconstruction. It is not permission to replace the original clock.
 
-- the origin owner mints `originId` and its own `sinceOriginMs` when it
-  creates the next process, and passes `{originId, elapsedAtSpawnMs,
-  remainingMs}`;
-- each participant samples its own monotonic start once, reports its phases as
-  `sinceStartMs`, and reports `originId` plus the `elapsedAtSpawnMs` it was
-  given; its `sinceCommonOriginMs` is the plain sum of two durations on the
-  same host, never a domain conversion;
-- every ceiling is enforced as `remainingMs` at the edge, and no participant
-  may extend a settlement allowance past it.
+Effigy's actual internal payload is `deadline_nanos: u64`, absolute nanoseconds
+on `libc::CLOCK_MONOTONIC`, with **no origin identity**. Its
+`EFFIGY_RUN_DEADLINE_MS` input is a duration from Effigy's own process start,
+not an inherited absolute deadline (`run_deadline.rs:28–29,80–89,110,239–246`;
+`supervise/memory.rs:93,140–159`). `from_origin` computes the nanos ceiling
+from its own current read plus the duration; an injected origin does not bind
+that value to an earlier origin. Phase readbacks are diagnostics, not authority.
 
-Effigy's actual seams make this concrete: `EFFIGY_RUN_DEADLINE_MS` is one
-absolute deadline with a 10 s settlement allowance and phase readback
-(`crates/effigy-core/src/run_deadline.rs:30,75,120–280`; origin sampled at
-`src/bin/effigy.rs:1–10`; `deadline` object in run/plan JSON). The same shape
-is reused, with an inherited origin and an alignment readback, instead of a
-new controller. The one non-free claim — that both implementations read the
-same monotonic timebase — is a **clock control obligation** for the clock
-owner, not an assumption here, and it is why no `CLOCK_UPTIME_RAW` ↔ `Instant`
-conversion is invented.
+Neither payload covers Nucleus reservation persistence, source capture or other
+effects before Effigy starts. A prepare sub-origin may only narrow an inherited
+ceiling, never mint or restart the full allowance. MS startup, worker spawn,
+gate and record effects are charged from the original origin even on refusal;
+"no prepare-root writes" does not mean no effects or allocations.
+
+The original-origin consumer binding and predecessor coverage remain
+**UNSUPPORTED, refuse** until their owners supply a source-bound same-timebase
+control. No `CLOCK_UPTIME_RAW` ↔ `Instant`/`CLOCK_MONOTONIC` conversion is
+assumed, and no clock service or inner clock is introduced. An allowance that
+cannot fit is a blocker, never a reset.
+
+Effigy's sentinel is **MS**; S above remains the Nucleus supervisor/publisher.
+MS holds no wait handle for its siblings W or the selector leader. Its gate or
+pin settlement proves neither their completion nor E's reap. Expired or
+abandoned `try_wait` leaves the edge unknown; every required edge still needs
+its actual creator's positive wait receipt with both identities, status,
+time/source and subject/run/attempt binding. 038 marks absent receipt fields
+**MISSING**. A sibling terminal or EOF cannot fill the publisher's own wait,
+and later exclusion settlement cannot recover qualification credit.
 
 ### DECIDING and FINAL: reuse the qualified provider, refuse the candidates
 
@@ -468,7 +480,7 @@ Minimal seams, existing machinery reused, and the removals that follow:
 | Nucleus | Supplier registry behind `qualification-subject.ts:187` that maps each id to its owning module's typed claim; keep `present`-without-evidence → `unknown` | `qualification-inputs.ts`, readiness/refusal strings, endpoint and supervisor gates |
 | Nucleus | Settlement assembler that fills each gate from its own receipt (`decidingCensus`, `censusJoin`, `finalCensus`, `imageAttachment`, `capture`, `delivery`, `storage`, `directChildWait`, `parentWaits`, `clock`) | `qualification-settlement.ts`, `host-runs.ts` settlement schema (already refuses cross-gate credit) |
 | Nucleus | Retained-failure exit (prerequisite above) | P7 retention and disposition |
-| Effigy | Inherited-origin deadline: accept `{originId, elapsedAtSpawnMs, remainingMs}`, keep the 10 s allowance as a sub-slice, report alignment in the existing `deadline` object | `run_deadline`, plan/run JSON readback, `EFFIGY_RUN_DEADLINE_MS` |
+| Effigy / Nucleus | First resolve the original-origin clock binding and predecessor coverage; current 038 says **UNSUPPORTED, refuse**. No duration-chain implementation is agreed | Existing deadline/readback seams only after an owner-supported common-timebase contract; no clock reset or assumed conversion |
 | Effigy | Opt-in qualification run receipt: exact-selector admission, attributable completion and the wait's parent/child start identities; prepare custody as its owner scopes | admission hook, `Admitted` record, terminal row, `effigy run status --json` |
 | Oxide | Add the monitor PIN's start identity beside `monitor_reaped` in the guard receipt | existing `Kinfo` reader, reap loop, receipt publication |
 | Oxide | Document the guard-receipt → settlement-gate mapping (no new executable, no second log) | `bounded-test.py` receipt, `qualification.observation.json` sidecar role |

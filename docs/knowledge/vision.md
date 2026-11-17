@@ -343,9 +343,10 @@ validation and refusal disposition; the real creation graph and its waits; one
 600-second origin with its clock interface; the qualified census and
 image-attachment providers reused and the unqualified candidates refused; the
 monitored 512 MiB and 22 GiB accounting inventory; and a finite implementation
-breakdown. The Effigy owner scopes prepare custody, common timing and
-exact-selector admission/completion in parallel, so every cross-owner item is
-an unresolved interface until its owner supports it. A Nucleus-owned exit for a
+breakdown. Effigy's reconciled 038 design records prepare custody, timing and
+exact-selector admission/completion; the contract records its unsupported
+original-clock binding and missing receipt fields. The provisional duration
+handoff is not an agreed interface. A Nucleus-owned exit for a
 retained qualification failure row is a prerequisite before any real proof. The
 Nucleus foundation (Spec 064, merged `2ce2ed9c`, source accepted at
 `9366a1a0`) refuses all nine unsupplied inputs; that refusal is the delivered
