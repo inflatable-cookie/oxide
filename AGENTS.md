@@ -64,7 +64,8 @@ dogfood finding. Preserve the ordinary routing and existing compiler profiles.
 `rust:barge-adoption` creates one private per-run directory below the invoking
 `TMPDIR`, passes it as TMPDIR/TMP/TEMP and the test fixture roots, and removes
 only that directory after a successful test command. A failed command retains
-it. Effigy owns heavy admission and the 600-second run deadline. Unit tests
+it. Effigy owns heavy admission and the 600-second run deadline. Tests run serially
+because child launches inherit process-wide Barge holds. Unit tests
 inject only the platform/classifier inputs that formerly required boot-volume
 temporary paths; their file operations remain in the private fixture. The
 shared supervisor and the separate dual-root recipe are unchanged and provide

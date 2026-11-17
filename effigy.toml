@@ -61,7 +61,7 @@ minimum_effigy_version = "0.14.0"
 admission = "heavy"
 run = '''adoption_root=$(mktemp -d "${TMPDIR:?}/qa.XXXXXX") || exit 2
 echo "oxide adoption fixtures: $adoption_root"
-TMPDIR="$adoption_root" TMP="$adoption_root" TEMP="$adoption_root" OXIDE_TASK_SCRATCH_ROOT="$adoption_root" OXIDE_TEST_INTERNAL_ROOT="$adoption_root" oxide test --workspace --all-targets --locked
+TMPDIR="$adoption_root" TMP="$adoption_root" TEMP="$adoption_root" OXIDE_TASK_SCRATCH_ROOT="$adoption_root" OXIDE_TEST_INTERNAL_ROOT="$adoption_root" oxide test --workspace --all-targets --locked -- --test-threads=1
 adoption_exit=$?
 if [ "$adoption_exit" -eq 0 ]; then
   rm -rf -- "$adoption_root"

@@ -178,7 +178,8 @@ The required covering route is `effigy rust:barge-adoption`: an ordinary heavy
 `oxide test --workspace --all-targets --locked` command, with one fresh private
 fixture directory strictly below the assigned task TMPDIR. It uses ordinary
 Effigy admission and deadline handling, with no staging/proof supervisor and no
-named skips. The old dual-root `rust:test-600` route is not this task's proof.
+named skips. The Rust harness runs serially so an unrelated parallel test
+cannot inherit another fixture's cooperative holds. The old dual-root `rust:test-600` route is not this task's proof.
 Prior use of internal and sibling validation roots remains disclosed history,
 not authorization or current proof. The shared supervisor is unchanged.
 
