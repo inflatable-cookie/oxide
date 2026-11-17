@@ -1250,7 +1250,9 @@ class Census:
         if trace is None:
             return function(*args)
         pid, start = identity if identity is not None else (None, None)
-        event = {"site": site, "operation": operation,
+        sequence = (trace.get("sequence", 0) % 0xffffffff) + 1
+        trace["sequence"] = sequence
+        event = {"sequence": sequence, "site": site, "operation": operation,
                  "pid": pid if type(pid) is int and 0 < pid <= 0xffffffff else None,
                  "start": start if type(start) is int and 0 <= start <= (1 << 64) - 1 else None}
         trace["entered"] = event

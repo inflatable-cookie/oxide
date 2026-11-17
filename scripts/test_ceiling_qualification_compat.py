@@ -170,8 +170,21 @@ class CensusStageControls(unittest.TestCase):
         with self.assertRaises(Interrupted):
             census.round()
         self.assertEqual(census.operation_trace["entered"],
-                         {"site": "round", "operation": "getsid", "pid": 42, "start": 7})
+                         {"sequence": 2, "site": "round", "operation": "getsid", "pid": 42, "start": 7})
         self.assertEqual(census.operation_trace["returned"]["outcome"], "raised")
+        self.assertEqual(census.operation_trace["entered"]["sequence"],
+                         census.operation_trace["returned"]["sequence"])
+
+    def test_repeated_call_is_distinguishable_from_previous_return(self):
+        trace = {"entered": None, "returned": None}
+        census = guard.Census(1)
+        census.operation_trace = trace
+        census.observed("round", "getsid", lambda: None, identity=(42, 7))
+        before = trace["returned"]["sequence"]
+        def check_inflight():
+            self.assertNotEqual(trace["entered"]["sequence"], before)
+            self.assertEqual(trace["returned"]["sequence"], before)
+        census.observed("round", "getsid", check_inflight, identity=(42, 7))
 
     def test_interruption_before_round_return_can_occur_in_distinct_stages(self):
         class Interrupted(BaseException):
