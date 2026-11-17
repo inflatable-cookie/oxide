@@ -8371,14 +8371,11 @@ pub(crate) fn test_rows(
         .collect())
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     include!("selection_protection_tests.rs");
-
 
     /// oxide#211 (decision 7aedd5af): a prune test hook arms on the internal
     /// volume, or under a DECLARED scratch pool inside the supervisor scratch.

@@ -190,9 +190,13 @@ impl Storage {
     /// Open the account's Barge state stored under Oxide's own state root.
     pub fn open(state_root: &Path) -> Result<Self, String> {
         let state_dir = state_root.join("barge");
-        Barge::open_with(state_dir, Arc::new(OxideOs), Arc::new(barge::SystemClock::new()))
-            .map(|barge| Self { barge })
-            .map_err(|error| format!("cannot open the storage state: {error}"))
+        Barge::open_with(
+            state_dir,
+            Arc::new(OxideOs),
+            Arc::new(barge::SystemClock::new()),
+        )
+        .map(|barge| Self { barge })
+        .map_err(|error| format!("cannot open the storage state: {error}"))
     }
 
     /// Open with explicit seams, for Oxide's own tests.
@@ -263,9 +267,7 @@ impl Storage {
             )?;
         }
         let absent = match &config.fallback {
-            Some(path) => Absent::Fallback {
-                path: path.clone(),
-            },
+            Some(path) => Absent::Fallback { path: path.clone() },
             None => Absent::Fail,
         };
         let spec = AreaSpec::new(NAMESPACE, config.area.clone(), config.volume.clone())
@@ -591,21 +593,13 @@ mod tests {
         let fixture = Fixture::new("storage-declare");
         let area = fixture.storage.declare(&fixture.pool()).expect("area");
         let root = area.create_root("quick").expect("root");
-        assert!(root.path.starts_with(
-            fixture
-                .mount
-                .join(VOLUME_PAYLOAD_FOLDER)
-                .join(POOL_FOLDER)
-        ));
+        assert!(root
+            .path
+            .starts_with(fixture.mount.join(VOLUME_PAYLOAD_FOLDER).join(POOL_FOLDER)));
         assert!(root.path.join(".barge-root.json").is_file());
         assert_eq!(
             fixture.storage.location(&fixture.pool()).expect("location"),
-            Location::Volume(
-                fixture
-                    .mount
-                    .join(VOLUME_PAYLOAD_FOLDER)
-                    .join(POOL_FOLDER)
-            )
+            Location::Volume(fixture.mount.join(VOLUME_PAYLOAD_FOLDER).join(POOL_FOLDER))
         );
         let listing = area.list().expect("list");
         assert_eq!(listing.roots.len(), 1);
@@ -698,7 +692,8 @@ mod tests {
         fixture
             .os
             .set_uuid(&fixture.mount, Some("11111111-2222-4333-8444-555555555555"));
-        let state = volume_state(&fixture.storage.volume("Builds").expect("volume")).expect("state");
+        let state =
+            volume_state(&fixture.storage.volume("Builds").expect("volume")).expect("state");
         assert!(matches!(state, VolumeState::Mismatch { .. }), "{state:?}");
         assert!(matches!(
             fixture.storage.location(&pool).expect("location"),
@@ -785,11 +780,12 @@ mod tests {
     fn pool_storage(fixture: &Fixture, label: &str) -> PoolStorage {
         let control = fixture._temp.path().join(format!("pool-{label}"));
         std::fs::create_dir_all(control.join("oxide-managed")).expect("control");
-        fixture
-            .os
-            .add_volume(&control, Some(UUID), 100 << 30);
-        PoolStorage::open(&control.join("oxide-managed"), &PoolBacking::budget(&control, 1 << 30))
-            .expect("pool storage")
+        fixture.os.add_volume(&control, Some(UUID), 100 << 30);
+        PoolStorage::open(
+            &control.join("oxide-managed"),
+            &PoolBacking::budget(&control, 1 << 30),
+        )
+        .expect("pool storage")
     }
 
     #[test]
