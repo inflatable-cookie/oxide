@@ -9,13 +9,13 @@
 //! the reserve; the report states what was observed.
 //!
 //! On a removable pool the same stop runs when the volume disappears: about
-//! once a second it checks that the mount root still opens as the device the
+//! once a second it checks that the mount root still opens as the uuid the
 //! build started on. A build script or other program whose executable lived
 //! on a forcibly removed volume can spin instead of exiting, so without the
 //! stop the wait for Cargo's group would never end (oxide#098).
 
 use crate::store::{GIB, HOST_RESERVE_BYTES};
-use oxide_storage::volume::Binding;
+use barge::Os;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -29,11 +29,11 @@ const CLOSE_BOUND: Duration = Duration::from_secs(10);
 
 enum Source {
     Statfs(PathBuf),
-    /// A removable pool's mount root and the device bound when the build
+    /// A removable pool's mount root and the uuid bound when the build
     /// started (`None`: it did not bind, so the first poll stops).
     Volume {
         mount: PathBuf,
-        device: Option<String>,
+        uuid: Option<String>,
     },
     /// Debug builds only: `OXIDE_TEST_WATCHDOG_READINGS` names a file holding
     /// the available-bytes reading, so the fixture proof never consumes host
@@ -74,13 +74,11 @@ impl Watchdog {
 
     /// The removal stop for a removable pool mounted at `mount`.
     pub fn for_volume(mount: &Path) -> Self {
-        let device = Binding::open(mount, None)
-            .ok()
-            .map(|binding| binding.device().to_owned());
+        let uuid = oxide_storage::storage::OxideOs.volume_identity(mount).ok().flatten();
         let mut watchdog = Self::new(
             Source::Volume {
                 mount: mount.to_path_buf(),
-                device,
+                uuid,
             },
             GRACE,
             CLOSE_BOUND,
@@ -213,9 +211,9 @@ impl Watchdog {
     fn sample(&self) -> Option<u64> {
         match &self.source {
             Source::Statfs(path) => available_bytes(path),
-            Source::Volume { mount, device } => Binding::open(mount, None)
-                .ok()
-                .filter(|binding| Some(binding.device()) == device.as_deref())
+            Source::Volume { mount, uuid } => oxide_storage::storage::OxideOs
+                .volume_identity(mount).ok().flatten()
+                .filter(|observed| Some(observed.as_str()) == uuid.as_deref())
                 .map(|_| u64::MAX),
             #[cfg(debug_assertions)]
             Source::Injected(path) => std::fs::read_to_string(path)
