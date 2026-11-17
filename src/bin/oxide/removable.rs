@@ -670,23 +670,6 @@ pub(crate) fn read_registration_at(
     };
     if fd < 0 {
         let error = std::io::Error::last_os_error();
-        #[cfg(test)]
-        let saved_errno = crate::tape::observer_errno();
-        #[cfg(test)]
-        crate::tape::read_row(
-            "removable:registration-open",
-            &control.join(REGISTRATION),
-            if error.kind() == std::io::ErrorKind::NotFound {
-                crate::tape::TapeOutcome::Absent
-            } else {
-                crate::tape::TapeOutcome::Refusal {
-                    reason: error.to_string(),
-                }
-            },
-            None,
-        );
-        #[cfg(test)]
-        crate::tape::restore_observer_errno(saved_errno);
         return if error.kind() == std::io::ErrorKind::NotFound {
             Ok(None)
         } else {
@@ -694,18 +677,7 @@ pub(crate) fn read_registration_at(
         };
     }
     #[cfg(test)]
-    {
-        let saved_errno = crate::tape::observer_errno();
-        crate::tape::read_row(
-            "removable:registration-open",
-            &control.join(REGISTRATION),
-            crate::tape::TapeOutcome::Facts {
-                facts: "opened; descriptor identity pending".to_owned(),
-            },
-            None,
-        );
-        crate::tape::restore_observer_errno(saved_errno);
-    }
+    {}
     // SAFETY: `fd` is a newly opened descriptor owned by this function.
     let file = unsafe { File::from_raw_fd(fd) };
     #[cfg(not(test))]
@@ -715,29 +687,10 @@ pub(crate) fn read_registration_at(
     #[cfg(test)]
     let metadata = {
         let result = file.metadata();
-        let saved_errno = crate::tape::observer_errno();
         match &result {
-            Ok(metadata) => crate::tape::read_row_dev(
-                "removable:registration-held",
-                &control.join(REGISTRATION),
-                metadata.dev(),
-                metadata.ino(),
-                crate::tape::TapeOutcome::Opened {
-                    dev: metadata.dev(),
-                    ino: metadata.ino(),
-                },
-                None,
-            ),
-            Err(error) => crate::tape::read_row(
-                "removable:registration-held",
-                &control.join(REGISTRATION),
-                crate::tape::TapeOutcome::Refusal {
-                    reason: error.to_string(),
-                },
-                None,
-            ),
+            Ok(metadata) => {}
+            Err(_) => {}
         }
-        crate::tape::restore_observer_errno(saved_errno);
         result.map_err(|error| format!("cannot read the removable registration: {error}"))?
     };
     // SAFETY: getuid has no preconditions.
@@ -1072,21 +1025,9 @@ pub fn coordinate(internal: Option<Store>) -> Result<Option<Store>, String> {
         return Ok(None);
     };
     if registration(&internal)?.is_none() {
-        #[cfg(test)]
-        crate::tape::classify_row(
-            "removable:coordinate",
-            &internal.control().display().to_string(),
-            "no-registration; internal pool only",
-        );
         return Ok(Some(internal));
     }
     let control = removable_control(internal.control());
-    #[cfg(test)]
-    crate::tape::classify_row(
-        "removable:coordinate",
-        &internal.control().display().to_string(),
-        &format!("sibling-control={}", control.display()),
-    );
     Ok(Some(internal.with_sibling(&control, false)))
 }
 

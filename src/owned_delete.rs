@@ -730,7 +730,6 @@ fn restore_mode_through(dir: BorrowedFd<'_>, mode: u32) -> Result<(), String> {
     #[cfg(test)]
     {
         let status = unsafe { libc::fchmod(dir.as_raw_fd(), bits) };
-        crate::tape::unbound_effect("restore-step-mode:fchmod", status == 0);
         if status != 0 {
             return Err(format!(
                 "the step directory's recorded mode cannot be restored ({})",
@@ -780,7 +779,6 @@ pub fn open_verified_step(
     {
         let status = unsafe { libc::fchmod(held.as_raw_fd(), bits) };
         if status != 0 {
-            crate::tape::unbound_effect("open-verified-step:fchmod", false);
             return Err(format!(
                 "the directory cannot be given access for the step ({})",
                 io::Error::last_os_error()
@@ -793,8 +791,6 @@ pub fn open_verified_step(
         mode,
         armed: true,
     };
-    #[cfg(test)]
-    crate::tape::unbound_effect("open-verified-step:fchmod", true);
     #[cfg(test)]
     crate::test_fs::run_after_step_chmod();
     let fault = {
@@ -875,7 +871,6 @@ pub fn restore_captured_mode(
     #[cfg(test)]
     {
         let status = unsafe { libc::fchmod(held.as_raw_fd(), bits) };
-        crate::tape::unbound_effect("restore-captured-mode:fchmod", status == 0);
         if status != 0 {
             return Err(format!(
                 "the captured directory's recorded mode cannot be restored ({})",
@@ -1185,7 +1180,6 @@ pub fn restore_root_capture(
         #[cfg(test)]
         {
             let status = unsafe { libc::fchmod(held.as_raw_fd(), plan.mode_bits()) };
-            crate::tape::unbound_effect("restore-root-capture:fchmod", status == 0);
             if status != 0 {
                 return Err(format!(
                     "the captured root's recorded mode cannot be restored ({})",
@@ -1206,7 +1200,6 @@ pub fn restore_root_capture(
     #[cfg(test)]
     {
         let result = rename_exclusive(parent, &private, name);
-        crate::tape::unbound_effect("restore-root-capture:rename", result.is_ok());
         result.map_err(|error| format!("the captured root cannot be put back ({error})"))?;
     }
     sync_directory(parent).map_err(|error| format!("the put-back cannot be synced ({error})"))?;
@@ -1268,7 +1261,6 @@ pub fn put_back(dir: BorrowedFd<'_>, capture: &Capture) -> io::Result<()> {
     #[cfg(test)]
     {
         let result = rename_exclusive(dir, &capture.private, &capture.original);
-        crate::tape::unbound_effect("put-back:rename", result.is_ok());
         result
     }
 }
@@ -1746,28 +1738,13 @@ fn stat_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<libc::stat> {
     #[cfg(test)]
     {
         use std::os::unix::ffi::OsStrExt;
-        let saved_errno = crate::tape::observer_errno();
         let outcome = if status == 0 {
-            crate::tape::TapeOutcome::Opened {
-                dev: stat_device(&stat),
-                ino: stat_ino(&stat),
-            }
         } else {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::NotFound {
-                crate::tape::TapeOutcome::Absent
             } else {
-                crate::tape::TapeOutcome::Refusal {
-                    reason: error.to_string(),
-                }
             }
         };
-        crate::tape::component_without_parent(
-            "owned-delete:stat-at",
-            std::ffi::OsStr::from_bytes(name.to_bytes()),
-            outcome,
-        );
-        crate::tape::restore_observer_errno(saved_errno);
     }
     if status != 0 {
         return Err(io::Error::last_os_error());
@@ -1897,19 +1874,9 @@ pub fn descriptor_identity(fd: BorrowedFd<'_>) -> io::Result<(u64, u64)> {
     #[cfg(test)]
     {
         let status = unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) };
-        let saved_errno = crate::tape::observer_errno();
         let outcome = if status == 0 {
-            crate::tape::TapeOutcome::Opened {
-                dev: stat_device(&stat),
-                ino: stat_ino(&stat),
-            }
         } else {
-            crate::tape::TapeOutcome::Refusal {
-                reason: io::Error::last_os_error().to_string(),
-            }
         };
-        crate::tape::descriptor_row("owned-delete:descriptor-identity", fd.as_raw_fd(), outcome);
-        crate::tape::restore_observer_errno(saved_errno);
         if status != 0 {
             return Err(io::Error::last_os_error());
         }

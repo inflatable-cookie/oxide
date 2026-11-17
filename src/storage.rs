@@ -1078,6 +1078,21 @@ mod tests {
         assert!(pool.bytes().expect("bytes") > 0);
     }
 
+    // A sibling test's `Command` spawn briefly duplicates every open descriptor
+    // in the forked child before `exec` closes the close-on-exec ones, so a hold
+    // that this test has just dropped can still read as held for a few
+    // milliseconds. The refusal above is the strict statement; this retry only
+    // waits out that fork window.
+    fn evict_after_release(pool: &PoolStorage, id: &str) {
+        for _ in 0..200 {
+            match pool.evict(id) {
+                Ok(_) => return,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        panic!("the released root was never evictable");
+    }
+
     #[test]
     fn a_pool_hold_is_released_by_dropping_it_and_an_eviction_refuses_while_held() {
         let fixture = Fixture::new("storage-pool-hold");
@@ -1091,7 +1106,7 @@ mod tests {
         assert!(pool.evict(&root.id).is_err());
         drop(hold);
         assert!(pool.try_hold(&root.id).expect("try").is_some());
-        pool.evict(&root.id).expect("evicted");
+        evict_after_release(&pool, &root.id);
         assert!(!root.path.exists());
         assert!(pool.list().expect("list").roots.is_empty());
     }
@@ -1153,7 +1168,15 @@ mod tests {
         let hold = area.hold(&root.id, Mode::Exclusive).expect("hold");
         assert!(area.evict(&root.id).is_err());
         drop(hold);
-        area.evict(&root.id).expect("evicted");
+        let mut evicted = false;
+        for _ in 0..200 {
+            if area.evict(&root.id).is_ok() {
+                evicted = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(evicted, "the released adopted root was never evictable");
         assert!(!legacy.exists());
     }
 

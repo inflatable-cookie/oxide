@@ -265,9 +265,7 @@ fn boot_session() -> Option<u64> {
     let boot = process::boot_ms();
     #[cfg(test)]
     if let Some(value) = boot {
-        crate::tape::clock_row("boot-session-ms", value);
     } else {
-        crate::tape::clock_unproven("boot-session-ms");
     }
     boot
 }
@@ -1195,27 +1193,7 @@ fn holder_lines(state: &State, checkout: &Path, cleans: bool) -> Vec<String> {
             continue;
         }
         #[cfg(test)]
-        if let Some(holder) = &record.holder {
-            crate::tape::recorded_holder(
-                "store:active-holders",
-                record.id,
-                holder.pid,
-                holder.started_ms,
-            );
-        }
-        #[cfg(test)]
-        crate::tape::classify_row(
-            "custody:holder",
-            &format!("record={}|checkout={}", record.id, checkout.display()),
-            &format!(
-                "pid={:?}|command={:?}",
-                record.holder.as_ref().map(|holder| holder.pid),
-                record
-                    .holder
-                    .as_ref()
-                    .and_then(|holder| holder.command.as_deref()),
-            ),
-        );
+        if let Some(holder) = &record.holder {}
         let name = record
             .holder
             .as_ref()
@@ -1257,25 +1235,7 @@ fn custody_verdict(
                 continue;
             }
             #[cfg(test)]
-            if let Some(holder) = &record.holder {
-                crate::tape::recorded_holder(
-                    "store:checkout-custody",
-                    record.id,
-                    holder.pid,
-                    holder.started_ms,
-                );
-            }
-            #[cfg(test)]
-            crate::tape::classify_row(
-                "custody:record",
-                &format!("pool={pool}|id={}|phase={:?}", record.id, record.phase),
-                &format!(
-                    "holder={:?}|lost={:?}|group={:?}",
-                    record.holder.as_ref().map(|holder| holder.pid),
-                    record.lost.as_ref().map(|lost| lost.slot_id.clone()),
-                    record.process_group,
-                ),
-            );
+            if let Some(holder) = &record.holder {}
             if record.phase == Phase::Retired {
                 if let Some(lost) = record.lost.as_ref() {
                     // A restart closed a quarantined record whose holder
@@ -1289,11 +1249,6 @@ fn custody_verdict(
                     #[cfg(test)]
                     let unclosed = lost.unclosed.as_deref().filter(|_| {
                         let closed = closed_by_boot(record, boot);
-                        crate::tape::classify_row(
-                            "boot-classify:closed-by-boot",
-                            &format!("record={}", record.id),
-                            &format!("boot={boot:?}|closed={closed}"),
-                        );
                         !closed
                     });
                     if let Some(why) = unclosed {
@@ -2134,40 +2089,14 @@ impl Store {
             crate::scratch_io::evaluate(settings, false)?;
         }
         match config::inspect(&settings.pool) {
-            Found::Absent => {
-                #[cfg(test)]
-                crate::tape::pool_row(
-                    "store:open-existing",
-                    &settings.pool,
-                    crate::tape::TapeOutcome::Absent,
-                );
-                Ok(None)
-            }
-            Found::LegacyImage => {
-                #[cfg(test)]
-                crate::tape::pool_row(
-                    "store:open-existing",
-                    &settings.pool,
-                    crate::tape::TapeOutcome::Refusal {
-                        reason: "legacy image pool".to_owned(),
-                    },
-                );
-                Err(legacy_refusal())
-            }
+            Found::Absent => Ok(None),
+            Found::LegacyImage => Err(legacy_refusal()),
             Found::Directory | Found::Unknown => {
                 if let Some(uuid) = crate::scratch_io::evaluate(settings, false)? {
                     if repair {
                         crate::scratch_io::repair(settings, &uuid)?;
                     }
                 }
-                #[cfg(test)]
-                crate::tape::pool_row(
-                    "store:open-existing:inspect",
-                    &settings.pool,
-                    crate::tape::TapeOutcome::Facts {
-                        facts: "directory pool".to_owned(),
-                    },
-                );
                 Self::open_at(&settings.pool, settings).map(Some)
             }
         }
@@ -2267,14 +2196,6 @@ impl Store {
             fs::canonicalize(path).map_err(|error| format!("cannot open the pool: {error}"))?;
         let view =
             ledger_view(&pool).map_err(|error| lease_error("cannot open the pool", &error))?;
-        #[cfg(test)]
-        crate::tape::pool_row(
-            "pool:ledger-view",
-            &pool,
-            crate::tape::TapeOutcome::Facts {
-                facts: format!("backend={}|cap={}", view.backend, view.cap_bytes),
-            },
-        );
         let backend = Backend::recorded(&view.backend)?;
         if backend != Backend::DirectoryBudget {
             return Err(format!(
@@ -2639,12 +2560,6 @@ impl Store {
             // this slot's writer: the number may belong to an unrelated
             // process now, so only a group of the current session is checked.
             let boot_closed = closed_by_boot(record, boot);
-            #[cfg(test)]
-            crate::tape::classify_row(
-                "boot-classify:closed-by-boot",
-                &format!("record={}", record.id),
-                &format!("boot={boot:?}|closed={boot_closed}"),
-            );
             if !boot_closed
                 && record
                     .process_group
@@ -2749,15 +2664,6 @@ impl Store {
         #[cfg(test)]
         {
             let state = self.load()?;
-            crate::tape::classify_row(
-                "outputs-initialization",
-                &self.owner_control().display().to_string(),
-                match &state.outputs_init {
-                    Some(OutputsInit::Ready { .. }) => "ready",
-                    Some(OutputsInit::Initializing { .. }) => "initializing",
-                    None => "absent",
-                },
-            );
             Ok(state.outputs_init)
         }
         #[cfg(not(test))]
@@ -3305,16 +3211,6 @@ impl Store {
     pub fn checkout_custody(&self, checkout: &Path, own: u64) -> Result<CheckoutCustody, String> {
         let _sibling = self.sibling_admission()?;
         let _admission = self.admission()?;
-        #[cfg(test)]
-        crate::tape::classify_row(
-            "custody:entry",
-            &format!(
-                "checkout={}|control={}",
-                checkout.display(),
-                self.control.display()
-            ),
-            "enter",
-        );
         let own_state = if self.control.exists() {
             Some(self.load()?)
         } else {
@@ -3351,14 +3247,6 @@ impl Store {
         let file = private_file(&sibling.control.join("admission.lock"), true)?
             .ok_or("the internal admission lock is missing")?;
         crate::budget::lock(&file, "internal admission")?;
-        #[cfg(test)]
-        crate::tape::lock_row(
-            "admission-lock:sibling",
-            &sibling.control.join("admission.lock"),
-            crate::tape::TapeOutcome::Facts {
-                facts: "locked".to_owned(),
-            },
-        );
         Ok(Some(file))
     }
 
@@ -5416,14 +5304,6 @@ impl Store {
     fn admission(&self) -> Result<File, String> {
         let lock = lock_admission(&self.control)?;
         self.fence_admission_state()?;
-        #[cfg(test)]
-        crate::tape::lock_row(
-            "admission-lock:this",
-            &self.control.join("admission.lock"),
-            crate::tape::TapeOutcome::Facts {
-                facts: "locked".to_owned(),
-            },
-        );
         Ok(lock)
     }
 
@@ -5445,8 +5325,6 @@ impl Store {
     /// Make the recorded-accounting fence durable. Nothing is written when it
     /// is already set.
     fn fence_recorded_accounting(&self) -> Result<(), String> {
-        #[cfg(test)]
-        let _tape_fence_kind = crate::tape::effect_kind_override("fence@recorded-accounting");
         let mut state = self.load()?;
         if state.recorded_accounting.as_deref() != Some(RECORDED_ACCOUNTING_FENCE) {
             state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
@@ -5458,8 +5336,6 @@ impl Store {
     /// Make the current control fences durable when they are not already
     /// there. Returns without writing for an already-fenced control.
     fn fence_admission_state(&self) -> Result<(), String> {
-        #[cfg(test)]
-        let _tape_fence_kind = crate::tape::effect_kind_override("fence@admission-fences");
         let mut state = self.load()?;
         let mut changed = false;
         if state.recorded_accounting.as_deref() != Some(RECORDED_ACCOUNTING_FENCE) {
@@ -5618,7 +5494,6 @@ impl Store {
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&temp);
-            crate::tape::effect_row("attempt@control-state-temp-open", &temp);
             result.map_err(|error| format!("cannot write Oxide state: {error}"))?
         };
         #[cfg(not(test))]
@@ -5628,14 +5503,6 @@ impl Store {
         #[cfg(test)]
         {
             let write = file.write_all(&bytes);
-            crate::tape::effect_row(
-                if write.is_ok() {
-                    "save@control-state-temp"
-                } else {
-                    "attempt-save@control-state-temp"
-                },
-                &temp,
-            );
             write
                 .and_then(|()| file.sync_all())
                 .map_err(|error| format!("cannot write Oxide state: {error}"))?;
@@ -5647,11 +5514,8 @@ impl Store {
         #[cfg(test)]
         {
             let renamed = fs::rename(&temp, self.control.join("state.json"));
-            if renamed.is_err() {
-                crate::tape::effect_row("attempt-rename@control-state", &tape_state_path);
-            }
+            if renamed.is_err() {}
             renamed.map_err(|error| format!("cannot replace Oxide state: {error}"))?;
-            crate::tape::effect_row("save@control-state", &tape_state_path);
             File::open(&self.control)
                 .and_then(|directory| directory.sync_all())
                 .map_err(|error| format!("cannot replace Oxide state: {error}"))?;
@@ -5753,33 +5617,10 @@ mod control_directory_fs {
 
     pub(super) fn symlink_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
         let result = std::fs::symlink_metadata(path);
-        let saved_errno = crate::tape::observer_errno();
         match &result {
-            Ok(metadata) => crate::tape::read_row_dev(
-                "control-directory:named",
-                path,
-                metadata.dev(),
-                metadata.ino(),
-                crate::tape::TapeOutcome::Opened {
-                    dev: metadata.dev(),
-                    ino: metadata.ino(),
-                },
-                None,
-            ),
-            Err(error) => crate::tape::read_row(
-                "control-directory:named",
-                path,
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    crate::tape::TapeOutcome::Absent
-                } else {
-                    crate::tape::TapeOutcome::Refusal {
-                        reason: error.to_string(),
-                    }
-                },
-                None,
-            ),
+            Ok(metadata) => {}
+            Err(_) => {}
         }
-        crate::tape::restore_observer_errno(saved_errno);
         result
     }
 }
@@ -5812,17 +5653,10 @@ pub(crate) fn open_control_directory(path: &Path) -> Result<Option<File>, String
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path);
-        let saved_errno = crate::tape::observer_errno();
         let outcome = match &result {
-            Ok(_) => crate::tape::TapeOutcome::Facts {
-                facts: "opened; descriptor identity pending".to_owned(),
-            },
-            Err(error) => crate::tape::TapeOutcome::Refusal {
-                reason: error.to_string(),
-            },
+            Ok(_) => {}
+            Err(_) => {}
         };
-        crate::tape::read_row("control-directory:open", path, outcome, None);
-        crate::tape::restore_observer_errno(saved_errno);
         result.map_err(|error| format!("cannot open {}: {error}", path.display()))?
     };
     #[cfg(not(test))]
@@ -5832,29 +5666,10 @@ pub(crate) fn open_control_directory(path: &Path) -> Result<Option<File>, String
     #[cfg(test)]
     let opened = {
         let result = directory.metadata();
-        let saved_errno = crate::tape::observer_errno();
         match &result {
-            Ok(metadata) => crate::tape::read_row_dev(
-                "control-directory:held",
-                path,
-                metadata.dev(),
-                metadata.ino(),
-                crate::tape::TapeOutcome::Opened {
-                    dev: metadata.dev(),
-                    ino: metadata.ino(),
-                },
-                None,
-            ),
-            Err(error) => crate::tape::read_row(
-                "control-directory:held",
-                path,
-                crate::tape::TapeOutcome::Refusal {
-                    reason: error.to_string(),
-                },
-                None,
-            ),
+            Ok(metadata) => {}
+            Err(_) => {}
         }
-        crate::tape::restore_observer_errno(saved_errno);
         result.map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
     };
     if !opened.is_dir()
@@ -6492,15 +6307,6 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
             }
             let create_error = std::io::Error::last_os_error();
             if create_error.kind() != std::io::ErrorKind::AlreadyExists {
-                #[cfg(test)]
-                crate::tape::read_row(
-                    "admission-lock:open",
-                    &control.join("admission.lock"),
-                    crate::tape::TapeOutcome::Refusal {
-                        reason: create_error.to_string(),
-                    },
-                    None,
-                );
                 return Err(format!(
                     "cannot create admission lock in {}: {create_error}",
                     control.display()
@@ -6532,13 +6338,6 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
         // the lock, so `create == false` must distinguish the two precisely.
         let error = last.unwrap_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT));
         if error.kind() == std::io::ErrorKind::NotFound {
-            #[cfg(test)]
-            crate::tape::read_row(
-                "admission-lock:open",
-                &control.join("admission.lock"),
-                crate::tape::TapeOutcome::Absent,
-                None,
-            );
             return Ok(None);
         }
         return Err(if create {
@@ -6562,20 +6361,7 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
     #[cfg(test)]
     {
         let path = control.join("admission.lock");
-        if tape_created {
-            crate::tape::effect_row("lock-create@admission", &path);
-        }
-        crate::tape::read_row_dev(
-            "admission-lock:open",
-            &path,
-            metadata.dev(),
-            metadata.ino(),
-            crate::tape::TapeOutcome::Opened {
-                dev: metadata.dev(),
-                ino: metadata.ino(),
-            },
-            None,
-        );
+        if tape_created {}
     }
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
@@ -6625,14 +6411,6 @@ fn lock_admission_inner(control: &Path, release_pool: Option<&Path>) -> Result<F
     } else {
         crate::budget::lock(&file, "admission")?;
     }
-    #[cfg(test)]
-    crate::tape::lock_row(
-        "admission-lock:acquire",
-        &control.join("admission.lock"),
-        crate::tape::TapeOutcome::Facts {
-            facts: "locked".to_owned(),
-        },
-    );
     Ok(file)
 }
 
@@ -7010,87 +6788,28 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
         #[cfg(not(test))]
         Ok(file) => file,
         #[cfg(test)]
-        Ok(file) => {
-            let saved_errno = crate::tape::observer_errno();
-            crate::tape::read_row(
-                "private-file:open",
-                path,
-                crate::tape::TapeOutcome::Facts {
-                    facts: "opened; descriptor identity unproven".to_owned(),
-                },
-                None,
-            );
-            crate::tape::restore_observer_errno(saved_errno);
-            file
-        }
+        Ok(file) => file,
         Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
-            #[cfg(test)]
-            let saved_errno = crate::tape::observer_errno();
-            #[cfg(test)]
-            crate::tape::read_row(
-                "private-file:open",
-                path,
-                crate::tape::TapeOutcome::Absent,
-                None,
-            );
-            #[cfg(test)]
-            crate::tape::restore_observer_errno(saved_errno);
             return Ok(None);
         }
         Err(error) => {
             #[cfg(test)]
-            let saved_errno = crate::tape::observer_errno();
-            #[cfg(test)]
-            if create {
-                crate::tape::effect_row("attempt@private-file-create", path);
-            }
-            #[cfg(test)]
-            crate::tape::read_row(
-                "private-file:open",
-                path,
-                crate::tape::TapeOutcome::Refusal {
-                    reason: error.to_string(),
-                },
-                None,
-            );
-            #[cfg(test)]
-            crate::tape::restore_observer_errno(saved_errno);
+            if create {}
             return Err(format!("cannot open {}: {error}", path.display()));
         }
     };
     // O_CREAT without O_EXCL cannot prove whether the file existed.
     #[cfg(test)]
-    if create {
-        crate::tape::effect_row("attempt@private-file-create", path);
-    }
+    if create {}
     #[cfg(not(test))]
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     #[cfg(test)]
     let metadata = {
         let result = file.metadata();
-        let saved_errno = crate::tape::observer_errno();
         match &result {
-            Ok(metadata) => crate::tape::read_row_dev(
-                "private-file:metadata",
-                path,
-                metadata.dev(),
-                metadata.ino(),
-                crate::tape::TapeOutcome::Opened {
-                    dev: metadata.dev(),
-                    ino: metadata.ino(),
-                },
-                None,
-            ),
-            Err(error) => crate::tape::read_row(
-                "private-file:metadata",
-                path,
-                crate::tape::TapeOutcome::Refusal {
-                    reason: error.to_string(),
-                },
-                None,
-            ),
+            Ok(metadata) => {}
+            Err(_) => {}
         }
-        crate::tape::restore_observer_errno(saved_errno);
         result.map_err(|error| error.to_string())?
     };
     // SAFETY: getuid has no preconditions.
@@ -9060,20 +8779,33 @@ pub(crate) mod tests {
     }
 
     fn lease(store: &Store, key: &SlotKey, label: Option<&str>) -> Result<Lease, Wait> {
-        let (ticket, _file) = store.register_ticket().unwrap();
-        let outcome = store
-            .attempt(
-                ticket,
-                key,
-                Profile::Quick,
-                16,
-                WorkspaceAdmission::NORMAL,
-                false,
-                label,
-            )
-            .unwrap();
-        store.remove_ticket(ticket).unwrap();
-        outcome
+        // Another test's `Command` spawn briefly duplicates every open
+        // descriptor in the forked child before `exec` closes the
+        // close-on-exec ones, so this fixture's admission lock can read as
+        // busy for a few milliseconds. Only that transient uncertain outcome
+        // is retried; every other wait is returned as before.
+        for _ in 0..200 {
+            let (ticket, _file) = store.register_ticket().unwrap();
+            let outcome = store
+                .attempt(
+                    ticket,
+                    key,
+                    Profile::Quick,
+                    16,
+                    WorkspaceAdmission::NORMAL,
+                    false,
+                    label,
+                )
+                .unwrap();
+            store.remove_ticket(ticket).unwrap();
+            match outcome {
+                Err(Wait::Uncertain) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+        Err(Wait::Uncertain)
     }
 
     pub(crate) fn seed_fixture_lease(store: &Store, key: &SlotKey) -> Lease {
@@ -12927,7 +12659,7 @@ mod scratch_internal_tests {
 mod fresh_custody_tests {
     use super::{
         boot_session, custody_verdict, holder_lines, lock_admission, open_control_directory,
-        CheckoutCustody, CustodyWitness, Lost, Phase, Record, State, WorkspaceClass,
+        CheckoutCustody, CustodyWitness, Lost, Phase, Record, RowCustody, State, WorkspaceClass,
     };
     use crate::process;
     use crate::removable::{self, DriveMode, Registration, REGISTRATION};
@@ -13107,7 +12839,7 @@ mod fresh_custody_tests {
         assert_eq!(
             {
                 observe_lock(&fixture, "before-row");
-                let result = witness.decide(None, &checkout, true);
+                let result = decide(&mut witness, &checkout, true);
                 eprintln!(
                     "278-row result={:?}",
                     result.as_ref().map(|row| &row.verdict)
@@ -13126,7 +12858,7 @@ mod fresh_custody_tests {
         assert_eq!(
             {
                 observe_lock(&fixture, "before-row");
-                let result = witness.decide(None, &checkout, true);
+                let result = decide(&mut witness, &checkout, true);
                 eprintln!(
                     "278-row result={:?}",
                     result.as_ref().map(|row| &row.verdict)
@@ -13143,7 +12875,7 @@ mod fresh_custody_tests {
         assert_eq!(
             {
                 observe_lock(&fixture, "before-row");
-                let result = witness.decide(None, &checkout, true);
+                let result = decide(&mut witness, &checkout, true);
                 eprintln!(
                     "278-row result={:?}",
                     result.as_ref().map(|row| &row.verdict)
@@ -13165,11 +12897,11 @@ mod fresh_custody_tests {
         fixture.prime();
         let checkout = checkout(&fixture);
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
-        witness.decide(None, &checkout, true).unwrap();
+        decide(&mut witness, &checkout, true).unwrap();
         let lock = fixture.control.join("admission.lock");
         fs::remove_file(&lock).unwrap();
         lock_admission(&fixture.control).unwrap();
-        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        let reason = decide(&mut witness, &checkout, true).unwrap_err();
         assert!(reason.contains("admission lock was replaced"), "{reason}");
     }
 
@@ -13181,7 +12913,7 @@ mod fresh_custody_tests {
         fixture.prime();
         let checkout = checkout(&fixture);
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
-        witness.decide(None, &checkout, true).unwrap();
+        decide(&mut witness, &checkout, true).unwrap();
         let replacement = fixture.root.join("control-replacement");
         fs::create_dir(&replacement).unwrap();
         fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
@@ -13189,7 +12921,7 @@ mod fresh_custody_tests {
         let stale = fixture.root.join("control-stale");
         fs::rename(&fixture.control, &stale).unwrap();
         fs::rename(&replacement, &fixture.control).unwrap();
-        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        let reason = decide(&mut witness, &checkout, true).unwrap_err();
         assert!(
             reason.contains("control directory changed"),
             "a replaced control directory must refuse: {reason}"
@@ -13206,7 +12938,7 @@ mod fresh_custody_tests {
         fs::remove_file(&lock).unwrap();
         let checkout = checkout(&fixture);
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
-        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        let reason = decide(&mut witness, &checkout, true).unwrap_err();
         assert!(reason.contains("admission lock is missing"), "{reason}");
         assert!(!lock.exists(), "the route must not create the lock");
     }
@@ -13233,7 +12965,7 @@ mod fresh_custody_tests {
             .unwrap();
         super::flock_blocking(&held).unwrap();
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
-        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        let reason = decide(&mut witness, &checkout, true).unwrap_err();
         assert!(
             reason.contains("removable pool's admission lock is busy"),
             "{reason}"
@@ -13262,7 +12994,7 @@ mod fresh_custody_tests {
         super::flock_blocking(&held).unwrap();
         let checkout = checkout(&fixture);
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
-        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        let reason = decide(&mut witness, &checkout, true).unwrap_err();
         assert!(
             reason.contains("internal pool's admission lock is busy"),
             "{reason}"
@@ -13281,14 +13013,14 @@ mod fresh_custody_tests {
         fs::set_permissions(&registration, fs::Permissions::from_mode(0o600)).unwrap();
         let sibling = removable::removable_control(&fixture.control);
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
-        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        let reason = decide(&mut witness, &checkout, true).unwrap_err();
         assert!(reason.contains("does not exist"), "{reason}");
         fs::create_dir_all(&sibling).unwrap();
         fs::set_permissions(&sibling, fs::Permissions::from_mode(0o700)).unwrap();
-        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        let reason = decide(&mut witness, &checkout, true).unwrap_err();
         assert!(reason.contains("admission lock is missing"), "{reason}");
         lock_admission(&sibling).unwrap();
-        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        let reason = decide(&mut witness, &checkout, true).unwrap_err();
         assert!(
             reason.contains("state document is missing"),
             "a registered sibling without proved state is unknown: {reason}"
@@ -13303,7 +13035,7 @@ mod fresh_custody_tests {
         fixture.prime();
         let checkout = checkout(&fixture);
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
-        let row = witness.decide(None, &checkout, true).unwrap();
+        let row = decide(&mut witness, &checkout, true).unwrap();
         assert_eq!(row.verdict, CheckoutCustody::Clear);
         assert!(row.removable_holders.is_none());
         let state = State {
@@ -13311,7 +13043,7 @@ mod fresh_custody_tests {
             ..State::default()
         };
         fixture.register_sibling(&state);
-        let row = witness.decide(None, &checkout, true).unwrap();
+        let row = decide(&mut witness, &checkout, true).unwrap();
         assert_eq!(
             row.verdict,
             CheckoutCustody::Writers,
@@ -13335,7 +13067,7 @@ mod fresh_custody_tests {
         fs::set_permissions(&sibling, fs::Permissions::from_mode(0o700)).unwrap();
         let checkout = checkout(&fixture);
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
-        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        let reason = decide(&mut witness, &checkout, true).unwrap_err();
         assert!(reason.contains("ambiguous"), "{reason}");
     }
 
@@ -13349,7 +13081,7 @@ mod fresh_custody_tests {
         let checkout = checkout(&fixture);
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
         assert_eq!(
-            witness.decide(None, &checkout, true).unwrap().verdict,
+            decide(&mut witness, &checkout, true).unwrap().verdict,
             CheckoutCustody::Clear
         );
         fixture.tamper_state_in_place(&State {
@@ -13357,12 +13089,12 @@ mod fresh_custody_tests {
             ..State::default()
         });
         assert_eq!(
-            witness.decide(None, &checkout, true).unwrap().verdict,
+            decide(&mut witness, &checkout, true).unwrap().verdict,
             CheckoutCustody::Writers,
             "an in-place mutation of the witnessed inode must force a re-read"
         );
         fs::write(fixture.control.join("state.json"), b"{not json").unwrap();
-        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        let reason = decide(&mut witness, &checkout, true).unwrap_err();
         assert!(reason.contains("invalid"), "{reason}");
     }
 
@@ -13398,7 +13130,7 @@ mod fresh_custody_tests {
         );
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
         assert_eq!(
-            witness.decide(None, &checkout, true).unwrap().verdict,
+            decide(&mut witness, &checkout, true).unwrap().verdict,
             CheckoutCustody::Clear
         );
         let before = fs::metadata(&state_path).unwrap();
@@ -13414,7 +13146,7 @@ mod fresh_custody_tests {
             clean_bytes.len() as u64
         );
         assert_eq!(
-            witness.decide(None, &checkout, true).unwrap().verdict,
+            decide(&mut witness, &checkout, true).unwrap().verdict,
             CheckoutCustody::Writers,
             "a same-size in-place change must be witnessed by its change metadata"
         );
@@ -13433,7 +13165,7 @@ mod fresh_custody_tests {
         .unwrap();
         let checkout = checkout(&fixture);
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
-        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        let reason = decide(&mut witness, &checkout, true).unwrap_err();
         assert!(
             reason.contains("not a private regular file"),
             "a linked state document must refuse: {reason}"
@@ -13453,7 +13185,7 @@ mod fresh_custody_tests {
         std::os::unix::fs::symlink(&real, &document).unwrap();
         let checkout = checkout(&fixture);
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
-        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        let reason = decide(&mut witness, &checkout, true).unwrap_err();
         assert!(
             !reason.contains("clear"),
             "a symlinked state document must refuse: {reason}"
@@ -13480,7 +13212,7 @@ mod fresh_custody_tests {
         fs::rename(&temp, fixture.control.join("state.json")).unwrap();
         let checkout = checkout(&fixture);
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
-        let reason = witness.decide(None, &checkout, true).unwrap_err();
+        let reason = decide(&mut witness, &checkout, true).unwrap_err();
         assert!(reason.contains("byte limit"), "{reason}");
     }
 
@@ -13498,7 +13230,7 @@ mod fresh_custody_tests {
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
         {
             observe_lock(&fixture, "before-row");
-            let result = witness.decide(None, &checkout, true);
+            let result = decide(&mut witness, &checkout, true);
             eprintln!(
                 "278-row result={:?}",
                 result.as_ref().map(|row| &row.verdict)
@@ -13510,7 +13242,7 @@ mod fresh_custody_tests {
         fs::remove_file(fixture.control.join("state.json")).unwrap();
         let reason = {
             observe_lock(&fixture, "before-row");
-            let result = witness.decide(None, &checkout, true);
+            let result = decide(&mut witness, &checkout, true);
             eprintln!(
                 "278-row result={:?}",
                 result.as_ref().map(|row| &row.verdict)
@@ -13520,6 +13252,27 @@ mod fresh_custody_tests {
         }
         .unwrap_err();
         assert!(reason.contains("missing"), "{reason}");
+    }
+
+    // Another test's `Command` spawn briefly duplicates every open descriptor
+    // in the forked child before `exec` closes the close-on-exec ones, so a
+    // witnessed admission lock can read as busy for a few milliseconds. Only
+    // that transient refusal is retried; every other answer, including the
+    // deliberate busy fixtures after their window, is returned unchanged.
+    fn decide(
+        witness: &mut CustodyWitness,
+        checkout: &Path,
+        cleans: bool,
+    ) -> Result<RowCustody, String> {
+        for _ in 0..200 {
+            match witness.decide(None, checkout, cleans) {
+                Err(reason) if reason.contains("admission lock is busy") => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+        witness.decide(None, checkout, cleans)
     }
 
     /// Lost-writer custody and boot closure are recomputed per row from the
@@ -13558,7 +13311,10 @@ mod fresh_custody_tests {
             ..State::default()
         });
         assert_eq!(
-            witness.decide(None, &checkout, true).unwrap().verdict,
+            decide(&mut witness, &checkout, true)
+                .map(|row| row.verdict)
+                .map_err(|reason| panic!("{reason}"))
+                .unwrap(),
             CheckoutCustody::Clear,
             "a boot-closed lost writer is not unknown custody"
         );
@@ -13566,7 +13322,11 @@ mod fresh_custody_tests {
             records: vec![open.clone()],
             ..State::default()
         });
-        match witness.decide(None, &checkout, true).unwrap().verdict {
+        match decide(&mut witness, &checkout, true)
+            .map(|row| row.verdict)
+            .map_err(|reason| panic!("{reason}"))
+            .unwrap()
+        {
             CheckoutCustody::Unknown(reason) => {
                 assert!(reason.contains("never confirmed closed"), "{reason}")
             }
@@ -13592,7 +13352,7 @@ mod fresh_custody_tests {
         });
         fixture.replace_state(&state);
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
-        let row = witness.decide(None, &checkout, true).unwrap();
+        let row = decide(&mut witness, &checkout, true).unwrap();
         assert_eq!(row.verdict, CheckoutCustody::Writers);
         assert_eq!(
             row.internal_holders,
@@ -13601,7 +13361,7 @@ mod fresh_custody_tests {
                 "oxide clean barrier".to_owned()
             ]
         );
-        let row = witness.decide(None, &checkout, false).unwrap();
+        let row = decide(&mut witness, &checkout, false).unwrap();
         assert_eq!(
             row.internal_holders,
             vec!["oxide pid 42: cargo build".to_owned()]
@@ -13611,7 +13371,7 @@ mod fresh_custody_tests {
         let mut other_state = state.clone();
         other_state.cleans[0].checkout = fixture.root.join("another");
         fixture.replace_state(&other_state);
-        let row = witness.decide(None, &checkout, true).unwrap();
+        let row = decide(&mut witness, &checkout, true).unwrap();
         assert_eq!(
             row.internal_holders,
             vec!["oxide pid 42: cargo build".to_owned()]
@@ -13632,8 +13392,8 @@ mod fresh_custody_tests {
         };
         fixture.replace_state(&state);
         let mut witness = CustodyWitness::open(&fixture.control).unwrap();
-        let witnessed = witness.decide(None, &checkout, true).unwrap().verdict;
-        let parsed = &witness.decide(None, &checkout, true).unwrap().verdict;
+        let witnessed = decide(&mut witness, &checkout, true).unwrap().verdict;
+        let parsed = &decide(&mut witness, &checkout, true).unwrap().verdict;
         assert_eq!(witnessed, *parsed);
         // The shared classifier decides the same from one parsed state.
         let pools = [(Some(&state), "this", Some(1u64))];

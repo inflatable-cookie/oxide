@@ -32,58 +32,16 @@ fn read_document(path: &Path, limit: u64) -> ReadDocument {
         #[cfg(not(test))]
         Ok(file) => file,
         #[cfg(test)]
-        Ok(file) => {
-            let saved_errno = crate::tape::observer_errno();
-            crate::tape::read_row(
-                "scratch-io:read-document:open",
-                path,
-                crate::tape::TapeOutcome::Facts {
-                    facts: "opened; descriptor identity pending".to_owned(),
-                },
-                Some(limit),
-            );
-            crate::tape::restore_observer_errno(saved_errno);
-            file
-        }
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            #[cfg(test)]
-            let saved_errno = crate::tape::observer_errno();
-            #[cfg(test)]
-            crate::tape::read_row(
-                "scratch-io:read-document",
-                path,
-                crate::tape::TapeOutcome::Absent,
-                Some(limit),
-            );
-            #[cfg(test)]
-            crate::tape::restore_observer_errno(saved_errno);
             return ReadDocument::Missing;
         }
         #[cfg(not(test))]
         Err(_) => {
-            #[cfg(test)]
-            crate::tape::read_row(
-                "scratch-io:read-document",
-                path,
-                crate::tape::TapeOutcome::Refusal {
-                    reason: "unreadable".to_owned(),
-                },
-                limit,
-            );
             return ReadDocument::Invalid;
         }
         #[cfg(test)]
         Err(error) => {
-            let saved_errno = crate::tape::observer_errno();
-            crate::tape::read_row(
-                "scratch-io:read-document",
-                path,
-                crate::tape::TapeOutcome::Refusal {
-                    reason: error.to_string(),
-                },
-                Some(limit),
-            );
-            crate::tape::restore_observer_errno(saved_errno);
             return ReadDocument::Invalid;
         }
     };
@@ -94,34 +52,10 @@ fn read_document(path: &Path, limit: u64) -> ReadDocument {
     #[cfg(test)]
     let meta = {
         let result = file.metadata();
-        let saved_errno = crate::tape::observer_errno();
         match &result {
-            Ok(meta) => crate::tape::read_row_dev(
-                "scratch-io:read-document:meta",
-                path,
-                meta.dev(),
-                meta.ino(),
-                crate::tape::TapeOutcome::Facts {
-                    facts: format!(
-                        "file={}|uid={}|mode={}|size={}",
-                        meta.is_file(),
-                        meta.uid(),
-                        meta.mode(),
-                        meta.len()
-                    ),
-                },
-                Some(limit),
-            ),
-            Err(error) => crate::tape::read_row(
-                "scratch-io:read-document:meta",
-                path,
-                crate::tape::TapeOutcome::Refusal {
-                    reason: error.to_string(),
-                },
-                Some(limit),
-            ),
+            Ok(meta) => {}
+            Err(_) => {}
         }
-        crate::tape::restore_observer_errno(saved_errno);
         let Ok(meta) = result else {
             return ReadDocument::Invalid;
         };
@@ -142,21 +76,12 @@ fn read_document(path: &Path, limit: u64) -> ReadDocument {
     #[cfg(test)]
     {
         let result = file.take(limit + 1).read_to_end(&mut bytes);
-        let saved_errno = crate::tape::observer_errno();
         let invalid = result.is_err() || bytes.len() as u64 > limit;
         let outcome = match &result {
-            Err(error) => crate::tape::TapeOutcome::Refusal {
-                reason: error.to_string(),
-            },
-            Ok(_) if invalid => crate::tape::TapeOutcome::Refusal {
-                reason: "over its byte limit".to_owned(),
-            },
-            Ok(_) => crate::tape::TapeOutcome::Digest {
-                digest: crate::tape::sha256_hex(&bytes),
-            },
+            Err(_) => {}
+            Ok(_) if invalid => {}
+            Ok(_) => {}
         };
-        crate::tape::read_row("scratch-io:read-document:bytes", path, outcome, Some(limit));
-        crate::tape::restore_observer_errno(saved_errno);
         if invalid {
             return ReadDocument::Invalid;
         }
@@ -285,25 +210,6 @@ pub(crate) fn evaluate(settings: &Settings, status: bool) -> Result<Option<Strin
         .zip(fs::metadata("/Volumes").ok())
         .is_some_and(|(a, b)| a.dev() != b.dev());
     let verified = Binding::open(&mount, None).ok();
-    #[cfg(test)]
-    crate::tape::volume_row(
-        "scratch-io:binding-open",
-        &mount,
-        verified.as_ref().map(|binding| binding.uuid()),
-        verified.as_ref().map(|binding| binding.device()),
-        match verified.as_ref() {
-            Some(binding) => crate::tape::TapeOutcome::Facts {
-                facts: format!(
-                    "mount={}|uuid={}",
-                    binding.mount_point().display(),
-                    binding.uuid()
-                ),
-            },
-            None => crate::tape::TapeOutcome::Refusal {
-                reason: "binding refused".to_owned(),
-            },
-        },
-    );
     let uuid = verified
         .as_ref()
         .map(|v| v.uuid().to_owned())

@@ -295,53 +295,9 @@ impl Binding {
     pub fn open_in(parent: &Path, name: &str, expected_uuid: Option<&str>) -> Result<Self, String> {
         let mount_point = parent.join(name);
         let parent_fd = open_dir(None, parent)?;
-        #[cfg(test)]
-        crate::tape::read_row(
-            "volume:open-parent",
-            parent,
-            crate::tape::TapeOutcome::Facts {
-                facts: "opened; identity unproven".to_owned(),
-            },
-            None,
-        );
-        let fd = open_dir(Some(parent_fd.as_fd_ref()), Path::new(name)).map_err(|error| {
-            #[cfg(test)]
-            crate::tape::read_row(
-                "volume:open-mount",
-                &mount_point,
-                crate::tape::TapeOutcome::Refusal {
-                    reason: error.to_string(),
-                },
-                None,
-            );
-            format!("{} is not available: {error}", mount_point.display())
-        })?;
-        #[cfg(test)]
-        crate::tape::read_row(
-            "volume:open-mount",
-            &mount_point,
-            crate::tape::TapeOutcome::Facts {
-                facts: "opened; identity unproven".to_owned(),
-            },
-            None,
-        );
+        let fd = open_dir(Some(parent_fd.as_fd_ref()), Path::new(name))
+            .map_err(|error| format!("{} is not available: {error}", mount_point.display()))?;
         let facts = observe(fd.as_fd())?;
-        #[cfg(test)]
-        crate::tape::volume_row(
-            "volume:observe",
-            &mount_point,
-            facts.uuid.as_deref(),
-            Some(&facts.device),
-            crate::tape::TapeOutcome::Facts {
-                facts: format!(
-                    "mounted_on={}|fstype={}|dev={}|read_only={}",
-                    facts.mounted_on.display(),
-                    facts.fstype,
-                    facts.dev,
-                    facts.read_only
-                ),
-            },
-        );
         judge(&mount_point, &facts, expected_uuid)?;
         if u64::try_from(fstat(parent_fd.as_fd_ref())?.st_dev).unwrap_or(u64::MAX) == facts.dev {
             return Err(format!(
@@ -357,16 +313,6 @@ impl Binding {
             device: facts.device,
         };
         binding.verify()?;
-        #[cfg(test)]
-        crate::tape::volume_row(
-            "volume:open-verified",
-            &binding.mount_point,
-            Some(&binding.uuid),
-            Some(&binding.device),
-            crate::tape::TapeOutcome::Facts {
-                facts: "verified".to_owned(),
-            },
-        );
         Ok(binding)
     }
 
@@ -399,21 +345,6 @@ impl Binding {
             return Ok(modelled);
         }
         let facts = observe(self.fd.as_fd())?;
-        #[cfg(test)]
-        crate::tape::volume_row(
-            "volume:verify",
-            &self.mount_point,
-            Some(&self.uuid),
-            Some(&facts.device),
-            crate::tape::TapeOutcome::Facts {
-                facts: format!(
-                    "mounted_on={}|fstype={}|dev={}",
-                    facts.mounted_on.display(),
-                    facts.fstype,
-                    facts.dev
-                ),
-            },
-        );
         judge(&self.mount_point, &facts, Some(&self.uuid))?;
         if facts.device != self.device {
             return Err(format!(
@@ -425,18 +356,6 @@ impl Binding {
         }
         let by_path = std::fs::symlink_metadata(&self.mount_point)
             .map_err(|error| format!("{} is gone: {error}", self.mount_point.display()))?;
-        #[cfg(test)]
-        crate::tape::read_row_dev(
-            "volume:verify:path",
-            &self.mount_point,
-            std::os::unix::fs::MetadataExt::dev(&by_path),
-            std::os::unix::fs::MetadataExt::ino(&by_path),
-            crate::tape::TapeOutcome::Opened {
-                dev: std::os::unix::fs::MetadataExt::dev(&by_path),
-                ino: std::os::unix::fs::MetadataExt::ino(&by_path),
-            },
-            None,
-        );
         if by_path.file_type().is_symlink()
             || std::os::unix::fs::MetadataExt::dev(&by_path) != facts.dev
         {

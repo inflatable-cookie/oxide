@@ -130,10 +130,24 @@ the transition.
 
 Deleted with the reset: the library and binary observation tapes, the capture
 wire and limited verdict policy, the prune capture harness, the shared-file
-comparison harness and its selectors, the capture transcripts and vectors, and
-the qualification/cooperative-supplier contracts that only served them. The
-ordinary shared process supervisor (`scripts/bounded-test.py`) and ordinary
-Effigy admission stay; a removed selector leaves no dangling reference.
+comparison harness and its selectors, the capture transcripts, vectors and
+manifest schemas, and the qualification/cooperative-supplier contracts that
+only served them. The ordinary shared process supervisor
+(`scripts/bounded-test.py`) and ordinary Effigy admission stay; a removed
+selector leaves no dangling reference.
+
+The recorder layer itself is gone from the source, not only from the selector
+list: `src/tape.rs`, `src/bin/oxide/tape.rs` and
+`src/bin/oxide/capture_wire.rs` are removed, and with them every `tape::*` call
+site, the test-only errno save/restore pair, the declared path-only authority
+observation seam and its forced-failure switch, and the captured-outcome
+guards. Production reads, refusals and writes are the ones the product already
+ran; only the recording statements and their test doubles were dropped.
+
+Some test-only helpers that only the deleted recording tests used are still
+unreferenced (the compiler reports them as dead code in test builds). They
+belong to the still-unmoved owned-delete and descriptor-census modules and go
+with those modules, not with this mechanical removal.
 
 ## Validation
 
