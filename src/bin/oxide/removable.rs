@@ -892,7 +892,9 @@ pub(crate) fn verified_registration(control: &Path, registration: &Registration)
 
 /// Passive status validates location without running pruning or admission.
 fn usable_recorded(internal: &Store, registration: &Registration) -> Result<Store, String> {
-    verified_registration(&removable_control(internal.control()), registration)?;
+    // Status observes platform facts without importing a registration or
+    // declaring an area. It grants no hold, ownership or deletion authority.
+    Binding::open(&registration.mount_point, Some(&registration.volume_uuid))?.verify()?;
     Store::open_recorded_removable(&internal.control().join(POOL_DIR), internal.max_active())
 }
 
