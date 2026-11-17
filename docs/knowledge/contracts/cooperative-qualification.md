@@ -214,6 +214,17 @@ unsupplied inputs; it qualifies no clock, provider or route, and a reported
 installed build is not independent runtime attestation. This section designs
 suppliers, not implementations, and activates nothing.
 
+Tom's later decision `49a06e97-ef58-46e4-9cf8-e5ecece6685e` v2
+(2026-11-17) selects one bounded common-clock source PR per owner, Nucleus
+and Effigy. Before authoring, both approved briefs must agree the actual
+source-supported clock API, domain/units, boot/origin identity, original
+first-effect origin/ceiling, propagation and refusal rules. No supported
+mechanism means a precise blocker, not a substituted clock policy. This scope
+allows named source-validation builds and bounded helper fixtures, with the
+limits recorded in [vision](../vision.md#authority-boundaries). It does not
+implement the other suppliers or activate qualification. The real-proof entry
+continues to refuse; existing 309/061/304 holds and all later gates remain.
+
 ### The nine inputs: owner, seam, evidence, disposition
 
 Every id, requirement string and readiness rule below is Nucleus's declared

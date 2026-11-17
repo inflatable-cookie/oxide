@@ -352,6 +352,20 @@ Nucleus foundation (Spec 064, merged `2ce2ed9c`, source accepted at
 `9366a1a0`) refuses all nine unsupplied inputs; that refusal is the delivered
 state, not readiness.
 
+Tom decision `49a06e97-ef58-46e4-9cf8-e5ecece6685e` v2 (2026-11-17,
+09:55:46Z) selects the common-clock foundation first: at most one bounded
+source implementation PR in Nucleus and one in Effigy, each through an
+approved Queue brief and independent exact-head review. Before authoring, the
+owners must agree the source-supported clock API, domain, units, boot/origin
+identity, original first-effect origin/ceiling and refusal rules. The original
+`CLOCK_UPTIME_RAW` policy stays; no assumed conversion or fresh clock is
+authorized. Author/reviewer limits are 60/30 active minutes per task, focused
+checks total at most 20 minutes plus one final-head covering set at most
+60 minutes, with 2 GiB owned temporary storage; docs checks stay within
+120 seconds and 64 MiB. The [supplier contract](contracts/cooperative-qualification.md#qualification-input-suppliers-design-2026-11-17)
+owns the boundaries: no other supplier implementation, real qualification,
+installation, consumer activation or existing-hold release follows.
+
 Tom decision `c6e3e9c8` v2 (2026-11-04) separates capture delivery from
 private launcher qualification for the bounded O2 capture tasks. Their named
 capture-only Cargo selectors cover build and embedded harness behavior; they
