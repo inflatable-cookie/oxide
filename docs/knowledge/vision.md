@@ -334,6 +334,23 @@ change no existing execution instruction. Existing 309/061/304 briefs and
 dispatch and merge holds remain binding; later activation requires
 prospective amendment.
 
+Tom decision `afae2fc0-f0e2-4ad7-9186-0439d6889715` v2 (2026-11-17)
+scopes the remaining supplier implementation through two bounded source-only
+design PRs, with no implementation, proof run or activation. Oxide's half is
+recorded in the [cooperative qualification contract](contracts/cooperative-qualification.md#qualification-input-suppliers-design-2026-11-17):
+all nine required inputs mapped to their actual owner, seam, evidence,
+validation and refusal disposition; the real creation graph and its waits; one
+600-second origin with its clock interface; the qualified census and
+image-attachment providers reused and the unqualified candidates refused; the
+monitored 512 MiB and 22 GiB accounting inventory; and a finite implementation
+breakdown. The Effigy owner scopes prepare custody, common timing and
+exact-selector admission/completion in parallel, so every cross-owner item is
+an unresolved interface until its owner supports it. A Nucleus-owned exit for a
+retained qualification failure row is a prerequisite before any real proof. The
+Nucleus foundation (Spec 064, merged `2ce2ed9c`, source accepted at
+`9366a1a0`) refuses all nine unsupplied inputs; that refusal is the delivered
+state, not readiness.
+
 Tom decision `c6e3e9c8` v2 (2026-11-04) separates capture delivery from
 private launcher qualification for the bounded O2 capture tasks. Their named
 capture-only Cargo selectors cover build and embedded harness behavior; they
