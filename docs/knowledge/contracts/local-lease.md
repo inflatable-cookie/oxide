@@ -1,5 +1,10 @@
 # Local lease library (standalone CLI retired)
 
+**Storage authority (oxide#314).** Slot roots, their cooperative holds, pins,
+byte-pressure and idle eviction, trash deletion and volume identity are Barge's
+([adoption contract](barge-adoption.md)); the lease workflow (slot compatibility,
+ranks, release and recovery rules) sits above them.
+
 **Retired, oxide#102 (Tom, 2026-10-20).** The standalone
 `oxide-storage-lease` binary, its `rust:storage-lease-cli` selector and the
 `apfs-sparse-image-v1` backend are gone from this repository. The library

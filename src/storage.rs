@@ -153,8 +153,12 @@ impl barge::Os for OxideOs {
                 return Ok(None);
             }
             return match crate::volume::observe_path(mount) {
-                Ok(facts) if facts.mounted_on == mount => Ok(facts.uuid),
-                Ok(_) => Ok(None),
+                Ok(facts) => judge_mount_identity(mount, &facts).map_err(|reason| {
+                    barge::Error::unknown_state(format!(
+                        "cannot read the volume identity at {}: {reason}",
+                        mount.display()
+                    ))
+                }),
                 Err(reason) => Err(barge::Error::unknown_state(format!(
                     "cannot read the volume identity at {}: {reason}",
                     mount.display()
@@ -167,6 +171,25 @@ impl barge::Os for OxideOs {
     fn free_bytes(&self, path: &Path) -> barge::Result<u64> {
         barge::os::platform().free_bytes(path)
     }
+}
+
+/// Decide a drive mount's identity from the facts observed on its descriptor.
+///
+/// A positively stale directory (the path is not its own mount root) is absent;
+/// a mounted root whose UUID cannot be read is unknown and refuses, never an
+/// absent volume that would silently take the fallback.
+pub fn judge_mount_identity(
+    mount: &Path,
+    facts: &crate::volume::Facts,
+) -> Result<Option<String>, String> {
+    if facts.mounted_on != mount {
+        return Ok(None);
+    }
+    facts
+        .uuid
+        .clone()
+        .map(Some)
+        .ok_or_else(|| format!("{} reports no volume UUID", mount.display()))
 }
 
 /// Whether `path` is a removable drive's mount point shape, `/Volumes/<name>`.
@@ -1362,5 +1385,46 @@ mod revision_tests {
         .expect("pool");
         pool.set_reserve(20 << 30).expect("reserve");
         assert_eq!(pool.space().expect("space").reserve_bytes, 20 << 30);
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn facts(mounted_on: &Path, uuid: Option<&str>) -> crate::volume::Facts {
+        crate::volume::Facts {
+            mounted_on: mounted_on.to_path_buf(),
+            device: "/dev/disk9s1".to_owned(),
+            fstype: "apfs".to_owned(),
+            read_only: false,
+            root_fs: false,
+            uuid: uuid.map(str::to_owned),
+            dev: 1,
+            capacity_bytes: None,
+            available_bytes: None,
+        }
+    }
+
+    #[test]
+    fn the_real_seam_refuses_a_mounted_root_without_a_uuid() {
+        let mount = Path::new("/Volumes/Builds");
+        assert_eq!(
+            judge_mount_identity(
+                mount,
+                &facts(mount, Some("8E4A5C1D-0000-4000-8000-00000000BEEF"))
+            )
+            .unwrap(),
+            Some("8E4A5C1D-0000-4000-8000-00000000BEEF".to_owned())
+        );
+        assert!(
+            judge_mount_identity(mount, &facts(mount, None)).is_err(),
+            "a mounted root with no UUID is unknown, not absent"
+        );
+        // A stale directory on another volume is positively not this mount.
+        assert_eq!(
+            judge_mount_identity(mount, &facts(Path::new("/"), Some("boot"))).unwrap(),
+            None
+        );
     }
 }

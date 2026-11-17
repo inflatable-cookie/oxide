@@ -9,6 +9,25 @@ applied to the facilities that remain after the 2026-10-18 retirement
 
 ## Storage and ownership
 
+**Barge owns storage mechanics.** Since oxide#314 the linked Barge library is
+the storage authority ([adoption contract](contracts/barge-adoption.md)):
+registered volumes and their identity, declared areas, marked roots, cooperative
+exclusive/shared holds (inherited by the child launch path), durable pins,
+reserve/floor pruning, idle least-recently-used eviction, marker-checked trash
+and scratch. The pool engine is moved onto it: a slot is a Barge root, its lease
+carries the root's hold, byte pressure retires eligible idle unpinned roots, and
+status reports the area's accounting. Oxide keeps the Cargo front door, leases
+as workflow state, compatibility and freshness, recipes/profiles, seeding
+policy, output member links and `exec`, and it forges no Barge marker. An
+unreadable volume identity is unknown and refuses; only positive absence (or a
+positively stale mount directory) takes a declared fallback. A legacy
+generation that never held a Barge lock is never adopted, recovered or pruned
+through one.
+
+The output-root pins and prune path, removable-volume registration and the
+owned-delete/census modules are not yet moved onto Barge; their existing
+authority remains until that lands.
+
 Persistent bounded cache slots partition by project/component identity, exact
 toolchain, host/target platform, and resolved configuration/profile/features/relevant
 environment. One exclusive durable lease covers compile through test and
@@ -50,9 +69,10 @@ ownership or eviction authority and never recommends deletion.
 
 ## Current facilities
 
-- The root library keeps the same-user pool, ledger, lease, recovery and
-  eviction code `oxide` uses, over budget-only directory and removable-volume
-  pools. There is no background storage service or project adapter. The
+- The root library keeps the same-user pool, ledger, lease and recovery state
+  `oxide` uses over budget-only directory and removable-volume pools; the
+  storage mechanics beneath them are Barge's. There is no background storage
+  service or project adapter. The
   standalone lease CLI and the APFS sparse-image backing are retired
   (oxide#102); Nucleus keeps its installed copy until its owner switches.
   UID trust permits a cooperative caller's explicit writer-closed release;

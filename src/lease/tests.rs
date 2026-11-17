@@ -467,3 +467,30 @@ fn an_unreadable_slot_makes_a_passive_measurement_partial() {
     assert_eq!(measured.status.coverage, super::AccountingCoverage::Partial);
     assert!(measured.status.payload_logical_bytes.is_none());
 }
+
+#[test]
+fn a_held_legacy_root_is_not_adopted_and_stays_out_of_barge_prune_authority() {
+    let fixture = Fixture::new("legacy-held-unowned");
+    let pool = fixture.pool();
+    let dir = slot_dir(&pool, "51");
+    fs::write(dir.join("artifact"), b"live").unwrap();
+    let project = fixture.dir("project");
+    write_legacy_ledger(&pool, "held", None, 51, project.to_str().unwrap());
+    managed::status(&pool).expect("open");
+    // A held legacy generation is never adopted: it stays outside every Barge
+    // area, so no prune or eviction decision can see it.
+    assert!(
+        !dir.join(".barge-root.json").exists(),
+        "a held legacy root is not adopted"
+    );
+    let area = crate::storage::PoolStorage::open(
+        &pool.join("oxide-managed"),
+        &crate::storage::PoolBacking::budget(&pool, 8 << 20),
+    )
+    .expect("area");
+    assert!(
+        area.all_roots().expect("roots").is_empty(),
+        "the legacy directory is not a Barge root"
+    );
+    assert!(dir.join("artifact").is_file());
+}

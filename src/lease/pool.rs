@@ -583,6 +583,8 @@ pub(super) struct Pool {
     /// The hold this admission took, handed to the caller with the grant so it
     /// lives as long as the command.
     pending_hold: Option<barge::Hold>,
+    /// A passive measurement's absolute deadline; a mutating open has none.
+    deadline: Option<std::time::Instant>,
     ledger: Ledger,
     /// Admission budget: the recorded one unless the request overrides it.
     budget: u64,
@@ -611,10 +613,10 @@ pub(super) struct Pool {
 pub mod managed {
     use super::super::backing::BackingPaths;
     use super::super::{
-        canonical_existing_dir, ensure_private_dir, io_error, LeaseError, Leased,
-        LedgerView, MeasuredPool, PassiveSnapshot, PoolInfo, PoolStatus, ReleaseReceipt,
-        VolumeDescription, ACCOUNTING_MAX_ELAPSED_MS, BUDGET_BACKEND_DIRECTORY_V1, CONFIG_NAME,
-        LEASE_VERSION, LEDGER_NAME, MAX_SLOTS, PAYLOAD_NAME, SLOTS_NAME, VOLUME_BACKEND_APFS_V1,
+        canonical_existing_dir, ensure_private_dir, io_error, LeaseError, Leased, LedgerView,
+        MeasuredPool, PassiveSnapshot, PoolInfo, PoolStatus, ReleaseReceipt, VolumeDescription,
+        ACCOUNTING_MAX_ELAPSED_MS, BUDGET_BACKEND_DIRECTORY_V1, CONFIG_NAME, LEASE_VERSION,
+        LEDGER_NAME, MAX_SLOTS, PAYLOAD_NAME, SLOTS_NAME, VOLUME_BACKEND_APFS_V1,
     };
     use super::LeaseRequest;
     use super::{
@@ -1312,6 +1314,7 @@ impl Pool {
             backing,
             storage,
             pending_hold: None,
+            deadline: None,
             budget: ledger.cap_bytes,
             ledger,
             reserve: None,
@@ -1352,6 +1355,7 @@ impl Pool {
             backing,
             storage: None,
             pending_hold: None,
+            deadline: None,
             budget: ledger.cap_bytes,
             ledger,
             reserve: None,
@@ -1519,7 +1523,13 @@ impl Pool {
         };
         let mut changed = false;
         for slot in &mut self.ledger.slots {
-            if slot.root.is_some() {
+            if slot.root.is_some()
+                || slot.state != SlotPersistState::Idle
+                || slot.lease_id.is_some()
+            {
+                // A held legacy generation is never adopted: its writer predates
+                // the Barge lock, and adopting it would put an in-use directory
+                // under Barge's prune authority.
                 continue;
             }
             let dir = slot.dir.clone().unwrap_or_else(|| slot.id.to_string());
@@ -1575,6 +1585,7 @@ impl Pool {
                 && existing.workspace == workspace
                 && existing.profile == request.profile
                 && existing.state == SlotPersistState::Held
+                && existing.owned
             {
                 return Ok(Leased {
                     grant: self.grant_from(existing, true)?,
@@ -2163,9 +2174,11 @@ impl Pool {
             }
             None => None,
         };
-        // A passive measurement is bounded by the caller's remaining window;
-        // a mutating status uses one short fixed budget.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        // A passive measurement is bounded by the caller's remaining window; a
+        // mutating status uses one short fixed budget.
+        let deadline = self
+            .deadline
+            .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(60));
         let mut slots = Vec::new();
         let mut incomplete = 0_u64;
         let mut total = 0_u64;
@@ -2202,6 +2215,8 @@ impl Pool {
         } else {
             AccountingCoverage::Partial
         };
+        // An incomplete total cannot answer whether the pool is full.
+        let full = (incomplete == 0).then_some(total >= self.config.cap_bytes);
         Ok(PoolStatus {
             version: LEASE_VERSION,
             store_id: self.config.store_id.clone(),
@@ -2211,7 +2226,7 @@ impl Pool {
             payload_unique_allocated_bytes: None,
             coverage,
             payload_accounting: barge_scan((incomplete == 0).then_some(total)),
-            full: Some(total >= self.config.cap_bytes),
+            full,
             slots,
             holding: Vec::new(),
         })
@@ -3410,6 +3425,7 @@ pub(super) fn volume_pool_for_test(
         // slots keep the pre-adoption directory path.
         storage: None,
         pending_hold: None,
+        deadline: None,
         budget,
         ledger,
         reserve,

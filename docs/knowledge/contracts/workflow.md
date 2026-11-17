@@ -1,5 +1,12 @@
 # Oxide workflow
 
+**Storage mechanics (oxide#314).** Barge owns volumes and identity, areas,
+marked roots, cooperative holds, pins, reserve/floor pruning, idle eviction and
+marker-checked trash; the pool engine runs on it. The output-root pins and
+prune path, removable registration and the owned-delete/census modules are not
+yet moved and keep their existing authority ([adoption
+contract](barge-adoption.md)).
+
 Status: product design under Tom's
 [2026-10-18 workflow direction and bounded implementation authority](../vision.md#product-workflow-direction).
 The foundation core and `init` / `new` adoption are implemented as the
