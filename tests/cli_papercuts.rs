@@ -791,7 +791,10 @@ fn output_prune_dry_run_preserves_pool_trash_and_partial_output_accounts() {
     write_private(&state_path, &serde_json::to_vec(&state).unwrap());
 
     let parent = scratch.path().join("outputs");
-    let location = format!("{:x}", sha2::Sha256::digest(parent.as_os_str().as_bytes()));
+    let location: String = sha2::Sha256::digest(parent.as_os_str().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let output_storage = Storage::open(&control.join("output-storage").join(location)).unwrap();
     let area = output_storage
         .declare(
