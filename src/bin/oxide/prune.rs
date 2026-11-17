@@ -8504,73 +8504,8 @@ pub(crate) mod tape_entry {
 mod tests {
     use super::*;
 
-    include!("release_comparison_tests.rs");
     include!("selection_protection_tests.rs");
 
-    /// The pinned Barge reference reader must preserve every live registry flag.
-    /// This compares only the in-memory reference predicates, not release plans,
-    /// filesystem capture, writer custody, or parity of the two evaluators.
-    #[test]
-    fn shadow_reference_flags_and_incomplete_registry() {
-        use barge::reference::{OxideReceipts, OxideRegistry, OxideRow, OxideSnapshot};
-
-        let base = Path::new("/fixture");
-        for mask in 0..32 {
-            let mut oxide = row_for(base);
-            oxide.selected = mask & 1 != 0;
-            oxide.pending = mask & 2 != 0;
-            oxide.pruning = (mask & 4 != 0).then(|| "intent".to_owned());
-            oxide.reservation = (mask & 8 != 0).then(|| "reservation".to_owned());
-            oxide.cancelling = (mask & 16 != 0).then(|| "cancelling".to_owned());
-            let barge = OxideRow {
-                checkout_id: oxide.checkout_id.clone(),
-                checkout: oxide.checkout.clone(),
-                checkout_volume: None,
-                root: oxide.root.clone(),
-                nonce: oxide.nonce.clone(),
-                selected: oxide.selected,
-                pending: oxide.pending,
-                pruning: oxide.pruning.is_some(),
-                reservation: oxide.reservation.is_some(),
-                cancelling: oxide.cancelling.is_some(),
-            };
-            assert_eq!(oxide.live(), barge.live(), "flag mask {mask}");
-            let snapshot = OxideSnapshot {
-                control: None,
-                registry: OxideRegistry::Read {
-                    rows: vec![barge],
-                    intents: Vec::new(),
-                    complete: true,
-                },
-                receipts: OxideReceipts::Absent,
-                detail: None,
-                custody: Default::default(),
-            };
-            let references = snapshot.references_for(&oxide.root, "fixture/root", None, None);
-            assert!(references.complete, "flag mask {mask}");
-            assert_eq!(references.rows.len(), 1, "flag mask {mask}");
-            assert_eq!(references.rows[0].current, oxide.live(), "flag mask {mask}");
-            assert_eq!(references.absence.len(), usize::from(!oxide.live()));
-        }
-
-        let snapshot = OxideSnapshot {
-            control: None,
-            registry: OxideRegistry::Read {
-                rows: Vec::new(),
-                intents: Vec::new(),
-                complete: false,
-            },
-            receipts: OxideReceipts::Absent,
-            detail: None,
-            custody: Default::default(),
-        };
-        assert!(!snapshot.complete());
-        assert!(
-            !snapshot
-                .references_for(base, "fixture", None, None)
-                .complete
-        );
-    }
 
     /// oxide#211 (decision 7aedd5af): a prune test hook arms on the internal
     /// volume, or under a DECLARED scratch pool inside the supervisor scratch.

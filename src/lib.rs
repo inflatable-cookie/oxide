@@ -46,6 +46,12 @@ pub mod seed_source;
 /// cross-checkout freshness gate.
 pub mod dep_info;
 
+/// Barge-backed storage authority: volumes, areas, marked roots, holds, pins,
+/// pruning, trash and scratch. The one place Oxide declares its areas and
+/// supplies Barge's platform seam.
+#[cfg(unix)]
+pub mod storage;
+
 /// Identity, descriptor binding and flush of a removable APFS volume for the
 /// `apfs-volume-v1` pool backend.
 #[cfg(unix)]
