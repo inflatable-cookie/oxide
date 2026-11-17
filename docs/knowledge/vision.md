@@ -317,6 +317,104 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 
 ## Validation policy
 
+Tom decision `ea8ee47f-adc0-4cd3-b420-aaa30642d623` v2 (2026-11-16)
+adopts the reviewed [cooperative qualification contract](contracts/cooperative-qualification.md)
+as the acceptance target for future 309 work and scopes one independently
+reviewed Nucleus-owned route proposal, without implementation or proof runs.
+The earlier `57374e05` v2 decision authorized drafting and review only. Those
+drafting and adoption facts remain accurate at their own time. Tom's later
+decision `5639bd34-635f-49b4-8261-92903d1013b4` v2 (2026-11-16, "Retain and
+count image evidence") records the future image-backing policy in that same
+contract: retain and count image files as evidence, and require positive
+ordinary provider evidence that every mount and attached entity of each exact
+owned image is absent. The earlier literal entire-backing-object absence gate
+is superseded prospectively only. The adoption and the 5639v2 ruling
+establish no route, readiness, qualified provider or proof activation and
+change no existing execution instruction. Existing 309/061/304 briefs and
+dispatch and merge holds remain binding; later activation requires
+prospective amendment.
+
+Tom decision `afae2fc0-f0e2-4ad7-9186-0439d6889715` v2 (2026-11-17)
+scopes the remaining supplier implementation through two bounded source-only
+design PRs, with no implementation, proof run or activation. Oxide's half is
+recorded in the [cooperative qualification contract](contracts/cooperative-qualification.md#qualification-input-suppliers-design-2026-11-17):
+all nine required inputs mapped to their actual owner, seam, evidence,
+validation and refusal disposition; the real creation graph and its waits; one
+600-second origin with its clock interface; the qualified census and
+image-attachment providers reused and the unqualified candidates refused; the
+monitored 512 MiB and 22 GiB accounting inventory; and a finite implementation
+breakdown. Effigy's reconciled 038 design records prepare custody, timing and
+exact-selector admission/completion; the contract records its unsupported
+original-clock binding and missing receipt fields. The provisional duration
+handoff is not an agreed interface. A Nucleus-owned exit for a
+retained qualification failure row is a prerequisite before any real proof. The
+Nucleus foundation (Spec 064, merged `2ce2ed9c`, source accepted at
+`9366a1a0`) refuses all nine unsupplied inputs; that refusal is the delivered
+state, not readiness.
+
+Tom decision `49a06e97-ef58-46e4-9cf8-e5ecece6685e` v2 (2026-11-17,
+09:55:46Z) selects the common-clock foundation first: at most one bounded
+source implementation PR in Nucleus and one in Effigy, each through an
+approved Queue brief and independent exact-head review. Before authoring, the
+owners must agree the source-supported clock API, domain, units, boot/origin
+identity, original first-effect origin/ceiling and refusal rules. The original
+`CLOCK_UPTIME_RAW` policy stays; no assumed conversion or fresh clock is
+authorized. Author/reviewer limits are 60/30 active minutes per task, focused
+checks total at most 20 minutes plus one final-head covering set at most
+60 minutes, with 2 GiB owned temporary storage; docs checks stay within
+120 seconds and 64 MiB. The [supplier contract](contracts/cooperative-qualification.md#qualification-input-suppliers-design-2026-11-17)
+owns the boundaries: no other supplier implementation, real qualification,
+installation, consumer activation or existing-hold release follows.
+
+Tom decision `984a3b0a-98ae-48f7-994e-65950020ae83` v2 (2026-11-17,
+10:31:04Z) prospectively changes that host source tranche to the continuous
+clock, so sleep consumes the fixed allowance. Nucleus's relayed decision
+`4380ff30-444b-412b-b738-a86677b77474` v2 records the same choice, with no
+second grant. The [supplier contract](contracts/cooperative-qualification.md#prospective-host-clock-domain)
+owns its direct-domain, original-origin, immutable-envelope and narrowing-cap
+requirements. This amends 49a06's RAW-domain requirement only for the future
+host tranche. Its two-PR source limits, all earlier clock evidence, Barge's
+guest/host policies and every qualification, installation and consumer gate
+remain unchanged.
+
+Tom decision `1b60743c-d496-485d-a1e9-5e48372d2590` v2 (2026-11-17)
+subsequently selects **Decouple**: "oxide and nucleus should not be tied
+together, nucleus's run mechanics should have no effect on the proof".
+The Nucleus planner also relays Tom's later direction: "Remove it. Let's
+simplify this across all three projects, clean up, just get it working without
+all the ceremony." Effigy's planner relays his selected **Plain run**.
+
+For 309, Nucleus is an ordinary task runner. Proof timing and process handling
+belong to the proof's ordinary Effigy execution, using the existing
+`EFFIGY_RUN_DEADLINE_MS=600000` mechanism. The common-clock work and the
+external envelope, supplier, custody/census certification and capture-delivery
+contracts are no longer prerequisites. The [earlier cooperative target](contracts/cooperative-qualification.md)
+is historical. Keep actual supervisor behavior tests, ordinary source/evidence
+review and honest run outcomes; source/native work follows the selected scoped
+Queue brief without further design tranches. Cleanup means obsolete source and
+documentation here, with earlier receipts, failures, charges and retained
+resources preserved. Consumer changes and historical-resource cleanup are not
+implied by this direction.
+
+Tom decision `25a1cefa-66f6-428c-85e3-7e6ee5532f4e` v2 (2026-11-17,
+11:22:38Z) selects **Run it plainly and remove the scaffolding** for the
+existing 309 task. Replace its qualification bootstrap with a small ordinary
+Effigy entrypoint, retire the cross-project machinery and keep supervisor
+behavior tests. The author runs the complete remaining suite with
+`EFFIGY_RUN_DEADLINE_MS=600000`; the retained reviewer judges the exact source
+and actual evidence, then Queue merges on PASS and accepted review. For 309
+this replaces the separate diagnostic/counted-author/counted-reviewer ladder;
+there are no further design rounds.
+
+The prospective allowance is 60 active author minutes and 30 reviewer minutes;
+source checks have 600 seconds/512 MiB, docs 120 seconds/64 MiB, and the ordinary
+native run 600 seconds/512 MiB within the author total. Use fresh owned Stash
+scratch and the existing 22 GiB reserve threshold, including the suite's tiny
+process/image fixtures. Earlier charges and failures stay permanent. Source
+and documentation cleanup leaves old retained resources untouched; installation,
+full QA and live consumer changes are excluded. 061/304 wait for actual 309
+PASS/publication and retain their own runtime prerequisites and guest/host bounds.
+
 Tom decision `c6e3e9c8` v2 (2026-11-04) separates capture delivery from
 private launcher qualification for the bounded O2 capture tasks. Their named
 capture-only Cargo selectors cover build and embedded harness behavior; they
