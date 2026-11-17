@@ -703,17 +703,9 @@ pub struct ReuseMeasurement {
 }
 
 /// A grant and, when reuse walked the slot, that measurement.
-///
-/// The cooperative hold on the slot's root travels with the grant: the caller
-/// must keep it for as long as the command uses the root and drop it only
-/// after the release is recorded. A child that keeps the inherited descriptor
-/// keeps the root held after the launcher's own copy is gone.
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Leased {
     pub grant: LeaseGrant,
-    /// The Barge hold on the root. `None` for a legacy Oxide slot directory,
-    /// which Barge does not own yet.
-    pub hold: Option<barge::Hold>,
     pub measured: Option<ReuseMeasurement>,
     /// Set when a new slot on a removable volume was admitted with its pool
     /// size **unknown** because the pool's own walk stopped at its bounds.

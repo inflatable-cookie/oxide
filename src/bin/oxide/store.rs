@@ -418,10 +418,6 @@ pub struct Lease {
     lease_id: String,
     record: u64,
     _lock: File,
-    /// The cooperative hold on the slot's Barge root, kept for as long as the
-    /// command uses it. Dropping the lease releases it; a child that kept the
-    /// inherited descriptor keeps the root held after that.
-    _root_hold: Option<barge::Hold>,
 }
 
 impl Lease {
@@ -4645,7 +4641,6 @@ impl Store {
             victims,
             slice,
         };
-        let mut hold: Option<barge::Hold> = None;
         let outcome = lease_measured(request);
         // The library deletes the requested victim only after complete
         // accounting and rank headroom, and it may still refuse afterwards.
@@ -4673,7 +4668,6 @@ impl Store {
                 if let Some(report) = &leased.slice {
                     Self::report_slice(class, report);
                 }
-                hold = leased.hold;
                 (
                     leased.grant,
                     leased.measured,
@@ -4770,7 +4764,6 @@ impl Store {
             lease_id: grant.lease_id,
             record,
             _lock: lock,
-            _root_hold: hold,
         }))
     }
 
