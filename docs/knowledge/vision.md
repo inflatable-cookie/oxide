@@ -164,7 +164,7 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 
 ### Storage
 
-- **Barge owns drive management** (approved, staged): volume registration and selection, placement and fallback, owned roots, pruning and scratch move to the separate Barge product ([inflatable-cookie/barge](https://github.com/inflatable-cookie/barge)), which Oxide will use as a library. Oxide keeps Cargo, slots, leases, recipes, freshness and `exec`. Until each part moves, Oxide's current implementation stays authoritative.
+- **Barge owns drive management** (implemented in oxide#314): volume registration and selection, placement and fallback, owned roots, pruning and scratch use the linked lean Barge library ([inflatable-cookie/barge](https://github.com/inflatable-cookie/barge)), which Oxide uses as a pinned library. Oxide keeps Cargo, slots, leases, recipes, freshness and `exec`. Barge holds and selected-output pins replace Oxide's deletion/census/prune engines; Cargo and output-link workflow stay in Oxide.
 - **Pools are budget-only:** a soft admission budget, whole-idle-slot eviction
   and the host-reserve watchdog, with no OS-enforced cap.
 - **Warm reuse redesign** (Tom, 2026-11-05, decision
@@ -316,6 +316,14 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   approved.
 
 ## Validation policy
+
+Tom's 2026-11-17 lean reset, implemented by oxide#314, uses ordinary bounded
+unit/integration tests on private fixtures and retained independent exact-head
+review for the linked Barge adoption. It removes the supplier/capture/native
+qualification ladders for that change. Existing shared-runner safeguards and
+unrelated product verification stay. Installation and live migration remain
+separate owner actions; old evidence is historical, with no transferred credit.
+
 
 Tom decision `ea8ee47f-adc0-4cd3-b420-aaa30642d623` v2 (2026-11-16)
 adopts the reviewed cooperative qualification contract (retired 2026-11-18)

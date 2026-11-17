@@ -11,7 +11,6 @@ mod adopt;
 mod budget;
 mod capacity;
 mod cargo_home;
-mod census;
 mod child_temp;
 mod clean;
 mod cli;

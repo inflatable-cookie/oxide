@@ -1,26 +1,13 @@
 # Barge adoption: Oxide's storage authority
 
-**Status (2026-11-18): lean reset; adoption in progress under oxide#314.**
-
-**Where the code stands.** `src/storage.rs` implements the declarations,
-administration and adoption below over the pinned release. The pool engine uses
-it for its whole slot lifecycle: a slot is a Barge root, the lease carries the
-root's exclusive hold (inherited by the child launch path), idle reuse keeps the
-root's path and bytes, byte pressure retires one idle unpinned root, release and
-crash recovery follow the hold, and status reports the area's own accounting.
-Oxide's own eviction journal, holding-area deleter, capture machinery and
-inventory accounting are deleted with their tests.
-
-The output-root pins, the output prune path, removable-volume registration and
-the owned-delete/census modules still use their own records; moving those onto
-this layer is the outstanding work of oxide#314 and is not claimed here. Nothing
-here authorizes a live installation or data migration. Tom's
-2026-11-17 lean reset replaces the earlier custody scans, operation journal,
-capture/equivalence apparatus and native qualification ladders. The Barge
-library was reset to one lean core (barge#064, merged as barge#65) and Oxide
-links it at a reviewed merged commit. This file is the owning contract for what
-Oxide delegates to Barge, what Oxide keeps, and how an existing Oxide
-installation moves onto it.
+**Lean storage boundary (oxide#314).** `src/storage.rs` provides the pinned
+Barge declarations. Pool slots, removable-volume selection, output pins and
+pruning all use Barge. Oxide's owned-delete, descriptor census and output-prune
+custody/eligibility engines are deleted with their mechanism tests. The
+selection/reservation index remains Rust workflow state for receipts and links;
+it grants no deletion authority. Nothing here authorizes installation or live
+data migration. Tom's 2026-11-17 lean reset replaces the old custody scans,
+operation journals, capture/equivalence apparatus and native proof ladders.
 
 The pre-reset design, its capture contract, the shared-file comparison harness
 and the qualification slices are deleted with their code. They remain in Git
@@ -30,7 +17,8 @@ and Queue history; no evidence, credit or fixture from them is migrated.
 
 `barge` is a Git dependency pinned by full 40-hex revision in `Cargo.toml` and
 `Cargo.lock`; never a branch or tag. The current pin is the merged lean core
-with its adopted-root seam (`be06c69b`; barge#065 merged as barge#66). Offline
+with its adopted-root seam, `be06c69b4720e4d5c786da331a5615cdcde9f9e0`
+(barge#065 merged as barge#66). Offline
 builds seed that locked Git source through
 `scripts/offline_seed.py`; a missing candidate is an offline failure, not
 permission to resolve a moving ref.
@@ -79,9 +67,20 @@ account state private to the pool:
   reserve and the product floor for a removable pool, and no reserve trigger
   for a budget pool (its soft cap is the admission bound).
 
-The outputs area is `oxide/outputs` with its folder overridden to the existing
-`oxide-outputs` directory on the same volume; a checkout-local root stays
-checkout-local and is never presented as a Barge root.
+Each output location has a private account under
+`<control>/output-storage/<parent-path-sha256>/barge`, with a literal
+`oxide/outputs` declaration. This preserves both permanent-drive and
+checkout-local root paths, member links and a real `target` directory.
+Selections are pinned before link publication; replaced selections are
+unpinned only after the receipt's durable rename. Existing receipts and markers
+are checked before generic Barge import. A root's stable Barge identity is
+resolved independently of receipt selection generation.
+
+Registration imports the existing Oxide policy into Barge when the registered
+volume is positively present; absence defers first import. An existing Barge
+registration must agree with Oxide's UUID/path. For a nonzero reserve below the
+default floor, the floor is lowered to that reserve, so it never exceeds the
+selected prune target. A zero reserve retains Barge's default floor.
 
 ## Holds, pins and prune
 
@@ -144,11 +143,6 @@ observation seam and its forced-failure switch, and the captured-outcome
 guards. Production reads, refusals and writes are the ones the product already
 ran; only the recording statements and their test doubles were dropped.
 
-Some test-only helpers that only the deleted recording tests used are still
-unreferenced (the compiler reports them as dead code in test builds). They
-belong to the still-unmoved owned-delete and descriptor-census modules and go
-with those modules, not with this mechanical removal.
-
 ## Validation
 
 Ordinary bounded unit and integration tests on private temporary directories
@@ -176,3 +170,10 @@ Required coverage:
   after the launcher releases its own copy, and the root becomes eligible
   after the child exits. A fixture root pinned independently of that test
   proves the pin, not the hold.
+
+The sanctioned covering route is `effigy rust:test-600`; `rust:barge-adoption`
+uses that same route without named skips. The separate compile, release
+compile, format and docs selectors cover their own concerns. The ordinary
+shared runner is unchanged. Historical failures, prior skips and the earlier
+unauthorized internal-fixture occurrence remain in Queue/PR history; none is
+claimed as final-head evidence.

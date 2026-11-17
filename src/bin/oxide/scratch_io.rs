@@ -29,38 +29,14 @@ fn read_document(path: &Path, limit: u64) -> ReadDocument {
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
     {
-        #[cfg(not(test))]
         Ok(file) => file,
-        #[cfg(test)]
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return ReadDocument::Missing;
-        }
-        #[cfg(not(test))]
-        Err(_) => {
-            return ReadDocument::Invalid;
-        }
-        #[cfg(test)]
-        Err(error) => {
-            return ReadDocument::Invalid;
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return ReadDocument::Missing,
+        Err(_) => return ReadDocument::Invalid,
     };
-    #[cfg(not(test))]
     let Ok(meta) = file.metadata() else {
         return ReadDocument::Invalid;
     };
-    #[cfg(test)]
-    let meta = {
-        let result = file.metadata();
-        match &result {
-            Ok(meta) => {}
-            Err(_) => {}
-        }
-        let Ok(meta) = result else {
-            return ReadDocument::Invalid;
-        };
-        meta
-    };
+    // SAFETY: getuid has no preconditions.
     if !meta.is_file()
         || meta.uid() != unsafe { libc::getuid() }
         || meta.mode() & 0o077 != 0
@@ -69,25 +45,12 @@ fn read_document(path: &Path, limit: u64) -> ReadDocument {
         return ReadDocument::Invalid;
     }
     let mut bytes = Vec::new();
-    #[cfg(not(test))]
     if file.take(limit + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > limit {
         return ReadDocument::Invalid;
     }
-    #[cfg(test)]
-    {
-        let result = file.take(limit + 1).read_to_end(&mut bytes);
-        let invalid = result.is_err() || bytes.len() as u64 > limit;
-        let outcome = match &result {
-            Err(_) => {}
-            Ok(_) if invalid => {}
-            Ok(_) => {}
-        };
-        if invalid {
-            return ReadDocument::Invalid;
-        }
-    }
     ReadDocument::Bytes(bytes)
 }
+
 fn record_path(pool: &Path) -> Result<PathBuf, String> {
     let hash = Sha256::digest(pool.as_os_str().as_bytes());
     let name = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();

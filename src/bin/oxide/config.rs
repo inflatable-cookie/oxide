@@ -650,14 +650,7 @@ pub fn config_file(facts: &Facts) -> Result<ConfigFile, String> {
             false,
         ),
     };
-    #[cfg(not(test))]
     let present = match fs::symlink_metadata(&path) {
-        Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
-    };
-    #[cfg(test)]
-    let present = match inspect_metadata_observed("config:config-file:metadata", &path, false) {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
@@ -970,42 +963,14 @@ fn physical_core_count() -> PhysicalCoreCount {
 
 fn read_config(path: &Path) -> Result<FileConfig, String> {
     let named = |error: String| format!("{}: {error}", path.display());
-    #[cfg(not(test))]
     let metadata = fs::metadata(path).map_err(|error| named(error.to_string()))?;
-    #[cfg(test)]
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => {
-            use std::os::unix::fs::MetadataExt;
-            let saved_errno = crate::prune::tape_errno();
-            crate::prune::tape_restore_errno(saved_errno);
-            metadata
-        }
-        Err(error) => {
-            let saved_errno = crate::prune::tape_errno();
-            crate::prune::tape_restore_errno(saved_errno);
-            return Err(named(error.to_string()));
-        }
-    };
     if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
         return Err(named("not a small regular file".to_owned()));
     }
     let mut text = String::new();
-    #[cfg(not(test))]
     fs::File::open(path)
         .and_then(|file| file.take(MAX_CONFIG_BYTES).read_to_string(&mut text))
         .map_err(|error| named(error.to_string()))?;
-    #[cfg(test)]
-    {
-        let result = fs::File::open(path)
-            .and_then(|file| file.take(MAX_CONFIG_BYTES).read_to_string(&mut text));
-        let saved_errno = crate::prune::tape_errno();
-        let outcome = match &result {
-            Ok(_) => {}
-            Err(_) => {}
-        };
-        crate::prune::tape_restore_errno(saved_errno);
-        result.map_err(|error| named(error.to_string()))?;
-    }
     parse_config(&text).map_err(named)
 }
 
@@ -1214,116 +1179,32 @@ pub enum Found {
     Unknown,
 }
 
-#[cfg(test)]
-fn inspect_metadata_observed(
-    site: &str,
-    path: &Path,
-    follow: bool,
-) -> std::io::Result<fs::Metadata> {
-    use std::os::unix::fs::MetadataExt;
-    let result = if follow {
-        fs::metadata(path)
-    } else {
-        fs::symlink_metadata(path)
-    };
-    let saved_errno = crate::prune::tape_errno();
-    match &result {
-        Ok(metadata) => {}
-        Err(_) => {}
-    }
-    crate::prune::tape_restore_errno(saved_errno);
-    result
-}
-
 pub fn inspect(path: &Path) -> Found {
-    #[cfg(not(test))]
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Found::Absent,
         Err(_) => return Found::Unknown,
         Ok(_) => {}
     }
-    #[cfg(test)]
-    match inspect_metadata_observed("config:inspect:initial", path, false) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Found::Absent,
-        Err(_) => return Found::Unknown,
-        Ok(_) => {}
-    }
     // Judge what an alias names, so a symlink to a legacy pool is legacy.
-    #[cfg(not(test))]
     let Ok(resolved) = fs::canonicalize(path) else {
         return Found::Unknown;
     };
-    #[cfg(test)]
-    let resolved = {
-        let result = fs::canonicalize(path);
-        let saved_errno = crate::prune::tape_errno();
-        let outcome = match &result {
-            Ok(resolved) => {}
-            Err(_) => {}
-        };
-        crate::prune::tape_restore_errno(saved_errno);
-        let Ok(resolved) = result else {
-            return Found::Unknown;
-        };
-        resolved
-    };
-    #[cfg(not(test))]
     if !fs::metadata(&resolved).is_ok_and(|metadata| metadata.is_dir()) {
         return Found::Unknown;
     }
-    #[cfg(test)]
-    if !inspect_metadata_observed("config:inspect:resolved", &resolved, true)
-        .is_ok_and(|metadata| metadata.is_dir())
-    {
-        return Found::Unknown;
-    }
     let path = resolved.as_path();
-    #[cfg(not(test))]
     if fs::symlink_metadata(path.join("image.sparseimage")).is_ok()
         || fs::symlink_metadata(path.join("receipt.json")).is_ok()
     {
         return Found::LegacyImage;
     }
-    #[cfg(test)]
-    if inspect_metadata_observed(
-        "config:inspect:image",
-        &path.join("image.sparseimage"),
-        false,
-    )
-    .is_ok()
-        || inspect_metadata_observed("config:inspect:receipt", &path.join("receipt.json"), false)
-            .is_ok()
-    {
-        return Found::LegacyImage;
-    }
     let config = path.join("config.json");
-    #[cfg(not(test))]
     match fs::symlink_metadata(&config) {
         Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_CONFIG_BYTES => {}
         _ => return Found::Unknown,
     }
-    #[cfg(test)]
-    match inspect_metadata_observed("config:inspect:config-metadata", &config, false) {
-        Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_CONFIG_BYTES => {}
-        _ => return Found::Unknown,
-    }
-    #[cfg(not(test))]
     let Ok(bytes) = fs::read(&config) else {
         return Found::Unknown;
-    };
-    #[cfg(test)]
-    let bytes = {
-        let result = fs::read(&config);
-        let saved_errno = crate::prune::tape_errno();
-        let outcome = match &result {
-            Ok(bytes) => {}
-            Err(_) => {}
-        };
-        crate::prune::tape_restore_errno(saved_errno);
-        let Ok(bytes) = result else {
-            return Found::Unknown;
-        };
-        bytes
     };
     let backend = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()

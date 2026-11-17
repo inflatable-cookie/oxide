@@ -118,3 +118,21 @@ allow = [
   "src/bin/oxide/capture_wire.rs",
   "docs/knowledge/contracts/capture-vectors/v2/invalid/apparatus-diagnostic.json",
 ]
+
+
+[[retired]]
+id = "oxide-storage-census-and-prune-engine"
+retired = "2026-11-17"
+replacement = "Lean linked Barge roots, cooperative holds, durable output pins and marker-checked trash. Ordinary temporary-fixture tests replace the old storage-native ladders. Legacy uncertain roots are retained."
+owner = "docs/knowledge/contracts/barge-adoption.md"
+paths = [
+  "src/owned_delete.rs",
+  "src/owned_delete_hook.rs",
+  "src/owned_delete_tests.rs",
+  "src/bin/oxide/census.rs",
+  "scripts/test-holding-delete.py",
+  "scripts/test-prune-authority.py",
+  "scripts/test-prune-fresh-custody.py",
+  "scripts/test-prune-absence.py",
+  "scripts/test-outputs-prune.py",
+]

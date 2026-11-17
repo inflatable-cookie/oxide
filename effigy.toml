@@ -55,34 +55,14 @@ minimum_effigy_version = "0.14.0"
   "git diff --check HEAD",
 ]
 
-# Whole-tree holding deletion (oxide#190): one fixed script and the whole
-# command of the qualified shared supervisor. A slot tree is renamed whole into
-# the payload's private holding area under the pool lock and deleted outside it,
-# with one durable row per held tree and a non-blocking per-entry custody lock.
-# Fixture pools use OXIDE_SCRATCH_ROOT under the supervisor's selected-volume
-# scratch, with explicit caps. The cases are a 20,000-entry eviction with the
-# product's recorded lock figure, a refused entry, concurrent admission, and a killed
-# deleter whose entry the next command finishes. 300 s, 512 MiB monitored
-# scratch. `--diagnostic` is the same guard, root and limits in keep-going mode
-# with a bounded `qualified: false` receipt; it is never a counted pass.
-# `proof:holding-delete:test` runs only the script's pure self-check (argument
-# boundary, plan, oracles, constants) with no child, Cargo, pool or scratch.
-# Every native run needs its own owner activation. Not a benchmark, a real-pool
-# rate claim or an alias for full QA.
-# Lean Barge adoption (oxide#314): the ordinary heavy covering suite for the
-# storage authority over the merged lean core. It runs the workspace's real
-# unit and integration tests, library and binary callers included. Not a
-# benchmark, not full QA.
-[tasks."proof:holding-delete:test"]
-run = "python3 scripts/test-holding-delete.py --self-check"
-
-[tasks."rust:holding-delete"]
+# Lean adoption uses the same sanctioned covering route, with no named skips.
+[tasks."rust:barge-adoption"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-holding-delete.py"
+run = "python3 scripts/rust-test-600.py"
 
-[tasks."rust:holding-delete:diagnostic"]
-admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-holding-delete.py --diagnostic"
+# Apply formatting during source authoring; rust:format remains check-only.
+[tasks."rust:format-write"]
+run = "oxide fmt --all"
 
 [test.suites.rust]
 run = "python3 scripts/bounded-test.py oxide test --workspace --all-targets --locked"
@@ -614,143 +594,6 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 [tasks."rust:auto-adopt-ineligible:diagnostic"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py auto-ineligible --diagnostic"
-
-# Owned-output prune (oxide#129, oxide#152): one fixed 22-case native proof
-# under the shared supervisor (`scripts/bounded-test.py` SHA-256
-# 94b1aba60a7475a31b5620039986336f13e1c88d58dd3732b5736290dc63685b,
-# the qualified oxide#151 guard plus oxide#191's opt-in post-census detach and
-# oxide#197's ancestor and launcher-sibling exclusions,
-# unqualified until their own qualifications pass): 360 s, 512 MiB monitored scratch, 30 s work
-# shutdown margin, one
-# owned 128 MiB scratch image, ordinary detach. Fence and initialization, root
-# nonces, shared and cancelled reservations, snapshot, overflow, eligibility,
-# receiptless legacy roots, custody, containment, four crash boundaries,
-# completion diagnostics, resolve-intent and the version-1 receipt scenario.
-# `--root-parent /private/tmp` is the owner-accepted internal-placement
-# exception (decision bd357a4c v4): cases 10 and 21 prove checkout absence on
-# the boot Data volume, and the fixture's internal directory pool is a genuine
-# internal pool the product correctly refuses on an external volume. The
-# supervisor monitors that same root. Each side's run is a separately counted
-# owner activation; `--plan` alone touches nothing.
-# oxide#134 focused authority/accounting proof, S4 migration (oxide#211): one
-# fixed script under the qualified shared supervisor. The Builds mode places its
-# directory pool in a scratch-pools directory under the supervisor's selected
-# volume (OXIDE_SCRATCH_ROOT); no --root-parent. 300 s and 512 MiB including
-# cleanup. Each native start requires independent source fit and explicit
-# activation.
-[tasks."rust:prune-authority"]
-admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-authority.py"
-
-# Uncounted keep-going diagnostic; it never grants native PASS credit.
-[tasks."rust:prune-authority:diagnostic"]
-admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-authority.py --diagnostic"
-
-# Keep-internal mode (decision 7aedd5af): ONLY the receiptless legacy-positive
-# case. Its legacy checkout's nearest existing ancestor must sit on the boot Data
-# volume (src/bin/oxide/prune.rs:3276-3287), so the owner-accepted /private/tmp
-# root (bd357a4c) stays for this mode alone. 300 s and 512 MiB including cleanup.
-[tasks."rust:prune-authority:internal"]
-admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-authority.py --internal"
-
-# Uncounted keep-going diagnostic for the internal mode; never a native PASS.
-[tasks."rust:prune-authority:internal:diagnostic"]
-admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-authority.py --internal --diagnostic"
-
-[tasks."proof:prune-authority:test"]
-run = "python3 scripts/test-prune-authority.py --self-check"
-
-# Effect-free: prints both modes' case tables, placements and premise dispositions.
-[tasks."proof:prune-authority:plan"]
-run = "python3 scripts/test-prune-authority.py --plan"
-
-# oxide#235 fresh per-row custody witnesses (frozen design oxide#229, brief v4):
-# one fixed script as the whole command of the QUALIFIED candidate runner at its
-# fixed path (planner decision 9575afc9; candidate SHA-256 c5782431…, consumed
-# only through this narrow new-proof route), under heavy admission. 360 s wall,
-# 512 MiB monitored scratch including staging/cleanup, at most one owned 128 MiB
-# image. Selected-volume scratch placement, no --root-parent. The counted run is
-# fail-fast; the diagnostic is the uncounted keep-going twin and is never a
-# native PASS. Each native run needs separate owner activation.
-[tasks."rust:prune-fresh-custody"]
-admission = "heavy"
-run = "python3 scripts/bounded-test-candidate.py --limit 360 --scratch-budget-mib 512 -- python3 scripts/test-prune-fresh-custody.py"
-
-# Uncounted keep-going diagnostic; it never grants native PASS credit.
-[tasks."rust:prune-fresh-custody:diagnostic"]
-admission = "heavy"
-run = "python3 scripts/bounded-test-candidate.py --limit 360 --scratch-budget-mib 512 -- python3 scripts/test-prune-fresh-custody.py --diagnostic"
-
-# Pure apparatus check: case tables, counterfactual oracles, bounds, the scale
-# arithmetic, source-literal pins and the exact selector text. No scratch,
-# child, image or pool.
-[tasks."proof:prune-fresh-custody:test"]
-run = "python3 scripts/test-prune-fresh-custody.py --self-check"
-
-# Effect-free: prints the case table, bounds, runner pins, the scale oracle and
-# the nine premise dispositions.
-[tasks."proof:prune-fresh-custody:plan"]
-run = "python3 scripts/test-prune-fresh-custody.py --plan"
-
-# oxide#135 focused checked-out-absence proof: one fixed script under the
-# qualified shared supervisor. A checkout path outside /Volumes may be proved
-# absent with missing ancestors only from a no-follow descriptor walk whose held
-# nearest existing ancestor is on the boot Data volume, and the real run's own
-# ancestry witness is compared again under the barrier and immediately before
-# publication. `--root-parent /private/tmp` is the owner-accepted
-# internal-placement exception (decision bd357a4c) for BOTH premises: the
-# missing-chain fixtures must sit on the boot Data volume, and the fixture's
-# directory-budget pool is a genuine internal pool the product correctly refuses
-# on an external volume. One owned 128 MiB scratch image is the non-Data and
-# ownership control. Prospective, UNMEASURED: 300 s, 512 MiB monitored scratch
-# including cleanup, staging at two Cargo jobs, fixtures run no Cargo child.
-# Each side's native run needs its own counted owner activation; its fit is
-# unmeasured and no native has run.
-[tasks."rust:prune-absence"]
-admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-absence.py"
-
-# The same fixed script in its opt-in keep-going diagnostic mode: the same guard,
-# root, image and limits with `--diagnostic` appended. It records reached,
-# completed, failed, dependency-skipped and unexecuted cases plus the latched
-# first fault in a bounded `qualified: false` receipt and never grants native
-# PASS credit. Owner-activated only.
-[tasks."rust:prune-absence:diagnostic"]
-admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-prune-absence.py --diagnostic"
-
-# Pure, effect-free apparatus check for that proof: the same fixed script's
-# `--self-check`, which stages nothing, starts no child and touches no fixture,
-# pool or image. It drives the real oracles, the mount-spelling classifier and
-# the case/allocation table with in-memory counterfactuals.
-[tasks."proof:prune-absence:test"]
-run = "python3 scripts/test-prune-absence.py --self-check"
-
-[tasks."rust:outputs-prune"]
-admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 360 --scratch-budget-mib 512 -- python3 scripts/test-outputs-prune.py"
-
-# The same fixed script in its opt-in keep-going diagnostic mode (oxide#152):
-# the same guard, internal root, limits, image and ordinary detach, with
-# `--diagnostic` appended. It records a bounded `qualified: false` receipt of
-# reached/completed/failed/dependent-skipped/unexecuted cases and the latched
-# first fault, continues only into dependency-independent cases, and aborts on
-# an unknown writer, device, custody, protocol, infrastructure, deadline or
-# receipt outcome. It is UNCOUNTED, never a PASS, and owner-activated only.
-[tasks."rust:outputs-prune:diagnostic"]
-admission = "heavy"
-run = "python3 scripts/bounded-test.py --root-parent /private/tmp --limit 360 --scratch-budget-mib 512 -- python3 scripts/test-outputs-prune.py --diagnostic"
-
-# Pure, effect-free apparatus check for that proof: the same fixed script's
-# `--self-test` mode, which stages nothing, starts no child and touches no
-# fixture, pool or image. It drives the real case table, the counted
-# fail-fast dispatcher, the keep-going/taint/abort precedence and the bounded
-# unqualified receipt with synthetic bodies.
-[tasks."proof:outputs-prune:test"]
-run = "python3 scripts/test-outputs-prune.py --self-test"
 
 # Removable drive modes (oxide#116): under the qualified shared supervisor,
 # stages oxide offline and exercises versioned registration metadata,

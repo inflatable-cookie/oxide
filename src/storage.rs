@@ -39,6 +39,16 @@ pub const PAYLOAD_FOLDER: &str = "payload";
 /// The registered volume's payload folder on a removable drive.
 pub const VOLUME_PAYLOAD_FOLDER: &str = "oxide-pool";
 
+/// Keep the refusal floor inside a configured nonzero reserve.
+/// A zero reserve disables reserve pruning and retains Barge's default floor.
+pub fn reserve_floor(reserve_bytes: u64) -> u64 {
+    if reserve_bytes == 0 {
+        barge::volume::DEFAULT_FLOOR_BYTES
+    } else {
+        barge::volume::DEFAULT_FLOOR_BYTES.min(reserve_bytes)
+    }
+}
+
 /// One area Oxide declares: the volume it belongs to, where its roots go, the
 /// absent-volume policy and the space policy.
 #[derive(Clone, Debug)]
@@ -478,7 +488,11 @@ impl PoolStorage {
             .folder(backing.folder.clone())
             .soft_cap_bytes(backing.soft_cap_bytes)
             .reserve_bytes(backing.reserve_bytes)
-            .floor_bytes(backing.floor_bytes);
+            .floor_bytes(if backing.reserve_bytes == 0 {
+                backing.floor_bytes
+            } else {
+                backing.floor_bytes.min(backing.reserve_bytes)
+            });
         let area = storage.declare(&config)?;
         let location = area
             .location()
@@ -510,7 +524,11 @@ impl PoolStorage {
             self.backing.uuid.as_deref(),
             "",
             reserve_bytes,
-            self.backing.floor_bytes,
+            if reserve_bytes == 0 {
+                self.backing.floor_bytes
+            } else {
+                self.backing.floor_bytes.min(reserve_bytes)
+            },
         )?;
         Ok(())
     }
