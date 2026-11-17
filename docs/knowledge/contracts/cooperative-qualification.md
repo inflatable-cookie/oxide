@@ -1,4 +1,14 @@
-# Cooperative qualification acceptance target for future 309 work
+# Historical cooperative qualification target
+
+This target is superseded for oxide#309. Tom's decision
+`1b60743c-d496-485d-a1e9-5e48372d2590` v2 (2026-11-17) decouples Nucleus
+run mechanics from the proof. His later simplification direction removes the
+cross-project clock, envelope and supplier work. The proof runs inside its own
+ordinary Effigy execution, using Effigy's existing timeout and process handling;
+Nucleus supplies ordinary task running. See [current authority](../vision.md#authority-boundaries).
+The text below preserves the earlier target, not a current prerequisite or
+implementation instruction. Source/proof work still needs its scoped Queue
+brief and ordinary independent review; earlier evidence is not relabelled.
 
 Tom's decision `ea8ee47f-adc0-4cd3-b420-aaa30642d623` v2
 (2026-11-16) adopts this reviewed contract as the acceptance target for future

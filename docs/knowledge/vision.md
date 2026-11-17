@@ -377,6 +377,25 @@ host tranche. Its two-PR source limits, all earlier clock evidence, Barge's
 guest/host policies and every qualification, installation and consumer gate
 remain unchanged.
 
+Tom decision `1b60743c-d496-485d-a1e9-5e48372d2590` v2 (2026-11-17)
+subsequently selects **Decouple**: "oxide and nucleus should not be tied
+together, nucleus's run mechanics should have no effect on the proof".
+The Nucleus planner also relays Tom's later direction: "Remove it. Let's
+simplify this across all three projects, clean up, just get it working without
+all the ceremony." Effigy's planner relays his selected **Plain run**.
+
+For 309, Nucleus is an ordinary task runner. Proof timing and process handling
+belong to the proof's ordinary Effigy execution, using the existing
+`EFFIGY_RUN_DEADLINE_MS=600000` mechanism. The common-clock work and the
+external envelope, supplier, custody/census certification and capture-delivery
+contracts are no longer prerequisites. The [earlier cooperative target](contracts/cooperative-qualification.md)
+is historical. Keep actual supervisor behavior tests, ordinary source/evidence
+review and honest run outcomes; source/native work follows the selected scoped
+Queue brief without further design tranches. Cleanup means obsolete source and
+documentation here, with earlier receipts, failures, charges and retained
+resources preserved. Consumer changes and historical-resource cleanup are not
+implied by this direction.
+
 Tom decision `c6e3e9c8` v2 (2026-11-04) separates capture delivery from
 private launcher qualification for the bounded O2 capture tasks. Their named
 capture-only Cargo selectors cover build and embedded harness behavior; they
