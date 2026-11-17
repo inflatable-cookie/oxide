@@ -1347,15 +1347,15 @@ impl Pool {
             VOLUME_BACKEND_APFS_V1 => open_volume_payload(&paths, &config)?,
             _ => return Err(LeaseError::BackingMismatch),
         };
-        let _ = max_elapsed_ms;
+        let bound = max_elapsed_ms.clamp(1, 60_000);
         Ok(Self {
             _lock: None,
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(bound)),
             root,
             config,
             backing,
             storage: None,
             pending_hold: None,
-            deadline: None,
             budget: ledger.cap_bytes,
             ledger,
             reserve: None,
@@ -1541,6 +1541,11 @@ impl Pool {
             let id = legacy_root_id(&dir);
             match storage.adopt_in(project_folder.as_deref(), &leaf, &label, &id) {
                 Ok(root) => {
+                    // A legacy generation never held a Barge lock; pin its root
+                    // so no prune or eviction can delete a directory an older
+                    // writer may still use. The pin is removed when a grant
+                    // takes the root.
+                    storage.pin_in(project_folder.as_deref(), &root.id, "legacy generation");
                     slot.root = Some(root.id);
                     changed = true;
                 }
@@ -1581,24 +1586,12 @@ impl Pool {
         let workspace = canonical_existing_dir(&request.workspace, false)?;
         require_holder(&request.holder)?;
         if let Some(existing) = self.find_holder_lease(&request.holder) {
-            if existing.project == project
-                && existing.workspace == workspace
-                && existing.profile == request.profile
-                && existing.state == SlotPersistState::Held
-                && existing.owned
-            {
-                return Ok(Leased {
-                    grant: self.grant_from(existing, true)?,
-                    hold: None,
-                    measured: None,
-                    admission_note: None,
-                    slice: None,
-                    unmeasured: Vec::new(),
-                    holding: Vec::new(),
-                });
-            }
             if existing.state == SlotPersistState::Held {
-                return Err(LeaseError::HolderConflict);
+                // The same holder already owns this generation. A second grant
+                // would carry no hold of its own, so it could outlive the
+                // original holder and leave the root unprotected; refuse it and
+                // let the caller finish its existing lease first.
+                return Err(LeaseError::Busy);
             }
         }
         if let Some(held) = self
@@ -1700,6 +1693,10 @@ impl Pool {
         {
             Some(hold) => {
                 self.pending_hold = Some(hold);
+                let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
+                // This generation now owns the root through its hold; the
+                // legacy protection pin is no longer needed.
+                let _ = storage.unpin_in(area.as_deref(), &root);
                 if let Some(slot) = self.slot_mut(slot_id) {
                     slot.owned = true;
                 }

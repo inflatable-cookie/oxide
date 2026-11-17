@@ -611,6 +611,20 @@ impl PoolStorage {
             .map_err(|error| format!("cannot hold slot root {id}: {error}"))
     }
 
+    /// Pin a root in one project area, protecting it from prune and eviction.
+    pub fn pin_in(&self, project_folder: Option<&str>, id: &str, reason: &str) {
+        if let Ok(area) = self.area_for(project_folder) {
+            let _ = area.pin(id, reason);
+        }
+    }
+
+    /// Remove a root's pin in one project area.
+    pub fn unpin_in(&self, project_folder: Option<&str>, id: &str) -> Result<(), String> {
+        self.area_for(project_folder)?
+            .unpin(id)
+            .map_err(|error| format!("cannot unpin root {id}: {error}"))
+    }
+
     /// Try to take an exclusive hold without waiting.
     pub fn try_hold_in(
         &self,

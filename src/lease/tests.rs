@@ -405,8 +405,16 @@ fn an_evicted_legacy_root_gets_a_fresh_successor_path() {
     let dir = slot_dir(&pool, "44");
     let project = fixture.dir("project");
     write_legacy_ledger(&pool, "idle", None, 44, project.to_str().unwrap());
-    // Adopt, then evict the idle legacy root by id.
+    // Adopt, then settle the legacy generation and evict the idle root. Its
+    // protection pin keeps it out of automatic prune until it is removed.
     managed::status(&pool).unwrap();
+    let area = crate::storage::PoolStorage::open(
+        &pool.join("oxide-managed"),
+        &crate::storage::PoolBacking::budget(&pool, 8 << 20),
+    )
+    .expect("area");
+    let (_, info) = area.all_roots().unwrap().first().expect("adopted").clone();
+    area.unpin_in(None, &info.id).expect("settled");
     managed::evict_idle_slot(&pool, "44").expect("evicted");
     assert!(!dir.exists(), "the recorded legacy root is deleted whole");
     let workspace = fixture.dir("workspace");
@@ -493,4 +501,73 @@ fn a_held_legacy_root_is_not_adopted_and_stays_out_of_barge_prune_authority() {
         "the legacy directory is not a Barge root"
     );
     assert!(dir.join("artifact").is_file());
+}
+
+#[test]
+fn a_second_grant_for_the_same_holder_is_refused_because_it_would_carry_no_hold() {
+    let fixture = Fixture::new("replay-refused");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let workspace = fixture.dir("workspace");
+    let first =
+        managed::lease_measured(request(&pool, &project, &workspace, "same")).expect("lease");
+    let second = managed::lease(request(&pool, &project, &workspace, "same"));
+    assert!(
+        matches!(
+            second,
+            Err(LeaseError::Busy) | Err(LeaseError::HolderConflict)
+        ),
+        "an independent replay must be refused: {second:?}"
+    );
+    drop(first);
+}
+
+#[test]
+fn an_adopted_idle_legacy_root_is_pinned_out_of_prune_and_eviction() {
+    let fixture = Fixture::new("legacy-pinned");
+    let pool = fixture.pool();
+    let dir = slot_dir(&pool, "61");
+    fs::write(dir.join("artifact"), b"old").unwrap();
+    let project = fixture.dir("project");
+    write_legacy_ledger(&pool, "idle", None, 61, project.to_str().unwrap());
+    managed::status(&pool).expect("open adopts the idle legacy root");
+    let area = crate::storage::PoolStorage::open(
+        &pool.join("oxide-managed"),
+        &crate::storage::PoolBacking::budget(&pool, 8 << 20),
+    )
+    .expect("area");
+    let roots = area.all_roots().expect("roots");
+    let (_, info) = roots.first().expect("the legacy root is adopted");
+    assert!(info.pinned, "an unheld legacy generation stays pinned");
+    assert!(
+        area.evict_any(&info.id).is_err(),
+        "the pinned legacy root cannot be evicted"
+    );
+    assert!(dir.join("artifact").is_file());
+}
+
+#[test]
+fn a_short_measurement_budget_is_applied_and_partial_totals_are_unknown() {
+    let fixture = Fixture::new("short-budget");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let workspace = fixture.dir("workspace");
+    let leased = managed::lease_measured(request(&pool, &project, &workspace, "a")).expect("lease");
+    let lease_id = leased.grant.lease_id.clone();
+    let slot_root = leased
+        .grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    drop(leased);
+    managed::release(&pool, &lease_id).expect("release");
+    // A one-millisecond budget must be honoured (no error) and a missing root
+    // makes the total unknown, not a false "not full".
+    std::fs::remove_dir_all(&slot_root).unwrap();
+    let measured = managed::measure_within(&pool, 1).expect("a short budget still measures");
+    assert_eq!(measured.status.coverage, super::AccountingCoverage::Partial);
+    assert_eq!(measured.status.full, None);
+    assert!(measured.status.payload_logical_bytes.is_none());
 }
