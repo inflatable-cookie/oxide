@@ -69,6 +69,15 @@ minimum_effigy_version = "0.14.0"
 # boundary, plan, oracles, constants) with no child, Cargo, pool or scratch.
 # Every native run needs its own owner activation. Not a benchmark, a real-pool
 # rate claim or an alias for full QA.
+# Lean Barge adoption (oxide#314): the ordinary heavy covering suite for the
+# storage authority over the merged lean core. It runs the workspace's real
+# unit and integration tests (library and binary callers, including the
+# child-launch hold inheritance case) under the qualified shared supervisor at
+# the suite's measured 600 s / 512 MiB bounds. Not a benchmark, not full QA.
+[tasks."rust:barge-adoption"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 -- oxide test --workspace --all-targets --locked"
+
 [tasks."proof:holding-delete:test"]
 run = "python3 scripts/test-holding-delete.py --self-check"
 
