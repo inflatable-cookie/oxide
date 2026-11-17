@@ -11,6 +11,9 @@
 //! `docs/knowledge/contracts/workflow.md`.
 
 mod backing;
+#[cfg(test)]
+mod tests;
+
 pub mod control;
 mod pool;
 pub mod seed;
@@ -19,19 +22,16 @@ mod slice;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub use pool::{managed, HoldingDrain, LeaseRequest, SlotLayout};
+pub use pool::{managed, LeaseRequest, SlotLayout};
 pub use slice::{
     slice_byte_limit, AdmissionClass, MemberPair, MemberSet, OneUseSlice, RestoreOutcome,
     SliceAdmission, SliceReport, VictimPolicy, ONE_USE_MAX_BYTES, ONE_USE_MAX_SLOTS,
 };
-
-#[cfg(test)]
-mod tests;
 
 /// Version of the lease JSON, receipts, pool config and ledger.
 pub const LEASE_VERSION: u32 = 1;
@@ -128,8 +128,6 @@ pub const MAX_REFUSAL_SLOTS: usize = 8;
 /// pool; depth covers build-script `out` trees; the deadline allows a cold
 /// walk of a USB pool. A walk that hits any bound is incomplete and refuses
 /// where complete accounting is required.
-const ACCOUNTING_MAX_ENTRIES: u64 = 2_000_000;
-const ACCOUNTING_MAX_DEPTH: usize = 64;
 const ACCOUNTING_MAX_ELAPSED_MS: u64 = 60_000;
 
 const CONFIG_NAME: &str = "config.json";
@@ -546,6 +544,18 @@ pub struct PoolStatus {
 }
 
 /// One slot tree already renamed into the payload's private holding area and
+/// One pass's result over a pool's holding area. This engine has no holding
+/// area: Barge evicts and deletes its own roots, so a pass claims nothing.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HoldingDrain {
+    pub claimed: Option<String>,
+    pub gone: bool,
+    pub entries: u64,
+    pub bytes: u64,
+    pub refused: Vec<String>,
+}
+
+/// One slot tree already renamed into the payload's private holding area and
 /// pending deletion outside the pool lock (oxide#190). It is a recorded fact,
 /// not a claim that the tree is still there or that a deleter is running.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -703,9 +713,17 @@ pub struct ReuseMeasurement {
 }
 
 /// A grant and, when reuse walked the slot, that measurement.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The cooperative hold on the slot's root travels with the grant: the caller
+/// must keep it for as long as the command uses the root and drop it only
+/// after the release is recorded. A child that keeps the inherited descriptor
+/// keeps the root held after the launcher's own copy is gone.
+#[derive(Debug)]
 pub struct Leased {
     pub grant: LeaseGrant,
+    /// The Barge hold on the root. `None` for a legacy Oxide slot directory,
+    /// which Barge does not own yet.
+    pub hold: Option<barge::Hold>,
     pub measured: Option<ReuseMeasurement>,
     /// Set when a new slot on a removable volume was admitted with its pool
     /// size **unknown** because the pool's own walk stopped at its bounds.
@@ -1557,43 +1575,4 @@ fn random_hex(bytes: usize) -> Result<String, LeaseError> {
             .map_err(|_| LeaseError::Io("token encoding failed".into()))?;
     }
     Ok(result)
-}
-
-/// A real, owned parent directory held by descriptor, with the path's own
-/// identity revalidated against the descriptor.
-fn open_verified_directory(path: &Path) -> Result<File, LeaseError> {
-    let metadata = fs::symlink_metadata(path).map_err(io_error)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_dir()
-        || metadata.uid() != current_uid()
-    {
-        return Err(LeaseError::UnsafePath(
-            "symlink parent must be an owned directory",
-        ));
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(io_error)?;
-    let held = file.metadata().map_err(io_error)?;
-    if held.dev() != metadata.dev() || held.ino() != metadata.ino() {
-        return Err(LeaseError::UnsafePath(
-            "the deletion parent was replaced before it was opened",
-        ));
-    }
-    Ok(file)
-}
-
-fn unlink_at(
-    parent: BorrowedFd<'_>,
-    name: &std::ffi::CStr,
-    flags: libc::c_int,
-) -> std::io::Result<()> {
-    // SAFETY: the descriptor and C string are live for the call.
-    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
 }

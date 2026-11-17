@@ -187,6 +187,11 @@ pub(crate) mod verified_facts {
         result
     }
 
+    /// Whether a caller in this thread installed modelled facts.
+    pub(crate) fn armed() -> bool {
+        CURRENT.with(|cell| cell.borrow().is_some())
+    }
+
     /// Replace the available bytes mid-run, as a re-read after a prune would.
     pub(crate) fn set_available(bytes: Option<u64>) {
         CURRENT.with(|cell| {

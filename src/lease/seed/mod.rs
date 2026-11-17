@@ -2147,7 +2147,13 @@ fn open_donor_slot_dirs(
             Ok(Some((fd, root.join(slot.id.to_string()))))
         }
         Some(dir) => {
-            let (folder, leaf) = dir.split_once('/').ok_or_else(slot_custody_error)?;
+            let Some((folder, leaf)) = dir.split_once('/') else {
+                let Some(fd) = open_slot_component_optional(slots.as_fd(), &cstring(dir)?, device)?
+                else {
+                    return Ok(None);
+                };
+                return Ok(Some((fd, root.join(dir))));
+            };
             let Some(folder_fd) =
                 open_slot_component_optional(slots.as_fd(), &cstring(folder)?, device)?
             else {
@@ -2195,12 +2201,19 @@ fn open_slot_dirs(
             let fd = open_slot_component(slots.as_fd(), &name, device)?;
             Ok((fd, root.join(slot.id.to_string())))
         }
-        Some(dir) => {
-            let (folder, leaf) = dir.split_once('/').ok_or_else(slot_custody_error)?;
-            let folder_fd = open_slot_component(slots.as_fd(), &cstring(folder)?, device)?;
-            let leaf_fd = open_slot_component(folder_fd.as_fd(), &cstring(leaf)?, device)?;
-            Ok((leaf_fd, root.join(dir)))
-        }
+        // A Barge root is one level (`<label>-<id>`); a legacy Oxide slot may
+        // sit under its project folder.
+        Some(dir) => match dir.split_once('/') {
+            Some((folder, leaf)) => {
+                let folder_fd = open_slot_component(slots.as_fd(), &cstring(folder)?, device)?;
+                let leaf_fd = open_slot_component(folder_fd.as_fd(), &cstring(leaf)?, device)?;
+                Ok((leaf_fd, root.join(dir)))
+            }
+            None => {
+                let fd = open_slot_component(slots.as_fd(), &cstring(dir)?, device)?;
+                Ok((fd, root.join(dir)))
+            }
+        },
     }
 }
 

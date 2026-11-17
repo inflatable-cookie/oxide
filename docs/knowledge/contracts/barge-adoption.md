@@ -3,11 +3,18 @@
 **Status (2026-11-18): lean reset; adoption in progress under oxide#314.**
 
 **Where the code stands.** `src/storage.rs` implements the declarations,
-administration and adoption below over the pinned release, with ordinary unit
-tests. The pool, output, prune and removable engines still drive their slot and
-root lifecycle through their own records; moving those internals onto this
-layer is the outstanding work of oxide#314 and is not claimed by this note.
-Nothing here authorizes a live installation or data migration. Tom's
+administration and adoption below over the pinned release. The pool engine uses
+it for its whole slot lifecycle: a slot is a Barge root, the lease carries the
+root's exclusive hold (inherited by the child launch path), idle reuse keeps the
+root's path and bytes, byte pressure retires one idle unpinned root, release and
+crash recovery follow the hold, and status reports the area's own accounting.
+Oxide's own eviction journal, holding-area deleter, capture machinery and
+inventory accounting are deleted with their tests.
+
+The output-root pins, the output prune path, removable-volume registration and
+the owned-delete/census modules still use their own records; moving those onto
+this layer is the outstanding work of oxide#314 and is not claimed here. Nothing
+here authorizes a live installation or data migration. Tom's
 2026-11-17 lean reset replaces the earlier custody scans, operation journal,
 capture/equivalence apparatus and native qualification ladders. The Barge
 library was reset to one lean core (barge#064, merged as barge#65) and Oxide

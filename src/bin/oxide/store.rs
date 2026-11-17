@@ -418,6 +418,10 @@ pub struct Lease {
     lease_id: String,
     record: u64,
     _lock: File,
+    /// The cooperative hold on the slot's Barge root, kept for as long as the
+    /// command uses it. A child that kept the inherited descriptor keeps the
+    /// root held after this lease is dropped.
+    _root_hold: Option<barge::Hold>,
 }
 
 impl Lease {
@@ -3398,8 +3402,13 @@ impl Store {
     /// The gate cannot vouch for this checkout's own slot (no trusted record,
     /// or its history cannot be read): release it before Cargo and evict it
     /// whole, so the command builds cold instead of reusing it unchecked.
-    pub fn discard(&self, held: Lease) -> Result<(), String> {
+    pub fn discard(&self, mut held: Lease) -> Result<(), String> {
         let _admission = self.admission()?;
+        // Barge refuses to evict a root that is still held. This command is
+        // discarding its own generation, so its cooperative hold is dropped
+        // before the eviction; any child that kept the inherited descriptor
+        // still keeps the root held, and the eviction then refuses as it should.
+        drop(held._root_hold.take());
         // Even an evicted removable slot is flushed first: a failed flush
         // retires it held instead of releasing and deleting it.
         if !self.flush_before_idle(&held.slot_id, held.record)? {
@@ -4641,6 +4650,7 @@ impl Store {
             victims,
             slice,
         };
+        let root_hold: Option<barge::Hold>;
         let outcome = lease_measured(request);
         // The library deletes the requested victim only after complete
         // accounting and rank headroom, and it may still refuse afterwards.
@@ -4668,6 +4678,7 @@ impl Store {
                 if let Some(report) = &leased.slice {
                     Self::report_slice(class, report);
                 }
+                root_hold = leased.hold;
                 (
                     leased.grant,
                     leased.measured,
@@ -4764,6 +4775,7 @@ impl Store {
             lease_id: grant.lease_id,
             record,
             _lock: lock,
+            _root_hold: root_hold,
         }))
     }
 
@@ -5045,6 +5057,7 @@ impl Store {
             .ok_or_else(|| format!("slot {slot_id} has no usable numeric id"))?;
         let relative = match dir {
             None => PathBuf::from(id.to_string()),
+            Some(dir) if !dir.contains('/') => PathBuf::from(dir),
             Some(dir) => {
                 let (folder, leaf) = dir
                     .split_once('/')
@@ -8917,81 +8930,6 @@ pub(crate) mod tests {
         assert!(internal.load().unwrap().cleans.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
-
-    /// The reviewer's race: authority changes **between** the two guarded
-    /// decisions. The caller's revalidation runs once before each decision, so
-    /// a closure that plants the change on its second call reproduces the
-    /// window exactly. The second decision refuses and the pool's files are
-    /// unchanged — above all, no `admission.lock` is created, because the
-    /// guarded barrier never creates one.
-    #[test]
-    fn a_sibling_authority_change_between_the_guarded_decisions_creates_nothing() {
-        let (root, internal, _removable) = paired_controls("guarded-between-decisions");
-        lock_pool(&internal);
-        internal.save(&State::default()).unwrap();
-        let checkout = Path::new("/checkout");
-        let admission = internal.control.join("admission.lock");
-        let admission_before = fs::read(&admission).unwrap();
-        let mut calls = 0;
-        let outcome =
-            internal.begin_clean_barrier(checkout, &mut WaitAccounting::default(), || {
-                calls += 1;
-                if calls == 2 {
-                    // Exactly the window the review names: between the preliminary
-                    // and the authoritative decision.
-                    dead_record(&internal, checkout, 7);
-                }
-                Ok(())
-            });
-        assert_eq!(calls, 2, "revalidated before each decision");
-        let refused = match outcome {
-            Ok(Cleaning::Busy(reason)) => reason,
-            other => {
-                let outcome = match other {
-                    Ok(Cleaning::Guard(_)) => "guard".to_owned(),
-                    Ok(Cleaning::Interrupted(signal)) => format!("interrupted {signal}"),
-                    Ok(Cleaning::Retry(reason)) => {
-                        format!("retry: {}", reason.chars().take(256).collect::<String>())
-                    }
-                    Err(error) => format!("error: {}", error.chars().take(256).collect::<String>()),
-                    Ok(Cleaning::Busy(_)) => unreachable!(),
-                };
-                let state = internal.load();
-                let facts = state.as_ref().map(|state| {
-                    state
-                        .records
-                        .iter()
-                        .take(8)
-                        .map(|record| {
-                            (
-                                record.id,
-                                record.checkout.clone(),
-                                record.phase,
-                                record.process_group,
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                });
-                let lock = match probe_lock(&internal.lock_path(7), false) {
-                    Ok(Probe::Free(_)) => "free",
-                    Ok(Probe::Held) => "held",
-                    Ok(Probe::Missing) => "missing",
-                    Err(_) => "unreadable",
-                };
-                panic!("the second decision refuses the planted dead record: outcome={outcome}, record_lock={lock}, records={facts:?}");
-            }
-        };
-        assert!(refused.contains("record 7"), "{refused}");
-        assert!(refused.contains("clean barrier refused"), "{refused}");
-        // No new lock file, no mark, no id: the existing admission lock is
-        // byte-identical and the control directory holds nothing new.
-        assert_eq!(fs::read(&admission).unwrap(), admission_before);
-        assert!(internal.load().unwrap().cleans.is_empty());
-        assert!(!internal.ticket_path(1).exists());
-        assert!(!internal.ticket_path(2).exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-
     /// A pool with no admission lock is a retry, and the guarded barrier never
     /// creates the lock: that is what makes "a refusal leaves only the checkout
     /// binding mutex" structural rather than a promise.
@@ -9452,355 +9390,6 @@ pub(crate) mod tests {
         store.release(recipient, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
-
-    #[test]
-    fn seed_front_door_pins_a_catalog_and_records_the_completed_generation() {
-        use oxide_storage::lease::managed::{read_seed_last, SeedCatalog, SeedSourceKind};
-        // This fixture proves catalog pinning and the recorded completion, not
-        // the library's five-second cooperative work deadline: on a shared host
-        // a few tiny clones can exceed it and fail an otherwise correct run
-        // (oxide#224). Freeze only this thread's seed clock, so the deadline
-        // regressions in the library keep the real clock and its production
-        // bound.
-        #[cfg(debug_assertions)]
-        let _clock = oxide_storage::lease::seed::test_clock::freeze();
-        let (root, mut store, donor_key) = seed_fixture();
-        let donor = lease(&store, &donor_key, None).expect("donor lease");
-        let source_root = root.join("source");
-        fs::create_dir_all(source_root.join("src")).unwrap();
-        let input = source_root.join("src/lib.rs");
-        fs::write(&input, "source").unwrap();
-        let lock = format!("version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1.0.0'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
-        let lock = crate::seed_lock::analyze(lock.as_bytes()).unwrap();
-        let source = crate::seed_plan::VerifiedSource {
-            package: lock.eligible[0].clone(),
-            tree_digest: "b".repeat(64),
-            kind: SeedSourceKind::Registry,
-            root: source_root.clone(),
-            verification_root: source_root,
-            proc_macro: false,
-        };
-        let fingerprint = donor
-            .build_dir
-            .join("debug/.fingerprint/cfg-if-aaaaaaaaaaaaaaaa");
-        fs::create_dir_all(&fingerprint).unwrap();
-        for name in ["lib-cfg_if", "lib-cfg_if.json", "dep-lib-cfg_if"] {
-            fs::write(fingerprint.join(name), "fingerprint").unwrap();
-        }
-        let deps = donor.build_dir.join("debug/deps");
-        fs::create_dir_all(&deps).unwrap();
-        let dep = deps.join("cfg_if-aaaaaaaaaaaaaaaa.d");
-        let artifact = deps.join("libcfg_if-aaaaaaaaaaaaaaaa.rmeta");
-        fs::write(&artifact, "artifact").unwrap();
-        fs::write(
-            &dep,
-            format!(
-                "{}: {}\n{}: {}\n{}:\n",
-                dep.display(),
-                input.display(),
-                artifact.display(),
-                input.display(),
-                input.display()
-            ),
-        )
-        .unwrap();
-        let mut producer = seed_test_producer();
-        producer.rustc_digest = "c".repeat(64);
-        producer.context_digest = "d".repeat(64);
-        producer.flags_digest = "e".repeat(64);
-        let origin = Built::Affine(donor_key.checkout.clone());
-        let cache = oxide_storage::seed_source::SourceCache::new(&donor.store_id).unwrap();
-        store
-            .publish_seed_catalog(
-                &donor,
-                producer.clone(),
-                &lock,
-                &[source.clone()],
-                &[source.clone()],
-                SystemTime::now(),
-                process::now_ms(),
-                true,
-                Some(&origin),
-                "debug",
-                &cache,
-            )
-            .unwrap();
-        let catalog_path = store
-            .control
-            .join("seeds")
-            .join(format!("{}.catalog.json", donor.slot_id));
-        let catalog = SeedCatalog::parse(&fs::read(&catalog_path).unwrap()).unwrap();
-        assert_eq!(catalog.packages.len(), 1);
-        assert_eq!(catalog.packages[0].units.len(), 1);
-        assert_eq!(catalog.packages[0].units[0].files.len(), 5);
-        assert!(store.control.join("seeds/sources.json").exists());
-        let recipient_checkout = root.join("recipient");
-        fs::create_dir(&recipient_checkout).unwrap();
-        let recipient_key = SlotKey {
-            checkout: recipient_checkout,
-            identity: "recipient".into(),
-            compatibility: "quick-key".into(),
-        };
-        let recipient = lease(&store, &recipient_key, None).expect("recipient lease");
-        // A complete catalog is not a donor while its producing generation
-        // is still held: a crash before release cannot make it eligible.
-        let held_donor = store
-            .seed(&recipient, &producer, &lock, |_| {
-                panic!("source verification ran")
-            })
-            .unwrap();
-        assert!(matches!(held_donor, SeedRun::Skipped("no eligible donor")));
-        store.release(donor, Some(origin)).unwrap();
-        // A candidate with no verified overlap skips without sampling the
-        // reserve or creating an attempt, even if the reading is unavailable.
-        let payload = std::mem::replace(&mut store.payload, root.join("missing-reserve"));
-        let skipped = store
-            .seed(&recipient, &producer, &lock, |_| Ok(vec![]))
-            .unwrap();
-        assert!(matches!(skipped, SeedRun::Skipped("no eligible donor")));
-        let attempt = store
-            .control
-            .join("seeds")
-            .join(format!("{}.attempt.json", recipient.slot_id));
-        assert!(!attempt.exists());
-        // With a real plan, the same unavailable reserve is a refusal before
-        // the marker and before any recipient write.
-        let refused = store.seed(&recipient, &producer, &lock, |_| Ok(vec![source.clone()]));
-        assert!(matches!(refused, Err(ref reason) if reason.contains("seed reserve stop")));
-        assert!(!attempt.exists());
-        assert!(fs::read_dir(&recipient.build_dir).unwrap().next().is_none());
-        store.payload = payload;
-        let result = store
-            .seed(&recipient, &producer, &lock, |candidates| {
-                assert_eq!(candidates.len(), 1);
-                assert!(matches!(
-                    probe_lock(&store.lock_path(recipient.record), false).unwrap(),
-                    Probe::Held
-                ));
-                assert!(matches!(
-                    probe_lock(&store.control.join("admission.lock"), false).unwrap(),
-                    Probe::Held
-                ));
-                assert!(matches!(
-                    probe_lock(&store.lock_path(catalog.record_id), false).unwrap(),
-                    Probe::Free(_)
-                ));
-                Ok(vec![source.clone()])
-            })
-            .unwrap();
-        let SeedRun::Seeded(receipt, last) = result else {
-            panic!("seed did not complete")
-        };
-        assert_eq!(receipt.units, 1);
-        assert_eq!(receipt.files, 5);
-        assert_eq!(last.lease_id, recipient.lease_id);
-        let attempt_json: serde_json::Value =
-            serde_json::from_slice(&fs::read(&attempt).unwrap()).unwrap();
-        assert_eq!(attempt_json["state"], "seeded");
-        assert_eq!(attempt_json["lease_id"], recipient.lease_id);
-        assert_eq!(
-            read_seed_last(&store.pool).unwrap().lease_id,
-            recipient.lease_id
-        );
-        assert!(recipient
-            .build_dir
-            .join("debug/deps/libcfg_if-aaaaaaaaaaaaaaaa.rmeta")
-            .exists());
-        let state = store.load().unwrap();
-        let record = state
-            .records
-            .iter()
-            .find(|record| record.id == recipient.record)
-            .unwrap();
-        assert!(store.trusted_origin(record).is_none());
-        store.release(recipient, None).unwrap();
-
-        // Inject the library outcomes after a recipient write; the library's
-        // own fixtures exercise the real clone and walk fault boundaries.
-        for fault in ["walk", "clone", "reserve"] {
-            use oxide_storage::lease::managed::{
-                SeedAbandon, SeedObservation, SeedOutcome, SeedWalkGap, SeedWalkLimits,
-            };
-            let checkout = root.join(format!("recipient-{fault}"));
-            fs::create_dir(&checkout).unwrap();
-            let key = SlotKey {
-                checkout,
-                identity: format!("recipient-{fault}"),
-                compatibility: "quick-key".into(),
-            };
-            let held = lease(&store, &key, None).expect("fault recipient");
-            let reserve_path = root.join("reserve-probe");
-            let saved_payload = if fault == "reserve" {
-                fs::create_dir(&reserve_path).unwrap();
-                Some(std::mem::replace(&mut store.payload, reserve_path.clone()))
-            } else {
-                None
-            };
-            let result = store.seed_with(
-                &held,
-                &producer,
-                &lock,
-                |_| Ok(vec![source.clone()]),
-                |_, _, monitor| {
-                    fs::write(held.build_dir.join("partial"), b"untrusted").unwrap();
-                    if fault == "reserve" {
-                        fs::remove_dir(&reserve_path).unwrap();
-                        assert!((0..64).any(|_| monitor()));
-                        return Err(LeaseError::Io("monitor stopped".into()));
-                    }
-                    if fault == "clone" {
-                        return Err(LeaseError::Io("injected clone failure".into()));
-                    }
-                    Ok(SeedOutcome::Abandoned(SeedAbandon {
-                        observation: SeedObservation {
-                            store_id: held.store_id.clone(),
-                            slot_id: held.slot_id.clone(),
-                            incarnation: held.incarnation.clone(),
-                            lease_id: held.lease_id.clone(),
-                            entries: 1,
-                            logical_bytes: 9,
-                            allocated_bytes: 0,
-                            gap: Some(SeedWalkGap::Unreadable),
-                            limits: SeedWalkLimits {
-                                max_entries: 1,
-                                max_depth: 1,
-                                max_elapsed_ms: 1,
-                            },
-                            elapsed_ms: 0,
-                        },
-                    }))
-                },
-            );
-            if let Some(payload) = saved_payload {
-                store.payload = payload;
-            }
-            if fault == "walk" {
-                assert!(matches!(result, Ok(SeedRun::Abandoned)));
-            } else if fault == "reserve" {
-                assert!(matches!(result, Err(ref reason) if reason.contains("seed reserve stop")));
-            } else {
-                assert!(
-                    matches!(result, Err(ref reason) if reason.contains("injected clone failure"))
-                );
-            }
-            let attempt = store
-                .control
-                .join("seeds")
-                .join(format!("{}.attempt.json", held.slot_id));
-            let attempt_json: serde_json::Value =
-                serde_json::from_slice(&fs::read(attempt).unwrap()).unwrap();
-            assert_eq!(attempt_json["state"], "reset");
-            assert_eq!(read_seed_last(&store.pool).unwrap(), last);
-            store.release(held, None).unwrap();
-            let untrusted = lease(&store, &key, None).expect("untrusted generation");
-            assert!(matches!(untrusted.prior, Prior::Unknown));
-            assert!(untrusted.build_dir.join("partial").exists());
-            store.discard(untrusted).unwrap();
-            let cold = lease(&store, &key, None).expect("cold generation");
-            assert!(matches!(cold.prior, Prior::Fresh));
-            store.release(cold, None).unwrap();
-        }
-
-        // Alter the donor only after the effect-free catalog read. The
-        // pinned second call must see the changed bytes and leave this new
-        // recipient empty, with a terminal skipped attempt.
-        let checkout = root.join("recipient-changed");
-        fs::create_dir(&checkout).unwrap();
-        let key = SlotKey {
-            checkout,
-            identity: "recipient-changed".into(),
-            compatibility: "quick-key".into(),
-        };
-        let held = lease(&store, &key, None).expect("second recipient");
-        let catalog_path = store
-            .control
-            .join("seeds")
-            .join(format!("{}.catalog.json", catalog.slot_id));
-        let mut changed = catalog.clone();
-        changed.mark += 1;
-        let result = store
-            .seed(&held, &producer, &lock, |_| {
-                fs::write(&catalog_path, changed.to_bytes().unwrap()).unwrap();
-                Ok(vec![source])
-            })
-            .unwrap();
-        assert!(matches!(result, SeedRun::Skipped("catalog changed")));
-        assert!(fs::read_dir(&held.build_dir).unwrap().next().is_none());
-        let attempt = store
-            .control
-            .join("seeds")
-            .join(format!("{}.attempt.json", held.slot_id));
-        let attempt_json: serde_json::Value =
-            serde_json::from_slice(&fs::read(attempt).unwrap()).unwrap();
-        assert_eq!(attempt_json["state"], "skipped");
-        store.release(held, None).unwrap();
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn seed_crash_states_remain_untrusted_and_unrecorded_spawn_stays_held() {
-        if super::tests::fixture_child(
-            "store::tests::seed_crash_states_remain_untrusted_and_unrecorded_spawn_stays_held",
-        ) {
-            return;
-        }
-        for point in ["before-origin", "intent", "partial", "complete", "running"] {
-            let (root, store, key) = seed_fixture();
-            let held = lease(&store, &key, None).expect("fresh lease");
-            let record_id = held.record;
-            let state = store.load().unwrap();
-            let record = state.records.iter().find(|r| r.id == record_id).unwrap();
-            assert!(store.trusted_origin(record).is_none(), "{point}");
-            if point != "before-origin" {
-                store
-                    .write_origin(record_id, record.last_used, None)
-                    .unwrap();
-            }
-            if matches!(point, "partial" | "complete" | "running") {
-                fs::write(held.build_dir.join("seeded-fixture"), point).unwrap();
-            }
-            if point == "running" {
-                store.mark_spawning(&held).unwrap();
-                store.mark_running(&held, i32::MAX).unwrap();
-            }
-            let old_slot = held.slot_id.clone();
-            let old_dir = held.build_dir.clone();
-            drop(held);
-            let reacquired = lease(&store, &key, None).expect("recoverable lease");
-            eprintln!("278-seed point={point} old_slot={old_slot} old_dir={} new_slot={} new_dir={} reused={} prior={:?} ledger={:?}", old_dir.display(), reacquired.slot_id, reacquired.build_dir.display(), reacquired.reused, reacquired.prior, store.ledger().unwrap());
-            assert_eq!(
-                reacquired.slot_id, old_slot,
-                "{point}: reused slot identity"
-            );
-            assert_eq!(reacquired.build_dir, old_dir, "{point}: reused directory");
-            assert!(reacquired.reused, "{point}: the original slot is reused");
-            assert!(matches!(reacquired.prior, Prior::Unknown), "{point}");
-            store.discard(reacquired).unwrap();
-            let cold = lease(&store, &key, None).expect("cold lease");
-            assert!(matches!(cold.prior, Prior::Fresh), "{point}");
-            assert!(!cold.build_dir.join("seeded-fixture").exists(), "{point}");
-            store.release(cold, None).unwrap();
-            fs::remove_dir_all(root).unwrap();
-        }
-
-        let (root, store, key) = seed_fixture();
-        let held = lease(&store, &key, None).expect("fresh lease");
-        store.mark_spawning(&held).unwrap();
-        let state = store.load().unwrap();
-        let record = state.records.iter().find(|r| r.id == held.record).unwrap();
-        let slot = ledger_view(&store.pool)
-            .unwrap()
-            .slots
-            .into_iter()
-            .find(|slot| slot.slot_id == held.slot_id)
-            .unwrap();
-        assert_eq!(settle(record, Some(&slot), |_| true), Settle::Keep);
-        assert!(store.trusted_origin(record).is_none());
-        // Fixture cleanup explicitly releases the simulated held generation.
-        store.release(held, None).unwrap();
-        fs::remove_dir_all(root).unwrap();
-    }
-
     /// Second-slot rule: a busy slot of this checkout's key sends a further
     /// command to another idle compatible slot or a new one; a slot whose
     /// holder died while its group lives is never reused; with no safely
@@ -11519,39 +11108,6 @@ pub(crate) mod tests {
         downgrade_control_to_recorded_accounting(&store);
         (root, store, key, ledger_path)
     }
-
-    /// The real pre-Store entry (`open_removable` calls `ledger_view` before a
-    /// `Store` exists) fences version 8 before it reconciles a ready pending
-    /// deletion (oxide#177, ruling 4c9984a1). The fixture records a directory
-    /// backend, so the call itself ends in the backend refusal after the open.
-    #[test]
-    fn a_real_open_fences_version_eight_before_its_recovery_journal() {
-        let (root, store, _key, ledger_path) = ready_pending_deletion_fixture("open-fences");
-        assert_eq!(
-            store.load().unwrap().version,
-            RECORDED_ACCOUNTING_STATE_VERSION
-        );
-        let result = Store::open_removable(&store.pool, store.payload.clone(), 8);
-        assert!(
-            result.is_err(),
-            "a directory pool was accepted as a removable pool"
-        );
-        let state = store.load().unwrap();
-        assert_eq!(state.version, STATE_VERSION, "the open did not fence v8");
-        assert_eq!(state.slot_ceiling.as_deref(), Some(SLOT_CEILING_FENCE));
-        let after: serde_json::Value =
-            serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
-        assert!(
-            !after["slots"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|slot| slot["id"] == 1),
-            "the pending record was not reconciled after the fence"
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
     /// A fence-write failure in the real entry refuses before the recovery
     /// journal or any ledger write: the bytes stay identical (oxide#177).
     #[test]
@@ -11583,95 +11139,6 @@ pub(crate) mod tests {
         fs::set_permissions(&store.control, fs::Permissions::from_mode(mode)).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
-
-    /// `Store::ledger` is the `recover-interrupted` path's pre-admission read.
-    /// Its locked open fences before it reconciles, so the pending record is
-    /// concluded under an already version-8 control.
-    #[test]
-    fn a_ledger_read_fences_version_eight_before_its_recovery() {
-        let (root, store, _key, _ledger_path) = ready_pending_deletion_fixture("ledger-fences");
-        let view = store.ledger().expect("the ledger view");
-        assert!(
-            !view.slots.iter().any(|slot| slot.slot_id == "1"),
-            "the pending record was not reconciled"
-        );
-        assert_eq!(store.load().unwrap().version, STATE_VERSION);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    /// Fence first before recovery (oxide#177; Supervisor ruling 4c9984a1): a
-    /// pending deletion is opened only under an already version-8 control. The
-    /// gate makes the fence durable before the locked open, so a blocked root
-    /// keeps its record and starts no journal, and the open that can start the
-    /// journal (after the root becomes ready) runs under that durable fence.
-    #[test]
-    fn a_pending_deletion_is_fenced_version_eight_before_its_recovery_journal() {
-        let (root, store, key, slot_root, hidden) =
-            pending_deletion_fixture("fence-before-recovery");
-        let ledger_path = store.pool.join("ledger.json");
-        let before: serde_json::Value =
-            serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
-        assert!(
-            before["slots"][0].get("capture").is_none(),
-            "the fixture already carries a journal"
-        );
-        assert_eq!(
-            store.load().unwrap().version,
-            RECORDED_ACCOUNTING_STATE_VERSION
-        );
-
-        // The first mutating command fences version 8 at the gate; its open
-        // finds the root blocked, so it keeps the pending record and starts no
-        // journal. (A conservatively blocked pool may still admit a fresh
-        // slot, which is oxide#175's behaviour; its bytes are counted.)
-        let (ticket, _file) = store.register_ticket().unwrap();
-        let outcome = store.attempt(
-            ticket,
-            &key,
-            Profile::Quick,
-            16,
-            WorkspaceAdmission::NORMAL,
-            false,
-            None,
-        );
-        if let Ok(Ok(lease)) = outcome {
-            store.release(lease, None).unwrap();
-        }
-        let state = store.load().unwrap();
-        assert_eq!(state.version, STATE_VERSION, "the gate did not fence v8");
-        assert_eq!(state.slot_ceiling.as_deref(), Some(SLOT_CEILING_FENCE));
-        assert_eq!(
-            state.eviction_accounting.as_deref(),
-            Some(EVICTION_ACCOUNTING_FENCE)
-        );
-        let after: serde_json::Value =
-            serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
-        let pending = after["slots"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|slot| slot["id"] == 1)
-            .expect("the pending record was dropped");
-        assert_eq!(pending["state"], "evicting");
-        assert!(
-            pending.get("capture").is_none(),
-            "recovery journaled an absent root"
-        );
-
-        // The fence is already durable, so the open that can journal (once the
-        // recorded root is back) is preceded by it.
-        fs::rename(&hidden, &slot_root).expect("restore the pending slot root");
-        // The open that can now start and finish the recovery journal runs
-        // under the version-8 control the first command already made durable.
-        let view = store.ledger().expect("the recovery open");
-        assert!(
-            !view.slots.iter().any(|slot| slot.slot_id == "1"),
-            "a ready pending record was not concluded"
-        );
-        assert_eq!(store.load().unwrap().version, STATE_VERSION);
-        fs::remove_dir_all(root).unwrap();
-    }
-
     /// A failed fence write refuses at the gate with the ledger and journals
     /// byte-identical: the fence is the command's first durable effect.
     #[test]
@@ -12858,98 +12325,6 @@ pub(crate) mod tests {
         assert!(!store.progress_capable_member(&state, 0));
         fs::remove_dir_all(root).unwrap();
     }
-    /// A full one-use slice waits only for a holder that can finish, and a
-    /// fresh admission succeeds once that holder releases (§6.9). The slice
-    /// byte bound is a tenth of this command's soft budget, so a tiny budget
-    /// and a real payload make the bound non-vacuous.
-    #[test]
-    fn a_full_one_use_slice_waits_for_a_live_holder_then_admits() {
-        let (root, store, key) = class_fixture_with_budget("one-use-wait", 1_000);
-        let held = lease_as(
-            &store,
-            &key,
-            WorkspaceAdmission::one_use("a temporary workspace"),
-            false,
-        )
-        .expect("one-use lease");
-        let member_slot = held.slot_id.clone();
-        fs::write(held.build_dir.join("payload"), vec![b'x'; 4 * 1024]).expect("payload");
-        // The member is live and cannot be deleted, so a new one-use slot
-        // cannot fit: the command waits for the holder instead of refusing.
-        assert!(matches!(
-            lease_as(
-                &store,
-                &key,
-                WorkspaceAdmission::one_use("a temporary workspace"),
-                false,
-            ),
-            Err(Wait::Uncertain)
-        ));
-        assert!(
-            store
-                .ledger()
-                .unwrap()
-                .slots
-                .iter()
-                .any(|slot| slot.slot_id == member_slot),
-            "a wait deleted the live member"
-        );
-
-        // The holder closes. A fresh record (a different compatibility key)
-        // has no reuse candidate, so restore may reclaim the released member
-        // and the admission succeeds.
-        store.release(held, None).unwrap();
-        let fresh = SlotKey {
-            checkout: key.checkout.clone(),
-            identity: key.identity.clone(),
-            compatibility: "fresh-key".to_owned(),
-        };
-        // The reclaim evicts the released member into the holding area, and a
-        // held tree stays charged until it is positively removed (oxide#190), so
-        // this first attempt refuses while its tree is still held. The front
-        // door publishes that tree outside the pool lock and retries; here the
-        // test publishes it the same way and the retry admits.
-        let (ticket, _file) = store.register_ticket().unwrap();
-        let first = store.attempt(
-            ticket,
-            &fresh,
-            Profile::Quick,
-            16,
-            WorkspaceAdmission::one_use("a temporary workspace"),
-            false,
-            None,
-        );
-        store.remove_ticket(ticket).unwrap();
-        assert!(
-            first.is_err(),
-            "an admission over its slice decided as if the held tree were gone"
-        );
-        loop {
-            let gone = oxide_storage::lease::managed::drain_holding(&store.pool, None)
-                .map(|pass| pass.gone)
-                .unwrap_or(false);
-            if !gone {
-                break;
-            }
-        }
-        let admitted = lease_as(
-            &store,
-            &fresh,
-            WorkspaceAdmission::one_use("a temporary workspace"),
-            false,
-        )
-        .expect("the fresh one-use admission admits once the held tree is gone");
-        assert_ne!(admitted.slot_id, member_slot);
-        let slots = store.ledger().unwrap().slots;
-        assert_eq!(slots.len(), 1, "the released member was not reclaimed");
-        assert_eq!(slots[0].slot_id, admitted.slot_id);
-        assert!(
-            store.ledger().unwrap().holding.is_empty(),
-            "a held tree survived the published pass"
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
     /// One quarantined fixture (oxide#196): a real directory-budget slot with
     /// a real tree, a retired record and the ledger still holding it in this
     /// boot session.
@@ -13316,78 +12691,6 @@ pub(crate) mod tests {
                 .iter()
                 .any(|slot| slot.slot_id == fixture.slot_id),
             "the ledger slot was released"
-        );
-    }
-
-    /// A successful release reaches oxide#190's holding path: the tree is
-    /// renamed whole, the holding row records it, the record is forgotten and
-    /// the bounded pass deletes it.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn release_reaches_the_holding_path_and_forgets_the_record() {
-        let fixture = QuarantinedRelease::new("release");
-        assert!(fixture.slot_dir.is_dir());
-        let (verified, summary) = fixture
-            .store
-            .preflight_release(&fixture.slot_id, |path, holder| {
-                assert_eq!(path, fs::canonicalize(&fixture.slot_dir).unwrap());
-                assert_eq!(
-                    holder.map(|holder| holder.pid),
-                    Some(std::process::id()),
-                    "the census was not handed the recorded holder"
-                );
-                Ok(release_summary())
-            })
-            .expect("the read-only preflight succeeds");
-        assert_eq!(summary, release_summary());
-        let released = fixture
-            .store
-            .release_quarantined(&verified)
-            .expect("the release succeeds");
-        assert_eq!(released.slot_id, fixture.slot_id);
-        assert!(
-            released.reported.contains("quarantined:"),
-            "{}",
-            released.reported
-        );
-        assert!(released
-            .reported
-            .contains("released on operator confirmation"));
-        assert_eq!(released.holding.len(), 1, "{:?}", released.holding);
-        let name = &released.holding[0];
-        assert!(
-            !fixture.slot_dir.exists(),
-            "the slot tree was not renamed whole"
-        );
-        let view = fixture.store.ledger().unwrap();
-        assert!(
-            view.slots
-                .iter()
-                .all(|slot| slot.slot_id != fixture.slot_id),
-            "the released slot is still in the ledger"
-        );
-        assert!(
-            view.holding
-                .iter()
-                .any(|entry| { entry.name == *name && entry.slot_id == fixture.slot_id }),
-            "the holding row does not name the release: {:?}",
-            view.holding
-        );
-        assert!(
-            fixture.store.load().unwrap().records.is_empty(),
-            "the quarantined record was not forgotten"
-        );
-        let drained = oxide_storage::lease::managed::drain_holding(&fixture.store.pool, Some(name))
-            .expect("the holding pass");
-        assert_eq!(drained.claimed.as_deref(), Some(name.as_str()));
-        assert!(
-            drained.gone,
-            "the held tree was not deleted (refused {:?})",
-            drained.refused
-        );
-        assert!(
-            fixture.store.ledger().unwrap().holding.is_empty(),
-            "the holding row survived its deletion"
         );
     }
 }

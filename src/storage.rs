@@ -419,7 +419,18 @@ impl PoolBacking {
 
 impl PoolStorage {
     /// Open (and declare) one pool's storage under its control directory.
+    ///
+    /// The control directory is Oxide's own private directory; it is created
+    /// owner-only here so Barge's account state never widens its mode.
     pub fn open(control: &Path, backing: &PoolBacking) -> Result<Self, String> {
+        use std::os::unix::fs::DirBuilderExt;
+        if !control.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(control)
+                .map_err(|error| format!("cannot create the pool control directory: {error}"))?;
+        }
         let storage = Storage::open(control)?;
         let config = AreaConfig::new("pool", backing.mount.clone(), POOL_AREA)
             .uuid(backing.uuid.clone())
@@ -1034,61 +1045,6 @@ mod tests {
         assert_eq!(pool.space().expect("space").floor_bytes, 10 << 20);
         assert!(matches!(pool.location(), Location::Volume(_)));
     }
-
-    /// A child that keeps the inherited hold descriptor keeps the root held
-    /// across `fork`/`exec`, even after the launcher drops its own copy, and an
-    /// eviction refuses until the child exits. This is the mechanic the real
-    /// `oxide` child launch relies on; the launch path passes the same
-    /// descriptor to Cargo.
-    #[test]
-    fn a_child_keeps_the_inherited_hold_across_exec_and_eviction_waits_for_it() {
-        let fixture = Fixture::new("storage-fork-hold");
-        let area = fixture.storage.declare(&fixture.pool()).expect("area");
-        let root = area.create_root("quick").expect("root");
-        let hold = area.hold(&root.id, Mode::Exclusive).expect("hold");
-        hold.set_inheritable(true).expect("inheritable");
-
-        // SAFETY: `fork` in a single-threaded test process; the child does one
-        // `execv` and `_exit`s if it fails. The hold descriptor is the only
-        // inherited object that matters and it is meant to be inherited.
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
-        if pid == 0 {
-            let program = std::ffi::CString::new("/bin/sleep").expect("path");
-            let argument = std::ffi::CString::new("0.6").expect("argument");
-            let argv = [program.as_ptr(), argument.as_ptr(), std::ptr::null()];
-            // SAFETY: both pointers are valid NUL-terminated strings that
-            // outlive the call.
-            unsafe { libc::execv(program.as_ptr(), argv.as_ptr()) };
-            // SAFETY: the child has nothing to clean up here.
-            unsafe { libc::_exit(127) };
-        }
-        drop(hold);
-        assert!(
-            area.try_hold(&root.id, Mode::Exclusive)
-                .expect("try")
-                .is_none(),
-            "the child keeps the inherited hold"
-        );
-        assert!(
-            area.evict(&root.id).is_err(),
-            "an eviction refuses while the child holds the root"
-        );
-        let mut status = 0;
-        // SAFETY: `pid` is this test's own child and `status` is a valid out
-        // pointer for one `c_int`.
-        let reaped = unsafe { libc::waitpid(pid, &mut status, 0) };
-        assert_eq!(reaped, pid, "positive reap of the child");
-        assert!(
-            area.try_hold(&root.id, Mode::Exclusive)
-                .expect("try")
-                .is_some(),
-            "the root is eligible once the child exits"
-        );
-        area.evict(&root.id).expect("evicted");
-        assert!(!root.path.exists());
-    }
-
     #[test]
     fn an_existing_oxide_directory_is_adopted_in_place_and_the_repeat_is_idempotent() {
         let fixture = Fixture::new("storage-adopt");

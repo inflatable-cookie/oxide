@@ -516,18 +516,7 @@ pub fn scope_directory(
 /// Exclude exact pending names before metadata lookup. This is only for
 /// admission accounting that separately charges each isolated name; it is
 /// never evidence of ownership or authority to mutate the excluded tree.
-pub(crate) fn scope_directory_isolating(
-    root: &Path,
-    stops: &[PathBuf],
-    isolated: &[PathBuf],
-    limits: InventoryLimits,
-) -> Result<InventoryReport, InventoryError> {
-    #[cfg(debug_assertions)]
-    walk_observer::record_scope(root);
-    inventory_with(root, limits, stops, isolated)
-}
-
-fn inventory_with(
+pub(crate) fn inventory_with(
     root: &Path,
     limits: InventoryLimits,
     stops: &[PathBuf],
