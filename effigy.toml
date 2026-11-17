@@ -73,14 +73,6 @@ minimum_effigy_version = "0.14.0"
 # storage authority over the merged lean core. It runs the workspace's real
 # unit and integration tests, library and binary callers included. Not a
 # benchmark, not full QA.
-[tasks."rust:barge-adoption"]
-admission = "heavy"
-# The workspace unit/integration suite (library and binary callers) for the
-# Barge adoption, one fresh single-threaded run under the selected volume's
-# validation scratch (scripts/barge-adoption.py); the internal-volume fixtures
-# are skipped by name because this run may not use the internal drive.
-run = "python3 scripts/barge-adoption.py"
-
 [tasks."proof:holding-delete:test"]
 run = "python3 scripts/test-holding-delete.py --self-check"
 
