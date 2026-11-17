@@ -83,6 +83,8 @@ struct Row {
     receipt: PathBuf,
     member: String,
     root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    barge_id: Option<String>,
     root_kind: RootKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     volume_uuid: Option<String>,
@@ -361,6 +363,7 @@ fn seed_registry(control: &Path, registry: &mut Registry) -> Result<(), String> 
                     receipt: outputs::receipt_path_public(control, &stub.checkout_id),
                     member: member.to_owned(),
                     root: selected.root().to_path_buf(),
+                    barge_id: None,
                     root_kind: selected.kind(),
                     volume_uuid: selected.volume_uuid().map(str::to_owned),
                     recipe: outputs::RECIPE_PUBLIC.to_owned(),
@@ -471,7 +474,8 @@ fn read_registry(control: &Path) -> Result<Option<Registry>, String> {
         return Ok(None);
     };
     let mut bytes = Vec::new();
-    file.take(MAX_REGISTRY_BYTES + 1).read_to_end(&mut bytes)
+    file.take(MAX_REGISTRY_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_REGISTRY_BYTES {
         return Err(format!(
@@ -773,6 +777,14 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
     }
     note_reservation(&mut registry, receipt, &receipt_path, checkout_volume_uuid)?;
     pin_references(control, receipt)?;
+    for row in &mut registry.rows {
+        if !row.live() || !row.root.is_dir() { continue; }
+        let selected = Selected { kind: row.root_kind, root: row.root.clone(), volume_uuid: row.volume_uuid.clone(),
+            nonce: row.nonce.clone(), generation: row.generation };
+        let area = output_area(control, &selected)?;
+        if let Some(root) = area.list().map_err(|error| error.to_string())?.roots.into_iter()
+            .find(|root| root.path == row.root) { row.barge_id = Some(root.id); }
+    }
     write_registry(control, &registry)
 }
 
@@ -863,6 +875,7 @@ fn note_placement(
                     receipt: receipt_path.to_path_buf(),
                     member: member.to_owned(),
                     root: selected.root().to_path_buf(),
+                    barge_id: None,
                     root_kind: selected.kind(),
                     volume_uuid: selected.volume_uuid().map(str::to_owned),
                     recipe: outputs::RECIPE_PUBLIC.to_owned(),
@@ -895,6 +908,7 @@ fn note_placement(
                     receipt: receipt_path.to_path_buf(),
                     member: member.to_owned(),
                     root: proposed.root().to_path_buf(),
+                    barge_id: None,
                     root_kind: proposed.kind(),
                     volume_uuid: proposed.volume_uuid().map(str::to_owned),
                     recipe: outputs::RECIPE_PUBLIC.to_owned(),
@@ -1038,6 +1052,7 @@ fn note_reservation(
         receipt: receipt_path.to_path_buf(),
         member: member.to_owned(),
         root: reserved.root.clone(),
+        barge_id: None,
         root_kind: reserved.kind,
         volume_uuid: reserved.volume_uuid.clone(),
         recipe: outputs::RECIPE_PUBLIC.to_owned(),
@@ -1407,14 +1422,18 @@ pub(crate) fn test_rows(
         .collect())
 }
 
-
 /// A separate account per physical output location keeps the declaration
 /// literally `oxide/outputs`, including checkout-local roots. The identity is
 /// the location's stable path, not whether a removable drive is present today.
 fn output_area(control: &Path, selected: &Selected) -> Result<barge::Area, String> {
-    let parent = selected.root().parent().ok_or("an output root has no parent")?;
+    let parent = selected
+        .root()
+        .parent()
+        .ok_or("an output root has no parent")?;
     let mount = parent.parent().ok_or("an output area has no mount")?;
-    let folder = parent.file_name().and_then(|name| name.to_str())
+    let folder = parent
+        .file_name()
+        .and_then(|name| name.to_str())
         .ok_or("an output area folder is not UTF-8")?;
     let location = sha256_hex(parent.as_os_str().as_encoded_bytes());
     let storage = Storage::open(&control.join("output-storage").join(location))?;
@@ -1423,8 +1442,12 @@ fn output_area(control: &Path, selected: &Selected) -> Result<barge::Area, Strin
     } else {
         None
     };
-    storage.declare(&AreaConfig::new("outputs", mount, "outputs")
-        .uuid(uuid).folder(folder).floor_bytes(0))
+    storage.declare(
+        &AreaConfig::new("outputs", mount, "outputs")
+            .uuid(uuid)
+            .folder(folder)
+            .floor_bytes(0),
+    )
 }
 
 fn output_id(selected: &Selected) -> String {
@@ -1433,37 +1456,63 @@ fn output_id(selected: &Selected) -> String {
 
 /// Import only after the caller's Oxide marker and receipt selection agree.
 /// A retired generation can never re-import a stray at its former path.
-fn import_output(control: &Path, checkout: &Path, checkout_id: &str, selected: &Selected)
-    -> Result<(barge::Area, String), String>
-{
+fn import_output(
+    control: &Path,
+    checkout: &Path,
+    checkout_id: &str,
+    selected: &Selected,
+) -> Result<(barge::Area, String), String> {
     let marker = outputs::read_marker_for_prune(selected.root())?;
     if !marker.is_owned_by(checkout, checkout_id)
         || marker.kind() != selected.kind()
         || marker.volume_uuid() != selected.volume_uuid()
-        || selected.nonce().is_some_and(|nonce| marker.nonce() != Some(nonce))
+        || selected
+            .nonce()
+            .is_some_and(|nonce| marker.nonce() != Some(nonce))
     {
-        return Err(format!("{} has a foreign output identity; retained", selected.root().display()));
+        return Err(format!(
+            "{} has a foreign output identity; retained",
+            selected.root().display()
+        ));
     }
-    if read_registry(control)?.is_some_and(|registry| registry.rows.iter().any(|row|
-        row.root == selected.root() && row.nonce.as_deref() == selected.nonce()
-            && row.pruned_ms.is_some()))
-    {
+    if read_registry(control)?.is_some_and(|registry| {
+        registry.rows.iter().any(|row| {
+            row.root == selected.root()
+                && row.nonce.as_deref() == selected.nonce()
+                && row.pruned_ms.is_some()
+        })
+    }) {
         return Err("a retired output generation cannot adopt its old path".to_owned());
     }
     let area = output_area(control, selected)?;
+    if let Some(id) = read_registry(control)?.and_then(|registry| registry.rows.into_iter()
+        .find(|row| row.root == selected.root() && row.barge_id.is_some()).and_then(|row| row.barge_id))
+    {
+        let root = area.resolve(&id).map_err(|error| format!("the recorded Barge output generation is unavailable: {error}"))?;
+        if root.path != selected.root() { return Err("the recorded Barge output ID moved".to_owned()); }
+        return Ok((area, id));
+    }
     let mut identity = selected.clone();
     identity.generation = marker.generation();
     let listing = area.list().map_err(|error| error.to_string())?;
-    let id = listing.roots.iter().find(|root| root.path == selected.root())
-        .map(|root| root.id.clone()).unwrap_or_else(|| output_id(&identity));
-    let folder = selected.root().file_name().and_then(|name| name.to_str())
+    let id = listing
+        .roots
+        .iter()
+        .find(|root| root.path == selected.root())
+        .map(|root| root.id.clone())
+        .unwrap_or_else(|| output_id(&identity));
+    let folder = selected
+        .root()
+        .file_name()
+        .and_then(|name| name.to_str())
         .ok_or("an output root folder is not UTF-8")?;
     // Resolve first: an existing matching import keeps exactly its path.
     match area.resolve(&id) {
         Ok(root) if root.path == selected.root() => {}
         Ok(_) => return Err("the output ID resolves to another path".to_owned()),
         Err(error) if error.kind() == barge::ErrorKind::NotFound => {
-            area.adopt_root(folder, "outputs", &id).map_err(|error| error.to_string())?;
+            area.adopt_root(folder, "outputs", &id)
+                .map_err(|error| error.to_string())?;
         }
         Err(error) => return Err(error.to_string()),
     }
@@ -1472,45 +1521,83 @@ fn import_output(control: &Path, checkout: &Path, checkout_id: &str, selected: &
 
 fn pin_references(control: &Path, receipt: &Receipt) -> Result<(), String> {
     for placement in receipt.links() {
-        for (selected, pending) in placement.selected_ref().filter(|_| receipt.holds_selection())
-            .map(|selected| (selected, false)).into_iter()
-            .chain(placement.prepared_ref().map(|prepared| (&prepared.to, true)))
+        for (selected, pending) in placement
+            .selected_ref()
+            .filter(|_| receipt.holds_selection())
+            .map(|selected| (selected, false))
+            .into_iter()
+            .chain(
+                placement
+                    .prepared_ref()
+                    .map(|prepared| (&prepared.to, true)),
+            )
         {
             match fs::symlink_metadata(selected.root()) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.to_string()),
                 Ok(_) => {}
             }
-            if pending && fs::symlink_metadata(selected.root().join(outputs::MARKER))
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) { continue; }
-            let (area, id) = import_output(control, receipt.checkout(), receipt.checkout_id(), selected)?;
-            area.pin(&id, "selected by an Oxide output receipt").map_err(|error| error.to_string())?;
+            if pending
+                && fs::symlink_metadata(selected.root().join(outputs::MARKER))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                continue;
+            }
+            let (area, id) =
+                import_output(control, receipt.checkout(), receipt.checkout_id(), selected)?;
+            area.pin(&id, "selected by an Oxide output receipt")
+                .map_err(|error| error.to_string())?;
         }
     }
     Ok(())
 }
 
 /// Pin the newly established root before a member link can expose it.
-pub(crate) fn pin_output(control: &Path, checkout: &Path, checkout_id: &str, selected: &Selected)
-    -> Result<(), String>
-{
+pub(crate) fn pin_output(
+    control: &Path,
+    checkout: &Path,
+    checkout_id: &str,
+    selected: &Selected,
+) -> Result<(), String> {
     let (area, id) = import_output(control, checkout, checkout_id, selected)?;
-    area.pin(&id, "selected by an Oxide output receipt").map_err(|error| error.to_string())
+    area.pin(&id, "selected by an Oxide output receipt")
+        .map_err(|error| error.to_string())?;
+    record_import(control, selected.root(), &id)
 }
 
 /// Release old selections only after their replacement receipt is durable.
 /// A crash before this step leaves an extra pin, never an exposed selection.
 pub(crate) fn finish_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
     let registry = ready_registry(control)?;
-    for row in registry.rows.iter().filter(|row| row.checkout_id == receipt.checkout_id()
-        && !row.selected && !row.pending && row.reservation.is_none() && row.pruned_ms.is_none())
-    {
-        if registry.rows.iter().any(|other| other.root == row.root && other.live()) { continue; }
-        let selected = Selected { kind: row.root_kind, root: row.root.clone(),
-            volume_uuid: row.volume_uuid.clone(), nonce: row.nonce.clone(), generation: row.generation };
+    for row in registry.rows.iter().filter(|row| {
+        row.checkout_id == receipt.checkout_id()
+            && !row.selected
+            && !row.pending
+            && row.reservation.is_none()
+            && row.pruned_ms.is_none()
+    }) {
+        if registry
+            .rows
+            .iter()
+            .any(|other| other.root == row.root && other.live())
+        {
+            continue;
+        }
+        let selected = Selected {
+            kind: row.root_kind,
+            root: row.root.clone(),
+            volume_uuid: row.volume_uuid.clone(),
+            nonce: row.nonce.clone(),
+            generation: row.generation,
+        };
         let area = output_area(control, &selected)?;
-        let id = area.list().map_err(|error| error.to_string())?.roots.into_iter()
-            .find(|root| root.path == selected.root()).map(|root| root.id)
+        let id = area
+            .list()
+            .map_err(|error| error.to_string())?
+            .roots
+            .into_iter()
+            .find(|root| root.path == selected.root())
+            .map(|root| root.id)
             .unwrap_or_else(|| output_id(&selected));
         match area.unpin(&id) {
             Ok(()) => {}
@@ -1526,11 +1613,21 @@ pub(crate) fn finish_receipt(control: &Path, receipt: &Receipt) -> Result<(), St
 pub(crate) fn hold_outputs(control: &Path, receipt: &Receipt) -> Result<Vec<barge::Hold>, String> {
     let mut held = Vec::new();
     let mut ids = std::collections::HashSet::new();
-    for selected in receipt.links().iter().filter_map(|placement| placement.selected_ref()) {
-        if !receipt.holds_selection() || !ids.insert(selected.root().to_path_buf()) { continue; }
-        let (area, id) = import_output(control, receipt.checkout(), receipt.checkout_id(), selected)?;
-        area.pin(&id, "selected by an Oxide output receipt").map_err(|error| error.to_string())?;
-        let hold = area.try_hold(&id, barge::Mode::Shared).map_err(|error| error.to_string())?
+    for selected in receipt
+        .links()
+        .iter()
+        .filter_map(|placement| placement.selected_ref())
+    {
+        if !receipt.holds_selection() || !ids.insert(selected.root().to_path_buf()) {
+            continue;
+        }
+        let (area, id) =
+            import_output(control, receipt.checkout(), receipt.checkout_id(), selected)?;
+        area.pin(&id, "selected by an Oxide output receipt")
+            .map_err(|error| error.to_string())?;
+        let hold = area
+            .try_hold(&id, barge::Mode::Shared)
+            .map_err(|error| error.to_string())?
             .ok_or("the output root is held exclusively")?;
         held.push(hold.into_inheritable().map_err(|error| error.to_string())?);
     }
@@ -1549,23 +1646,43 @@ fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
     let mut roots = Vec::new();
     let mut locations = std::collections::HashSet::new();
     for row in &registry.rows {
-        if row.pruned_ms.is_some() { continue; }
-        let selected = Selected { kind: row.root_kind, root: row.root.clone(),
-            volume_uuid: row.volume_uuid.clone(), nonce: row.nonce.clone(), generation: row.generation };
-        let Some(parent) = selected.root().parent() else { continue; };
-        if !locations.insert(parent.to_path_buf()) { continue; }
+        if row.pruned_ms.is_some() {
+            continue;
+        }
+        let selected = Selected {
+            kind: row.root_kind,
+            root: row.root.clone(),
+            volume_uuid: row.volume_uuid.clone(),
+            nonce: row.nonce.clone(),
+            generation: row.generation,
+        };
+        let Some(parent) = selected.root().parent() else {
+            continue;
+        };
+        if !locations.insert(parent.to_path_buf()) {
+            continue;
+        }
         let area = output_area(control, &selected)?;
         let listing = area.list().map_err(|error| error.to_string())?;
         for root in listing.roots {
-            if root.idle_and_unpinned() { roots.push(root.path); }
+            if root.idle_and_unpinned() {
+                roots.push(root.path);
+            }
         }
     }
-    roots.sort(); roots.dedup();
-    Ok(Preview { version: "oxide.outputs.barge-prune/1".to_owned(), registry_revision: registry.revision, roots })
+    roots.sort();
+    roots.dedup();
+    Ok(Preview {
+        version: "oxide.outputs.barge-prune/1".to_owned(),
+        registry_revision: registry.revision,
+        roots,
+    })
 }
 
 pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
-    let words = args.iter().map(|word| word.to_str().ok_or("arguments must be UTF-8"))
+    let words = args
+        .iter()
+        .map(|word| word.to_str().ok_or("arguments must be UTF-8"))
         .collect::<Result<Vec<_>, _>>()?;
     if matches!(words.as_slice(), ["prune", "--help" | "-h"]) {
         println!("usage: oxide outputs prune --dry-run\n       oxide outputs prune --plan FILE --plan-sha256 HEX\n\nBarge prunes idle unpinned output roots; selected member roots stay pinned.");
@@ -1576,7 +1693,9 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
     let _guard = store::publication_guard(control)?;
     let mut registry = require_ready(&internal, control)?;
     if registry.unfinished_intents().next().is_some() {
-        return Err("historical output prune intents remain unsettled; their roots are retained".to_owned());
+        return Err(
+            "historical output prune intents remain unsettled; their roots are retained".to_owned(),
+        );
     }
     let planned = preview(control, &registry)?;
     let bytes = serde_json::to_vec_pretty(&planned).map_err(|error| error.to_string())?;
@@ -1621,7 +1740,10 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
 
 pub fn status_lines(control: &Path) -> Vec<String> {
     match read_registry(control) {
-        Ok(Some(registry)) => vec![format!("outputs: {} references; pruning uses Barge holds and pins", registry.rows.len())],
+        Ok(Some(registry)) => vec![format!(
+            "outputs: {} references; pruning uses Barge holds and pins",
+            registry.rows.len()
+        )],
         Ok(None) => vec!["outputs: no selections recorded".to_owned()],
         Err(reason) => vec![format!("outputs: unavailable ({reason})")],
     }
@@ -1630,7 +1752,14 @@ pub fn status_lines(control: &Path) -> Vec<String> {
 #[cfg(test)]
 pub(crate) fn test_output_storage(control: &Path, selected: &Selected) -> (barge::Area, String) {
     let area = output_area(control, selected).unwrap();
-    let id = area.list().unwrap().roots.into_iter().find(|root| root.path == selected.root()).unwrap().id;
+    let id = area
+        .list()
+        .unwrap()
+        .roots
+        .into_iter()
+        .find(|root| root.path == selected.root())
+        .unwrap()
+        .id;
     (area, id)
 }
 
@@ -1638,15 +1767,39 @@ pub(crate) fn test_output_storage(control: &Path, selected: &Selected) -> (barge
 /// replaced old marker is never ownership for another generation.
 pub(crate) fn needs_successor(control: &Path, root: &Path) -> Result<bool, String> {
     let Some(registry) = read_registry(control)? else { return Ok(false); };
-    Ok(registry.rows.iter().any(|row| row.root == root &&
-        (row.pruned_ms.is_some() || (row.marker_digest.is_some()
-            && fs::symlink_metadata(root.join(outputs::MARKER))
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)))))
+    for row in registry.rows.iter().filter(|row| row.root == root) {
+        if row.pruned_ms.is_some() { return Ok(true); }
+        if let Some(id) = &row.barge_id {
+            let selected = Selected { kind: row.root_kind, root: row.root.clone(), volume_uuid: row.volume_uuid.clone(),
+                nonce: row.nonce.clone(), generation: row.generation };
+            match output_area(control, &selected)?.resolve(id) {
+                Ok(found) if found.path == root => {}
+                Ok(_) => return Ok(true),
+                Err(error) if error.kind() == barge::ErrorKind::NotFound => return Ok(true),
+                Err(error) => return Err(error.to_string()),
+            }
+        } else if row.marker_digest.is_some() && fs::symlink_metadata(root.join(outputs::MARKER))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) { return Ok(true); }
+    }
+    Ok(false)
 }
 
 pub(crate) fn fresh_output(control: &Path, selected: &Selected) -> Result<barge::Root, String> {
     let area = output_area(control, selected)?;
-    let root = area.create_root("outputs").map_err(|error| error.to_string())?;
-    area.pin(&root.id, "Oxide output transition").map_err(|error| error.to_string())?;
+    let root = area
+        .create_root("outputs")
+        .map_err(|error| error.to_string())?;
+    area.pin(&root.id, "Oxide output transition")
+        .map_err(|error| error.to_string())?;
     Ok(root)
+}
+
+fn record_import(control: &Path, root: &Path, id: &str) -> Result<(), String> {
+    let Some(mut registry) = read_registry(control)? else { return Ok(()); };
+    let mut changed = false;
+    for row in registry.rows.iter_mut().filter(|row| row.root == root) {
+        if row.barge_id.as_deref() != Some(id) { row.barge_id = Some(id.to_owned()); changed = true; }
+    }
+    if changed { registry.bump()?; write_registry(control, &registry)?; }
+    Ok(())
 }

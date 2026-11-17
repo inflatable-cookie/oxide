@@ -505,6 +505,7 @@ impl Reservation {
 impl Receipt {
     /// A receipt for a checkout that has never converted: the legacy
     /// whole-target layout, selected by nothing.
+    #[cfg(test)]
     fn first(checkout: &Path, checkout_id: &str) -> Self {
         Self::first_with(checkout, checkout_id, LayoutKind::WholeTarget)
     }
@@ -1759,7 +1760,7 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
             holders
         }
     };
-    let usable = usable_external(context);
+    let usable = external_choice(context)?;
     let next = next_generation;
     let external = usable
         .as_ref()
@@ -2359,7 +2360,7 @@ fn adopt_under_barrier(
     receipt: Receipt,
 ) -> Result<(Receipt, Selected, bool), String> {
     let target = context.target()?;
-    let usable = usable_external(context);
+    let usable = external_choice(context)?;
     let spec = match &usable {
         Ok(registration) => external_spec(registration, &context.workspace),
         Err(_) => local_spec(&context.workspace),
@@ -3926,7 +3927,7 @@ fn adopt_profile_from(
             let desired = match &desired {
                 Some(desired) => desired.clone(),
                 None => {
-                    let usable = usable_external(context);
+                    let usable = external_choice(context)?;
                     let spec = match &usable {
                         Ok(registration) => external_spec(registration, &context.workspace),
                         Err(_) => local_spec(&context.workspace),
@@ -4119,7 +4120,7 @@ pub fn auto_adopt(
         Some(store.owner_control().to_path_buf()),
         checkout.to_path_buf(),
     );
-    let current = usable_external(&context);
+    let current = external_choice(&context)?;
     let facts = AutoFacts {
         selected_permanent,
         same_selection: current.as_ref().is_ok_and(|registration| {
@@ -4164,7 +4165,7 @@ pub fn auto_adopt(
         if context.receipt()?.is_some() || context.target()? != TargetState::Missing {
             return Ok(None);
         }
-        let Ok(registration) = usable_external(&context) else {
+        let Ok(registration) = external_choice(&context)? else {
             return Ok(None);
         };
         let spec = external_spec(&registration, checkout);
@@ -4852,7 +4853,10 @@ fn bind_under_binding(
             },
         },
     };
-    let usable = usable_external(context);
+    let usable = match external_choice(context) {
+        Ok(usable) => usable,
+        Err(reason) => return Bind::Refuse(reason),
+    };
     if wanted.kind == RootKind::External {
         if let Err(reason) = &usable {
             return Bind::Refuse(format!(
@@ -6021,7 +6025,7 @@ fn desired_selection(context: &Context, receipt: &Receipt) -> Result<Option<Sele
     }
     let next = receipt.generation.saturating_add(1);
     let spec = if context.mode()? == Some(DriveMode::Permanent) {
-        match usable_external(context) {
+        match external_choice(context)? {
             Ok(registration) => external_spec(&registration, &context.workspace),
             Err(_) => local_spec(&context.workspace),
         }
@@ -6914,40 +6918,66 @@ fn release_barrier(store: &Store, guard: CleanGuard) -> Result<(), String> {
     store.abandon_clean(guard)
 }
 
-/// The registered volume when the permanent drive is usable right now.
-fn usable_external(context: &Context) -> Result<removable::Registration, String> {
-    let control = context
-        .control()
-        .ok_or("no internal pool exists, so no removable drive is registered")?;
-    let registration =
-        removable::read_registration(control)?.ok_or("no removable drive is registered")?;
+/// Only positive absence selects checkout-local fallback. Identity failures,
+/// a different registered volume and unwritable storage refuse the command.
+/// Existing declarations route through Barge's location; a legacy read-only
+/// plan observes its platform seam without importing state as a side effect.
+fn external_choice(context: &Context) -> Result<Result<removable::Registration, String>, String> {
+    use barge::Os;
+    let Some(control) = context.control() else {
+        return Ok(Err("no removable drive is registered".to_owned()));
+    };
+    let Some(registration) = removable::read_registration(control)? else {
+        return Ok(Err("no removable drive is registered".to_owned()));
+    };
     if registration.mode != DriveMode::Permanent {
-        return Err("the drive is not in permanent mode".to_owned());
+        return Ok(Err("the drive is not in permanent mode".to_owned()));
     }
     if let Some(reason) = context.pool_fallback.as_deref() {
-        return Err(format!(
-            "this command's intermediate slot fell back to the internal pool ({reason}), so the drive's removal is not supervised"
-        ));
+        return Ok(Err(format!("this command's intermediate slot fell back to the internal pool ({reason})")));
     }
-    if !cfg!(target_os = "macos") {
-        return Err("the removable backend is macOS-only".to_owned());
+    let state = removable::removable_control(control);
+    let present = if state.join("barge/areas").is_dir() {
+        let storage = oxide_storage::storage::Storage::open(&state)?;
+        let area = storage.areas()?.into_iter().find(|area| area.key().label() == "oxide/pool")
+            .ok_or("the registered Barge pool area is missing")?;
+        if area.volume().spec().mount != registration.mount_point
+            || !area.volume().spec().uuid.eq_ignore_ascii_case(&registration.volume_uuid) {
+            return Err("the output registration differs from Barge's volume".to_owned());
+        }
+        external_location(&area)?
+    } else {
+        match oxide_storage::storage::OxideOs.volume_identity(&registration.mount_point)
+            .map_err(|error| error.to_string())? {
+            None => false,
+            Some(uuid) if uuid.eq_ignore_ascii_case(&registration.volume_uuid) => true,
+            Some(uuid) => return Err(format!("output volume identity mismatch: expected {}, found {uuid}; refusing fallback", registration.volume_uuid)),
+        }
+    };
+    if !present {
+        return Ok(Err(format!("registered volume {} is absent", registration.mount_point.display())));
     }
-    let binding = Binding::open(&registration.mount_point, Some(&registration.volume_uuid))?;
-    if !volume::writable(binding.mount_point())? {
-        return Err("the volume is not writable".to_owned());
+    if !volume::writable(&registration.mount_point)? {
+        return Err("the registered output volume is not writable".to_owned());
     }
-    let facts = binding.verify()?;
-    let available = facts
-        .available_bytes
-        .ok_or("the volume's free space is unknown")?;
-    if available <= registration.reserve_bytes {
-        return Err(format!(
-            "{} MiB available is not above the {} MiB reserve",
-            available / crate::MIB,
-            registration.reserve_bytes / crate::MIB
-        ));
+    // Reserve is a Barge pruning trigger, never permission to change volumes.
+    Ok(Ok(registration))
+}
+
+fn external_location(area: &barge::Area) -> Result<bool, String> {
+    match area.location().map_err(|error| error.to_string())? {
+        barge::Location::Volume(_) => Ok(true),
+        barge::Location::Fallback(_) => Ok(false),
+        barge::Location::Unavailable(_) => match area.volume().state().map_err(|error| error.to_string())? {
+            barge::VolumeState::Absent => Ok(false),
+            _ => Err("the registered output volume is unavailable".to_owned()),
+        },
     }
-    Ok(registration)
+}
+
+#[cfg(test)]
+fn usable_external(context: &Context) -> Result<removable::Registration, String> {
+    external_choice(context)?
 }
 
 fn external_spec(registration: &removable::Registration, checkout: &Path) -> RootSpec {
@@ -6967,7 +6997,7 @@ fn current_or_successor_spec(
     spec: RootSpec,
 ) -> Result<RootSpec, String> {
     let wanted = spec.selected(0);
-    if let Some(selected) = receipt
+    for selected in receipt
         .roots
         .iter()
         .rev()
@@ -6977,13 +7007,16 @@ fn current_or_successor_spec(
                 .iter()
                 .filter_map(|placement| placement.selected_ref()),
         )
-        .find(|selected| {
+        .filter(|selected| {
             selected.kind == wanted.kind
                 && selected.volume_uuid == wanted.volume_uuid
                 && selected.root.parent() == wanted.root.parent()
                 && read_marker(&selected.root).is_ok()
         })
     {
+        if let Some(control) = context.control() {
+            if crate::prune::needs_successor(control, &selected.root)? { continue; }
+        }
         return Ok(spec_for(selected));
     }
     let Some(control) = context.control() else {
@@ -18729,6 +18762,7 @@ mod tests {
         fs::create_dir(&foreign).unwrap();
         fs::write(foreign.join("keep"), b"foreign bytes").unwrap();
         symlink(&foreign, selected.root().join("foreign-link")).unwrap();
+        let copied_marker = fs::read(selected.root().join(MARKER)).unwrap();
         let holds = crate::prune::hold_outputs(&fixture.control, &committed).unwrap();
         let (detached, changed) = detach_profile(&context, &fixture.control, committed).unwrap();
         assert!(changed);
@@ -18742,6 +18776,7 @@ mod tests {
         assert_eq!(fs::read(foreign.join("keep")).unwrap(), b"foreign bytes");
         fs::create_dir(selected.root()).unwrap();
         fs::write(selected.root().join("stray"), b"unowned").unwrap();
+        fs::write(selected.root().join(MARKER), copied_marker).unwrap();
         let (_, successor, _) = adopt_profile(&context, detached).unwrap();
         assert_ne!(successor.root(), selected.root());
         assert_eq!(fs::read(selected.root().join("stray")).unwrap(), b"unowned");
@@ -18753,4 +18788,25 @@ mod tests {
             .to_string()
             .contains("pinned"));
     }
+    #[test]
+    fn output_location_distinguishes_absence_mismatch_and_pressure() {
+        use std::sync::Arc;
+        let fixture = Fixture::new();
+        let mount = fixture.root.join("fake-volume");
+        fs::create_dir(&mount).unwrap();
+        let uuid = "1E8E7F10-0000-4000-8000-000000000001";
+        let os = barge::FakeOs::with_volume(&mount, uuid, 0);
+        let storage = oxide_storage::storage::Storage::open_with(fixture.root.join("barge-state"),
+            Arc::new(os.clone()), Arc::new(barge::ManualClock::new(1000))).unwrap();
+        let area = storage.declare(&oxide_storage::storage::AreaConfig::new("outputs", &mount, "outputs")
+            .uuid(Some(uuid.to_owned())).folder("oxide-outputs").reserve_bytes(1024).floor_bytes(512)).unwrap();
+        assert!(external_location(&area).unwrap(), "low free space never changes output volumes");
+        os.set_uuid(&mount, None);
+        assert!(!external_location(&area).unwrap());
+        os.set_uuid(&mount, Some("1E8E7F10-0000-4000-8000-000000000002"));
+        assert!(external_location(&area).is_err());
+        os.set_uuid(&mount, Some(uuid));
+        assert!(external_location(&area).unwrap());
+    }
+
 }
