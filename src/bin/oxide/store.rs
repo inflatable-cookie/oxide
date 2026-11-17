@@ -10878,6 +10878,35 @@ pub(crate) mod tests {
         outcome
     }
 
+    /// The checkout's clean barrier still refuses while this checkout holds a
+    /// lease and proceeds once it is released.
+    /// The checkout's clean barrier still refuses while this checkout holds a
+    /// lease (non-blocking Barrier mode) and proceeds once it is released.
+    #[test]
+    fn a_clean_barrier_refuses_a_held_lease_and_proceeds_after_release() {
+        let (_root, store, key) = class_fixture("clean-barrier");
+        let held = lease(&store, &key, None).unwrap();
+        let mut waits = WaitAccounting::default();
+        let refused = store
+            .begin_clean_barrier(&key.checkout, &mut waits, || Ok(()))
+            .unwrap();
+        assert!(
+            matches!(
+                refused,
+                Cleaning::Retry(_) | Cleaning::Busy(_) | Cleaning::Interrupted(_)
+            ),
+            "clean must refuse while the checkout holds a lease"
+        );
+        store.release(held, None).unwrap();
+        match store
+            .begin_clean_barrier(&key.checkout, &mut waits, || Ok(()))
+            .unwrap()
+        {
+            Cleaning::Guard(guard) => store.abandon_clean(guard).unwrap(),
+            _ => panic!("expected a clean guard after release"),
+        }
+    }
+
     #[test]
     fn warm_reuse_has_no_measurement_sidecar() {
         let (root, store, key) = class_fixture("warm-reuse-size");
