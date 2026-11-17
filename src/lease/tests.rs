@@ -663,3 +663,14 @@ fn passive_open_time_consumes_the_callers_measurement_budget() {
     ));
     assert!(managed::measure_within(&pool, 1_000).is_ok());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_directory_pool_opens_through_the_production_storage_seam() {
+    let fixture = Fixture::new("linux-production-directory");
+    let pool = fixture.pool();
+    let first = managed::ledger_view(&pool).expect("ordinary directory pool opens on Linux");
+    let again = managed::ledger_view(&pool).expect("recorded filesystem identity is reusable");
+    assert_eq!(first.store_id, again.store_id);
+    assert_eq!(first.backend, "directory-budget-v1");
+}

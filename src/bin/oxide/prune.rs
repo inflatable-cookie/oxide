@@ -1442,7 +1442,10 @@ pub(crate) fn test_rows(
 /// A separate account per physical output location keeps the declaration
 /// literally `oxide/outputs`, including checkout-local roots. The identity is
 /// the location's stable path, not whether a removable drive is present today.
-fn output_area(control: &Path, selected: &Selected) -> Result<barge::Area, String> {
+fn output_area_config(
+    control: &Path,
+    selected: &Selected,
+) -> Result<(PathBuf, AreaConfig), String> {
     let parent = selected
         .root()
         .parent()
@@ -1453,18 +1456,35 @@ fn output_area(control: &Path, selected: &Selected) -> Result<barge::Area, Strin
         .and_then(|name| name.to_str())
         .ok_or("an output area folder is not UTF-8")?;
     let location = sha256_hex(parent.as_os_str().as_encoded_bytes());
-    let storage = Storage::open(&control.join("output-storage").join(location))?;
+    let account = control.join("output-storage").join(location);
     let uuid = if oxide_storage::storage::is_drive_mount_point(mount) {
         selected.volume_uuid.clone()
     } else {
         None
     };
-    storage.declare(
-        &AreaConfig::new("outputs", mount, "outputs")
+    Ok((
+        account,
+        AreaConfig::new("outputs", mount, "outputs")
             .uuid(uuid)
             .folder(folder)
             .floor_bytes(0),
-    )
+    ))
+}
+
+fn output_area(control: &Path, selected: &Selected) -> Result<barge::Area, String> {
+    let (account, config) = output_area_config(control, selected)?;
+    Storage::open(&account)?.declare(&config)
+}
+
+fn existing_output_area(
+    control: &Path,
+    selected: &Selected,
+) -> Result<Option<barge::Area>, String> {
+    let (account, config) = output_area_config(control, selected)?;
+    if !account.join("barge/areas").is_dir() {
+        return Ok(None);
+    }
+    Storage::open(&account)?.existing_area(&config)
 }
 
 fn output_id(selected: &Selected) -> String {
@@ -1703,16 +1723,9 @@ fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
         if !locations.insert(parent.to_path_buf()) {
             continue;
         }
-        let location = sha256_hex(parent.as_os_str().as_encoded_bytes());
-        if !control
-            .join("output-storage")
-            .join(location)
-            .join("barge/areas")
-            .is_dir()
-        {
+        let Some(area) = existing_output_area(control, &selected)? else {
             continue;
-        }
-        let area = output_area(control, &selected)?;
+        };
         for root in area.list().map_err(|error| error.to_string())?.roots {
             let recorded = registry
                 .rows
@@ -1751,11 +1764,11 @@ fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
     })
 }
 
-fn evict_planned(
+fn evict_planned_root(
     control: &Path,
-    registry: &mut Registry,
+    registry: &Registry,
     planned: &PlannedRoot,
-) -> Result<bool, String> {
+) -> Result<barge::area::Eviction, String> {
     let row = registry
         .rows
         .iter()
@@ -1782,9 +1795,23 @@ fn evict_planned(
     if root.path != planned.path {
         return Err("the planned Barge root moved; retained".to_owned());
     }
-    // Barge re-resolves this exact ID under its eviction lock. A replacement
-    // after the check can never substitute its ID for the one the user saw.
-    let result = area.evict(&planned.id).map_err(|error| error.to_string())?;
+    // The supplier must validate this ID's current marker under its locks
+    // through rename; an outer path check cannot supply that authority.
+    area.evict(&planned.id).map_err(|error| error.to_string())
+}
+
+#[derive(Debug)]
+enum EvictError {
+    Retained(String),
+    Publication(String),
+}
+
+fn evict_planned(
+    control: &Path,
+    registry: &mut Registry,
+    planned: &PlannedRoot,
+) -> Result<bool, EvictError> {
+    let result = evict_planned_root(control, registry, planned).map_err(EvictError::Retained)?;
     for row in registry
         .rows
         .iter_mut()
@@ -1792,9 +1819,38 @@ fn evict_planned(
     {
         row.pruned_ms = Some(process::now_ms());
     }
-    registry.bump()?;
-    write_registry(control, registry)?;
+    registry
+        .bump()
+        .and_then(|()| write_registry(control, registry))
+        .map_err(|error| {
+            EvictError::Publication(format!(
+                "Barge evicted {} ({}), but the output registry could not be published: {error}",
+                planned.path.display(),
+                planned.id
+            ))
+        })?;
     Ok(result.deleted)
+}
+
+fn execute_plan(control: &Path, registry: &mut Registry, planned: &Preview) -> Result<(), String> {
+    for root in &planned.roots {
+        match evict_planned(control, registry, root) {
+            Ok(deleted) => println!(
+                "{}: {}",
+                root.path.display(),
+                if deleted {
+                    "removed"
+                } else {
+                    "kept in Barge trash"
+                }
+            ),
+            Err(EvictError::Retained(error)) => {
+                eprintln!("oxide: kept {}: {error}", root.path.display())
+            }
+            Err(EvictError::Publication(error)) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
@@ -1806,9 +1862,19 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
         println!("usage: oxide outputs prune --dry-run\n       oxide outputs prune --plan FILE --plan-sha256 HEX\n\nBarge prunes idle unpinned output roots; selected member roots stay pinned.");
         return Ok(0);
     }
-    let internal = internal_store()?;
+    let dry_run = matches!(words.as_slice(), ["prune", "--dry-run"]);
+    let internal = if dry_run {
+        Store::open_recorded(&store::settings()?)?
+            .ok_or("no internal pool exists; run a building oxide command first")?
+    } else {
+        internal_store()?
+    };
     let control = internal.owner_control();
-    let _guard = store::publication_guard(control)?;
+    let _guard = if dry_run {
+        None
+    } else {
+        Some(store::publication_guard(control)?)
+    };
     let mut registry = require_ready(&internal, control)?;
     if registry.unfinished_intents().next().is_some() {
         return Err(
@@ -1834,13 +1900,7 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
             if sha256_hex(given) != *hash || given != bytes {
                 return Err("the output prune plan changed; take a new preview".to_owned());
             }
-            for root in &planned.roots {
-                match evict_planned(control, &mut registry, root) {
-                    Ok(deleted) => println!("{}: {}", root.path.display(),
-                        if deleted { "removed" } else { "kept in Barge trash" }),
-                    Err(error) => eprintln!("oxide: kept {}: {error}", root.path.display()),
-                }
-            }
+            execute_plan(control, &mut registry, &planned)?;
         }
         ["resolve-intent", _] => return Err("historical prune intents are retained; the Barge replacement does not replay old deletion journals".to_owned()),
         _ => return Err("usage: oxide outputs prune --dry-run | --plan FILE --plan-sha256 HEX".to_owned()),
@@ -1939,8 +1999,16 @@ fn record_import(control: &Path, root: &Path, id: &str) -> Result<(), String> {
 mod plan_identity_tests {
     use super::*;
 
-    #[test]
-    fn replacing_a_root_at_the_planned_path_never_deletes_the_replacement() {
+    struct Fixture {
+        _temp: barge::testing::TempDir,
+        control: PathBuf,
+        area: barge::Area,
+        original: barge::Root,
+        registry: Registry,
+        plan: Preview,
+    }
+
+    fn fixture() -> Fixture {
         let fixture = barge::testing::TempDir::new("oxide-prune-identity").unwrap();
         let control = fixture.path().join("control");
         fs::create_dir(&control).unwrap();
@@ -1984,10 +2052,53 @@ mod plan_identity_tests {
         historical.member = "target".to_owned();
         historical.barge_id = None;
         registry.rows.push(historical);
+        write_registry(&control, &registry).unwrap();
         let plan = preview(&control, &registry).unwrap();
         assert_eq!(plan.roots.len(), 1);
         assert_eq!(plan.roots[0].id, original.id);
         assert_eq!(plan.roots[0].area, "oxide/outputs");
+        Fixture {
+            _temp: fixture,
+            control,
+            area,
+            original,
+            registry,
+            plan,
+        }
+    }
+
+    #[test]
+    fn registry_write_failure_after_eviction_is_a_failed_execution() {
+        let Fixture {
+            _temp,
+            control,
+            area,
+            original,
+            mut registry,
+            plan,
+        } = fixture();
+        let path = registry_path(&control);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("block-publication"), b"keep").unwrap();
+        let error = execute_plan(&control, &mut registry, &plan).unwrap_err();
+        assert!(error.contains("Barge evicted"), "{error}");
+        assert!(error.contains("could not be published"), "{error}");
+        assert!(!original.path.exists());
+        assert!(area.resolve(&original.id).is_err());
+        assert_eq!(fs::read(path.join("block-publication")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn replacing_a_root_at_the_planned_path_never_deletes_the_replacement() {
+        let Fixture {
+            _temp,
+            control,
+            area,
+            original,
+            mut registry,
+            plan,
+        } = fixture();
         let revision = registry.revision;
         area.evict(&original.id).unwrap();
         fs::create_dir(&original.path).unwrap();

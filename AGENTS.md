@@ -49,6 +49,8 @@ dogfood finding. Preserve the ordinary routing and existing compiler profiles.
   Run both compile selectors for unconditional Rust changes.
 - `rust:format`: check formatting; `rust:format-write`: apply it during authoring.
 - `rust:compile-linux`: offline compile for the already-installed target only.
+- `rust:barge-adoption-linux`: compile all targets, including the Linux pool
+  regression, for that installed target; no linking or runtime claim.
 - `docs:check`: links, retired concepts, changelog and whitespace.
 - `rust:barge-adoption`: ordinary heavy covering workspace unit/integration
   suite for oxide#314, with no named skips and fresh fixtures below task TMPDIR.

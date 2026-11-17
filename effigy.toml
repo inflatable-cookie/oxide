@@ -70,6 +70,12 @@ else
 fi
 exit "$adoption_exit"'''
 
+# Compile the production Linux seam and its cfg(linux) regression on the
+# already-installed target. This does not link, execute or install anything.
+[tasks."rust:barge-adoption-linux"]
+admission = "heavy"
+run = "oxide check --workspace --all-targets --locked --offline --target x86_64-unknown-linux-gnu"
+
 # Apply formatting during source authoring; rust:format remains check-only.
 [tasks."rust:format-write"]
 run = "oxide fmt --all"

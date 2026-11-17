@@ -135,8 +135,9 @@ impl AreaConfig {
     }
 }
 
-/// Barge's platform seam with Oxide's one extra fact: a stale `/Volumes/<name>`
-/// directory left on the boot disk is not a volume.
+/// Barge's platform seam for macOS mount roots and Linux directory filesystems.
+/// A stale `/Volumes/<name>` directory on macOS's boot disk is absent; Linux
+/// directory pools use the kernel filesystem identity through `DirectoryOs`.
 ///
 /// Barge's own `volume_identity` answers the UUID of the filesystem that holds
 /// any path, so on a directory left behind by an unclean detach it would report
@@ -152,7 +153,7 @@ pub struct OxideOs;
 
 impl barge::Os for OxideOs {
     fn volume_identity(&self, mount: &Path) -> barge::Result<Option<String>> {
-        if is_drive_mount_point(mount) {
+        if cfg!(target_os = "macos") && is_drive_mount_point(mount) {
             // A path that does not exist is positively absent; a stale
             // directory (a positive observation that this is not the volume's
             // mount root) is absent too; any observation failure is unknown
@@ -175,7 +176,84 @@ impl barge::Os for OxideOs {
                 ))),
             };
         }
+        #[cfg(target_os = "linux")]
+        {
+            barge::Os::volume_identity(&DirectoryOs, mount)
+        }
+        #[cfg(not(target_os = "linux"))]
         barge::os::platform().volume_identity(mount)
+    }
+
+    fn free_bytes(&self, path: &Path) -> barge::Result<u64> {
+        barge::os::platform().free_bytes(path)
+    }
+}
+
+/// Directory backends on Linux use the kernel filesystem ID, not an APFS UUID.
+/// Encode that observed ID in a namespaced UUID so Barge can compare it on each
+/// open. A missing directory is absent; an unreadable/zero ID is unknown.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug)]
+struct DirectoryOs;
+
+#[cfg(any(target_os = "linux", test))]
+impl barge::Os for DirectoryOs {
+    fn volume_identity(&self, path: &Path) -> barge::Result<Option<String>> {
+        use sha2::{Digest, Sha256};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+        {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(barge::Error::unknown_state(format!(
+                    "cannot open directory filesystem at {}: {error}",
+                    path.display()
+                )))
+            }
+        };
+        let mut facts = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: the file owns a live directory descriptor and facts is a
+        // writable statvfs buffer; it is read only after a successful call.
+        #[allow(unsafe_code)]
+        let result = unsafe { libc::fstatvfs(directory.as_raw_fd(), facts.as_mut_ptr()) };
+        if result != 0 {
+            return Err(barge::Error::unknown_state(format!(
+                "cannot read directory filesystem at {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: fstatvfs succeeded and initialized this buffer.
+        #[allow(unsafe_code)]
+        let facts = unsafe { facts.assume_init() };
+        if facts.f_fsid == 0 {
+            return Err(barge::Error::unknown_state(
+                "directory filesystem reports no filesystem ID",
+            ));
+        }
+        let mut digest = Sha256::digest(
+            format!("oxide.directory-filesystem.statvfs.v1:{}", facts.f_fsid).as_bytes(),
+        );
+        digest[6] = (digest[6] & 0x0f) | 0x80;
+        digest[8] = (digest[8] & 0x3f) | 0x80;
+        let hex: String = digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect();
+        Ok(Some(format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )))
     }
 
     fn free_bytes(&self, path: &Path) -> barge::Result<u64> {
@@ -326,6 +404,47 @@ impl Storage {
                 config.volume
             )
         })
+    }
+
+    /// Find an existing declaration without registering a volume or declaring
+    /// an area. Missing state is not permission to publish a new declaration.
+    pub fn existing_area(&self, config: &AreaConfig) -> Result<Option<Area>, String> {
+        let Some(area) = self
+            .areas()?
+            .into_iter()
+            .find(|area| area.key().label() == config.key())
+        else {
+            return Ok(None);
+        };
+        let proposed = barge::AreaRecord {
+            schema: barge::area::AREA_SCHEMA.to_owned(),
+            namespace: NAMESPACE.to_owned(),
+            name: config.area.clone(),
+            volume: config.volume.clone(),
+            folder: Some(config.folder.clone()),
+            absent: match &config.fallback {
+                Some(path) => Absent::Fallback { path: path.clone() },
+                None => Absent::Fail,
+            },
+            soft_cap_bytes: config.soft_cap_bytes,
+            counts_toward_reserve: true,
+        };
+        let differing = area.record().differing_fields(&proposed);
+        let volume = area.volume().spec();
+        if !differing.is_empty()
+            || volume.mount != config.mount
+            || volume.root_dir != config.root_dir
+            || config
+                .uuid
+                .as_ref()
+                .is_some_and(|uuid| !uuid.eq_ignore_ascii_case(&volume.uuid))
+        {
+            return Err(format!(
+                "the existing declaration for {} differs from its recorded output location",
+                config.key()
+            ));
+        }
+        Ok(Some(area))
     }
 
     /// Where an area's new roots go right now.
@@ -850,6 +969,46 @@ mod tests {
     use barge::{FakeOs, ManualClock, Mode, Os};
 
     const UUID: &str = "8E4A5C1D-0000-4000-8000-00000000BEEF";
+
+    #[test]
+    fn directory_filesystem_identity_opens_and_reopens_barge_pool_storage() {
+        let temp = TempDir::new("directory-filesystem-identity").unwrap();
+        let mount = temp.path().join("pool");
+        std::fs::create_dir(&mount).unwrap();
+        let identity = DirectoryOs.volume_identity(&mount).unwrap().unwrap();
+        assert_eq!(barge::os::canonical_uuid(&identity).unwrap(), identity);
+        assert_eq!(
+            DirectoryOs.volume_identity(temp.path()).unwrap().as_ref(),
+            Some(&identity)
+        );
+        let state = temp.path().join("state");
+        let open = || {
+            let storage = Storage::open_with(
+                state.clone(),
+                Arc::new(DirectoryOs),
+                Arc::new(barge::SystemClock::new()),
+            )
+            .unwrap();
+            PoolStorage::from_storage(storage, &PoolBacking::budget(&mount, 8 << 20)).unwrap()
+        };
+        let pool = open();
+        let root = pool.area().create_root("warm").unwrap();
+        std::fs::write(root.path.join("artifact"), b"warm").unwrap();
+        drop(pool);
+        let reopened = open();
+        let same = reopened.area().resolve(&root.id).unwrap();
+        assert_eq!(same.path, root.path);
+        assert_eq!(std::fs::read(same.path.join("artifact")).unwrap(), b"warm");
+        let link = temp.path().join("alias");
+        std::os::unix::fs::symlink(&mount, &link).unwrap();
+        assert!(DirectoryOs.volume_identity(&link).is_err());
+        assert_eq!(
+            DirectoryOs
+                .volume_identity(&temp.path().join("absent"))
+                .unwrap(),
+            None
+        );
+    }
 
     struct Fixture {
         _temp: TempDir,

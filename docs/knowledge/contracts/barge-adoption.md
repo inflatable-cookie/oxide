@@ -43,7 +43,16 @@ Barge marker and writes no Barge document except through the library.
 | Recipes and profiles, seeding policy, output member links, `exec` | Oxide |
 | Platform attachment facts (a path is a mounted APFS root, writable) | Oxide, through Barge's `Os` seam |
 
-Oxide supplies exactly one platform fact Barge's own seam cannot see: a
+Oxide supplies the platform facts Barge's current seam cannot see. Linux
+budget-directory storage observes the kernel filesystem ID through an opened
+directory descriptor (`fstatvfs`) and encodes it as a namespaced UUID for
+Barge's identity comparison. A missing directory is absent; unreadable or zero
+filesystem IDs refuse. The ID names the containing filesystem, independent of
+the pool folder. Tests exercise this real directory seam and compile the Linux
+production pool-opening regression with `rust:barge-adoption-linux`; cross
+compilation is not Linux runtime evidence.
+
+On macOS, a
 `/Volumes/<name>` path that is a directory left on the boot disk by an unclean
 detach is *absent*, not a different volume. `src/storage.rs` implements
 `barge::Os` with that rule; every other path answers its containing
@@ -100,6 +109,9 @@ selected prune target. A zero reserve retains Barge's default floor.
   exclusive lock without waiting, then rechecks the pin under the area lock
   before renaming the root into `.trash/`. An earlier "idle and unpinned"
   reading never authorises an eviction by itself.
+- A workflow publication failure after Barge eviction fails the command and
+  reports that eviction occurred. It is never described as a retained root,
+  and the dispatcher stops before attempting another planned root.
 - Deletion never follows a symlink and never descends into another filesystem;
   a trash entry is removed only when its marker still names the area.
   Eviction renames first, so a crash leaves owned trash, which the next prune
@@ -185,6 +197,14 @@ not authorization or current proof. The shared supervisor is unchanged.
 
 Prune previews name the Barge area, stable root ID and path, and match the
 recorded ID in the selection registry. Execution resolves and evicts only that
-ID; a different root adopted at the same folder is retained, including a
-replacement between preview and eviction. Matching paths do not substitute for
-identity.
+ID. Matching paths do not substitute for identity. Barge must revalidate the
+expected root marker under its root and area locks immediately before rename;
+an earlier unlocked resolve does not establish that authority. The current
+`be06c69b` eviction resolves before locking and needs that supplier correction.
+
+Preview uses the passive Oxide store and looks up existing output declarations;
+it never imports roots, reconciles the ledger, sweeps trash or declares an
+area. A missing declaration yields no eligible roots. Barge's current account
+opener can create the areas directory, so an existing-directory precheck alone
+does not close a concurrent-removal race; a genuinely passive Barge opener is
+required before this boundary can be claimed under that race.
