@@ -18769,6 +18769,24 @@ mod tests {
     }
     #[test]
     fn barge_pins_selected_members_and_detach_releases_only_their_pin() {
+        // Close-on-exec descriptors are still inherited between fork and exec.
+        // Isolate this released-lock assertion from other fixtures' Git forks.
+        const NAME: &str =
+            "outputs::tests::barge_pins_selected_members_and_detach_releases_only_their_pin";
+        if std::env::var("OXIDE_OUTPUT_PIN_FIXTURE_CHILD").as_deref() != Ok("1") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("OXIDE_OUTPUT_PIN_FIXTURE_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "private pin fixture failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
         let context = fixture.context();
         let receipt =
