@@ -1591,14 +1591,7 @@ pub(crate) fn finish_receipt(control: &Path, receipt: &Receipt) -> Result<(), St
             generation: row.generation,
         };
         let area = output_area(control, &selected)?;
-        let id = area
-            .list()
-            .map_err(|error| error.to_string())?
-            .roots
-            .into_iter()
-            .find(|root| root.path == selected.root())
-            .map(|root| root.id)
-            .unwrap_or_else(|| output_id(&selected));
+        let id = row.barge_id.clone().unwrap_or_else(|| output_id(&selected));
         match area.unpin(&id) {
             Ok(()) => {}
             Err(error) if error.kind() == barge::ErrorKind::NotFound => {}
@@ -1660,6 +1653,10 @@ fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
             continue;
         };
         if !locations.insert(parent.to_path_buf()) {
+            continue;
+        }
+        let location = sha256_hex(parent.as_os_str().as_encoded_bytes());
+        if !control.join("output-storage").join(location).join("barge/areas").is_dir() {
             continue;
         }
         let area = output_area(control, &selected)?;
