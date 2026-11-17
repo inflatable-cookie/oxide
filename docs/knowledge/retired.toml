@@ -86,17 +86,14 @@ allow = [
 ]
 
 [[retired]]
-id = "prune-capture-and-equivalence-apparatus"
+id = "prune-capture-harness-and-comparison"
 retired = "2026-11-18"
-replacement = "Tom's 2026-11-17 lean reset: Ordinary Effigy admission, the shared proof supervisor and the lean Barge storage authority. The observation tapes, capture wire and its limited verdict policy, the prune capture harness, the release comparison harness and the capturable qualification contracts are deleted with their code; their evidence stays in Git and Queue history."
+replacement = "Tom's 2026-11-17 lean reset: ordinary Effigy admission, the shared proof supervisor and the lean Barge storage authority, recorded in docs/knowledge/contracts/barge-adoption.md. The prune capture harness, the limited verdict policy, the release comparison harness, the private-build validation gate and the seed-readiness control are deleted with their scripts and selectors; their evidence stays in Git and Queue history."
 owner = "docs/knowledge/contracts/barge-adoption.md"
 terms = [
-  "oxide.capture.transcript/2",
   "oxide.capture.apparatus/2",
-  "oxide.capture.manifest/2",
   "oxide.capture.embedded-control-observation/1",
   "tape_prune_eval",
-  "capture_wire",
   "capture_verdict",
   "tape_harness",
   "release_comparison_tests",
@@ -113,12 +110,11 @@ paths = [
   "scripts/tape-embedded-observation.py",
   "scripts/tape-seed-readiness.py",
   "docs/knowledge/contracts/cooperative-qualification.md",
-  "docs/knowledge/contracts/oxide-capture-manifest.schema.json",
-  "docs/knowledge/contracts/capture-examples/",
-  "docs/knowledge/contracts/capture-vectors/",
 ]
-# The remaining observation-recorder call sites and their tests are removed
-# with the recorder module; history text stays as history.
+# The observation-recorder call sites stay with their recorder module.
 allow = [
   "docs/knowledge/retired.toml",
+  "src/bin/oxide/tape.rs",
+  "src/bin/oxide/capture_wire.rs",
+  "docs/knowledge/contracts/capture-vectors/v2/invalid/apparatus-diagnostic.json",
 ]

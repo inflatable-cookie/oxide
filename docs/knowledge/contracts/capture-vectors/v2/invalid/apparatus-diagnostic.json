@@ -1,0 +1,7 @@
+{
+  "schema": "oxide.capture.apparatus/2",
+  "version": "oxide.capture.apparatus/2",
+  "case": "VECTOR-ABSENT",
+  "manifest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "reason": "manifest refused"
+}

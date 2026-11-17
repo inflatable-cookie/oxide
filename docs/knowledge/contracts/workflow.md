@@ -2338,7 +2338,7 @@ applicable separately activated diagnostic before a counted run.
 
 ## Shared proof supervisor
 
-The [cooperative qualification acceptance contract](cooperative-qualification.md)
+The cooperative qualification acceptance contract (retired 2026-11-18 with the capture programme)
 is the adopted prospective acceptance target for future 309 briefs (Tom decision
 `ea8ee47f` v2). Tom's later `5639bd34` v2 ruling records the future
 retained-and-counted image-evidence policy and whole-attachment-absence gate
@@ -6203,7 +6203,7 @@ exact plan and all fresh product checks below.
   The locked candidate recheck applies the same exclusion after its existing
   checks and group validation. A legacy operator list does not waive current
   selection. This adds no write, deletion path, barrier or writer-closure rule.
-  The [bounded comparison](barge-adoption.md#controlled-decision-comparison)
+  The superseded bounded comparison, recorded in the [lean adoption contract](barge-adoption.md)
   preserves the pre-alignment disagreement and its evidence limits.
 
 
