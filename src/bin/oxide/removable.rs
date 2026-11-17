@@ -835,11 +835,32 @@ fn registered_area(control: &Path, registration: &Registration) -> Result<Option
 }
 
 fn declare_registered_area(storage: &Storage, registration: &Registration) -> Result<Option<barge::Area>, String> {
-    if storage.known_volume("pool").is_err()
-        && oxide_storage::storage::OxideOs.volume_identity(&registration.mount_point)
-            .map_err(|error| error.to_string())?.is_none()
-    {
-        return Ok(None);
+    match storage.known_volume("pool") {
+        Ok(volume) => {
+            let spec = volume.spec();
+            if spec.mount != registration.mount_point
+                || !spec.uuid.eq_ignore_ascii_case(&registration.volume_uuid)
+            {
+                return Err("the Oxide registration differs from its Barge volume; refusing to reinterpret it".to_owned());
+            }
+            if volume.state().map_err(|error| error.to_string())? == barge::VolumeState::Present
+                && (spec.reserve_bytes != registration.reserve_bytes
+                    || spec.floor_bytes != oxide_storage::storage::reserve_floor(registration.reserve_bytes))
+            {
+                storage.register_volume(
+                    "pool", &registration.mount_point, Some(&registration.volume_uuid), "",
+                    registration.reserve_bytes,
+                    oxide_storage::storage::reserve_floor(registration.reserve_bytes),
+                )?;
+            }
+        }
+        Err(_) => {
+            if oxide_storage::storage::OxideOs.volume_identity(&registration.mount_point)
+                .map_err(|error| error.to_string())?.is_none()
+            {
+                return Ok(None);
+            }
+        }
     }
     let config = AreaConfig::new("pool", &registration.mount_point, "pool")
         .uuid(Some(registration.volume_uuid.clone()))
