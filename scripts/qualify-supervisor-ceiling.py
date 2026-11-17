@@ -37,9 +37,9 @@ def main(argv=None):
     root = Path(tempfile.mkdtemp(prefix="ceiling-proof.", dir=scratch))
     outcome = root / "cases.json"
     env = dict(os.environ)
-    owned = root / "owned"
-    owned.mkdir(mode=0o700)
-    env["OXIDE_TASK_SCRATCH_ROOT"] = str(owned)
+    # Let the candidate create its owned root: scratch and retained evidence
+    # are siblings inside the same monitored tree.
+    env.pop("OXIDE_TASK_SCRATCH_ROOT", None)
     env["OXIDE_SUPERVISOR_CASES"] = str(outcome)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     start = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)

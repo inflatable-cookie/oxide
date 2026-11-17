@@ -650,8 +650,30 @@ class Kinfo:
 
     @classmethod
     def one(cls, pid):
-        rows = cls.parse(cls.sysctl([1, 14, 1, pid]))
-        return rows[0] if rows and rows[0]["pid"] == pid else None
+        # KERN_PROC_PID names at most one record. Read into a fresh single-row
+        # buffer; preserve the generic bounded sizing path for ENOMEM.
+        if cls._libc is None:
+            cls._libc = ctypes.CDLL(None, use_errno=True)
+        mib = (ctypes.c_int * 4)(1, 14, 1, pid)
+        buffer = ctypes.create_string_buffer(cls.SIZE)
+        size = ctypes.c_size_t(cls.SIZE)
+        if cls._libc.sysctl(mib, 4, buffer, ctypes.byref(size), None, 0):
+            error = ctypes.get_errno()
+            if error != errno.ENOMEM:
+                raise OSError(error, "sysctl read")
+            raw = cls.sysctl([1, 14, 1, pid])
+        else:
+            if size.value > cls.SIZE:
+                raise ValueError("kinfo_proc oversized result")
+            raw = buffer.raw[:size.value]
+        if not raw:
+            return None
+        if len(raw) != cls.SIZE:
+            raise ValueError("kinfo_proc single-row size mismatch")
+        rows = cls.parse(raw)
+        if len(rows) != 1 or rows[0]["pid"] != pid:
+            raise ValueError("kinfo_proc single-row identity mismatch")
+        return rows[0]
 
     @classmethod
     def check(cls):

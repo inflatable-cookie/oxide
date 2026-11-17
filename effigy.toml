@@ -39,7 +39,7 @@ minimum_effigy_version = "0.14.0"
 "proof:supervisor:ceiling:test" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_supervisor_ceiling.py"
 "proof:supervisor:ceiling:plan" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_supervisor_ceiling.py --plan"
 # Collection only: no scratch, fixture, child or qualification is started.
-"proof:supervisor:ceiling:qualification:plan" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_supervisor_ceiling_qualification.py --pins-sha256 02ab90cdc2889817c3a9424a81207ede45a2ac26a716faab0d986ba876d8116e --plan"
+"proof:supervisor:ceiling:qualification:plan" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_supervisor_ceiling_qualification.py --pins-sha256 3672fadfa5211cd89dc34cef4e51fea60e6834e249f47672b618db0436f0e074 --plan"
 "proof:supervisor:ceiling:qualification:compat" = "PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_ceiling_qualification_compat.py"
 # Effect-free readiness for the selected host (oxide#151): path, mode, owner and
 # device metadata only. Creates nothing (an absent private leaf is reported as
@@ -820,7 +820,7 @@ run = "python3 scripts/qualify-supervisor.py --diagnostic"
 # Ordinary full ceiling behavior suite; Effigy owns its 600-second deadline.
 [tasks."proof:supervisor:ceiling:qualify"]
 admission = "heavy"
-run = "python3 scripts/qualify-supervisor-ceiling.py --pins-sha256 02ab90cdc2889817c3a9424a81207ede45a2ac26a716faab0d986ba876d8116e"
+run = "python3 scripts/qualify-supervisor-ceiling.py --pins-sha256 3672fadfa5211cd89dc34cef4e51fea60e6834e249f47672b618db0436f0e074"
 
 # SUSPENDED by oxide#102: provisions its pool with the retired standalone
 # lease CLI and APFS image backend, so it refuses before any effect until

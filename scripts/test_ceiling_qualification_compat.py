@@ -98,6 +98,18 @@ class Entrypoint(unittest.TestCase):
                 entry.main(["--pins-sha256", "wrong"])
         create.assert_not_called()
 
+    def test_candidate_owns_monitored_root_instead_of_adopting_scratch(self):
+        digest = hashlib.sha256((scripts / "ceiling-qualification-pins.json").read_bytes()).hexdigest()
+        with mock.patch.dict(os.environ, {"TMPDIR": "/Volumes/Stash/fake", "OXIDE_TASK_SCRATCH_ROOT": "/old"}), \
+             mock.patch.object(Path, "resolve", return_value=Path("/Volumes/Stash/fake")), \
+             mock.patch.object(Path, "is_dir", return_value=True), \
+             mock.patch.object(entry.shutil, "disk_usage", return_value=mock.Mock(free=30 * 1024 ** 3)), \
+             mock.patch.object(entry.tempfile, "mkdtemp", return_value="/Volumes/Stash/fake/owned"), \
+             mock.patch.object(entry.subprocess, "run", return_value=mock.Mock(returncode=1)) as run:
+            self.assertEqual(entry.main(["--pins-sha256", digest]), 1)
+        self.assertNotIn("OXIDE_TASK_SCRATCH_ROOT", run.call_args.kwargs["env"])
+        self.assertIn("--root-parent", run.call_args.args[0])
+
 
 class FailureReporting(unittest.TestCase):
     @classmethod
@@ -202,6 +214,47 @@ class CensusStageControls(unittest.TestCase):
             guard.Census(1, snapshot=snapshot, getsid=read).round()
         snapshot.assert_called_once()
         read.assert_called_once_with(42)
+
+
+class SinglePidRead(unittest.TestCase):
+    def call(self, size, *, error=None, parsed=None):
+        def sysctl(mib, length, buffer, size_ptr, new, newlen):
+            self.assertEqual(list(mib), [1, 14, 1, 42])
+            self.assertEqual(length, 4)
+            target = guard.ctypes.cast(size_ptr, guard.ctypes.POINTER(guard.ctypes.c_size_t))
+            self.assertEqual(target[0], guard.Kinfo.SIZE)
+            target[0] = size
+            if error is not None:
+                guard.ctypes.set_errno(error)
+                return -1
+            return 0
+        libc = mock.Mock(sysctl=mock.Mock(side_effect=sysctl))
+        with mock.patch.object(guard.Kinfo, "_libc", libc), \
+             mock.patch.object(guard.Kinfo, "parse", return_value=parsed or [{"pid": 42}]):
+            return guard.Kinfo.one(42)
+
+    def test_exact_and_empty_results(self):
+        self.assertEqual(self.call(guard.Kinfo.SIZE), {"pid": 42})
+        self.assertIsNone(self.call(0))
+
+    def test_malformed_length_and_wrong_identity_are_not_absence(self):
+        for size in (1, guard.Kinfo.SIZE + 1):
+            with self.subTest(size=size), self.assertRaises(ValueError):
+                self.call(size)
+        with self.assertRaises(ValueError):
+            self.call(guard.Kinfo.SIZE, parsed=[{"pid": 43}])
+
+    def test_read_failure_is_not_absence(self):
+        with self.assertRaises(OSError):
+            self.call(0, error=guard.errno.EPERM)
+
+    def test_enomem_uses_bounded_existing_fallback(self):
+        with mock.patch.object(guard.Kinfo, "sysctl", return_value=bytes(guard.Kinfo.SIZE)) as fallback:
+            self.assertEqual(self.call(0, error=guard.errno.ENOMEM), {"pid": 42})
+        fallback.assert_called_once_with([1, 14, 1, 42])
+        with mock.patch.object(guard.Kinfo, "sysctl", return_value=b"x"):
+            with self.assertRaises(ValueError):
+                self.call(0, error=guard.errno.ENOMEM)
 
 
 if __name__ == "__main__":
