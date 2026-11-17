@@ -1,34 +1,11 @@
 #!/usr/bin/env python3
-"""Focused proof for the removable build volume, part 1 (oxide#097).
+"""Budget-only default-pool regression (oxide#102).
 
-Stages `oxide` offline with 1.97.1 (debug, so the flush-failure injection
-exists), then models the removable drive as ONE separately attached 128 MiB
-APFS sparse image in owned scratch, mounted normally by hdiutil at a unique
-/Volumes/<name>. The internal pool is a budget-only directory pool in the same
-scratch, so no second image exists. Covers registration and its refusals,
-selection when the volume is present, below its reserve and absent (with no
-mount point recreated), flush-on-release with its cost, retirement on an
-injected flush failure, warm reuse after re-attaching, and status.
-
-Bounds: 300 s from admission through teardown, 512 MiB owned bytes
-(mounted payload included), 8 MiB fixture source, 32 MiB output, 96 Cargo
-processes, 20 GiB host reserve sampled every 250 ms. No forced detach: an
-ordinary detach that fails stops the proof and keeps the evidence. Not a
-benchmark and not full QA.
-
-`--budget-default` (oxide#102, selector `rust:oxide-budget-default`) first
-runs the budget-only default-pool cases in the same guarded session, over a
-scratch HOME (Rust toolchains still from the real RUSTUP_HOME): legacy image
-pool detection without touching it, default creation at the new path as a
-directory pool with a verified Time Machine exclusion, honest Spotlight
-status, the ignored macOS `~/.config` file, config-file and environment
-precedence, refusals (Git work tree, symlink alias, `..` traversal in
-OXIDE_POOL, /Volumes, unknown key, malformed file) creating nothing, a
-symlink alias to the legacy pool refused before any lock, the orphan report after a path change, a
-build growing past a tiny soft budget completing, whole-idle-slot eviction
-at the next admission and an injected low-reserve watchdog stop. The
-removable phase then also proves the previous-registration refusal (idle and
-held legacy fixtures) before its ordinary registration.
+The retained --budget-default mode exercises default creation, legacy-image
+refusal, configuration precedence, soft-budget growth and idle eviction, and
+the ordinary host-reserve watchdog. All fixture state is private scratch.
+The former mounted-volume qualification is retired: Barge location, ownership,
+pruning and trash behavior is covered by ordinary temporary-fixture tests.
 """
 
 from __future__ import annotations
@@ -38,11 +15,8 @@ import sys
 # No bytecode files in the counted tree or the repository.
 sys.dont_write_bytecode = True
 
-import glob
 import json
 import os
-import plistlib
-import secrets
 import shutil
 import signal
 import subprocess
@@ -52,7 +26,6 @@ import bounded_runner as br
 import bounded_runner_cases
 
 BUILDER = "1.97.1"
-IMAGE_MIB = 128
 PROOF_SECONDS = 300
 SCRATCH_LIMIT_BYTES = 512 * 1024 * 1024
 SOURCE_LIMIT_BYTES = 8 * 1024 * 1024
@@ -61,7 +34,6 @@ HOST_RESERVE_BYTES = 20 * 1024 * 1024 * 1024
 CARGO_LIMIT = 96
 MIB = 1024 * 1024
 
-BUDGET_DEFAULT = "--budget-default" in sys.argv[1:]
 # A build script that writes 4 MiB into the slot, past a 2 MB soft budget.
 GROWER = {
     "Cargo.toml": '[package]\nname = "grower"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n',
@@ -137,10 +109,7 @@ def run_owned(command: list, *, env: dict, cwd: str | None = None, text: bool = 
 class Proof:
     def __init__(self, parent: str):
         self.parent = parent
-        self.mount = None
-        self.image = os.path.join(parent, "volume.sparseimage")
         self.env = dict(os.environ)
-        self.name = "OxRm" + secrets.token_hex(4)
 
     def account(self, phase: str) -> None:
         GUARDIAN.check()
@@ -148,49 +117,6 @@ class Proof:
             f"sample {phase}: {time.monotonic() - STARTED:.1f} s, max sampled owned {GUARDIAN.walk_max // 1024} KiB "
             f"over {GUARDIAN.walk_count} complete walks, host free minimum {GUARDIAN.reserve_min // MIB} MiB"
         )
-
-    def hdiutil(self, *args: str, cleanup: bool = False) -> subprocess.CompletedProcess:
-        result = run_owned(["/usr/bin/hdiutil", *args], env=self.env, text=False, timeout=60, cleanup=cleanup)
-        emit(f"hdiutil {args[0]} exit {result.returncode}", result.stderr.decode(errors="replace"))
-        return result
-
-    def attach(self, read_only: bool = False) -> str:
-        args = ["attach", "-nobrowse", "-plist", *(["-readonly"] if read_only else []), self.image]
-        # Attach intent before mutation: until resolved, owned bytes are
-        # unknown and the walk faults rather than counting zero.
-        GUARDIAN.walker.unresolved_attach = (self.image, IMAGE_MIB * MIB)
-        result = self.hdiutil(*args)
-        if result.returncode:
-            fail("attach failed; attachment unresolved, image preserved")
-        entities = plistlib.loads(result.stdout)["system-entities"]
-        mounts = [entity for entity in entities if entity.get("mount-point")]
-        if len(mounts) != 1:
-            fail(f"expected one mounted volume, got {mounts}")
-        mount = mounts[0]["mount-point"]
-        if mount != f"/Volumes/{self.name}":
-            # Another volume holds the name: never touch it.
-            self.mount = mount
-            fail(f"the scratch volume mounted at {mount}, not /Volumes/{self.name}")
-        self.mount = mount
-        GUARDIAN.walker.mounts[mount] = os.stat(mount).st_dev
-        GUARDIAN.walker.unresolved_attach = None
-        print(f"attached {self.image} at {mount} ({mounts[0].get('dev-entry')}, read-only {read_only})")
-        return mount
-
-    def detach(self, cleanup: bool = False) -> None:
-        if GUARDIAN.walker.unresolved_attach is not None:
-            fail(f"attachment of {self.image} is unresolved; image and scratch preserved")
-        if not self.mount or not os.path.ismount(self.mount):
-            return
-        if GUARDIAN.unclosed:
-            fail(f"owned sessions {sorted(GUARDIAN.unclosed)} are not positively closed; no detach, evidence kept")
-        # Ordinary detach only; a busy volume stops the proof. The payload
-        # stays counted until the mount is confirmed gone.
-        GUARDIAN.walker.hold(self.mount)
-        result = self.hdiutil("detach", self.mount, cleanup=cleanup)
-        if result.returncode:
-            fail(f"ordinary detach of {self.mount} failed; evidence kept")
-        GUARDIAN.walker.release(self.mount)
 
 
 def build(parent: str, repo: str) -> str:
@@ -234,10 +160,10 @@ def build(parent: str, repo: str) -> str:
 
 
 def main() -> int:
-    if sys.argv[1:] not in ([], ["--budget-default"]):
-        fail("usage: test-oxide-removable-pool.py [--budget-default]")
+    if sys.argv[1:] != ["--budget-default"]:
+        fail("usage: test-oxide-removable-pool.py --budget-default")
     if sys.platform != "darwin":
-        fail("the removable-pool proof requires macOS")
+        fail("the budget-default regression requires macOS")
     raw = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
     if raw:
         root = os.path.realpath(raw)
@@ -251,7 +177,7 @@ def main() -> int:
     parent = os.path.join(root, "removable-pool")
     os.makedirs(parent, mode=0o700, exist_ok=False)
     # One fresh canonical temp directory, inside the counted tree, for this
-    # process and every child (staging, oxide, Cargo, hdiutil) before any of
+    # process and every child (staging, oxide and Cargo) before any of
     # them writes.
     scratch = os.path.join(parent, "tmp")
     os.makedirs(scratch, mode=0o700)
@@ -288,13 +214,12 @@ def main() -> int:
         # clearing the fault or starting experimental work.
         try:
             GUARDIAN.settle()
-            proof.detach(cleanup=True)
         except BaseException as error:  # keep the first failure
             print(f"cleanup after failure: {error!r}", file=sys.stderr)
         for failure in GUARDIAN.cleanup_failures:
             print(f"cleanup failure: {failure}", file=sys.stderr)
         print(
-            f"removable-pool proof failed after {time.monotonic() - STARTED:.0f} s (guardian first fault: {GUARDIAN.first}); "
+            f"budget-default regression failed after {time.monotonic() - STARTED:.0f} s (guardian first fault: {GUARDIAN.first}); "
             f"evidence kept at {parent}",
             file=sys.stderr,
         )
@@ -317,7 +242,7 @@ def main() -> int:
         os.rmdir(root)
     elapsed = time.monotonic() - STARTED
     print(
-        f"removable-pool proof held: {elapsed:.0f} s, max sampled owned {peak // MIB} MiB over {walks} complete walks "
+        f"budget-default regression held: {elapsed:.0f} s, max sampled owned {peak // MIB} MiB over {walks} complete walks "
         f"(at most every 2 s, each within 1 s; 512 MiB monitored cap, not an instantaneous ceiling), "
         f"host free minimum {low // MIB} MiB, output {OUTPUT} bytes, scratch removed"
     )
@@ -523,41 +448,13 @@ def budget_default(proof, parent: str, home: str, base: dict, oxide_run, expect,
     proof.account("after budget-default cases")
 
 
-def previous_registration_refused(home: str, mount: str, control: str, oxide_run, expect) -> None:
-    """A registration under the previous (legacy) pool refuses a new one and
-    is never moved, forked or removed: idle and held fixtures."""
-    legacy = os.path.join(home, "Library/Caches/oxide/pool")
-    managed = os.path.join(legacy, "oxide-managed")
-    os.makedirs(managed, mode=0o700)
-    with open(os.path.join(managed, "removable.json"), "w", encoding="utf-8") as handle:
-        handle.write('{"version":1}')
-    for case in ("idle", "held"):
-        if case == "held":
-            held = os.path.join(managed, "removable")
-            os.makedirs(held, mode=0o700)
-            with open(os.path.join(held, "ledger.json"), "w", encoding="utf-8") as handle:
-                handle.write('{"slots":[{"id":1,"state":"held"}]}')
-        before = snapshot(legacy)
-        code, _, stderr = oxide_run(["pool", "register-removable", mount, "--reserve", "16MiB", "--cap", "64MiB"], f"refusal: previous registration ({case})")
-        expect(code != 0 and "registered under the previous pool" in stderr and "no held slots or waiting commands" in stderr, f"{case} previous registration was not refused")
-        expect(snapshot(legacy) == before, f"the {case} previous registration changed")
-        expect(not os.path.exists(os.path.join(control, "removable.json")) and not os.path.exists(os.path.join(control, "removable")), "a refusal forked a removable ledger")
-        expect(not os.path.exists(os.path.join(mount, "oxide-pool")), "a refusal wrote to the volume")
-    code, _, stderr = oxide_run(["check"], "build note: previous registration")
-    expect(code == 0 and "the removable registration under the previous pool" in stderr, "the previous registration was silently dropped")
-    # The fixture is this proof's own scratch; remove it for the no-registration path.
-    shutil.rmtree(legacy)
-
-
 def run(proof: Proof, parent: str) -> None:
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     real_cargo = shutil.which("cargo")
     if not real_cargo:
         fail("no cargo on PATH")
     source = run_owned(["git", "rev-parse", "HEAD"], cwd=repo, env=dict(os.environ), timeout=30)
-    print(f"removable-pool proof {os.getpid()} source {source.stdout.strip()} volume name {proof.name}")
-    if os.path.lexists(f"/Volumes/{proof.name}"):
-        fail(f"/Volumes/{proof.name} already exists; never touched")
+    print(f"budget-default regression {os.getpid()} source {source.stdout.strip()}")
     oxide = build(parent, repo)
     proof.oxide = oxide
     print(f"staging: {time.monotonic() - STARTED:.0f} s (1 Cargo process)")
@@ -636,189 +533,12 @@ def run(proof: Proof, parent: str) -> None:
         expect(len(lines) == 1, f"expected one summary line: {stderr}")
         return lines[0]
 
-    if BUDGET_DEFAULT:
-        budget_default(proof, parent, home, env, oxide_run, expect, summary)
-
-    control = os.path.join(pool, "oxide-managed")
-    removable_root = os.path.join(control, "removable")
-
-    def removable_state() -> dict:
-        with open(os.path.join(removable_root, "oxide-managed", "state.json"), encoding="utf-8") as handle:
-            return json.load(handle)
-
-    def ledger() -> dict:
-        with open(os.path.join(removable_root, "ledger.json"), encoding="utf-8") as handle:
-            return json.load(handle)
-
-    # Internal pool first; nothing registered: unchanged behavior.
-    code, _, stderr = oxide_run(["check"], "internal, nothing registered")
-    expect(code == 0, "internal check failed")
-    line = summary(stderr)
-    # The scratch path itself contains "removable"; look for Oxide's words.
-    expect(
-        "directory-budget-v1" in line and "removable volume" not in stderr and "apfs-volume-v1" not in stderr,
-        f"unregistered build changed: {line}",
-    )
-    code, stdout, _ = oxide_run(["status"], "status, nothing registered")
-    expect(code == 0 and "removable pool: none registered" in stdout, "status did not report no registration")
-
-    # Mount-parent rule: the real standard /Volumes (read only), then an
-    # owned scratch directory before and after an account-name ACL. The
-    # ACL refusal must be reported by name, not hidden behind the owner.
-    import pwd
-
-    shape = run_owned(["/usr/bin/stat", "-f", "%Su %Sp %Sf flags=%f", "/Volumes"], env=env, timeout=30)
-    emit(f"/Volumes shape exit {shape.returncode}", shape.stdout + shape.stderr)
-    code, stdout, _ = oxide_run(["pool", "debug-check-parent", "/Volumes"], "parent rule: /Volumes")
-    expect(code == 0 and "parent accepted: /Volumes" in stdout, "the standard /Volumes parent was refused")
-    acl_dir = os.path.join(parent, "acl-parent")
-    os.makedirs(acl_dir, mode=0o755)
-    os.chmod(acl_dir, 0o755)
-    code, stdout, _ = oxide_run(["pool", "debug-check-parent", acl_dir], "parent rule: owned, no ACL")
-    expect(code == 1 and "not root" in stdout and "ACL" not in stdout, "owned directory control did not refuse on owner alone")
-    account = pwd.getpwuid(os.geteuid()).pw_name
-    expect(account and not account.isdigit() and pwd.getpwnam(account).pw_uid == os.geteuid(), f"account name {account!r} does not round-trip")
-    grant = run_owned(["/bin/chmod", "+a", f"{account} allow add_subdirectory", acl_dir], env=env, timeout=30)
-    emit(f"chmod +a '{account} allow add_subdirectory' exit {grant.returncode}", grant.stdout + grant.stderr)
-    expect(grant.returncode == 0, "the owned ACL could not be set")
-    listing = run_owned(["/bin/ls", "-led", acl_dir], env=env, timeout=30)
-    emit(f"ls -led exit {listing.returncode}", listing.stdout + listing.stderr)
-    expect(f"user:{account} allow add_subdirectory" in listing.stdout, "the owned ACL is not visible")
-    code, stdout, _ = oxide_run(["pool", "debug-check-parent", acl_dir], "parent rule: owned, with ACL")
-    expect(code == 1 and "1 extended ACL entries" in stdout and "not root" in stdout, "the ACL was not refused by name")
-
-    # Refusals before any image exists.
-    image_size = f"{IMAGE_MIB}m"
-    for args, needle, label in (
-        (["pool", "register-removable", "/Volumes/" + proof.name, "--cap", "64MiB"], "usage", "missing reserve"),
-        (["pool", "register-removable", "/Volumes/" + proof.name, "--reserve", "0", "--cap", "64MiB"], "--reserve", "zero reserve"),
-        (["pool", "register-removable", "/Volumes/" + proof.name, "--reserve", "99999999999TiB", "--cap", "64MiB"], "--reserve", "overflow reserve"),
-        (["pool", "register-removable", parent, "--reserve", "16MiB", "--cap", "64MiB"], "directly under /Volumes", "custom mount parent"),
-        (["pool", "register-removable", "/Volumes/" + proof.name + "/nested", "--reserve", "16MiB", "--cap", "64MiB"], "directly under /Volumes", "nested path"),
-        (["pool", "register-removable", "/Volumes/" + proof.name, "--reserve", "16MiB", "--cap", "64MiB"], "not available", "absent volume"),
-        (["pool", "register-removable", "/Volumes/Macintosh HD", "--reserve", "16MiB", "--cap", "64MiB"], "not available", "symlink alias"),
-    ):
-        code, stdout, stderr = oxide_run(args, f"refusal: {label}")
-        expect(code != 0 and needle in (stdout + stderr), f"{label} was not refused with {needle!r}")
-    expect(not os.path.exists(os.path.join(control, "removable.json")), "a refusal wrote a registration")
-    expect(not os.path.lexists(f"/Volumes/{proof.name}"), "a refusal created a mount point")
-
-    create = run_owned(
-        ["/usr/bin/hdiutil", "create", "-size", image_size, "-fs", "APFS", "-volname", proof.name, "-type", "SPARSE", proof.image],
-        env=env,
-        timeout=60,
-    )
-    emit(f"hdiutil create exit {create.returncode}", create.stdout + create.stderr)
-    expect(create.returncode == 0, "image creation failed")
-    proof.account("after image creation")
-
-    # Read-only attach refuses.
-    mount = proof.attach(read_only=True)
-    code, stdout, stderr = oxide_run(["pool", "register-removable", mount, "--reserve", "16MiB", "--cap", "64MiB"], "refusal: read-only")
-    expect(code != 0 and "read-only" in stderr, "read-only volume was not refused")
-    proof.detach()
-
-    mount = proof.attach()
-    proof.account("after attach")
-    code, stdout, stderr = oxide_run(["pool", "register-removable", mount + "x", "--reserve", "16MiB", "--cap", "64MiB"], "refusal: prefix look-alike")
-    expect(code != 0, "prefix look-alike registered")
-    if BUDGET_DEFAULT:
-        previous_registration_refused(home, mount, control, oxide_run, expect)
-    code, stdout, stderr = oxide_run(["pool", "register-removable", mount, "--reserve", "16MiB", "--cap", "64MiB"], "register")
-    expect(code == 0 and "registered removable pool" in stdout, "registration failed")
-    with open(os.path.join(control, "removable.json"), encoding="utf-8") as handle:
-        registration = json.load(handle)
-    info = plistlib.loads(run_owned(["/usr/sbin/diskutil", "info", "-plist", mount], env=env, text=False, timeout=30).stdout)
-    expect(registration["volume_uuid"] == info["VolumeUUID"], "registered UUID is not diskutil's")
-    expect(registration["mount_point"] == mount and registration["reserve_bytes"] == 16 * MIB and registration["cap_bytes"] == 64 * MIB, f"registration {registration}")
-    # Control plane internal, data plane external.
-    expect(sorted(os.listdir(os.path.join(mount, "oxide-pool"))) == ["slots"], "the volume holds more than slots")
-    for name in ("config.json", "ledger.json"):
-        expect(os.path.isfile(os.path.join(removable_root, name)), f"internal {name} missing")
-    code, stdout, stderr = oxide_run(["pool", "register-removable", mount, "--reserve", "16MiB", "--cap", "64MiB"], "refusal: already registered")
-    expect(code != 0 and "already registered" in stderr, "second registration was not refused")
-
-    # Present: selected, flushed before release, warm on repeat.
-    code, _, stderr = oxide_run(["check"], "removable present")
-    expect(code == 0, "removable check failed")
-    line = summary(stderr)
-    expect("apfs-volume-v1" in line and f"removable {mount}/oxide-pool" in line and "cold" in line, f"removable not selected: {line}")
-    expect("flushed the removable volume before releasing slot 1 in " in stderr, "no flush cost line")
-    flushes = removable_state()["flushes"]
-    expect(len(flushes) == 1 and flushes[0]["micros"] is not None and flushes[0]["slot_id"] == "1", f"flush not recorded: {flushes}")
-    print(f"flush cost: {flushes[0]['micros']} us")
-    # oxide#104: slot 1 is `slots/<project folder>/<profile>-1`.
-    expect(len(glob.glob(os.path.join(mount, "oxide-pool", "slots", "*", "*-1", "build"))) == 1, "slot 1 is not on the volume")
-    code, _, stderr = oxide_run(["check"], "removable repeat")
-    line = summary(stderr)
-    expect(code == 0 and "slot 1 warm" in line and "apfs-volume-v1" in line, f"repeat not warm on the volume: {line}")
-    code, stdout, _ = oxide_run(["status"], "status, removable present")
-    expect(code == 0, "status failed")
-    for needle in (
-        f"removable pool: {mount} volume {registration['volume_uuid']} container {registration['container_uuid']}",
-        "reserve 16 MiB, Oxide admission cap 64 MiB",
-        "selected for the next build: removable pool",
-        "backend apfs-volume-v1",
-        "flush before releasing slot 1: ",
-        "backend directory-budget-v1",
-    ):
-        expect(needle in stdout, f"status lacks {needle!r}")
-    proof.account("after removable builds")
-
-    # Below the reserve: the registration's reserve is raised past the
-    # volume's free space (an owned scratch control file).
-    registration_path = os.path.join(control, "removable.json")
-    raised = dict(registration, reserve_bytes=IMAGE_MIB * MIB)
-    with open(registration_path, "w", encoding="utf-8") as handle:
-        json.dump(raised, handle)
-    code, _, stderr = oxide_run(["check"], "removable below reserve")
-    line = summary(stderr)
-    expect(code == 0 and "directory-budget-v1" in line and "not above the 128 MiB reserve" in stderr, f"below-reserve volume was used: {line}")
-    with open(registration_path, "w", encoding="utf-8") as handle:
-        json.dump(registration, handle)
-
-    # Injected flush failure: the slot is retired and stays held.
-    with open(os.path.join(app, "src/lib.rs"), "a", encoding="utf-8") as handle:
-        handle.write("pub fn more() -> u32 {\n    8\n}\n")
-    code, _, stderr = oxide_run(["check"], "flush failure injected", {"OXIDE_TEST_FAIL_FLUSH": "1"})
-    expect(code == 0 and "flush failed for slot 1" in stderr and "slot 1 is retired" in stderr, "injected flush failure did not retire")
-    held = [slot for slot in ledger()["slots"] if slot["id"] == 1]
-    expect(held and held[0]["state"] == "held", f"retired slot is not held: {held}")
-    records = removable_state()["records"]
-    expect(any(record["phase"] == "retired" for record in records), f"no retired record: {records}")
-    code, _, stderr = oxide_run(["check"], "after retirement")
-    line = summary(stderr)
-    expect(code == 0 and "slot 2 cold" in line and "apfs-volume-v1" in line, f"retired slot reused or volume lost: {line}")
-    code, stdout, _ = oxide_run(["status"], "status, retired slot")
-    expect("slot 1 retired and held, never reused" in stdout and "failed (injected flush failure" in stdout, "status lacks the retired slot")
-    proof.account("after retirement")
-
-    # Absent: ordinary detach of the idle volume, then fallback; the mount
-    # point is never recreated.
-    proof.detach()
-    code, _, stderr = oxide_run(["check"], "removable absent")
-    line = summary(stderr)
-    expect(code == 0 and "directory-budget-v1" in line and "removable volume not used" in stderr, f"absent volume selected: {line}")
-    expect(not os.path.lexists(mount), f"{mount} was recreated while the volume was absent")
-    code, stdout, _ = oxide_run(["status"], "status, removable absent")
-    expect(code == 0 and "selected for the next build: internal pool (removable volume not used:" in stdout, "status did not report the absent volume")
-    expect(not os.path.lexists(mount), f"status recreated {mount}")
-
-    # Re-attached: selected again, its own warmth kept.
-    proof.attach()
-    code, _, stderr = oxide_run(["check"], "removable re-attached")
-    line = summary(stderr)
-    expect(code == 0 and "slot 2 warm" in line and "apfs-volume-v1" in line, f"re-attached volume lost its warmth: {line}")
-    proof.account("after re-attach")
-
+    budget_default(proof, parent, home, env, oxide_run, expect, summary)
     with open(cargo_log, encoding="utf-8") as handle:
         calls = handle.read().splitlines()
-    emit("fixture Cargo", "\n".join(calls) + "\n")
     total = len(calls) + 1
     print(f"Cargo processes: {total} (staging 1, fixture {len(calls)})")
     expect(total <= CARGO_LIMIT, f"{total} Cargo processes exceed {CARGO_LIMIT}")
-    proof.detach()
-    proof.account("after final detach")
 
 
 if __name__ == "__main__":
