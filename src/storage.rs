@@ -489,7 +489,6 @@ impl PoolStorage {
 
     /// Every area this pool declares, in name order.
     fn areas(&self) -> Result<Vec<Area>, String> {
-        let prefix = format!("{NAMESPACE}/{}", self.name);
         Ok(self
             .storage
             .areas()?
