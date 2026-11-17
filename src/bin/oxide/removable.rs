@@ -915,7 +915,12 @@ fn release_quarantined(arguments: ReleaseArguments<'_>) -> Result<u8, String> {
         "oxide: deleted slot {} {}",
         released.slot_id, released.reported
     );
-    // Barge deleted the evicted root itself, inside its own trash sweep.
+    // Delete the renamed tree outside the pool lock, named by this release.
+    // One bounded pass: a tree that cannot finish stays recorded and charged,
+    // and a later command resumes it.
+    let mut sweep =
+        crate::HoldingSweep::start(recorded.pool.clone(), released.holding.first().cloned());
+    sweep.finish();
     Ok(0)
 }
 

@@ -418,10 +418,6 @@ pub struct Lease {
     lease_id: String,
     record: u64,
     _lock: File,
-    /// The cooperative hold on the slot's Barge root, kept for as long as the
-    /// command uses it. Dropping the lease releases it; a child that kept the
-    /// inherited descriptor keeps the root held after that.
-    _root_hold: Option<barge::Hold>,
 }
 
 impl Lease {
@@ -4645,7 +4641,6 @@ impl Store {
             victims,
             slice,
         };
-        let mut hold: Option<barge::Hold> = None;
         let outcome = lease_measured(request);
         // The library deletes the requested victim only after complete
         // accounting and rank headroom, and it may still refuse afterwards.
@@ -4673,7 +4668,6 @@ impl Store {
                 if let Some(report) = &leased.slice {
                     Self::report_slice(class, report);
                 }
-                hold = leased.hold;
                 (
                     leased.grant,
                     leased.measured,
@@ -4770,7 +4764,6 @@ impl Store {
             lease_id: grant.lease_id,
             record,
             _lock: lock,
-            _root_hold: hold,
         }))
     }
 
@@ -12870,7 +12863,94 @@ pub(crate) mod tests {
     /// byte bound is a tenth of this command's soft budget, so a tiny budget
     /// and a real payload make the bound non-vacuous.
     #[test]
-        /// One quarantined fixture (oxide#196): a real directory-budget slot with
+    fn a_full_one_use_slice_waits_for_a_live_holder_then_admits() {
+        let (root, store, key) = class_fixture_with_budget("one-use-wait", 1_000);
+        let held = lease_as(
+            &store,
+            &key,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+        )
+        .expect("one-use lease");
+        let member_slot = held.slot_id.clone();
+        fs::write(held.build_dir.join("payload"), vec![b'x'; 4 * 1024]).expect("payload");
+        // The member is live and cannot be deleted, so a new one-use slot
+        // cannot fit: the command waits for the holder instead of refusing.
+        assert!(matches!(
+            lease_as(
+                &store,
+                &key,
+                WorkspaceAdmission::one_use("a temporary workspace"),
+                false,
+            ),
+            Err(Wait::Uncertain)
+        ));
+        assert!(
+            store
+                .ledger()
+                .unwrap()
+                .slots
+                .iter()
+                .any(|slot| slot.slot_id == member_slot),
+            "a wait deleted the live member"
+        );
+
+        // The holder closes. A fresh record (a different compatibility key)
+        // has no reuse candidate, so restore may reclaim the released member
+        // and the admission succeeds.
+        store.release(held, None).unwrap();
+        let fresh = SlotKey {
+            checkout: key.checkout.clone(),
+            identity: key.identity.clone(),
+            compatibility: "fresh-key".to_owned(),
+        };
+        // The reclaim evicts the released member into the holding area, and a
+        // held tree stays charged until it is positively removed (oxide#190), so
+        // this first attempt refuses while its tree is still held. The front
+        // door publishes that tree outside the pool lock and retries; here the
+        // test publishes it the same way and the retry admits.
+        let (ticket, _file) = store.register_ticket().unwrap();
+        let first = store.attempt(
+            ticket,
+            &fresh,
+            Profile::Quick,
+            16,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+            None,
+        );
+        store.remove_ticket(ticket).unwrap();
+        assert!(
+            first.is_err(),
+            "an admission over its slice decided as if the held tree were gone"
+        );
+        loop {
+            let gone = oxide_storage::lease::managed::drain_holding(&store.pool, None)
+                .map(|pass| pass.gone)
+                .unwrap_or(false);
+            if !gone {
+                break;
+            }
+        }
+        let admitted = lease_as(
+            &store,
+            &fresh,
+            WorkspaceAdmission::one_use("a temporary workspace"),
+            false,
+        )
+        .expect("the fresh one-use admission admits once the held tree is gone");
+        assert_ne!(admitted.slot_id, member_slot);
+        let slots = store.ledger().unwrap().slots;
+        assert_eq!(slots.len(), 1, "the released member was not reclaimed");
+        assert_eq!(slots[0].slot_id, admitted.slot_id);
+        assert!(
+            store.ledger().unwrap().holding.is_empty(),
+            "a held tree survived the published pass"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One quarantined fixture (oxide#196): a real directory-budget slot with
     /// a real tree, a retired record and the ledger still holding it in this
     /// boot session.
     #[cfg(target_os = "macos")]
@@ -13239,6 +13319,78 @@ pub(crate) mod tests {
         );
     }
 
+    /// A successful release reaches oxide#190's holding path: the tree is
+    /// renamed whole, the holding row records it, the record is forgotten and
+    /// the bounded pass deletes it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn release_reaches_the_holding_path_and_forgets_the_record() {
+        let fixture = QuarantinedRelease::new("release");
+        assert!(fixture.slot_dir.is_dir());
+        let (verified, summary) = fixture
+            .store
+            .preflight_release(&fixture.slot_id, |path, holder| {
+                assert_eq!(path, fs::canonicalize(&fixture.slot_dir).unwrap());
+                assert_eq!(
+                    holder.map(|holder| holder.pid),
+                    Some(std::process::id()),
+                    "the census was not handed the recorded holder"
+                );
+                Ok(release_summary())
+            })
+            .expect("the read-only preflight succeeds");
+        assert_eq!(summary, release_summary());
+        let released = fixture
+            .store
+            .release_quarantined(&verified)
+            .expect("the release succeeds");
+        assert_eq!(released.slot_id, fixture.slot_id);
+        assert!(
+            released.reported.contains("quarantined:"),
+            "{}",
+            released.reported
+        );
+        assert!(released
+            .reported
+            .contains("released on operator confirmation"));
+        assert_eq!(released.holding.len(), 1, "{:?}", released.holding);
+        let name = &released.holding[0];
+        assert!(
+            !fixture.slot_dir.exists(),
+            "the slot tree was not renamed whole"
+        );
+        let view = fixture.store.ledger().unwrap();
+        assert!(
+            view.slots
+                .iter()
+                .all(|slot| slot.slot_id != fixture.slot_id),
+            "the released slot is still in the ledger"
+        );
+        assert!(
+            view.holding
+                .iter()
+                .any(|entry| { entry.name == *name && entry.slot_id == fixture.slot_id }),
+            "the holding row does not name the release: {:?}",
+            view.holding
+        );
+        assert!(
+            fixture.store.load().unwrap().records.is_empty(),
+            "the quarantined record was not forgotten"
+        );
+        let drained = oxide_storage::lease::managed::drain_holding(&fixture.store.pool, Some(name))
+            .expect("the holding pass");
+        assert_eq!(drained.claimed.as_deref(), Some(name.as_str()));
+        assert!(
+            drained.gone,
+            "the held tree was not deleted (refused {:?})",
+            drained.refused
+        );
+        assert!(
+            fixture.store.ledger().unwrap().holding.is_empty(),
+            "the holding row survived its deletion"
+        );
+    }
+}
 
 #[cfg(all(test, target_os = "macos"))]
 mod scratch_internal_tests {
