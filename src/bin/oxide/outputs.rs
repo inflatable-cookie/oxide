@@ -6939,37 +6939,38 @@ fn external_choice(context: &Context) -> Result<Result<removable::Registration, 
         )));
     }
     let state = removable::removable_control(control);
-    let present =
-        if state.join("barge/areas").is_dir() {
-            let storage = oxide_storage::storage::Storage::open(&state)?;
-            let area = storage
-                .areas()?
-                .into_iter()
-                .find(|area| area.key().label() == "oxide/pool")
-                .ok_or("the registered Barge pool area is missing")?;
-            if area.volume().spec().mount != registration.mount_point
-                || !area
-                    .volume()
-                    .spec()
-                    .uuid
-                    .eq_ignore_ascii_case(&registration.volume_uuid)
-            {
-                return Err("the output registration differs from Barge's volume".to_owned());
-            }
-            external_location(&area)?
-        } else {
-            match oxide_storage::storage::OxideOs
-                .volume_identity(&registration.mount_point)
-                .map_err(|error| error.to_string())?
-            {
-                None => false,
-                Some(uuid) if uuid.eq_ignore_ascii_case(&registration.volume_uuid) => true,
-                Some(uuid) => return Err(format!(
+    let present = if state.join("barge/areas").is_dir() {
+        let storage = oxide_storage::storage::Storage::open(&state)?;
+        let area = storage
+            .areas()?
+            .into_iter()
+            .find(|area| area.key().label() == "oxide/pool")
+            .ok_or("the registered Barge pool area is missing")?;
+        if area.volume().spec().mount != registration.mount_point
+            || !area
+                .volume()
+                .spec()
+                .uuid
+                .eq_ignore_ascii_case(&registration.volume_uuid)
+        {
+            return Err("the output registration differs from Barge's volume".to_owned());
+        }
+        external_location(&area)?
+    } else {
+        match oxide_storage::storage::OxideOs
+            .volume_identity(&registration.mount_point)
+            .map_err(|error| error.to_string())?
+        {
+            None => false,
+            Some(uuid) if uuid.eq_ignore_ascii_case(&registration.volume_uuid) => true,
+            Some(uuid) => {
+                return Err(format!(
                     "output volume identity mismatch: expected {}, found {uuid}; refusing fallback",
                     registration.volume_uuid
-                )),
+                ))
             }
-        };
+        }
+    };
     if !present {
         return Ok(Err(format!(
             "registered volume {} is absent",

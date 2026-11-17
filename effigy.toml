@@ -859,47 +859,6 @@ run = "python3 scripts/test-front-door-accounting.py --self-check"
 [tasks."proof:front-door:plan"]
 run = "python3 scripts/test-front-door-accounting.py --plan"
 
-# Finder metadata (oxide#105): a short fixed script under heavy admission
-# (deadline checked before each child, 20 GiB reserve sampled every 250 ms
-# while it runs, owned bytes between phases, one 300 s budget, child
-# sessions killed on breach or deadline, ordinary detach). Stages `oxide` offline with
-# 1.97.1; .DS_Store and ._* files at every pool level keep a budget-only
-# internal pool and one 128 MiB scratch-image removable pool complete and
-# warm, bytes counted; an unknown payload entry refuses by name and nothing
-# is deleted. Not a benchmark and not full QA.
-[tasks."rust:oxide-finder-metadata"]
-admission = "heavy"
-run = "python3 scripts/test-oxide-finder-metadata.py"
-
-# Bounded Finder-metadata deletion race (oxide#155), under the qualified shared
-# supervisor. Every fixture pool is a genuine directory-budget pool, so each
-# case declares its own OXIDE_SCRATCH_ROOT inside its run root and keeps its
-# pool strictly inside it with an explicit cap: on the selected volume that is
-# a scratch pool on removable media, and a /private/tmp fallback exercises the
-# internal path where the declaration is inert, which is not scratch-pool
-# coverage. 420 s (Tom's decision 138a8155) with the approved 30 s shutdown
-# margin and 512 MiB monitored scratch; one owned 128 MiB image per prune case,
-# attached -owners on and ordinarily detached. Migrated to the scratch pool
-# recipe (S4, oxide#213), so its source changed: no earlier native receipt is
-# carried forward and each run needs its own owner activation.
-[tasks."rust:finder-metadata-race"]
-admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 420 --scratch-budget-mib 512 -- python3 scripts/test-finder-metadata-race.py"
-
-[tasks."rust:finder-metadata-race:diagnostic"]
-admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 420 --scratch-budget-mib 512 -- python3 scripts/test-finder-metadata-race.py --diagnostic"
-
-# The pure fixture-layout check for both selectors above (oxide#155): the
-# fixture's declared scratch pool (one root per case, the pool strictly inside
-# it, an explicit cap) and the selectors' own recipe are asserted with no
-# effect, every prune image volume name and case slug must keep the product's
-# per-command temporary path inside its 91-byte Unix-socket bound, and the
-# layouts the first owner-activated diagnostic refused (92/102/103 bytes) must
-# still be refused. No scratch, child, image or attachment; it stages nothing.
-[tasks."rust:finder-metadata-race:test"]
-run = "python3 scripts/test-finder-metadata-race.py --self-check"
-
 # Project-named slots and pool status (oxide#104), under the qualified shared
 # proof supervisor (oxide#109): 300 s absolute, 512 MiB monitored scratch,
 # children kept in its session, writes and evidence under its scratch and

@@ -125,6 +125,7 @@ paths = [
   "src/owned_delete_tests.rs",
   "src/bin/oxide/census.rs",
   "scripts/test-holding-delete.py",
+  "scripts/test-finder-metadata-race.py",
   "scripts/test-prune-authority.py",
   "scripts/test-prune-fresh-custody.py",
   "scripts/test-prune-absence.py",

@@ -158,7 +158,7 @@ deployed selector command, and a historical receipt are separate facts.
 
 | Consumer class | Source and constraint to preserve |
 | --- | --- |
-| Shared Rust arming and callers | `src/supervisor.rs`, `src/proof.rs`, `src/bin/oxide/admission.rs`, `src/owned_delete_hook.rs`, `src/lease/seed/mod.rs`, `src/bin/oxide/{prune,store,seed_plan}.rs`: arming controls admission reports and proof hooks, while each hook retains its own additional scope. Tests in the shared module and admission exercise nested and sibling cases. |
+| Shared Rust arming and callers | `src/supervisor.rs`, `src/proof.rs`, `src/bin/oxide/admission.rs`, `src/lease/seed/mod.rs`, `src/bin/oxide/{prune,store,seed_plan}.rs`: arming controls admission reports and proof hooks, while each hook retains its own additional scope. Tests in the shared module and admission exercise nested and sibling cases. |
 | Independent Rust gates | `config.rs`, `store.rs`, and `inventory.rs` have the independent restrictions above; do not replace them with mere receipt presence. `prune.rs`, `one_use.rs`, `lease/pool.rs`, `handoff.rs` and `adopt.rs` also use scratch containment for their own test or product controls. Their path boundaries are not blanket proof-root authority. |
 | Scratch and evidence pass-through | `offline_seed.py`, `test-storage-inventory-cli.py`, `test-oxide-cli.py`, `test-status-fast.py`,  `test-pool-describe.py`, `test-oxide-wrapper-bypass.py`, `test-installed-handoff.py`, `test-scratch-pool.py`, `test-front-door-accounting.py`, `test-cold-slot-seeding.py` and `test-finder-metadata-race.py` use reported paths, create fixtures under scratch, write evidence, or pass controls into isolated children. Existing canonicality, containment, deadline and digest checks remain effective even where no component spelling is inferred. |
 | Guard-presence and temp equality | `test-drive-mode.py`, `test-everyday-cli.py`, `test-init-guidance.py`, `test-freshness-submodules.py`, `test-oxide-pool-layout.py`, `test-oxide-removable-removal.py`, `test-permanent-outputs.py`, `test-profile-outputs.py`, `test-seed-default-off.py`, `test-storage-layout.py`, `test-max-active.py`, `test-slot-headroom.py` and `test-oxide-removable-pool.py` check or propagate scratch/evidence/deadline and, where applicable, temp equality or image custody. Do not convert a presence check into an assertion of provenance. |
@@ -184,21 +184,13 @@ observations alone do not close that gap. The current
 ignore_errors=True)` on its two created roots after a successful child and on
 some setup failures; it is not evidence of identity-atomic cleanup.
 
-`src/owned_delete.rs` supplies a source-grounded alternative building block:
-a same-directory exclusive rename (`renameatx_np(RENAME_EXCL)` on macOS,
-`renameat2(RENAME_NOREPLACE)` on Linux), with bounded collision retries and
-journaled captures. Capturing may itself capture a replacement: its identity
-must be checked *after* capture and a foreign capture retained under journal
-custody, not deleted. Its existence does not prove the Python supervisor has
-an integrated, qualified recursive deletion protocol or exclude a cooperating
-owner moving a name after capture. Until a future design binds every removal
-to a protected captured entry, defines recovery and proves the cooperative
-boundary and mount/writer checks, the short-layout implementation must
-**KEEP and report** rather than use these primitives as claimed proof. It
-must not remove a replacement, retry an ambiguous deletion, or treat an
-unreadable observation as absence. Partial work remains retained and reported.
-This is a precise no-go for the new cleanup mechanism, not a retroactive
-judgment of historical receipts.
+The former per-entry capture/deletion implementation was retired with Oxide's
+storage engine. Barge now owns product root deletion; this does not integrate
+Barge into the Python supervisor or establish identity-atomic cleanup for it.
+A future cleanup design still needs to bind every removal to its protected
+owned entry, define recovery and test its cooperative boundary. Until then it
+must keep and report replacements or unreadable observations. Historical
+receipts retain their original scope.
 
 ## Cleanup ownership
 
