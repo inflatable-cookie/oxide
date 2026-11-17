@@ -778,8 +778,10 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
     note_reservation(&mut registry, receipt, &receipt_path, checkout_volume_uuid)?;
     pin_references(control, receipt)?;
     for row in &mut registry.rows {
-        if !row.live() || !row.root.is_dir()
-            || (row.barge_id.is_none() && !row.root.join(barge::root::MARKER_NAME).exists()) {
+        if !row.live()
+            || !row.root.is_dir()
+            || (row.barge_id.is_none() && !row.root.join(barge::root::MARKER_NAME).exists())
+        {
             continue;
         }
         let selected = Selected {
@@ -1506,9 +1508,15 @@ fn import_output(
     // The Barge marker and account can already own this path even before
     // its first Oxide index row is committed. Re-pinning it is conservative;
     // the caller still validates every Oxide link and marker before use.
-    let existing = area.list().map_err(|error| error.to_string())?.roots.into_iter()
+    let existing = area
+        .list()
+        .map_err(|error| error.to_string())?
+        .roots
+        .into_iter()
         .find(|root| root.path == selected.root());
-    if let Some(root) = existing { return Ok((area, root.id)); }
+    if let Some(root) = existing {
+        return Ok((area, root.id));
+    }
     let marker = outputs::read_marker_for_prune(selected.root())?;
     if !marker.is_owned_by(checkout, checkout_id)
         || marker.kind() != selected.kind()
@@ -1613,7 +1621,9 @@ pub(crate) fn finish_receipt(control: &Path, receipt: &Receipt) -> Result<(), St
         {
             continue;
         }
-        let Some(id) = row.barge_id.as_deref() else { continue; };
+        let Some(id) = row.barge_id.as_deref() else {
+            continue;
+        };
         let selected = Selected {
             kind: row.root_kind,
             root: row.root.clone(),
@@ -1737,7 +1747,13 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
             eprintln!("plan-sha256: {}", sha256_hex(&bytes));
         }
         ["prune", "--plan", path, "--plan-sha256", hash] => {
-            let given = fs::read(path).map_err(|error| error.to_string())?;
+            let mut given = Vec::new();
+            File::open(path)
+                .and_then(|file| file.take(MAX_REGISTRY_BYTES + 1).read_to_end(&mut given))
+                .map_err(|error| error.to_string())?;
+            if given.len() as u64 > MAX_REGISTRY_BYTES {
+                return Err("the output prune plan exceeds its byte limit".to_owned());
+            }
             let given = given.strip_suffix(b"\n").unwrap_or(&given);
             if sha256_hex(given) != *hash || given != bytes {
                 return Err("the output prune plan changed; take a new preview".to_owned());

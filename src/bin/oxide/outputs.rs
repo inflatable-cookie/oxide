@@ -12726,7 +12726,9 @@ mod tests {
     #[test]
     fn adoption_relinks_to_the_desired_place_instead_of_trusting_the_old_receipt() {
         let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
-        let context = fixture.context().with_pool_fallback(Some("fixture registered drive absent"));
+        let context = fixture
+            .context()
+            .with_pool_fallback(Some("fixture registered drive absent"));
         // An older receipt selects an EXTERNAL root whose member links are
         // live. With no registration the desired place is now the local
         // fallback, so adoption must relink even though the links still match
