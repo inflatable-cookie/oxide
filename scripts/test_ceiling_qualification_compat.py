@@ -5,6 +5,7 @@ import io
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 import threading
 import unittest
@@ -96,6 +97,74 @@ class Entrypoint(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 entry.main(["--pins-sha256", "wrong"])
         create.assert_not_called()
+
+
+class FailureReporting(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        path = scripts / "test_supervisor_ceiling_qualification.py"
+        digest = hashlib.sha256((scripts / "ceiling-qualification-pins.json").read_bytes()).hexdigest()
+        spec = importlib.util.spec_from_file_location("ceiling_suite", path)
+        cls.suite = importlib.util.module_from_spec(spec)
+        with mock.patch.object(sys, "argv", [str(path), "--pins-sha256", digest]):
+            spec.loader.exec_module(cls.suite)
+
+    def test_failure_is_flushed_with_case_and_fixture_before_summary(self):
+        output = io.StringIO()
+        stream = unittest.runner._WritelnDecorator(output)
+        stream.flush = mock.Mock(wraps=stream.flush)
+        result = self.suite.Results(stream, True, 2)
+        test = unittest.FunctionTestCase(lambda: None)
+        test.dir = "/owned/case"
+        self.suite.CASES.append({"case": test.id().rsplit(".", 1)[-1], "exit": 0})
+        try:
+            result.startTest(test)
+            try:
+                raise AssertionError("specific failure")
+            except AssertionError:
+                result.addFailure(test, sys.exc_info())
+            self.assertIn("active case:", output.getvalue())
+            self.assertIn("specific failure", output.getvalue())
+            self.assertIn("/owned/case", output.getvalue())
+            self.assertGreaterEqual(stream.flush.call_count, 2)
+            self.assertEqual(self.suite.Results.outcomes[-1][1], "fail")
+        finally:
+            self.suite.CASES.pop()
+            self.suite.Results.outcomes.clear()
+
+    def test_error_traceback_is_bounded_and_retains_error_status(self):
+        output = io.StringIO()
+        result = self.suite.Results(unittest.runner._WritelnDecorator(output), True, 2)
+        test = unittest.FunctionTestCase(lambda: None)
+        try:
+            try:
+                raise RuntimeError("x" * 12000)
+            except RuntimeError:
+                result.addError(test, sys.exc_info())
+            self.assertIn("[traceback truncated]", output.getvalue())
+            self.assertLess(len(output.getvalue()), 10000)
+            self.assertEqual(self.suite.Results.outcomes[-1][1], "error")
+        finally:
+            self.suite.Results.outcomes.clear()
+
+
+class CensusStageControls(unittest.TestCase):
+    def test_interruption_before_round_return_can_occur_in_distinct_stages(self):
+        class Interrupted(BaseException):
+            pass
+
+        read = mock.Mock(side_effect=Interrupted("row"))
+        snapshot = mock.Mock(side_effect=Interrupted("snapshot"))
+        with self.assertRaisesRegex(Interrupted, "snapshot"):
+            guard.Census(1, snapshot=snapshot, getsid=read).round()
+        read.assert_not_called()
+
+        row = {"pid": 42, "start": 7, "zombie": False}
+        snapshot = mock.Mock(return_value=[row])
+        with self.assertRaisesRegex(Interrupted, "row"):
+            guard.Census(1, snapshot=snapshot, getsid=read).round()
+        snapshot.assert_called_once()
+        read.assert_called_once_with(42)
 
 
 if __name__ == "__main__":

@@ -10213,6 +10213,24 @@ class CeilingReal(unittest.TestCase):
 class Results(unittest.TextTestResult):
     outcomes = []
 
+    def startTest(self, test):
+        super().startTest(test)
+        self.stream.write(f"\nactive case: {test.id()}\n")
+        self.stream.flush()
+
+    def report_failure(self, test, err):
+        # The runner may be interrupted before unittest prints its final summary.
+        # Bound each immediate diagnostic, while retaining the ordinary summary.
+        detail = self._exc_info_to_string(err, test)
+        locator = str(getattr(test, "dir", None))[:1024]
+        matching = next((row for row in reversed(CASES)
+                         if row.get("case") == test.id().rsplit(".", 1)[-1]), None)
+        self.stream.write(f"\ncase failure: {test.id()} fixture={locator} facts={str(matching)[:4096]}\n")
+        self.stream.write(detail[:8192])
+        if len(detail) > 8192:
+            self.stream.write("\n[traceback truncated]\n")
+        self.stream.flush()
+
     def addSuccess(self, test):
         super().addSuccess(test)
         Results.outcomes.append([test.id(), "pass"])
@@ -10224,10 +10242,12 @@ class Results(unittest.TextTestResult):
     def addFailure(self, test, err):
         super().addFailure(test, err)
         Results.outcomes.append([test.id(), "fail"])
+        self.report_failure(test, err)
 
     def addError(self, test, err):
         super().addError(test, err)
         Results.outcomes.append([test.id(), "error"])
+        self.report_failure(test, err)
 
 
 def write(name, size):
