@@ -354,6 +354,11 @@ pub struct PoolStorage {
     storage: Storage,
     area: Area,
     location: Location,
+    /// The area name, folder and absent policy sub-areas inherit.
+    name: String,
+    folder: String,
+    absent: Absent,
+    soft_cap_bytes: Option<u64>,
 }
 
 /// The facts a pool's storage declaration needs.
@@ -430,6 +435,13 @@ impl PoolStorage {
             storage,
             area,
             location,
+            name: config.area.clone(),
+            folder: backing.folder.clone(),
+            absent: match &config.fallback {
+                Some(path) => Absent::Fallback { path: path.clone() },
+                None => Absent::Fail,
+            },
+            soft_cap_bytes: backing.soft_cap_bytes,
         })
     }
 
@@ -453,11 +465,157 @@ impl PoolStorage {
         self.location.on_volume()
     }
 
-    /// Create one root for a slot (a fresh id and path).
+    /// The declared area, or the sub-area for one project folder.
+    ///
+    /// The flat slot parent (`slots/`) is one area; a legacy slot recorded as
+    /// `<folder>/<leaf>` lives one level lower, so its own project folder is
+    /// its area. Declaring it is idempotent, and it is how an existing nested
+    /// slot is adopted with its path intact.
+    pub fn area_for(&self, folder: Option<&str>) -> Result<Area, String> {
+        let Some(folder) = folder else {
+            return Ok(self.area.clone());
+        };
+        let name = format!("{}-{}", self.name, slug(folder));
+        let spec = barge::AreaSpec::new(NAMESPACE, name, "pool")
+            .folder(format!("{}/{folder}", self.folder))
+            .absent(self.absent.clone())
+            .soft_cap_bytes(self.soft_cap_bytes)
+            .counts_toward_reserve(true);
+        self.storage
+            .barge()
+            .area(spec)
+            .map_err(|error| format!("cannot declare the area for {folder}: {error}"))
+    }
+
+    /// Every area this pool declares, in name order.
+    fn areas(&self) -> Result<Vec<Area>, String> {
+        let prefix = format!("{NAMESPACE}/{}", self.name);
+        Ok(self
+            .storage
+            .areas()?
+            .into_iter()
+            .filter(|area| {
+                let key = area.key();
+                key.namespace() == NAMESPACE
+                    && (key.name() == self.name
+                        || key.name().starts_with(&format!("{}-", self.name)))
+            })
+            .collect::<Vec<_>>())
+    }
+
+    /// Adopt an existing Oxide directory as an owned root, keeping its folder
+    /// name and bytes. `folder` is the directory's own name in its area;
+    /// `id` is Oxide's stable identity for it.
+    pub fn adopt_in(
+        &self,
+        project_folder: Option<&str>,
+        folder: &str,
+        label: &str,
+        id: &str,
+    ) -> Result<barge::Root, String> {
+        let area = self.area_for(project_folder)?;
+        area.adopt_root(folder, label, id)
+            .map_err(|error| format!("cannot adopt {folder}: {error}"))
+    }
+
+    /// Create one root for a slot (a fresh id and path) in the flat area.
     pub fn create(&self, label: &str) -> Result<barge::Root, String> {
         self.area
             .create_root(label)
             .map_err(|error| format!("cannot create a slot root: {error}"))
+    }
+
+    /// Find a root by id in the pool's areas.
+    pub fn resolve_any(&self, id: &str) -> Result<barge::Root, String> {
+        for area in self.areas()? {
+            if let Ok(root) = area.resolve(id) {
+                return Ok(root);
+            }
+        }
+        Err(format!("no pool root {id}"))
+    }
+
+    /// Take a waiting exclusive hold on a root in the given project folder.
+    pub fn hold_in(&self, project_folder: Option<&str>, id: &str) -> Result<Hold, String> {
+        self.area_for(project_folder)?
+            .hold(id, Mode::Exclusive)
+            .map_err(|error| format!("cannot hold slot root {id}: {error}"))
+    }
+
+    /// Try to take an exclusive hold without waiting.
+    pub fn try_hold_in(
+        &self,
+        project_folder: Option<&str>,
+        id: &str,
+    ) -> Result<Option<Hold>, String> {
+        self.area_for(project_folder)?
+            .try_hold(id, Mode::Exclusive)
+            .map_err(|error| format!("cannot test slot root {id}: {error}"))
+    }
+
+    /// Evict one root in the given project folder.
+    pub fn evict_in(
+        &self,
+        project_folder: Option<&str>,
+        id: &str,
+    ) -> Result<barge::area::Eviction, String> {
+        self.area_for(project_folder)?
+            .evict(id)
+            .map_err(|error| format!("cannot evict slot root {id}: {error}"))
+    }
+
+    /// Evict one root from whichever area holds it.
+    pub fn evict_any(&self, id: &str) -> Result<barge::area::Eviction, String> {
+        let mut last = format!("no pool root {id}");
+        for area in self.areas()? {
+            match area.evict(id) {
+                Ok(eviction) => return Ok(eviction),
+                Err(error) => last = format!("cannot evict slot root {id}: {error}"),
+            }
+        }
+        Err(last)
+    }
+
+    /// The bytes every area of this pool holds.
+    pub fn total_bytes(&self) -> Result<u64, String> {
+        let mut total = 0_u64;
+        for area in self.areas()? {
+            total = total.saturating_add(
+                area.bytes()
+                    .map_err(|error| format!("cannot account the pool area: {error}"))?,
+            );
+        }
+        Ok(total)
+    }
+
+    /// Every owned root of this pool with its area's project folder (the first
+    /// component of `folder` is the area, so a root's area is recoverable).
+    pub fn all_roots(&self) -> Result<Vec<(Option<String>, barge::RootInfo)>, String> {
+        let mut roots = Vec::new();
+        for area in self.areas()? {
+            let area_folder = area.record().effective_folder();
+            let project = project_folder(self.folder.as_str(), &area_folder);
+            let listing = area
+                .list()
+                .map_err(|error| format!("cannot list the pool area: {error}"))?;
+            for info in listing.roots {
+                roots.push((project.clone(), info));
+            }
+        }
+        Ok(roots)
+    }
+
+    /// Sweep every area's owned trash.
+    pub fn sweep_all_trash(&self) -> Result<barge::SweepReport, String> {
+        let mut report = barge::SweepReport::default();
+        for area in self.areas()? {
+            let swept = area
+                .sweep_trash()
+                .map_err(|error| format!("cannot sweep the pool trash: {error}"))?;
+            report.deleted.extend(swept.deleted);
+            report.kept.extend(swept.kept);
+        }
+        Ok(report)
     }
 
     /// Find a root by its id.
@@ -526,6 +684,41 @@ impl PoolStorage {
     pub fn admit(&self) -> Result<PruneReport, String> {
         self.storage.admit("pool")
     }
+}
+
+/// A bounded, Barge-safe suffix for a sub-area name.
+fn slug(text: &str) -> String {
+    let mut slug: String = text
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    slug.truncate(48);
+    while slug.ends_with('-') && slug.len() > 1 {
+        slug.pop();
+    }
+    slug
+}
+
+/// The project folder of an area whose folder is `<base>/<project>`.
+fn project_folder(base: &str, area_folder: &str) -> Option<String> {
+    area_folder
+        .strip_prefix(base)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|rest| !rest.is_empty())
+        .map(str::to_owned)
+}
+
+/// Make a directory Barge created owner-only, the mode Oxide writes slots in.
+pub fn make_private(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
 /// Read a root's hold without waiting. `None` means something else holds it.
@@ -895,6 +1088,132 @@ mod tests {
         );
         area.evict(&root.id).expect("evicted");
         assert!(!root.path.exists());
+    }
+
+    #[test]
+    fn an_existing_oxide_directory_is_adopted_in_place_and_the_repeat_is_idempotent() {
+        let fixture = Fixture::new("storage-adopt");
+        let area = fixture.storage.declare(&fixture.pool()).expect("area");
+        let location = fixture.storage.location(&fixture.pool()).expect("location");
+        let base = location.path().expect("path").to_path_buf();
+        let legacy = base.join("oxide-72ea0e6b");
+        std::fs::create_dir_all(&legacy).expect("legacy root");
+        std::fs::write(legacy.join("payload.bin"), vec![0_u8; 4096]).expect("content");
+
+        let root = area
+            .adopt_root("oxide-72ea0e6b", "checkout", "deadbeef00c0ffee")
+            .expect("adopt");
+        assert_eq!(root.path, legacy);
+        assert_eq!(root.folder_name(), "oxide-72ea0e6b");
+        assert!(legacy.join("payload.bin").is_file(), "nothing moved");
+        let marker: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(legacy.join(".barge-root.json")).expect("marker"),
+        )
+        .expect("json");
+        assert_eq!(marker["schema"], "barge.root/2");
+        assert_eq!(marker["folder"], "oxide-72ea0e6b");
+
+        let repeat = area
+            .adopt_root("oxide-72ea0e6b", "checkout", "deadbeef00c0ffee")
+            .expect("idempotent repeat");
+        assert_eq!(repeat.id, root.id);
+        let listing = area.list().expect("list");
+        assert_eq!(listing.roots.len(), 1);
+        assert!(listing.bytes() >= 4096);
+
+        // Adopted roots behave like created ones.
+        let hold = area.hold(&root.id, Mode::Exclusive).expect("hold");
+        assert!(area.evict(&root.id).is_err());
+        drop(hold);
+        area.evict(&root.id).expect("evicted");
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn adoption_refuses_a_foreign_marker_a_symlink_and_a_writable_folder() {
+        let fixture = Fixture::new("storage-adopt-refuse");
+        let area = fixture.storage.declare(&fixture.pool()).expect("area");
+        let other = fixture
+            .storage
+            .declare(
+                &AreaConfig::new("Builds", fixture.mount.clone(), "other")
+                    .folder(format!("{VOLUME_PAYLOAD_FOLDER}/{POOL_FOLDER}")),
+            )
+            .expect("other area");
+        let base = fixture
+            .storage
+            .location(&fixture.pool())
+            .expect("location")
+            .path()
+            .expect("path")
+            .to_path_buf();
+        let foreign = base.join("oxide-adopted-elsewhere");
+        std::fs::create_dir_all(&foreign).expect("dir");
+        other
+            .adopt_root("oxide-adopted-elsewhere", "checkout", "aaaabbbbccccdddd")
+            .expect("adopted by the other area");
+        let error = area
+            .adopt_root("oxide-adopted-elsewhere", "checkout", "aaaabbbbccccdddd")
+            .expect_err("foreign marker");
+        assert!(error.message().contains("area"), "{error}");
+
+        let writable = base.join("oxide-writable");
+        std::fs::create_dir_all(&writable).expect("dir");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o777)).expect("mode");
+        assert!(area
+            .adopt_root("oxide-writable", "checkout", "1111222233334444")
+            .is_err());
+
+        let target = base.join("oxide-real");
+        std::fs::create_dir_all(&target).expect("dir");
+        std::os::unix::fs::symlink(&target, base.join("oxide-link")).expect("link");
+        assert!(area
+            .adopt_root("oxide-link", "checkout", "5555666677778888")
+            .is_err());
+
+        assert!(
+            area.adopt_root("oxide-missing", "checkout", "9999aaaabbbbcccc")
+                .is_err(),
+            "a missing folder is never created by adoption"
+        );
+    }
+
+    #[test]
+    fn a_pool_adopts_a_legacy_nested_slot_in_its_project_area() {
+        let fixture = Fixture::new("storage-adopt-nested");
+        let control = fixture._temp.path().join("pool-nested");
+        std::fs::create_dir_all(control.join("oxide-managed")).expect("control");
+        fixture.os.add_volume(&control, Some(UUID), 100 << 30);
+        let pool = PoolStorage::open(
+            &control.join("oxide-managed"),
+            &PoolBacking::budget(&control, 1 << 30),
+        )
+        .expect("pool storage");
+        let base = control.join("payload/slots");
+        let nested = base.join("oxide-f88047ec/quick-3");
+        std::fs::create_dir_all(&nested).expect("nested slot");
+        std::fs::write(nested.join("build.log"), b"log").expect("content");
+
+        let root = pool
+            .adopt_in(
+                Some("oxide-f88047ec"),
+                "quick-3",
+                "quick",
+                "0123456789abcdef",
+            )
+            .expect("adopt nested");
+        assert_eq!(root.path, nested);
+        assert!(pool.total_bytes().expect("bytes") >= 3);
+        let hold = pool
+            .hold_in(Some("oxide-f88047ec"), &root.id)
+            .expect("hold");
+        assert!(pool.evict_any(&root.id).is_err());
+        drop(hold);
+        pool.evict_any(&root.id).expect("evicted");
+        assert!(!nested.exists());
+        // The project folder itself is kept: only the recorded slot is gone.
+        assert!(base.join("oxide-f88047ec").is_dir());
     }
 
     #[test]
