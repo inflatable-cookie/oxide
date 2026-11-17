@@ -143,12 +143,23 @@ pub struct OxideOs;
 impl barge::Os for OxideOs {
     fn volume_identity(&self, mount: &Path) -> barge::Result<Option<String>> {
         if is_drive_mount_point(mount) {
-            return Ok(match crate::volume::observe_path(mount) {
-                Ok(facts) if facts.mounted_on == mount => facts.uuid,
-                // A stale mount point, or one that cannot be read: absent, so
-                // the area's declared fallback is used and reported.
-                _ => None,
-            });
+            // A path that does not exist is positively absent; a stale
+            // directory (a positive observation that this is not the volume's
+            // mount root) is absent too; any observation failure is unknown
+            // and refuses rather than falling back.
+            if std::fs::symlink_metadata(mount)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Ok(None);
+            }
+            return match crate::volume::observe_path(mount) {
+                Ok(facts) if facts.mounted_on == mount => Ok(facts.uuid),
+                Ok(_) => Ok(None),
+                Err(reason) => Err(barge::Error::unknown_state(format!(
+                    "cannot read the volume identity at {}: {reason}",
+                    mount.display()
+                ))),
+            };
         }
         barge::os::platform().volume_identity(mount)
     }
@@ -359,6 +370,7 @@ pub struct PoolStorage {
     folder: String,
     absent: Absent,
     soft_cap_bytes: Option<u64>,
+    backing: PoolBacking,
 }
 
 /// The facts a pool's storage declaration needs.
@@ -432,6 +444,12 @@ impl PoolStorage {
                 .map_err(|error| format!("cannot create the pool control directory: {error}"))?;
         }
         let storage = Storage::open(control)?;
+        Self::from_storage(storage, backing)
+    }
+
+    /// Build a pool storage over an already-open account (Oxide's tests use a
+    /// fake platform seam).
+    pub fn from_storage(storage: Storage, backing: &PoolBacking) -> Result<Self, String> {
         let config = AreaConfig::new("pool", backing.mount.clone(), POOL_AREA)
             .uuid(backing.uuid.clone())
             .folder(backing.folder.clone())
@@ -453,7 +471,25 @@ impl PoolStorage {
                 None => Absent::Fail,
             },
             soft_cap_bytes: backing.soft_cap_bytes,
+            backing: backing.clone(),
         })
+    }
+
+    /// Record the front door's registered reserve on this volume, so Barge's
+    /// prune target is the operator's reserve rather than zero.
+    pub fn set_reserve(&self, reserve_bytes: u64) -> Result<(), String> {
+        if self.backing.reserve_bytes == reserve_bytes {
+            return Ok(());
+        }
+        self.storage.register_volume(
+            "pool",
+            &self.backing.mount,
+            self.backing.uuid.as_deref(),
+            "",
+            reserve_bytes,
+            self.backing.floor_bytes,
+        )?;
+        Ok(())
     }
 
     /// Where the pool's new slot roots go right now, or why there is nowhere.
@@ -1210,5 +1246,121 @@ mod tests {
         // The root's marker is its own bytes; what matters is that Barge lists
         // and accounts for it.
         assert!(area.bytes().expect("bytes") > 0);
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+    use barge::{FakeOs, ManualClock, Mode};
+    use std::sync::Arc;
+
+    const UUID: &str = "8E4A5C1D-0000-4000-8000-00000000BEEF";
+
+    fn fixture(label: &str) -> (barge::testing::TempDir, Storage, FakeOs, PathBuf) {
+        let temp = barge::testing::TempDir::new(label).expect("temp");
+        let mount = temp.path().join("Builds");
+        std::fs::create_dir_all(&mount).expect("mount");
+        let os = FakeOs::with_volume(mount.clone(), UUID, 100 << 30);
+        let storage = Storage::open_with(
+            temp.path().join("state"),
+            Arc::new(os.clone()),
+            Arc::new(ManualClock::new(1_000)),
+        )
+        .expect("storage");
+        (temp, storage, os, mount)
+    }
+
+    /// An OS seam whose drive mount identity cannot be read: that is unknown,
+    /// never absent, so no fallback is taken.
+    #[derive(Debug, Clone, Copy)]
+    struct UnreadableOs;
+
+    impl barge::Os for UnreadableOs {
+        fn volume_identity(&self, mount: &Path) -> barge::Result<Option<String>> {
+            Err(barge::Error::unknown_state(format!(
+                "cannot read the volume identity at {}",
+                mount.display()
+            )))
+        }
+        fn free_bytes(&self, _path: &Path) -> barge::Result<u64> {
+            Ok(100 << 30)
+        }
+    }
+
+    #[test]
+    fn an_unreadable_drive_identity_refuses_instead_of_falling_back() {
+        let temp = barge::testing::TempDir::new("storage-unknown-identity").expect("temp");
+        let mount = temp.path().join("Builds");
+        std::fs::create_dir_all(&mount).expect("mount");
+        let storage = Storage::open_with(
+            temp.path().join("state"),
+            Arc::new(UnreadableOs),
+            Arc::new(ManualClock::new(1_000)),
+        )
+        .expect("storage");
+        let fallback = temp.path().join("internal/slots");
+        let config = AreaConfig::new("Builds", mount.clone(), POOL_AREA)
+            .uuid(Some(UUID.to_owned()))
+            .folder("oxide-pool/slots")
+            .fallback(Some(fallback));
+        assert!(
+            storage.declare(&config).is_err(),
+            "an unknown identity is a refusal, not an absent volume"
+        );
+    }
+
+    #[test]
+    fn a_prune_skips_a_pinned_and_a_held_root_and_evicts_a_later_eligible_one() {
+        let (_temp, storage, os, mount) = fixture("storage-multi-victim");
+        let config = AreaConfig::new("Builds", mount.clone(), POOL_AREA)
+            .folder("oxide-pool/slots")
+            .reserve_bytes(20 << 30)
+            .floor_bytes(10 << 30);
+        let area = storage.declare(&config).expect("area");
+        let pinned = area.create_root("quick").expect("root");
+        area.pin(&pinned.id, "selected output").expect("pin");
+        let held = area.create_root("quick").expect("root");
+        let hold = area.hold(&held.id, Mode::Exclusive).expect("hold");
+        let eligible = area.create_root("quick").expect("root");
+        std::fs::write(eligible.path.join("file"), vec![0_u8; 8192]).expect("write");
+        let eligible_bytes = area
+            .list()
+            .expect("list")
+            .get(&eligible.id)
+            .map(|root| root.bytes)
+            .expect("eligible");
+        // Below the reserve by exactly the eligible root's bytes: only that
+        // root can bring free space back.
+        os.set_free(&mount, (20_u64 << 30) - eligible_bytes);
+        let report = storage.prune("Builds", false).expect("prune");
+        assert_eq!(report.evicted.len(), 1, "{report:?}");
+        assert_eq!(report.evicted[0].id, eligible.id);
+        assert!(pinned.path.exists(), "the pin kept its root");
+        assert!(held.path.exists(), "the hold kept its root");
+        drop(hold);
+    }
+
+    #[test]
+    fn a_removable_area_records_the_front_door_reserve() {
+        let (_temp, storage, os, mount) = fixture("storage-reserve");
+        let control = _temp.path().join("pool");
+        std::fs::create_dir_all(control.join("oxide-managed")).expect("control");
+        os.add_volume(&control, Some(UUID), 100 << 30);
+        let pool = PoolStorage::from_storage(
+            storage.clone(),
+            &PoolBacking {
+                mount: mount.clone(),
+                folder: "oxide-pool/slots".to_owned(),
+                uuid: Some(UUID.to_owned()),
+                soft_cap_bytes: Some(1 << 30),
+                reserve_bytes: 0,
+                floor_bytes: 10 << 20,
+                removable: true,
+            },
+        )
+        .expect("pool");
+        pool.set_reserve(20 << 30).expect("reserve");
+        assert_eq!(pool.space().expect("space").reserve_bytes, 20 << 30);
     }
 }

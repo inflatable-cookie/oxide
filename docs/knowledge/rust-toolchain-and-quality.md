@@ -30,10 +30,9 @@ a TOML 1.0 parser whose only dependency is the already-pinned `serde`, so
 `Cargo.lock` gains this one package; it was resolved offline from the local
 cache (checksum `ba62675e8242a4c4e806d12f11d136e626e6c8361d6b829310732241652a178a`, matching the cached archive). This does not establish production host support.
 
-Since oxide#219 the package also depends on Barge's library at one full
-40-hex commit, `4af9360bd09629e970c143080ca159de8eef2562` (the merged PR #39
-commit, which contains R1, R2 and R4). The dependency is feature-off, so
-`proof-synthetic-account` is not enabled. `Cargo.lock` gains only the `barge`
+Since oxide#314 the package depends on Barge's lean storage core at one full
+40-hex commit, `be06c69b4720e4d5c786da331a5615cdcde9f9e0` (barge#064 merged as
+barge#65, plus the adopted-root seam barge#065 merged as barge#66). `Cargo.lock` gains only the `barge`
 package; its `serde`, `serde_json` and `libc` are already pinned. Offline builds
 take the locked Barge source from the bounded seeder, as they do for Longhorn.
 

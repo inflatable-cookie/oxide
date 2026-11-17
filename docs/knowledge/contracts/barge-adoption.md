@@ -30,7 +30,8 @@ and Queue history; no evidence, credit or fixture from them is migrated.
 
 `barge` is a Git dependency pinned by full 40-hex revision in `Cargo.toml` and
 `Cargo.lock`; never a branch or tag. The current pin is the merged lean core
-(`a942a1d`). Offline builds seed that locked Git source through
+with its adopted-root seam (`be06c69b`; barge#065 merged as barge#66). Offline
+builds seed that locked Git source through
 `scripts/offline_seed.py`; a missing candidate is an offline failure, not
 permission to resolve a moving ref.
 
@@ -108,19 +109,18 @@ Oxide's existing roots are not Barge roots: they predate the marker, and Barge
 records any folder without a matching marker as a straggler it will not reuse,
 evict or delete.
 
-The lean core has no "adopt an existing root" call. Oxide has therefore raised
-one concrete, generic API gap with the Barge owner: an `adopt_root` that
-validates a caller-owned directory inside a declared area, writes the library's
-own marker, and is idempotent for the same identity. Oxide supplies the layout
-and identity facts; Barge must not learn any Oxide format. Until that reviewed
-API is merged and pinned:
-
-- an existing root is left in place, unowned: nothing is moved, copied,
-  relabelled, retired or deleted;
-- no Oxide fallback deleter is added, and no marker is forged;
-- the transition is exercised only on fresh temporary legacy fixtures,
-  including a refused foreign/mismatched root and an idempotent repeat, never
-  on a live installation.
+Barge offers one generic `Area::adopt_root(folder, label, id)`: it validates a
+caller-owned directory inside a declared area, records the folder in a
+`barge.root/2` marker, refuses a symlink, a group- or other-writable folder, a
+foreign or mismatched marker and a duplicate id, and repeats a matching
+adoption idempotently. Oxide supplies the layout and identity facts; Barge never
+learns an Oxide format. The pool adopts each recorded legacy slot in place,
+keeping its path and bytes, and never adopts an unrecorded stray at a retired
+folder. A row whose adoption is refused stays unowned: it is never reused or
+evicted through a lock this version did not establish, and nothing is moved,
+copied, relabelled or deleted. Every transition test runs on fresh temporary
+legacy fixtures (active, foreign, nested, repeated and successor cases), never
+on a live installation.
 
 Selecting a volume, refusing a mismatch, falling back while the drive is away
 and reporting the fallback in status are ordinary behaviour and do not wait on

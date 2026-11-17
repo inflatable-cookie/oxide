@@ -269,3 +269,201 @@ fn a_pinned_root_is_not_evicted_by_pressure() {
         "the pinned slot stays"
     );
 }
+
+/// Write a ledger with one legacy row, as an older Oxide wrote it, over the
+/// config a fresh budget pool produced.
+fn write_legacy_ledger(pool: &Path, state: &str, dir: Option<&str>, id: u64, project: &str) {
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("config.json")).unwrap()).unwrap();
+    let store_id = config["store_id"].as_str().unwrap();
+    let cap = config["cap_bytes"].as_u64().unwrap();
+    let row = serde_json::json!({
+        "id": id,
+        "incarnation": 1,
+        "state": state,
+        "project": project,
+        "workspace": "/fixture/workspace",
+        "profile": "dev",
+        "holder": "legacy",
+        "lease_id": if state == "held" { serde_json::json!(format!("v1.{store_id}.{id}.1.1")) } else { serde_json::Value::Null },
+        "last_lease_id": format!("v1.{store_id}.{id}.1.1"),
+        "dir": dir,
+        "rank": 1,
+    });
+    let ledger = serde_json::json!({
+        "version": 1,
+        "store_id": store_id,
+        "cap_bytes": cap,
+        "next_slot": id + 1,
+        "next_lease": 2,
+        "capacity_policy": 3,
+        "next_rank": 2,
+        "slots": [row],
+    });
+    fs::write(
+        pool.join("ledger.json"),
+        serde_json::to_vec(&ledger).unwrap(),
+    )
+    .unwrap();
+}
+
+fn slot_dir(pool: &Path, name: &str) -> PathBuf {
+    let path = pool.join("payload/slots").join(name);
+    fs::create_dir_all(&path).unwrap();
+    path
+}
+
+#[test]
+fn a_held_legacy_row_is_not_reclaimed_by_a_free_barge_lock() {
+    let fixture = Fixture::new("legacy-held");
+    let pool = fixture.pool();
+    let dir = slot_dir(&pool, "41");
+    fs::write(dir.join("artifact"), b"live").unwrap();
+    let project = fixture.dir("project");
+    write_legacy_ledger(&pool, "held", None, 41, project.to_str().unwrap());
+    // Opening adopts the directory but must not infer closure: the legacy
+    // writer never held this lock.
+    let status = managed::status(&pool).unwrap();
+    assert_eq!(status.slots.len(), 1);
+    assert_eq!(status.slots[0].state, SlotOccupancy::Held);
+    let workspace = fixture.dir("workspace");
+    let outcome = managed::lease(request(&pool, &project, &workspace, "new"));
+    if let Ok(leased) = outcome {
+        assert_ne!(
+            leased.grant.slot_id, "41",
+            "the legacy row is never granted"
+        );
+    }
+    assert!(dir.join("artifact").is_file(), "the legacy bytes stay");
+}
+
+#[test]
+fn a_foreign_legacy_root_is_never_reused_or_deleted() {
+    let fixture = Fixture::new("legacy-foreign");
+    let pool = fixture.pool();
+    let dir = slot_dir(&pool, "42");
+    fs::write(dir.join("artifact"), b"foreign").unwrap();
+    // A marker for another area makes this directory not ours to adopt.
+    fs::write(
+        dir.join(".barge-root.json"),
+        br#"{"schema":"barge.root/1","area":"other/area","id":"0123456789abcdef","label":"other","created_unix_ms":1}"#,
+    )
+    .unwrap();
+    let project = fixture.dir("project");
+    write_legacy_ledger(&pool, "idle", None, 42, project.to_str().unwrap());
+    let status = managed::status(&pool).unwrap();
+    assert_eq!(status.slots.len(), 1);
+    let workspace = fixture.dir("workspace");
+    let outcome = managed::lease(request(&pool, &project, &workspace, "new"));
+    assert!(
+        outcome
+            .map(|leased| leased.grant.slot_id != "42")
+            .unwrap_or(true),
+        "an unowned legacy root is never granted"
+    );
+    assert!(
+        dir.join("artifact").is_file(),
+        "nothing was deleted or moved"
+    );
+}
+
+#[test]
+fn a_nested_legacy_slot_is_adopted_in_its_area_and_reused_after_a_repeat() {
+    let fixture = Fixture::new("legacy-nested");
+    let pool = fixture.pool();
+    let dir = slot_dir(&pool, "repo/quick-3");
+    fs::write(dir.join("artifact"), b"warm").unwrap();
+    let project = fixture.dir("project");
+    write_legacy_ledger(
+        &pool,
+        "idle",
+        Some("repo/quick-3"),
+        3,
+        project.to_str().unwrap(),
+    );
+    // First open adopts it; a repeat resolves the same root id.
+    let first = managed::status(&pool).unwrap();
+    let second = managed::status(&pool).unwrap();
+    assert_eq!(first.slots.len(), 1);
+    assert_eq!(second.slots.len(), 1);
+    let workspace = fixture.dir("workspace");
+    let reused =
+        managed::lease_measured(request(&pool, &project, &workspace, "new")).expect("reuse");
+    assert!(
+        reused.grant.reused_slot,
+        "the adopted nested root is reused"
+    );
+    assert_eq!(reused.grant.slot_id, "3");
+    assert!(reused.grant.env.cargo_build_build_dir.starts_with(&dir));
+    assert!(dir.join("artifact").is_file());
+}
+
+#[test]
+fn an_evicted_legacy_root_gets_a_fresh_successor_path() {
+    let fixture = Fixture::new("legacy-successor");
+    let pool = fixture.pool();
+    let dir = slot_dir(&pool, "44");
+    let project = fixture.dir("project");
+    write_legacy_ledger(&pool, "idle", None, 44, project.to_str().unwrap());
+    // Adopt, then evict the idle legacy root by id.
+    managed::status(&pool).unwrap();
+    managed::evict_idle_slot(&pool, "44").expect("evicted");
+    assert!(!dir.exists(), "the recorded legacy root is deleted whole");
+    let workspace = fixture.dir("workspace");
+    let fresh =
+        managed::lease_measured(request(&pool, &project, &workspace, "new")).expect("admit");
+    assert!(!fresh.grant.reused_slot, "the successor is a new slot");
+    let path = &fresh.grant.env.cargo_build_build_dir;
+    assert!(
+        !path.starts_with(&dir),
+        "the successor never reuses the evicted path"
+    );
+    assert!(path.parent().unwrap().join(".barge-root.json").is_file());
+}
+
+#[test]
+fn a_passive_measurement_reports_logical_bytes_without_claiming_allocation() {
+    let fixture = Fixture::new("measure");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let workspace = fixture.dir("workspace");
+    let leased = managed::lease_measured(request(&pool, &project, &workspace, "a")).expect("lease");
+    fill(&leased, 4096);
+    let lease_id = leased.grant.lease_id.clone();
+    drop(leased);
+    managed::release(&pool, &lease_id).expect("release");
+    // `oxide status --measure` opens passively: no storage handle, a bounded
+    // read-only walk, logical bytes only and an honest coverage.
+    let measured = managed::measure(&pool).expect("measurement succeeds");
+    let status = &measured.status;
+    assert_eq!(status.slots.len(), 1);
+    let slot = &status.slots[0];
+    assert!(slot.logical_bytes.unwrap_or(0) >= 4096, "{slot:?}");
+    assert_eq!(slot.unique_allocated_bytes, None, "no allocation claim");
+    assert_eq!(status.payload_unique_allocated_bytes, None);
+    assert_eq!(status.coverage, super::AccountingCoverage::Complete);
+}
+
+#[test]
+fn an_unreadable_slot_makes_a_passive_measurement_partial() {
+    let fixture = Fixture::new("measure-partial");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let workspace = fixture.dir("workspace");
+    let leased = managed::lease_measured(request(&pool, &project, &workspace, "a")).expect("lease");
+    let lease_id = leased.grant.lease_id.clone();
+    let slot_root = leased
+        .grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    drop(leased);
+    managed::release(&pool, &lease_id).expect("release");
+    std::fs::remove_dir_all(&slot_root).unwrap();
+    let measured =
+        managed::measure(&pool).expect("a missing root is a partial figure, not an error");
+    assert_eq!(measured.status.coverage, super::AccountingCoverage::Partial);
+    assert!(measured.status.payload_logical_bytes.is_none());
+}
