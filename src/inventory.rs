@@ -1673,7 +1673,10 @@ pub mod walk_observer {
         pub(crate) fn from_environment() -> Option<Self> {
             #[cfg(test)]
             let test_value = TEST_MUTATIONS.with(|cell| cell.borrow().clone());
+            #[cfg(not(test))]
             let test_value: Option<String> = None;
+            #[cfg(test)]
+            let value = test_value.clone()?;
             #[cfg(not(test))]
             let value = {
                 std::env::var("OXIDE_PROOF_DEADLINE_NS")
