@@ -20,10 +20,6 @@
 //! leaves (`src/volume.rs`, `src/inventory.rs`, `src/lease/pool.rs`) resolve
 //! `crate::tape` to this same sink in the re-rooted harness crate.
 
-/// The separate limited (O2-CAL) verdict policy: test-only, beside the strict
-/// `/2` result and never a replacement for it.
-#[path = "capture_verdict.rs"]
-pub(crate) mod capture_verdict;
 #[path = "capture_wire.rs"]
 pub(crate) mod capture_wire;
 use capture_wire::{Provenance, K1_PREMISE_QUALIFIED};
