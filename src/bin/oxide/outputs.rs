@@ -1425,13 +1425,6 @@ impl Marker {
         self.volume_uuid.as_deref()
     }
 
-    /// The checkout's volume UUID recorded when the root was created, if the
-    /// marker carries one (shared `oxide.outputs.root/2`). A version-1 marker
-    /// has no such field and reports `None`; a recorded value is never waived.
-    pub(crate) fn checkout_volume_uuid(&self) -> Option<&str> {
-        self.checkout_volume_uuid.as_deref()
-    }
-
     pub(crate) fn nonce(&self) -> Option<&str> {
         self.nonce.as_deref()
     }
@@ -2384,6 +2377,7 @@ fn adopt_under_barrier(
         Ok(registration) => external_spec(registration, &context.workspace),
         Err(_) => local_spec(&context.workspace),
     };
+    let spec = current_or_successor_spec(context, &receipt, spec)?;
     let current = receipt.selected().cloned();
     match (&target, &current) {
         // Already converted to the place this command would select.
@@ -3956,6 +3950,7 @@ fn adopt_profile_from(
             spec_for(&desired)
         }
     };
+    let spec = current_or_successor_spec(context, &receipt, spec)?;
     let wanted = match &desired {
         Some(desired) => Some(desired.clone()),
         None => Some(spec.selected(receipt.generation.saturating_add(1))),
@@ -4422,6 +4417,7 @@ fn detach_profile(
 pub struct OutputBinding {
     pub outcome: Outcome,
     _lock: Option<File>,
+    _holds: Vec<barge::Hold>,
 }
 
 impl OutputBinding {
@@ -4429,6 +4425,7 @@ impl OutputBinding {
         Self {
             outcome,
             _lock: None,
+            _holds: Vec::new(),
         }
     }
 }
@@ -4457,6 +4454,25 @@ const BINDING_POLL: Duration = Duration::from_millis(200);
 /// command keeps the existing refusal, so a dangling member link never
 /// transitions automatically.
 pub fn bind_for_command(
+    store: &Store,
+    checkout: &Path,
+    own_record: u64,
+    expected: Option<&Plan>,
+    pool_fallback: Option<&str>,
+    repair_absent_members: bool,
+    guarded: Option<&LocalOutputs<'_>>,
+) -> Result<OutputBinding, String> {
+    let owned = guarded.is_none();
+    let mut binding = bind_for_command_inner(store, checkout, own_record, expected,
+        pool_fallback, repair_absent_members, guarded)?;
+    let id = identity::digest(&checkout.to_string_lossy());
+    if let Some(receipt) = if owned { read_receipt(store.owner_control(), checkout, &id)? } else { None } {
+        binding._holds = crate::prune::hold_outputs(store.owner_control(), &receipt)?;
+    }
+    Ok(binding)
+}
+
+fn bind_for_command_inner(
     store: &Store,
     checkout: &Path,
     own_record: u64,
@@ -4498,6 +4514,7 @@ pub fn bind_for_command(
         return Ok(OutputBinding {
             outcome,
             _lock: Some(lock),
+        _holds: Vec::new(),
         });
     }
     if context.receipt()?.is_none() {
@@ -4519,6 +4536,7 @@ pub fn bind_for_command(
             return Ok(OutputBinding {
                 outcome: unconverted_outcome(),
                 _lock: Some(lock),
+        _holds: Vec::new(),
             });
         };
         keyed_state_matches(Some(&receipt), expected)?;
@@ -4548,6 +4566,7 @@ pub fn bind_for_command(
                 return Ok(OutputBinding {
                     outcome,
                     _lock: Some(lock),
+        _holds: Vec::new(),
                 })
             }
             Bind::Refuse(reason) => return Err(reason),
@@ -6014,6 +6033,11 @@ fn desired_selection(context: &Context, receipt: &Receipt) -> Result<Option<Sele
             None => return Ok(None),
         }
     };
+    let spec = receipt.roots.iter().rev().chain(receipt.links().iter().filter_map(|placement| placement.selected_ref()))
+        .find(|selected| selected.kind == spec.selected(0).kind
+            && selected.volume_uuid == spec.selected(0).volume_uuid
+            && selected.root.parent() == spec.root().parent() && read_marker(&selected.root).is_ok())
+        .map(spec_for).unwrap_or(spec);
     let marker = read_marker(spec.root()).ok();
     let generation = marker.as_ref().map_or(next, |marker| marker.generation);
     let wanted = spec.selected(generation);
@@ -6762,6 +6786,7 @@ fn bind_local_outputs(
     Ok(OutputBinding {
         outcome: local_outcome(local.reason),
         _lock: Some(lock),
+        _holds: Vec::new(),
     })
 }
 
@@ -6923,6 +6948,32 @@ fn external_spec(registration: &removable::Registration, checkout: &Path) -> Roo
         uuid: registration.volume_uuid.clone(),
         leaf,
     }
+}
+
+fn current_or_successor_spec(context: &Context, receipt: &Receipt, spec: RootSpec) -> Result<RootSpec, String> {
+    let wanted = spec.selected(0);
+    if let Some(selected) = receipt.roots.iter().rev().chain(receipt.links().iter()
+        .filter_map(|placement| placement.selected_ref()))
+        .find(|selected| selected.kind == wanted.kind && selected.volume_uuid == wanted.volume_uuid
+            && selected.root.parent() == wanted.root.parent() && read_marker(&selected.root).is_ok())
+    {
+        return Ok(spec_for(selected));
+    }
+    let Some(control) = context.control() else { return Ok(spec); };
+    if !crate::prune::needs_successor(control, spec.root())? { return Ok(spec); }
+    let root = crate::prune::fresh_output(control, &wanted)?;
+    let replacement = match spec {
+        RootSpec::External { uuid, .. } => RootSpec::External {
+            leaf: root.folder, root: root.path, uuid,
+        },
+        RootSpec::Local { .. } => RootSpec::Local { root: root.path },
+    };
+    let binding = match &replacement {
+        RootSpec::External { uuid, .. } => Some(binding_for(context, uuid)?),
+        RootSpec::Local { .. } => None,
+    };
+    create_marker(context, &replacement, receipt.generation.saturating_add(1), binding.as_ref(), None)?;
+    Ok(replacement)
 }
 
 fn local_spec(checkout: &Path) -> RootSpec {
@@ -7168,7 +7219,7 @@ fn validate_root_device(
 /// clean's deletions) outside the checkout.
 fn validate_local_ancestry(checkout: &Path, root: &Path) -> Result<(), String> {
     let outer = checkout.join(LOCAL_DIR);
-    if root != outer.join(LOCAL_ROOT) {
+    if root.parent() != Some(outer.as_path()) {
         return Err(format!(
             "{} is not this checkout's local root {}",
             root.display(),
@@ -7184,7 +7235,7 @@ fn validate_local_ancestry(checkout: &Path, root: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot resolve {}: {error}", checkout.display()))?;
     let canonical = fs::canonicalize(root)
         .map_err(|error| format!("cannot resolve {}: {error}", root.display()))?;
-    if canonical != canonical_checkout.join(LOCAL_DIR).join(LOCAL_ROOT) {
+    if canonical != canonical_checkout.join(LOCAL_DIR).join(root.file_name().ok_or("the local root has no folder")?) {
         return Err(format!(
             "{} resolves to {}, outside this checkout",
             root.display(),
@@ -7233,7 +7284,7 @@ fn ensure_root_with(
         RootSpec::External { uuid, .. } => Some(binding_for(context, uuid)?),
         RootSpec::Local { .. } => None,
     };
-    match fs::symlink_metadata(root) {
+    let marker = match fs::symlink_metadata(root) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
             let marker = match read_marker(root) {
                 Ok(marker) => marker,
@@ -7281,7 +7332,12 @@ fn ensure_root_with(
             create_marker(context, spec, generation, binding.as_ref(), nonce)
         }
         Err(error) => Err(format!("cannot inspect {}: {error}", root.display())),
+    }?;
+    if let Some(control) = context.control() {
+        let selected = spec.selected(marker.generation).with_nonce(marker.nonce.clone());
+        crate::prune::pin_output(control, checkout, &context.checkout_id, &selected)?;
     }
+    Ok(marker)
 }
 
 fn binding_for(context: &Context, uuid: &str) -> Result<Binding, String> {
@@ -8209,18 +8265,8 @@ fn read_receipt_with(
         return Ok(None);
     };
     let mut bytes = Vec::new();
-    #[cfg(not(test))]
-    crate::prune::authority_read(file.take(MAX_RECEIPT_BYTES + 1), &mut bytes)
+    file.take(MAX_RECEIPT_BYTES + 1).read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    #[cfg(test)]
-    crate::prune::authority_read_observed(
-        &file,
-        &path,
-        "outputs::read_receipt_with",
-        MAX_RECEIPT_BYTES,
-        &mut bytes,
-    )
-    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_RECEIPT_BYTES {
         return Err(format!(
             "{} exceeds its {MAX_RECEIPT_BYTES}-byte limit",
@@ -8284,7 +8330,8 @@ fn write_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
         let _ = fs::remove_file(&temp);
         format!("cannot publish the output receipt: {error}")
     })?;
-    sync_directory(&directory)
+    sync_directory(&directory)?;
+    crate::prune::finish_receipt(control, receipt)
 }
 
 pub(crate) fn receipt_path_public(control: &Path, checkout_id: &str) -> PathBuf {
@@ -8302,50 +8349,14 @@ pub(crate) fn read_receipt_for_prune(
     read_receipt_with(LegacyReceiptReading::Read, control, checkout, checkout_id)
 }
 
-#[cfg(test)]
-fn observed_marker_open(site: &str, path: &Path) -> std::io::Result<File> {
-    let result = File::open(path);
-    let outcome = match &result {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => {}
-    };
-    result
-}
-
-#[cfg(test)]
-fn observed_marker_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
-    use std::os::unix::fs::MetadataExt;
-    let result = fs::symlink_metadata(path);
-    match &result {
-        Ok(metadata) => {}
-        Err(_) => {}
-    }
-    result
-}
-
 /// The SHA-256 of the exact marker bytes, for the recorded root identity.
 pub(crate) fn marker_digest(root: &Path) -> Result<String, String> {
     let path = root.join(MARKER);
-    #[cfg(not(test))]
     let file =
         File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    #[cfg(test)]
-    let file = observed_marker_open("outputs:marker-digest:open", &path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut bytes = Vec::new();
-    #[cfg(not(test))]
-    crate::prune::authority_read(file.take(MAX_MARKER_BYTES + 1), &mut bytes)
+    file.take(MAX_MARKER_BYTES + 1).read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    #[cfg(test)]
-    crate::prune::authority_read_observed(
-        &file,
-        &path,
-        "outputs::marker_digest",
-        MAX_MARKER_BYTES,
-        &mut bytes,
-    )
-    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_MARKER_BYTES {
         return Err(format!("{} exceeds its byte limit", path.display()));
     }
@@ -8360,224 +8371,14 @@ pub(crate) fn marker_digest(root: &Path) -> Result<String, String> {
     Ok(hex)
 }
 
-/// Record the terminal prune outcome in the checkout's receipt. The registry
-/// terminal state is already durable when this runs.
-/// Publish the receipt's terminal prune image with an exact FIXED timestamp.
-pub(crate) fn mark_pruned_at(
-    control: &Path,
-    checkout: &Path,
-    checkout_id: &str,
-    intent: &str,
-    outcome: &str,
-    at_ms: u64,
-) -> Result<(), String> {
-    let receipt = read_receipt_with(LegacyReceiptReading::Read, control, checkout, checkout_id)?
-        .ok_or_else(|| "the checkout's receipt disappeared before its prune receipt".to_owned())?;
-    let terminal = pruned_receipt(receipt, intent, outcome, at_ms)?;
-    if terminal.pruned.as_ref().is_none() {
-        // Already the terminal image for this exact intent: nothing to write.
-        return Ok(());
-    }
-    write_receipt(control, &terminal)
-}
-
-/// The exact terminal receipt image for one prune intent, with its fixed
-/// timestamp. The caller persists its digest before publishing it.
-pub(crate) fn terminal_receipt_image(
-    control: &Path,
-    checkout: &Path,
-    checkout_id: &str,
-    intent: &str,
-    outcome: &str,
-    at_ms: u64,
-) -> Result<Vec<u8>, String> {
-    let receipt = read_receipt_with(LegacyReceiptReading::Read, control, checkout, checkout_id)?
-        .ok_or_else(|| "the checkout's receipt disappeared before its prune receipt".to_owned())?;
-    let terminal = pruned_receipt(receipt, intent, outcome, at_ms)?;
-    serde_json::to_vec_pretty(&terminal)
-        .map_err(|error| format!("cannot encode the terminal receipt image: {error}"))
-}
-
-/// Apply the terminal prune state to one receipt, clearing every owned
-/// placement of the deleted root and preserving all other placements,
-/// selections and history. This is the ONE place a version-1 receipt's
-/// in-memory whole-target form becomes a current-format document: it runs only
-/// for the exact root the real run prunes, after the normal custody checks,
-/// and its bytes are pinned in the intent before publication (oxide#152).
-fn pruned_receipt(
-    mut receipt: Receipt,
-    intent: &str,
-    outcome: &str,
-    at_ms: u64,
-) -> Result<Receipt, String> {
-    if receipt.state == ReceiptState::Pruned {
-        if receipt
-            .pruned
-            .as_ref()
-            .is_some_and(|record| record.intent == intent)
-        {
-            return Ok(receipt);
-        }
-        return Err("the receipt records a different prune intent".to_owned());
-    }
-    if receipt.state == ReceiptState::Pruning
-        && receipt
-            .pruned
-            .as_ref()
-            .is_none_or(|record| record.intent != intent)
-    {
-        return Err("the pruning receipt records a different prune intent".to_owned());
-    }
-    if receipt.state == ReceiptState::Prepared {
-        return Err(
-            "the receipt has a pending transition; a prune terminal image refuses".to_owned(),
-        );
-    }
-    match receipt.current().map(|selected| selected.root.clone()) {
-        Some(root) => {
-            // Clear only the deleted root's placements; another root's
-            // selection and unrelated history stay exactly as they are.
-            for placement in &mut receipt.links {
-                if placement
-                    .selected
-                    .as_ref()
-                    .is_some_and(|selected| selected.root == root)
-                {
-                    placement.selected = None;
-                    placement.prepared = None;
-                }
-            }
-            if receipt
-                .links
-                .iter()
-                .all(|placement| placement.selected.is_none())
-            {
-                receipt.state = ReceiptState::Pruned;
-            }
-        }
-        None => {
-            // A receiptless legacy root's pruning receipt selects nothing; its
-            // terminal image is still this intent's evidence.
-            receipt.state = ReceiptState::Pruned;
-        }
-    }
-    receipt.pruned = Some(PruneRecord {
-        intent: intent.to_owned(),
-        outcome: outcome.to_owned(),
-        at_ms,
-    });
-    receipt.updated_ms = at_ms;
-    Ok(receipt)
-}
-
-/// Exclusively create the `pruning` receipt that protects an operator-listed
-/// receiptless legacy root before its prune intent is journaled (oxide#129).
-/// Under the internal publication lock: no receipt may exist, except this
-/// writer's own interrupted creation (a `pruning` receipt whose intent no
-/// registry journal records), which is rebound to the new intent. Any other
-/// existing receipt refuses. No adoption history is reconstructed.
-///
-/// The publication is compare-and-set on the registry revision: it happens
-/// only while the registry still has `expected_revision` (the revision the
-/// locked recheck read) and returns the exact revision its own publication
-/// produced, read under the same internal publication lock. `Ok(None)`
-/// means an unrelated writer changed the registry first: nothing was
-/// written.
-pub(crate) fn create_pruning_receipt(
-    control: &Path,
-    checkout: &Path,
-    checkout_id: &str,
-    intent: &str,
-    journaled: &dyn Fn(&str) -> bool,
-    expected_revision: u64,
-) -> Result<Option<u64>, String> {
-    let _guard = store::publication_guard(control)?;
-    if crate::prune::registry_revision(control)? != expected_revision {
-        return Ok(None);
-    }
-    let mut receipt = match read_receipt_with(
-        LegacyReceiptReading::Read,
-        control,
-        checkout,
-        checkout_id,
-    )? {
-        None => Receipt::first(checkout, checkout_id),
-        Some(existing)
-            if existing.state == ReceiptState::Pruning
-                && existing
-                    .pruned
-                    .as_ref()
-                    .is_some_and(|record| !journaled(&record.intent)) =>
-        {
-            existing
-        }
-        Some(_) => return Err(
-            "the checkout already has an owned-output receipt; a receiptless legacy root is kept"
-                .to_owned(),
-        ),
-    };
-    receipt.state = ReceiptState::Pruning;
-    receipt.link_mut().selected = None;
-    receipt.link_mut().prepared = None;
-    *receipt.reserved_mut() = None;
-    receipt.pruned = Some(PruneRecord {
-        intent: intent.to_owned(),
-        outcome: "pruning".to_owned(),
-        at_ms: process::now_ms(),
-    });
-    receipt.updated_ms = process::now_ms();
-    write_receipt(control, &receipt)?;
-    // Still under the publication lock: this is exactly our own revision.
-    crate::prune::registry_revision(control).map(Some)
-}
-
-/// Remove this writer's own `pruning` receipt for exactly `intent`, when its
-/// journal was never published or was rolled back with no root effect.
-pub(crate) fn discard_pruning_receipt(
-    control: &Path,
-    checkout: &Path,
-    checkout_id: &str,
-    intent: &str,
-) -> Result<bool, String> {
-    let _guard = store::publication_guard(control)?;
-    let Some(receipt) = read_receipt(control, checkout, checkout_id)? else {
-        return Ok(false);
-    };
-    if receipt.state != ReceiptState::Pruning
-        || receipt
-            .pruned
-            .as_ref()
-            .is_none_or(|record| record.intent != intent)
-    {
-        return Ok(false);
-    }
-    let path = receipt_path(control, checkout_id);
-    fs::remove_file(&path).map_err(|error| {
-        format!(
-            "cannot remove the pruning receipt {}: {error}",
-            path.display()
-        )
-    })?;
-    sync_directory(&control.join("outputs"))?;
-    Ok(true)
-}
-
 /// A marker read for prune discovery of a listed receiptless root.
 pub(crate) fn read_marker_for_prune(root: &Path) -> Result<Marker, String> {
     read_marker(root)
 }
 
-pub(crate) fn receipt_is_pruning(receipt: &Receipt) -> bool {
-    receipt.state == ReceiptState::Pruning
-}
-
 fn read_marker(root: &Path) -> Result<Marker, String> {
     let path = root.join(MARKER);
-    #[cfg(not(test))]
     let metadata = fs::symlink_metadata(&path)
-        .map_err(|error| format!("{} has no readable owner marker ({error})", root.display()))?;
-    #[cfg(test)]
-    let metadata = observed_marker_metadata(&path)
         .map_err(|error| format!("{} has no readable owner marker ({error})", root.display()))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(format!("{} is not an owner marker file", path.display()));
@@ -8585,25 +8386,11 @@ fn read_marker(root: &Path) -> Result<Marker, String> {
     if metadata.len() > MAX_MARKER_BYTES {
         return Err(format!("{} exceeds its byte limit", path.display()));
     }
-    #[cfg(not(test))]
     let file =
         File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    #[cfg(test)]
-    let file = observed_marker_open("outputs:read-marker:open", &path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut bytes = Vec::new();
-    #[cfg(not(test))]
-    crate::prune::authority_read(file.take(MAX_MARKER_BYTES + 1), &mut bytes)
+    file.take(MAX_MARKER_BYTES + 1).read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    #[cfg(test)]
-    crate::prune::authority_read_observed(
-        &file,
-        &path,
-        "outputs::read_marker",
-        MAX_MARKER_BYTES,
-        &mut bytes,
-    )
-    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_MARKER_BYTES {
         return Err(format!("{} exceeds its byte limit", path.display()));
     }
@@ -11445,68 +11232,7 @@ mod tests {
     /// The real run's terminal image for an actually pruned version-1 root is
     /// the current receipt shape; it is deterministic, pinned by the caller's
     /// digest, and published only through the existing terminal transaction.
-    #[test]
-    fn a_version_one_terminal_image_publishes_the_current_shape() {
-        let fixture = Fixture::new();
-        let root = fixture.local().root().to_path_buf();
-        write_receipt_document(
-            &fixture,
-            &version_one_receipt(&fixture, "committed", Some(&root)),
-        );
-        let published = receipt_proof(&fixture);
-        let checkout = fixture.checkout.clone();
-        let id = context_id(&fixture);
-        let intent = "e".repeat(32);
-        let image =
-            terminal_receipt_image(&fixture.control, &checkout, &id, &intent, "deleted", 42)
-                .unwrap();
-        assert_eq!(
-            image,
-            terminal_receipt_image(&fixture.control, &checkout, &id, &intent, "deleted", 42)
-                .unwrap(),
-            "the terminal image is not deterministic"
-        );
-        // Computing the image reads only: the version-1 bytes are untouched.
-        assert_eq!(receipt_proof(&fixture), published);
-        let document: serde_json::Value = serde_json::from_slice(&image).unwrap();
-        assert_eq!(document["version"], RECEIPT_VERSION);
-        assert_eq!(document["state"], "pruned");
-        assert_eq!(document["pruned"]["intent"], intent);
-        assert_eq!(document["pruned"]["outcome"], "deleted");
-        assert_eq!(document["pruned"]["at_ms"], 42);
-        assert_eq!(
-            document["roots"][0]["root"],
-            root.to_string_lossy().as_ref()
-        );
-        assert!(document["links"][0].get("selected").is_none());
-        mark_pruned_at(&fixture.control, &checkout, &id, &intent, "deleted", 42).unwrap();
-        assert_eq!(
-            fs::read(receipt_path(&fixture.control, &id)).unwrap(),
-            image,
-            "the published image is not the recorded one"
-        );
-        // A replay of the same intent republishes exactly the recorded image
-        // and another intent refuses, changing nothing.
-        mark_pruned_at(&fixture.control, &checkout, &id, &intent, "deleted", 42).unwrap();
-        assert_eq!(
-            fs::read(receipt_path(&fixture.control, &id)).unwrap(),
-            image
-        );
-        let settled = fs::read(receipt_path(&fixture.control, &id)).unwrap();
-        assert!(terminal_receipt_image(
-            &fixture.control,
-            &checkout,
-            &id,
-            &"f".repeat(32),
-            "deleted",
-            43,
-        )
-        .is_err());
-        assert_eq!(
-            fs::read(receipt_path(&fixture.control, &id)).unwrap(),
-            settled
-        );
-    }
+
 
     /// A committed profile receipt for `debug` and `release` on one root.
     fn profile_receipt(fixture: &Fixture) -> Receipt {
@@ -14617,81 +14343,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_terminal_prune_image_is_fixed_and_replay_accepts_exactly_it() {
-        let fixture = Fixture::new();
-        let mut receipt = profile_receipt(&fixture);
-        write_receipt(&fixture.control, &receipt).unwrap();
-        let id = "e".repeat(32);
-        let first = terminal_receipt_image(
-            &fixture.control,
-            &fixture.checkout,
-            &context_id(&fixture),
-            &id,
-            "deleted",
-            42,
-        )
-        .unwrap();
-        let again = terminal_receipt_image(
-            &fixture.control,
-            &fixture.checkout,
-            &context_id(&fixture),
-            &id,
-            "deleted",
-            42,
-        )
-        .unwrap();
-        assert_eq!(first, again, "the terminal image is not deterministic");
-        mark_pruned_at(
-            &fixture.control,
-            &fixture.checkout,
-            &context_id(&fixture),
-            &id,
-            "deleted",
-            42,
-        )
-        .unwrap();
-        let published = fs::read(receipt_path(&fixture.control, &context_id(&fixture))).unwrap();
-        assert_eq!(
-            published, first,
-            "the published image is not the recorded one"
-        );
-        let terminal: Receipt = serde_json::from_slice(&published).unwrap();
-        assert_eq!(terminal.state, ReceiptState::Pruned);
-        assert_eq!(
-            terminal
-                .pruned
-                .as_ref()
-                .map(|record| (record.intent.as_str(), record.at_ms)),
-            Some((id.as_str(), 42))
-        );
-        // A later replay of the same intent accepts the exact image and does
-        // not rewrite it; a different fixed timestamp is refused.
-        mark_pruned_at(
-            &fixture.control,
-            &fixture.checkout,
-            &context_id(&fixture),
-            &id,
-            "deleted",
-            42,
-        )
-        .unwrap();
-        assert_eq!(
-            fs::read(receipt_path(&fixture.control, &context_id(&fixture))).unwrap(),
-            first
-        );
-        assert!(terminal_receipt_image(
-            &fixture.control,
-            &fixture.checkout,
-            &context_id(&fixture),
-            &"f".repeat(32),
-            "deleted",
-            43,
-        )
-        .is_err());
-        receipt.state = ReceiptState::Committed;
-        let _ = receipt;
-    }
+
 
     #[test]
     fn a_profile_receipt_refuses_unsorted_overlapping_or_foreign_members() {
@@ -17586,99 +17238,7 @@ mod tests {
     /// receipt: every replay/bind path refuses it, an existing receipt
     /// refuses the creator, only this writer's unjournaled creation is
     /// rebound, and the terminal receipt needs the same intent.
-    #[test]
-    fn a_pruning_receipt_is_exclusive_and_refuses_every_binding_path() {
-        let fixture = Fixture::new();
-        let context = fixture.context();
-        let checkout_id = identity::digest(&fixture.checkout.to_string_lossy());
-        crate::prune::seed_test_registry(&fixture.control).unwrap();
-        let first = crate::prune::fresh_nonce().unwrap();
-        create_pruning_receipt(
-            &fixture.control,
-            &fixture.checkout,
-            &checkout_id,
-            &first,
-            &|_| true,
-            crate::prune::registry_revision(&fixture.control).unwrap(),
-        )
-        .unwrap();
-        let receipt = context.receipt().unwrap().unwrap();
-        assert!(receipt_is_pruning(&receipt));
-        assert!(replay(&context, receipt.clone())
-            .unwrap_err()
-            .contains("being pruned"));
-        // Journaled: another creation refuses.
-        let second = crate::prune::fresh_nonce().unwrap();
-        assert!(create_pruning_receipt(
-            &fixture.control,
-            &fixture.checkout,
-            &checkout_id,
-            &second,
-            &|_| true,
-            crate::prune::registry_revision(&fixture.control).unwrap(),
-        )
-        .is_err());
-        // This writer's own unjournaled creation is rebound to a new intent.
-        create_pruning_receipt(
-            &fixture.control,
-            &fixture.checkout,
-            &checkout_id,
-            &second,
-            &|_| false,
-            crate::prune::registry_revision(&fixture.control).unwrap(),
-        )
-        .unwrap();
-        assert!(mark_pruned_at(
-            &fixture.control,
-            &fixture.checkout,
-            &checkout_id,
-            &first,
-            "deleted",
-            5
-        )
-        .is_err());
-        assert!(!discard_pruning_receipt(
-            &fixture.control,
-            &fixture.checkout,
-            &checkout_id,
-            &first
-        )
-        .unwrap());
-        mark_pruned_at(
-            &fixture.control,
-            &fixture.checkout,
-            &checkout_id,
-            &second,
-            "deleted",
-            5,
-        )
-        .unwrap();
-        assert_eq!(
-            context.receipt().unwrap().unwrap().state,
-            ReceiptState::Pruned
-        );
-        // A committed receipt is never replaced by the creator.
-        let other = Fixture::new();
-        let other_context = other.context();
-        transition(
-            &other_context,
-            &other.receipt(),
-            &other.local(),
-            Start::Any,
-            NonceAuthority::Unkeyed,
-        )
-        .unwrap();
-        let other_id = identity::digest(&other.checkout.to_string_lossy());
-        assert!(create_pruning_receipt(
-            &other.control,
-            &other.checkout,
-            &other_id,
-            &first,
-            &|_| false,
-            crate::prune::registry_revision(&other.control).unwrap(),
-        )
-        .is_err());
-    }
+
 
     #[test]
     fn paths_in_receipts_are_absolute() {
@@ -19101,4 +18661,38 @@ mod tests {
             assert!(line.len() < 200, "{line}");
         }
     }
+    #[test]
+    fn barge_pins_selected_members_and_detach_releases_only_their_pin() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        let receipt = Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        let (committed, selected, _) = adopt_profile(&context, receipt).unwrap();
+        assert!(fs::symlink_metadata(context.link()).unwrap().is_dir());
+        assert!(fs::symlink_metadata(context.link().join("debug")).unwrap().file_type().is_symlink());
+        let (area, id) = crate::prune::test_output_storage(&fixture.control, &selected);
+        assert!(area.list().unwrap().roots.iter().any(|root| root.id == id && root.pinned));
+        assert!(area.evict(&id).unwrap_err().to_string().contains("pinned"));
+        let foreign = fixture.root.join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("keep"), b"foreign bytes").unwrap();
+        symlink(&foreign, selected.root().join("foreign-link")).unwrap();
+        let holds = crate::prune::hold_outputs(&fixture.control, &committed).unwrap();
+        let (detached, changed) = detach_profile(&context, &fixture.control, committed).unwrap();
+        assert!(changed);
+        assert!(fs::symlink_metadata(context.link().join("debug")).unwrap().is_dir());
+        assert!(area.evict(&id).unwrap_err().to_string().contains("held"));
+        drop(holds);
+        assert!(area.evict(&id).unwrap().deleted);
+        assert!(!selected.root().exists());
+        assert_eq!(fs::read(foreign.join("keep")).unwrap(), b"foreign bytes");
+        fs::create_dir(selected.root()).unwrap();
+        fs::write(selected.root().join("stray"), b"unowned").unwrap();
+        let (_, successor, _) = adopt_profile(&context, detached).unwrap();
+        assert_ne!(successor.root(), selected.root());
+        assert_eq!(fs::read(selected.root().join("stray")).unwrap(), b"unowned");
+        let (next_area, next_id) = crate::prune::test_output_storage(&fixture.control, &successor);
+        assert_ne!(id, next_id);
+        assert!(next_area.evict(&next_id).unwrap_err().to_string().contains("pinned"));
+    }
+
 }

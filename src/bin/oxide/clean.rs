@@ -348,7 +348,8 @@ fn plan(
                 }
                 continue;
             }
-            if keep_root && depth == 0 && entry.file_name() == outputs::MARKER {
+            if keep_root && depth == 0 && (entry.file_name() == outputs::MARKER
+                || entry.file_name() == barge::root::MARKER_NAME) {
                 // The root's ownership marker is Oxide's, not Cargo's, and it
                 // stays with the root.
                 plan.preserved.push(path);
@@ -1053,6 +1054,7 @@ mod tests {
         let owned = root.join("owned");
         cargo_target(&owned);
         std::fs::write(owned.join(crate::outputs::MARKER), b"{}").unwrap();
+        std::fs::write(owned.join(barge::root::MARKER_NAME), b"{}").unwrap();
         let plan = checked_plan(&owned, None, false, true, &[], false)
             .unwrap()
             .unwrap();
@@ -1065,6 +1067,7 @@ mod tests {
         remove(&plan).unwrap();
         assert!(owned.is_dir());
         assert!(owned.join(crate::outputs::MARKER).is_file());
+        assert!(owned.join(barge::root::MARKER_NAME).is_file());
         assert!(!owned.join("oxide-quick").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
