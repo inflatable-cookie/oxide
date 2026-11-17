@@ -14,7 +14,7 @@ use super::{
     RAISED_CAPACITY_POLICY_VERSION, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
-use crate::owned_delete::open_directory_at;
+use crate::fs_util::open_directory_at;
 use crate::volume::Binding;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -303,8 +303,6 @@ struct SlotRecord {
     hold_intent: Option<serde_json::Value>,
 }
 
-/// Most captures one deletion may have recorded and not yet removed. A
-
 /// Logical bytes below `path`, read-only, bounded by a deadline: `None` when
 /// the walk could not finish or an entry could not be read, so an unknown
 /// figure is never reported as a measured one.
@@ -412,6 +410,8 @@ pub(super) struct SeedSlotView {
     pub(super) project: PathBuf,
     pub(super) held: bool,
     pub(super) idle: bool,
+    root: Option<String>,
+    owned: bool,
 }
 
 /// The pool and ledger facts call 1 and call 2 may read.
@@ -440,9 +440,61 @@ impl SeedPoolView {
 pub(super) struct SeedPoolOpen {
     _lock: File,
     pub(super) view: SeedPoolView,
+    storage: Option<crate::storage::PoolStorage>,
 }
 
 impl SeedPoolOpen {
+    /// Share the donor's Barge hold for every payload read and clone. The
+    /// recipient's exclusive hold belongs to the caller's live lease and is
+    /// retained through this call; a ledger row alone does not replace it.
+    pub(super) fn hold_donor(
+        &self,
+        donor: &SeedSlotView,
+        recipient: &SeedSlotView,
+    ) -> Result<Option<barge::Hold>, LeaseError> {
+        let storage = self.storage.as_ref().ok_or(LeaseError::BackingMismatch)?;
+        if !recipient.owned {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        let recipient_root = recipient
+            .root
+            .as_deref()
+            .ok_or(LeaseError::UnknownAccounting)?;
+        let recipient_project = recipient
+            .dir
+            .as_deref()
+            .and_then(|dir| dir.split_once('/'))
+            .map(|(folder, _)| folder);
+        let recipient_area = storage
+            .area_for(recipient_project)
+            .map_err(LeaseError::Io)?;
+        // A shared probe conflicts only with an exclusive holder. A free or
+        // merely shared lock cannot protect this recipient's writes.
+        if recipient_area
+            .try_hold(recipient_root, barge::Mode::Shared)
+            .map_err(|error| LeaseError::Io(error.to_string()))?
+            .is_some()
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        if !donor.owned {
+            return Ok(None);
+        }
+        let Some(root) = donor.root.as_deref() else {
+            return Ok(None);
+        };
+        let project = donor
+            .dir
+            .as_deref()
+            .and_then(|dir| dir.split_once('/'))
+            .map(|(folder, _)| folder);
+        storage
+            .area_for(project)
+            .map_err(LeaseError::Io)?
+            .try_hold(root, barge::Mode::Shared)
+            .map_err(|error| LeaseError::Io(error.to_string()))
+    }
+
     /// Re-read the ledger from disk and require this donor's generation to be
     /// unchanged: exactly `Idle`, without a lease, with the planned lease id as
     /// its most recent grant. The final recheck the pin exists for.
@@ -527,6 +579,11 @@ fn open_seed_inner(root: &Path, with_payload: bool) -> Result<SeedPoolOpen, Leas
     };
     Ok(SeedPoolOpen {
         _lock: lock,
+        storage: if with_payload {
+            pool_storage(&root, &config)?
+        } else {
+            None
+        },
         view: SeedPoolView {
             store_id: config.store_id.clone(),
             pool_root: root,
@@ -544,6 +601,8 @@ fn open_seed_inner(root: &Path, with_payload: bool) -> Result<SeedPoolOpen, Leas
                     project: slot.project.clone(),
                     held: slot.state == SlotPersistState::Held,
                     idle: slot.state == SlotPersistState::Idle,
+                    root: slot.root.clone(),
+                    owned: slot.owned,
                 })
                 .collect(),
         },
@@ -1289,8 +1348,6 @@ impl Pool {
             }
         }
         let storage = pool_storage(&root, &config)?;
-        #[cfg(test)]
-        let tape_open_root = root.display().to_string();
         let mut pool = Self {
             _lock: Some(lock),
             root,
@@ -2449,30 +2506,13 @@ fn open_budget_payload(
     if config.version != LEASE_VERSION || config.cap_bytes == 0 || config.image_bytes != 0 {
         return Err(LeaseError::BackingMismatch);
     }
-    #[cfg(not(test))]
     if paths.image.symlink_metadata().is_ok() || paths.receipt.symlink_metadata().is_ok() {
-        return Err(LeaseError::BackingMismatch);
-    }
-    #[cfg(test)]
-    if observe_pool_metadata("pool:budget:image", &paths.image).is_ok()
-        || observe_pool_metadata("pool:budget:receipt", &paths.receipt).is_ok()
-    {
         return Err(LeaseError::BackingMismatch);
     }
     let payload =
         canonical_existing_dir(&paths.mount, true).map_err(|_| LeaseError::BackingMismatch)?;
-    #[cfg(not(test))]
     let root_device = fs::symlink_metadata(root).map_err(io_error)?.dev();
-    #[cfg(test)]
-    let root_device = observe_pool_metadata("pool:budget:root", root)
-        .map_err(io_error)?
-        .dev();
-    #[cfg(not(test))]
     let payload_device = fs::symlink_metadata(&payload).map_err(io_error)?.dev();
-    #[cfg(test)]
-    let payload_device = observe_pool_metadata("pool:budget:payload", &payload)
-        .map_err(io_error)?
-        .dev();
     if payload != paths.mount || payload_device != root_device {
         return Err(LeaseError::BackingMismatch);
     }
@@ -2490,17 +2530,9 @@ fn open_volume_payload(paths: &BackingPaths, config: &PoolConfig) -> Result<Payl
     if config.version != LEASE_VERSION || config.cap_bytes == 0 || config.image_bytes != 0 {
         return Err(LeaseError::BackingMismatch);
     }
-    #[cfg(not(test))]
     if paths.image.symlink_metadata().is_ok()
         || paths.receipt.symlink_metadata().is_ok()
         || paths.mount.symlink_metadata().is_ok()
-    {
-        return Err(LeaseError::BackingMismatch);
-    }
-    #[cfg(test)]
-    if observe_pool_metadata("pool:volume:image", &paths.image).is_ok()
-        || observe_pool_metadata("pool:volume:receipt", &paths.receipt).is_ok()
-        || observe_pool_metadata("pool:volume:internal-payload", &paths.mount).is_ok()
     {
         return Err(LeaseError::BackingMismatch);
     }
@@ -2511,23 +2543,10 @@ fn open_volume_payload(paths: &BackingPaths, config: &PoolConfig) -> Result<Payl
         .map_err(|_| LeaseError::BackingMismatch)?;
     let root = volume.mount_point.join(&volume.payload_dir);
     let payload = canonical_existing_dir(&root, true).map_err(|_| LeaseError::BackingMismatch)?;
-    #[cfg(not(test))]
     let by_path = fs::symlink_metadata(&payload).map_err(io_error)?;
-    #[cfg(test)]
-    let by_path = observe_pool_metadata("pool:volume:payload-path", &payload).map_err(io_error)?;
-    #[cfg(not(test))]
     let by_fd = fs::File::from(fd.try_clone().map_err(io_error)?)
         .metadata()
         .map_err(io_error)?;
-    #[cfg(test)]
-    let by_fd = {
-        let result = fs::File::from(fd.try_clone().map_err(io_error)?).metadata();
-        match &result {
-            Ok(metadata) => {}
-            Err(_) => {}
-        }
-        result.map_err(io_error)?
-    };
     if payload != root || by_path.dev() != by_fd.dev() || by_path.ino() != by_fd.ino() {
         return Err(LeaseError::BackingMismatch);
     }
@@ -2797,7 +2816,6 @@ fn lock_pool(pool: &Path) -> Result<File, LeaseError> {
 
 fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, LeaseError> {
     let path = pool.join(LOCK_NAME);
-    #[cfg(not(test))]
     let existing = match fs::symlink_metadata(&path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -2808,24 +2826,6 @@ fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, Leas
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => None,
         Err(error) => return Err(io_error(error)),
     };
-    #[cfg(test)]
-    let existing = {
-        let result = fs::symlink_metadata(&path);
-        match &result {
-            Ok(metadata) => {}
-            Err(_) => {}
-        }
-        match result {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
-                    return Err(LeaseError::UnsafePath("lock file must be a regular file"));
-                }
-                Some(metadata)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => None,
-            Err(error) => return Err(io_error(error)),
-        }
-    };
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -2835,25 +2835,8 @@ fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, Leas
     if create {
         options.create(true);
     }
-    #[cfg(not(test))]
     let file = options.open(&path).map_err(io_error)?;
-    #[cfg(test)]
-    let file = {
-        let result = options.open(&path);
-        if create {}
-        result.map_err(io_error)?
-    };
-    #[cfg(not(test))]
     let metadata = file.metadata().map_err(io_error)?;
-    #[cfg(test)]
-    let metadata = {
-        let result = file.metadata();
-        match &result {
-            Ok(metadata) => {}
-            Err(_) => {}
-        }
-        result.map_err(io_error)?
-    };
     if !metadata.is_file()
         || metadata.permissions().mode() & 0o077 != 0
         || metadata.uid() != current_uid()
@@ -2879,10 +2862,6 @@ fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, Leas
     }
     // SAFETY: `file` is open for the pool lock; flock holds until File drop.
     let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    #[cfg(test)]
-    if status != 0 {
-        let error = std::io::Error::last_os_error();
-    }
     if status != 0 {
         return Err(LeaseError::Io("exclusive pool lock failed".into()));
     }
@@ -3053,34 +3032,12 @@ pub(super) fn write_ledger_bytes_injected(
 /// retired image or receipt, or whose config records any backend but the
 /// two current ones, refuses untouched. A missing config is left to the
 /// locked read, which waits for a concurrent creation.
-#[cfg(test)]
-fn observe_pool_metadata(site: &str, path: &Path) -> std::io::Result<fs::Metadata> {
-    let result = fs::symlink_metadata(path);
-    match &result {
-        Ok(metadata) => {}
-        Err(_) => {}
-    }
-    result
-}
-
 fn refuse_retired_image_pool(pool: &Path) -> Result<(), LeaseError> {
     let paths = BackingPaths::under(pool);
-    #[cfg(not(test))]
     if paths.image.symlink_metadata().is_ok() || paths.receipt.symlink_metadata().is_ok() {
         return Err(LeaseError::BackingMismatch);
     }
-    #[cfg(test)]
-    if observe_pool_metadata("pool:retired:image", &paths.image).is_ok()
-        || observe_pool_metadata("pool:retired:receipt", &paths.receipt).is_ok()
-    {
-        return Err(LeaseError::BackingMismatch);
-    }
-    #[cfg(not(test))]
     if pool.join(CONFIG_NAME).symlink_metadata().is_err() {
-        return Ok(());
-    }
-    #[cfg(test)]
-    if observe_pool_metadata("pool:retired:config", &pool.join(CONFIG_NAME)).is_err() {
         return Ok(());
     }
     let config = read_config(pool)?;
@@ -3100,13 +3057,6 @@ fn listed_control_entry(path: &Path) -> Result<Option<fs::Metadata>, LeaseError>
     let metadata = crate::test_fs::symlink_metadata(path);
     #[cfg(not(test))]
     let metadata = fs::symlink_metadata(path);
-    #[cfg(test)]
-    {
-        match &metadata {
-            Ok(metadata) => {}
-            Err(_) => {}
-        }
-    }
     match metadata {
         Ok(metadata) => Ok(Some(metadata)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -3114,55 +3064,8 @@ fn listed_control_entry(path: &Path) -> Result<Option<fs::Metadata>, LeaseError>
     }
 }
 
-/// Test-only observer for the same `read_dir` and iterator used by the
-/// production loop below. The real directory handle and error flow are kept;
-/// no later pathname lookup is used to invent a parent identity.
-#[cfg(test)]
-mod pool_directory_tape {
-    use std::path::{Path, PathBuf};
-
-    pub(super) fn read_dir_at(path: &Path, site: &'static str) -> std::io::Result<Entries> {
-        let result = std::fs::read_dir(path);
-        let outcome = match &result {
-            Ok(_) => {}
-            Err(_) => {}
-        };
-        let wrapped = result.map(|inner| Entries {
-            inner,
-            path: path.to_path_buf(),
-            site,
-        });
-        wrapped
-    }
-
-    pub(super) struct Entries {
-        inner: std::fs::ReadDir,
-        path: PathBuf,
-        site: &'static str,
-    }
-
-    impl Iterator for Entries {
-        type Item = std::io::Result<std::fs::DirEntry>;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            let result = self.inner.next();
-            match &result {
-                Some(Ok(entry)) => {}
-                Some(Err(error)) => {}
-                None => {}
-            }
-            result
-        }
-    }
-}
-
 fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
-    #[cfg(not(test))]
     let device = fs::symlink_metadata(pool).map_err(io_error)?.dev();
-    #[cfg(test)]
-    let device = observe_pool_metadata("pool:entries:root", pool)
-        .map_err(io_error)?
-        .dev();
     for entry in fs::read_dir(pool).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         let name = entry.file_name();

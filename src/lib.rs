@@ -15,10 +15,9 @@ pub mod inventory;
 #[cfg(unix)]
 pub mod lease;
 
-/// Descriptor-relative deletion of a verified owned tree, with the fixed
-/// Finder-metadata race bound (oxide#155).
+/// Internal directory reads and safe diagnostic names; deletion is Barge's.
 #[cfg(unix)]
-pub mod owned_delete;
+mod fs_util;
 
 /// Debug-only guard for product proof hooks (oxide#155).
 #[cfg(debug_assertions)]

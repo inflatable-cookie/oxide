@@ -50,41 +50,9 @@ pub const MAX_SLOTS: usize = 256;
 /// older binary refuses it at ledger read instead of reading a slot table it
 /// cannot represent (oxide#177).
 pub const LEGACY_MAX_SLOTS: usize = 128;
-/// Finite ledger file size including the atomic temp. This constant is the
-/// **worst-valid byte bound** (oxide#177; Oxide Supervisor ruling 49081d79):
-/// the read and write paths refuse a ledger above it, so a larger ledger is
-/// corrupt and refused, and any otherwise-valid ledger at or below it is
-/// accepted — including one that carries more than one `Evicting` journal,
-/// because the reader validates each slot's journal independently and bounds no
-/// journal count. No count rule is added and the cap does not grow for
-/// multi-journal states.
-///
-/// The measured states are reported separately: the raised-ceiling
-/// representation at `MAX_SLOTS` with every bounded field and numeric field at
-/// its maximum is 4,213,726 bytes all-idle — the figure this writer's ordinary
-/// eviction path reaches, because since oxide#190 an eviction writes one
-/// holding row in two O(1) synced writes and starts no journal — and
-/// 5,625,456 bytes with a maximal single `DeletionJournal` on an `Evicting`
-/// record that also keeps its closed observation, 2,763,152 bytes below the
-/// cap. A journal is now only **legacy input**: an older writer left it, the
-/// reader accepts it, and `Pool::open`'s replay rewrites or drops it. No path
-/// in this binary creates a `SlotCaptureJournal`, so the journaled figure
-/// bounds what an accepted legacy ledger may carry rather than what this
-/// writer produces. An earlier write can still have left more than
-/// one such journal in a pool, and the reader accepts any otherwise-valid
-/// ledger below this cap. A write above the cap is refused, so a durable
-/// ledger never exceeds it. The front door's admission gate, and the
-/// library's own locked open before reconciliation, make the version-9 control
-/// fence (which carries `oxide.holding/1`) durable (oxide#177, fence first), so
-/// recovery, holding moves and ledger writes are all preceded by the hand-off
-/// fence. A legacy journal
-/// is bounded by `MAX_OUTSTANDING_CAPTURES` (96) capture records and
-/// `MAX_FOREIGN_CAPTURES` (32) mismatched captures, each with a chain of at
-/// most `MAX_CAPTURE_DEPTH` (64) capture private names, and by the enforced
-/// journal-name bounds: a name field of at most `PATH_MAX` (1024) bytes in
-/// `NAME_MAX` (255)-byte components, escaped sixfold by compact JSON. The
-/// writer refuses an over-bound object per object without deleting it, and the
-/// reader refuses a ledger that carries one.
+/// Finite ledger file size including the atomic temp. Legacy ledger reads
+/// retain bounded inert journal fields; new storage deletion and trash belong
+/// exclusively to Barge. No Oxide deletion journal is replayed.
 pub const MAX_LEDGER_BYTES: u64 = 8 * 1024 * 1024;
 /// Permanent capacity-policy fence in the library ledger (oxide#118). Its
 /// presence tells an older binary that this ledger uses ranked idle
@@ -763,7 +731,7 @@ pub enum AccountingCoverage {
 /// The oxide#105 tolerated-metadata rule, shared with the deletion seam: the
 /// name alone grants nothing, a caller still requires an owned regular file on
 /// the pool's device, and its bytes stay in accounting.
-pub(crate) use crate::owned_delete::{entry_label, is_finder_metadata, is_tolerated_metadata_file};
+pub(crate) use crate::fs_util::{entry_label, is_finder_metadata, is_tolerated_metadata_file};
 
 fn unexpected_entry(place: &'static str, name: &std::ffi::OsStr) -> LeaseError {
     LeaseError::UnexpectedEntry {
@@ -915,19 +883,8 @@ fn canonical_existing_dir(path: &Path, owner_only: bool) -> Result<PathBuf, Leas
     if path.as_os_str().as_bytes().len() > MAX_PATH_BYTES {
         return Err(LeaseError::InvalidInput("path is too long"));
     }
-    #[cfg(not(test))]
     let metadata =
         fs::symlink_metadata(path).map_err(|_| LeaseError::UnsafePath("path missing"))?;
-    #[cfg(test)]
-    let metadata = {
-        use std::os::unix::fs::MetadataExt;
-        let result = fs::symlink_metadata(path);
-        match &result {
-            Ok(metadata) => {}
-            Err(_) => {}
-        }
-        result.map_err(|_| LeaseError::UnsafePath("path missing"))?
-    };
     if metadata.file_type().is_symlink() {
         return Err(LeaseError::UnsafePath("symlinks are refused"));
     }
@@ -944,17 +901,7 @@ fn canonical_existing_dir(path: &Path, owner_only: bool) -> Result<PathBuf, Leas
             ));
         }
     }
-    #[cfg(not(test))]
     let canonical = fs::canonicalize(path).map_err(io_error)?;
-    #[cfg(test)]
-    let canonical = {
-        let result = fs::canonicalize(path);
-        let outcome = match &result {
-            Ok(canonical) => {}
-            Err(_) => {}
-        };
-        result.map_err(io_error)?
-    };
     if canonical != path {
         return Err(LeaseError::UnsafePath(
             "path must be supplied in canonical form",
@@ -1011,35 +958,14 @@ fn persist_private_file(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
     let temp_path = parent.join(temp_name);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
-    #[cfg(not(test))]
     let mut file = options.open(&temp_path).map_err(io_error)?;
-    #[cfg(test)]
-    let mut file = {
-        let result = options.open(&temp_path);
-        result.map_err(io_error)?
-    };
-    #[cfg(not(test))]
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         let _ = fs::remove_file(&temp_path);
         return Err(io_error(error));
     }
-    #[cfg(test)]
-    {
-        let write = file.write_all(bytes);
-        if let Err(error) = write.and_then(|()| file.sync_all()) {
-            let removed = fs::remove_file(&temp_path);
-            return Err(io_error(error));
-        }
-    }
     drop(file);
-    #[cfg(not(test))]
     if let Err(error) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
-        return Err(io_error(error));
-    }
-    #[cfg(test)]
-    if let Err(error) = fs::rename(&temp_path, path) {
-        let removed = fs::remove_file(&temp_path);
         return Err(io_error(error));
     }
     // oxide#196: an injected failure after the replacement but before the
@@ -1061,18 +987,7 @@ fn read_private_file(path: &Path) -> Result<Vec<u8>, LeaseError> {
 }
 
 fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseError> {
-    #[cfg(not(test))]
     let metadata = fs::symlink_metadata(path).map_err(io_error)?;
-    #[cfg(test)]
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            use std::os::unix::fs::MetadataExt;
-            metadata
-        }
-        Err(error) => {
-            return Err(io_error(error));
-        }
-    };
     if metadata.file_type().is_symlink()
         || !metadata.file_type().is_file()
         || metadata.permissions().mode() & 0o077 != 0
@@ -1081,29 +996,11 @@ fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseErro
     {
         return Err(LeaseError::UnknownAccounting);
     }
-    #[cfg(not(test))]
     let file = File::open(path).map_err(io_error)?;
-    #[cfg(test)]
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) => {
-            return Err(io_error(error));
-        }
-    };
     let mut bytes = Vec::new();
-    #[cfg(not(test))]
     file.take(max + 1)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
-    #[cfg(test)]
-    {
-        let result = file.take(max + 1).read_to_end(&mut bytes);
-        let outcome = match &result {
-            Ok(_) => {}
-            Err(_) => {}
-        };
-        result.map_err(io_error)?;
-    }
     if bytes.len() as u64 > max {
         return Err(LeaseError::LedgerExhausted);
     }
@@ -1152,25 +1049,10 @@ pub(crate) fn fence_managed_control(pool: &Path) -> Result<(), LeaseError> {
     // Only an absent control state means "a library fixture with nothing to
     // fence". Any other metadata failure is a refusal: a state this binary
     // cannot inspect must never let recovery run unfenced.
-    #[cfg(not(test))]
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(io_error(error)),
-    };
-    #[cfg(test)]
-    let metadata = {
-        use std::os::unix::fs::MetadataExt;
-        let result = fs::symlink_metadata(&path);
-        match &result {
-            Ok(metadata) => {}
-            Err(_) => {}
-        }
-        match result {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(io_error(error)),
-        }
     };
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
@@ -1221,25 +1103,8 @@ fn open_control_admission(control: &Path) -> Result<File, LeaseError> {
         .create(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW);
-    #[cfg(not(test))]
     let file = options.open(&path).map_err(io_error)?;
-    #[cfg(test)]
-    let file = {
-        let result = options.open(&path);
-        result.map_err(io_error)?
-    };
-    #[cfg(not(test))]
     let metadata = file.metadata().map_err(io_error)?;
-    #[cfg(test)]
-    let metadata = {
-        use std::os::unix::fs::MetadataExt;
-        let result = file.metadata();
-        match &result {
-            Ok(metadata) => {}
-            Err(_) => {}
-        }
-        result.map_err(io_error)?
-    };
     if !metadata.is_file()
         || metadata.uid() != current_uid()
         || metadata.permissions().mode() & 0o077 != 0
@@ -1248,28 +1113,12 @@ fn open_control_admission(control: &Path) -> Result<File, LeaseError> {
             "control admission lock must be a private regular file",
         ));
     }
-    #[cfg(not(test))]
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::WouldBlock {
             return Err(LeaseError::UnknownAccounting);
         }
         return Err(io_error(error));
-    }
-    #[cfg(test)]
-    {
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        let error = (result != 0).then(std::io::Error::last_os_error);
-        let outcome = match &error {
-            Some(_) => {}
-            None => {}
-        };
-        if let Some(error) = error {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                return Err(LeaseError::UnknownAccounting);
-            }
-            return Err(io_error(error));
-        }
     }
     Ok(file)
 }
@@ -1283,35 +1132,14 @@ fn persist_control_state(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
     let temp_path = parent.join(temp_name);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
-    #[cfg(not(test))]
     let mut file = options.open(&temp_path).map_err(io_error)?;
-    #[cfg(test)]
-    let mut file = {
-        let result = options.open(&temp_path);
-        result.map_err(io_error)?
-    };
-    #[cfg(not(test))]
     if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         let _ = fs::remove_file(&temp_path);
         return Err(io_error(error));
     }
-    #[cfg(test)]
-    {
-        let write = file.write_all(bytes);
-        if let Err(error) = write.and_then(|()| file.sync_all()) {
-            let removed = fs::remove_file(&temp_path);
-            return Err(io_error(error));
-        }
-    }
     drop(file);
-    #[cfg(not(test))]
     if let Err(error) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
-        return Err(io_error(error));
-    }
-    #[cfg(test)]
-    if let Err(error) = fs::rename(&temp_path, path) {
-        let removed = fs::remove_file(&temp_path);
         return Err(io_error(error));
     }
     // oxide#196: an injected failure after the replacement but before the
@@ -1330,19 +1158,9 @@ fn persist_control_state(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
 
 fn random_hex(bytes: usize) -> Result<String, LeaseError> {
     let mut value = vec![0_u8; bytes];
-    #[cfg(not(test))]
     File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut value))
         .map_err(io_error)?;
-    #[cfg(test)]
-    {
-        let result = File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut value));
-        let outcome = match &result {
-            Ok(()) => {}
-            Err(_) => {}
-        };
-        result.map_err(io_error)?;
-    }
     let mut result = String::with_capacity(bytes * 2);
     for byte in value {
         use std::fmt::Write as _;

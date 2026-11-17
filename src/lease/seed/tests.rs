@@ -46,6 +46,8 @@ thread_local! {
     static CATALOG_FAULT: Cell<Option<bool>> = const { Cell::new(None) };
     static VANISH_ENTRY: RefCell<Option<OsString>> = const { RefCell::new(None) };
     static AFTER_VISIT_DELAY_MS: Cell<Option<u64>> = const { Cell::new(None) };
+    static HOLD_CHECK: RefCell<Option<(PathBuf, PathBuf)>> = const { RefCell::new(None) };
+    static HOLD_CHECK_DONE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The injected clone-operation interruption, if this thread set one: `true`
@@ -107,6 +109,8 @@ fn reset_hooks() {
     CATALOG_FAULT.with(|cell| cell.set(None));
     VANISH_ENTRY.with(|cell| *cell.borrow_mut() = None);
     AFTER_VISIT_DELAY_MS.with(|cell| cell.set(None));
+    HOLD_CHECK.with(|cell| *cell.borrow_mut() = None);
+    HOLD_CHECK_DONE.with(|cell| cell.set(false));
 }
 
 pub(super) fn inject(point: TestPoint<'_>) {
@@ -169,6 +173,40 @@ pub(super) fn inject(point: TestPoint<'_>) {
             }
         }
         TestPoint::BeforeFinalDonorCheck { pool } => {
+            HOLD_CHECK.with(|cell| {
+                if let Some((donor, recipient)) = cell.borrow().as_ref() {
+                    let storage = crate::storage::Storage::open(&pool.join(MANAGED_NAME))
+                        .expect("storage account");
+                    let mut checked = 0;
+                    for area in storage.areas().expect("areas") {
+                        for root in area.list().expect("roots").roots {
+                            if root.path != *donor && root.path != *recipient {
+                                continue;
+                            }
+                            assert!(root.held, "the seed keeps each root held");
+                            assert!(area
+                                .try_hold(&root.id, barge::Mode::Exclusive)
+                                .expect("exclusive probe")
+                                .is_none());
+                            let shared = area
+                                .try_hold(&root.id, barge::Mode::Shared)
+                                .expect("shared probe");
+                            assert_eq!(
+                                shared.is_some(),
+                                root.path == *donor,
+                                "the donor is shared; the recipient is exclusive"
+                            );
+                            assert!(
+                                area.evict(&root.id).is_err(),
+                                "held roots cannot be evicted"
+                            );
+                            checked += 1;
+                        }
+                    }
+                    assert_eq!(checked, 2);
+                    HOLD_CHECK_DONE.with(|done| done.set(true));
+                }
+            });
             if TAMPER_LEDGER.with(Cell::get) {
                 tamper_idle_generations_injected(pool).expect("tamper ledger");
             }
@@ -938,6 +976,65 @@ fn seed_clones_catalogued_units_and_records_a_complete_observation() {
     // are all the producing window's, and the ledger records no seed fact.
     assert_eq!(rig.sidecars(), before_sidecars);
     assert_eq!(rig.ledger_bytes(), before_ledger);
+}
+
+#[test]
+fn the_real_seed_keeps_a_shared_donor_and_exclusive_recipient_hold() {
+    reset_hooks();
+    let rig = Rig::new("barge-seed-holds");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    HOLD_CHECK.with(|cell| {
+        *cell.borrow_mut() = Some((
+            donor
+                .grant
+                .env
+                .cargo_build_build_dir
+                .parent()
+                .expect("donor root")
+                .to_path_buf(),
+            grant
+                .env
+                .cargo_build_build_dir
+                .parent()
+                .expect("recipient root")
+                .to_path_buf(),
+        ));
+    });
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    assert!(matches!(outcome, SeedOutcome::Seeded(_)), "{outcome:?}");
+    assert!(HOLD_CHECK_DONE.with(Cell::get));
+    reset_hooks();
+    let storage = crate::storage::Storage::open(&rig.control()).expect("storage account");
+    let mut donor_idle = false;
+    for area in storage.areas().expect("areas") {
+        for root in area.list().expect("roots").roots {
+            if root.path
+                == donor
+                    .grant
+                    .env
+                    .cargo_build_build_dir
+                    .parent()
+                    .expect("root")
+            {
+                for _ in 0..200 {
+                    if let Some(hold) = area
+                        .try_hold(&root.id, barge::Mode::Exclusive)
+                        .expect("donor exclusive probe")
+                    {
+                        donor_idle = true;
+                        drop(hold);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+    assert!(
+        donor_idle,
+        "the seed releases its donor hold when it returns"
+    );
 }
 
 #[test]
