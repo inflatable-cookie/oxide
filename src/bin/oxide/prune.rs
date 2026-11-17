@@ -1667,19 +1667,27 @@ pub(crate) fn hold_outputs(control: &Path, receipt: &Receipt) -> Result<Vec<barg
     Ok(held)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlannedRoot {
+    area: String,
+    id: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Preview {
     version: String,
     registry_revision: u64,
-    roots: Vec<PathBuf>,
+    roots: Vec<PlannedRoot>,
 }
 
 fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
     let mut roots = Vec::new();
     let mut locations = std::collections::HashSet::new();
     for row in &registry.rows {
-        if row.pruned_ms.is_some() {
+        if row.pruned_ms.is_some() || row.barge_id.is_none() {
             continue;
         }
         let selected = Selected {
@@ -1705,20 +1713,86 @@ fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
             continue;
         }
         let area = output_area(control, &selected)?;
-        let listing = area.list().map_err(|error| error.to_string())?;
-        for root in listing.roots {
+        for root in area.list().map_err(|error| error.to_string())?.roots {
+            let recorded = registry
+                .rows
+                .iter()
+                .filter(|row| row.root == root.path && row.pruned_ms.is_none())
+                .collect::<Vec<_>>();
+            if recorded.is_empty() {
+                continue;
+            }
+            if recorded
+                .iter()
+                .any(|row| row.barge_id.as_deref() != Some(&root.id))
+            {
+                return Err(format!(
+                    "{} no longer names its recorded Barge root; retained",
+                    root.path.display()
+                ));
+            }
             if root.idle_and_unpinned() {
-                roots.push(root.path);
+                roots.push(PlannedRoot {
+                    area: area.key().label(),
+                    id: root.id,
+                    path: root.path,
+                });
             }
         }
     }
-    roots.sort();
+    roots.sort_by(|left, right| left.path.cmp(&right.path).then(left.id.cmp(&right.id)));
     roots.dedup();
     Ok(Preview {
-        version: "oxide.outputs.barge-prune/1".to_owned(),
+        version: "oxide.outputs.barge-prune/2".to_owned(),
         registry_revision: registry.revision,
         roots,
     })
+}
+
+fn evict_planned(
+    control: &Path,
+    registry: &mut Registry,
+    planned: &PlannedRoot,
+) -> Result<bool, String> {
+    let row = registry
+        .rows
+        .iter()
+        .find(|row| {
+            row.root == planned.path
+                && row.barge_id.as_deref() == Some(&planned.id)
+                && row.pruned_ms.is_none()
+        })
+        .ok_or("the planned Barge identity is no longer recorded; retained")?;
+    let selected = Selected {
+        kind: row.root_kind,
+        root: row.root.clone(),
+        volume_uuid: row.volume_uuid.clone(),
+        nonce: row.nonce.clone(),
+        generation: row.generation,
+    };
+    let area = output_area(control, &selected)?;
+    if area.key().label() != planned.area {
+        return Err("the planned Barge area changed; retained".to_owned());
+    }
+    let root = area
+        .resolve(&planned.id)
+        .map_err(|error| error.to_string())?;
+    if root.path != planned.path {
+        return Err("the planned Barge root moved; retained".to_owned());
+    }
+    // Barge re-resolves this exact ID under its eviction lock. A replacement
+    // after the check can never substitute its ID for the one the user saw.
+    let result = area.evict(&planned.id).map_err(|error| error.to_string())?;
+    for row in registry
+        .rows
+        .iter_mut()
+        .filter(|row| row.root == planned.path && row.barge_id.as_deref() == Some(&planned.id))
+    {
+        row.pruned_ms = Some(process::now_ms());
+    }
+    registry.bump()?;
+    write_registry(control, registry)?;
+    Ok(result.deleted)
 }
 
 pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
@@ -1758,25 +1832,11 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
             if sha256_hex(given) != *hash || given != bytes {
                 return Err("the output prune plan changed; take a new preview".to_owned());
             }
-            for path in &planned.roots {
-                let Some(row) = registry.rows.iter().find(|row| row.root == *path) else { continue; };
-                let selected = Selected { kind: row.root_kind, root: row.root.clone(),
-                    volume_uuid: row.volume_uuid.clone(), nonce: row.nonce.clone(), generation: row.generation };
-                let area = output_area(control, &selected)?;
-                // Atomic exclusive lock plus pin recheck belongs to Barge.
-                let id = area.list().map_err(|error| error.to_string())?.roots.into_iter()
-                    .find(|root| root.path == selected.root()).map(|root| root.id)
-                    .ok_or("the planned Barge output root disappeared")?;
-                match area.evict(&id) {
-                    Ok(result) => {
-                        for row in registry.rows.iter_mut().filter(|row| row.root == *path) {
-                            row.pruned_ms = Some(process::now_ms());
-                        }
-                        registry.bump()?;
-                        write_registry(control, &registry)?;
-                        println!("{}: {}", path.display(), if result.deleted { "removed" } else { "kept in Barge trash" });
-                    }
-                    Err(error) => eprintln!("oxide: kept {}: {error}", path.display()),
+            for root in &planned.roots {
+                match evict_planned(control, &mut registry, root) {
+                    Ok(deleted) => println!("{}: {}", root.path.display(),
+                        if deleted { "removed" } else { "kept in Barge trash" }),
+                    Err(error) => eprintln!("oxide: kept {}: {error}", root.path.display()),
                 }
             }
         }
@@ -1871,4 +1931,72 @@ fn record_import(control: &Path, root: &Path, id: &str) -> Result<(), String> {
         write_registry(control, &registry)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod plan_identity_tests {
+    use super::*;
+
+    #[test]
+    fn replacing_a_root_at_the_planned_path_never_deletes_the_replacement() {
+        let fixture = barge::testing::TempDir::new("oxide-prune-identity").unwrap();
+        let control = fixture.path().join("control");
+        fs::create_dir(&control).unwrap();
+        oxide_storage::storage::make_private(&control).unwrap();
+        seed_test_registry(&control).unwrap();
+        let selected = Selected {
+            kind: RootKind::Local,
+            root: fixture.path().join("outputs/placeholder"),
+            volume_uuid: None,
+            nonce: None,
+            generation: 1,
+        };
+        let area = output_area(&control, &selected).unwrap();
+        let original = area.create_root("victim").unwrap();
+        let mut registry = ready_registry(&control).unwrap();
+        registry.rows.push(Row {
+            checkout_id: "a".repeat(64),
+            checkout: fixture.path().join("checkout"),
+            checkout_volume_uuid: None,
+            receipt: control.join("receipt.json"),
+            member: "debug".to_owned(),
+            root: original.path.clone(),
+            root_kind: RootKind::Local,
+            volume_uuid: None,
+            nonce: None,
+            generation: 1,
+            root_dev: None,
+            root_ino: None,
+            marker_digest: None,
+            selected: false,
+            pending: false,
+            pruning: None,
+            pruned_ms: None,
+            reservation: None,
+            cancelling: None,
+            barge_id: Some(original.id.clone()),
+            recipe: "test".to_owned(),
+        });
+        let plan = preview(&control, &registry).unwrap();
+        assert_eq!(plan.roots.len(), 1);
+        assert_eq!(plan.roots[0].id, original.id);
+        assert_eq!(plan.roots[0].area, "oxide/outputs");
+        let revision = registry.revision;
+        area.evict(&original.id).unwrap();
+        fs::create_dir(&original.path).unwrap();
+        let folder = original.path.file_name().unwrap().to_str().unwrap();
+        let replacement = area
+            .adopt_root(folder, "replacement", "replacement-id")
+            .unwrap();
+        fs::write(replacement.path.join("keep"), b"replacement bytes").unwrap();
+        assert!(evict_planned(&control, &mut registry, &plan.roots[0]).is_err());
+        assert_eq!(registry.revision, revision);
+        assert_eq!(
+            fs::read(replacement.path.join("keep")).unwrap(),
+            b"replacement bytes"
+        );
+        assert!(preview(&control, &registry)
+            .unwrap_err()
+            .contains("recorded Barge root"));
+    }
 }

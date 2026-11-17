@@ -307,6 +307,9 @@ struct SlotRecord {
 /// the walk could not finish or an entry could not be read, so an unknown
 /// figure is never reported as a measured one.
 fn barge_tree_bytes_bounded(path: &Path, deadline: std::time::Instant) -> Option<u64> {
+    if std::time::Instant::now() >= deadline {
+        return None;
+    }
     fn walk(path: &Path, device: u64, total: &mut u64, deadline: std::time::Instant) -> bool {
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
@@ -345,7 +348,7 @@ fn barge_tree_bytes_bounded(path: &Path, deadline: std::time::Instant) -> Option
     }
     let device = metadata.dev();
     let mut total = 0;
-    if walk(path, device, &mut total, deadline) {
+    if walk(path, device, &mut total, deadline) && std::time::Instant::now() < deadline {
         Some(total)
     } else {
         None
@@ -1249,21 +1252,26 @@ impl Pool {
     /// reconciliation, for [`measure`] only. The recorded payload must still
     /// be the backend's real, verified payload root, so the walks cover what
     /// admission would cover; nothing is created or written.
-    fn open_passive(root: &Path, max_elapsed_ms: u64) -> Result<Self, LeaseError> {
+    fn open_passive(root: &Path, deadline: std::time::Instant) -> Result<Self, LeaseError> {
+        #[cfg(test)]
+        PASSIVE_OPEN_DELAY.with(|delay| std::thread::sleep(delay.get()));
+        measurement_remaining(deadline)?;
         let root = canonical_existing_dir(root, true)?;
-        refuse_foreign_pool_entries(&root)?;
+        measurement_remaining(deadline)?;
+        refuse_foreign_pool_entries_before(&root, Some(deadline))?;
         refuse_retired_image_pool(&root)?;
-        let (config, ledger) = read_consistent_pair(&root)?;
+        measurement_remaining(deadline)?;
+        let (config, ledger) = read_consistent_pair_before(&root, Some(deadline))?;
         let paths = BackingPaths::under(&root);
         let backing = match config.backend.as_str() {
             BUDGET_BACKEND_DIRECTORY_V1 => open_budget_payload(&root, &paths, &config)?,
             VOLUME_BACKEND_APFS_V1 => open_volume_payload(&paths, &config)?,
             _ => return Err(LeaseError::BackingMismatch),
         };
-        let bound = max_elapsed_ms.clamp(1, 60_000);
+        measurement_remaining(deadline)?;
         Ok(Self {
             _lock: None,
-            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(bound)),
+            deadline: Some(deadline),
             root,
             config,
             backing,
@@ -2272,9 +2280,25 @@ pub(super) fn seed_record_matches(
 }
 
 fn read_consistent_pair(root: &Path) -> Result<(PoolConfig, Ledger), LeaseError> {
+    read_consistent_pair_before(root, None)
+}
+
+fn read_consistent_pair_before(
+    root: &Path,
+    deadline: Option<std::time::Instant>,
+) -> Result<(PoolConfig, Ledger), LeaseError> {
     for _ in 0..2 {
+        if let Some(deadline) = deadline {
+            measurement_remaining(deadline)?;
+        }
         let config = read_config(root)?;
+        if let Some(deadline) = deadline {
+            measurement_remaining(deadline)?;
+        }
         let ledger = read_ledger(root)?;
+        if let Some(deadline) = deadline {
+            measurement_remaining(deadline)?;
+        }
         if ledger.version == LEASE_VERSION
             && ledger.store_id == config.store_id
             && ledger.cap_bytes == config.cap_bytes
@@ -2357,10 +2381,12 @@ fn snapshot_of(
 /// rather than pairing a walk with a different slot generation. Nothing is
 /// repaired or waited for.
 fn measure_within(pool: &Path, max_elapsed_ms: u64) -> Result<MeasuredPool, LeaseError> {
-    let opened = Pool::open_passive(pool, max_elapsed_ms)?;
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(max_elapsed_ms.min(60_000));
+    let opened = Pool::open_passive(pool, deadline)?;
     let snapshot = opened.recorded();
     let mut status = opened.accounted()?;
-    let stable = match read_consistent_pair(&opened.root) {
+    let stable = match read_consistent_pair_before(&opened.root, Some(deadline)) {
         Ok((config, ledger)) => same_generations(&snapshot, &config, &ledger),
         Err(_) => false,
     };
@@ -2980,8 +3006,21 @@ fn listed_control_entry(path: &Path) -> Result<Option<fs::Metadata>, LeaseError>
 }
 
 fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
+    refuse_foreign_pool_entries_before(pool, None)
+}
+
+fn refuse_foreign_pool_entries_before(
+    pool: &Path,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), LeaseError> {
+    if let Some(deadline) = deadline {
+        measurement_remaining(deadline)?;
+    }
     let device = fs::symlink_metadata(pool).map_err(io_error)?.dev();
     for entry in fs::read_dir(pool).map_err(io_error)? {
+        if let Some(deadline) = deadline {
+            measurement_remaining(deadline)?;
+        }
         let entry = entry.map_err(io_error)?;
         let name = entry.file_name();
         if is_finder_metadata(&name) {
@@ -3016,4 +3055,34 @@ fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
         }
     }
     Ok(())
+}
+
+fn measurement_remaining(deadline: std::time::Instant) -> Result<(), LeaseError> {
+    if std::time::Instant::now() >= deadline {
+        Err(LeaseError::UnknownAccounting)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PASSIVE_OPEN_DELAY: std::cell::Cell<std::time::Duration> = const {
+        std::cell::Cell::new(std::time::Duration::ZERO)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn with_passive_open_delay<T>(
+    delay: std::time::Duration,
+    body: impl FnOnce() -> T,
+) -> T {
+    struct Restore(std::time::Duration);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PASSIVE_OPEN_DELAY.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(PASSIVE_OPEN_DELAY.with(|slot| slot.replace(delay)));
+    body()
 }

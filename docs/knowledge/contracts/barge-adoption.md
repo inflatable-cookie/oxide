@@ -174,9 +174,16 @@ Required coverage:
   after the child exits. A fixture root pinned independently of that test
   proves the pin, not the hold.
 
-The sanctioned covering route is `effigy rust:test-600`; `rust:barge-adoption`
-uses that same route without named skips. The separate compile, release
-compile, format and docs selectors cover their own concerns. The ordinary
-shared runner is unchanged. Historical failures, prior skips and the earlier
-unauthorized internal-fixture occurrence remain in Queue/PR history; none is
-claimed as final-head evidence.
+The required covering route is `effigy rust:barge-adoption`: an ordinary heavy
+`oxide test --workspace --all-targets --locked` command, with one fresh private
+fixture directory strictly below the assigned task TMPDIR. It uses ordinary
+Effigy admission and deadline handling, with no staging/proof supervisor and no
+named skips. The old dual-root `rust:test-600` route is not this task's proof.
+Prior use of internal and sibling validation roots remains disclosed history,
+not authorization or current proof. The shared supervisor is unchanged.
+
+Prune previews name the Barge area, stable root ID and path, and match the
+recorded ID in the selection registry. Execution resolves and evicts only that
+ID; a different root adopted at the same folder is retained, including a
+replacement between preview and eviction. Matching paths do not substitute for
+identity.

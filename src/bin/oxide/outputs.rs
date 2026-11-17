@@ -17608,50 +17608,32 @@ mod tests {
         checkout_root: PathBuf,
         checkout: PathBuf,
         store: Store,
+        _candidates: one_use::CandidateScope,
     }
 
     impl GuardFixture {
-        /// A fixture whose classification is deterministic: the **checkout**
-        /// lives under the literal `/private/tmp` (a §3.2 candidate root) and
-        /// the **pool** lives under the process temporary directory, which is
-        /// never inside `/private/tmp` in the AGENTS.md recipe (its `TMPDIR` is
-        /// on the selected volume). Neither directory is a fixed path: each is
-        /// created fresh and removed by `Drop`.
-        ///
-        /// The alternative — both under one scratch root — would make the
-        /// pool's own payload sit inside the candidate root, which §3.3
-        /// deliberately drops as unsafe-broad (the design's §12.1
-        /// counterexample), so the fixture could never be guarded.
+        /// Separate checkout and payload paths under this run's TMPDIR. Only
+        /// the classifier's candidate input is injected; its path/ownership
+        /// and unsafe-broad decisions still inspect the real private fixture.
         fn new(label: &str) -> Self {
             let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let name = format!("oxide-guard-{label}-{}-{id}", std::process::id());
-            let pool_base = std::env::temp_dir()
-                .canonicalize()
-                .expect("the process temporary directory resolves");
-            assert!(
-                !pool_base.starts_with("/private/tmp"),
-                "the fixture pool must live outside /private/tmp so the checkout's \
-                 temporary root stays safe-broad; set TMPDIR to a directory on the \
-                 selected volume (the AGENTS.md recipe does): {pool_base:?}"
-            );
-            let root = pool_base.join(&name);
+            let root = std::env::temp_dir().canonicalize().unwrap().join(name);
             fs::create_dir(&root).unwrap();
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-            let temporary = std::env::var_os("OXIDE_TEST_INTERNAL_ROOT")
-                .map(PathBuf::from)
-                .filter(|path| path.is_dir())
-                .unwrap_or_else(|| PathBuf::from("/private/tmp"));
-            let checkout_root = temporary.canonicalize().unwrap().join(&name);
+            let checkout_root = root.join("temporary");
             fs::create_dir(&checkout_root).unwrap();
             fs::set_permissions(&checkout_root, fs::Permissions::from_mode(0o700)).unwrap();
             let checkout = checkout_root.join("checkout");
             fs::create_dir(&checkout).unwrap();
             let store = pool_store(&root);
+            let candidates = one_use::candidate_scope(&checkout_root);
             Self {
                 root,
                 checkout_root,
                 checkout,
                 store,
+                _candidates: candidates,
             }
         }
 

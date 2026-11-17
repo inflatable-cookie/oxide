@@ -22,7 +22,7 @@ Tom's 2026-10-10 blanket approval in [vision](docs/knowledge/vision.md#authority
 
 Oxide#314's lean reset removes the capture-only Cargo selectors with the
 capture programme. Their older rulings below remain historical; this adoption
-uses the ordinary Oxide selectors and `rust:test-600`.
+uses the ordinary Oxide selectors and `rust:barge-adoption`.
 
 Tom approved risk-proportionate verification on 2026-10-20 ([vision](docs/knowledge/vision.md#validation-policy)). Every product brief names its tier, covering Effigy selectors, wall-clock limit and scratch-disk budget.
 Tom decision `c6e3e9c8` v2 (2026-11-04) permits the named capture-only Cargo selectors `rust:compile:cargo`, `rust:compile-release:cargo`, `rust:format:cargo` and `rust:test-600:cargo` for direct capture covering. They establish build and embedded-harness behavior, not private launcher isolation or current export production. Ordinary Rust selectors remain through Oxide. The direct checks require separate planner activation and the existing guard, root and host safeguards.
@@ -50,8 +50,10 @@ dogfood finding. Preserve the ordinary routing and existing compiler profiles.
 - `rust:format`: check formatting; `rust:format-write`: apply it during authoring.
 - `rust:compile-linux`: offline compile for the already-installed target only.
 - `docs:check`: links, retired concepts, changelog and whitespace.
-- `rust:test-600`: sanctioned covering workspace unit/integration run; no named
-  test skips. `rust:barge-adoption` uses the same covering route.
+- `rust:barge-adoption`: ordinary heavy covering workspace unit/integration
+  suite for oxide#314, with no named skips and fresh fixtures below task TMPDIR.
+- `rust:test-600`: the separate historical dual-root wrapper; not authorized
+  for this task's scratch boundary.
 - `proof:rust-test-600:test` / `:plan`: wrapper self-check / effect-free plan.
 - `proof:supervisor:test` / `:preflight`: pure cases / effect-free host readiness.
   Native `proof:supervisor:qualify` and its diagnostic still require their own
@@ -59,13 +61,14 @@ dogfood finding. Preserve the ordinary routing and existing compiler profiles.
 - `oxide:install` / `oxide:reinstall`: planner-only installation after reviewed
   merge, with receipt matching; source adoption authorizes neither.
 
-`rust:test-600` uses the existing dual-root wrapper: one per-run internal root
-for fixtures requiring the boot Data filesystem (`OXIDE_TASK_SCRATCH_ROOT` and
-`OXIDE_TEST_INTERNAL_ROOT`) and one per-run validation temp root on the selected
-volume (`TMPDIR`, `TMP`, `TEMP`). Its fixed shared supervisor monitors 512 MiB
-and 600 seconds, removes only its own roots after a closed run and retains them
-otherwise. The planner explicitly authorized this covering route for oxide#314.
-Individual ordinary adoption tests use fresh private task TMPDIR fixtures.
+`rust:barge-adoption` creates one private per-run directory below the invoking
+`TMPDIR`, passes it as TMPDIR/TMP/TEMP and the test fixture roots, and removes
+only that directory after a successful test command. A failed command retains
+it. Effigy owns heavy admission and the 600-second run deadline. Unit tests
+inject only the platform/classifier inputs that formerly required boot-volume
+temporary paths; their file operations remain in the private fixture. The
+shared supervisor and the separate dual-root recipe are unchanged and provide
+no authority for this task to create internal-drive fixtures.
 
 The lean Barge adoption uses ordinary tests and independent exact-head review,
 with no adoption/capture/supplier native ladder. Barge owns volumes, locations,

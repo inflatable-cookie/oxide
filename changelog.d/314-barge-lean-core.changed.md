@@ -1,1 +1,1 @@
-Oxide now links the lean Barge library for volumes, roots, cooperative holds, output pins, pruning and trash. Preserve warm reuse, output links and explicit adoption; remove the old deletion, census and capture machinery.
+Oxide now links the lean Barge library for volumes, roots, cooperative holds, output pins, pruning and trash. Preserve warm reuse, output links and explicit adoption; remove the old deletion, census and capture machinery. Bind prune plans to recorded root IDs and honor measurement deadlines from entry.

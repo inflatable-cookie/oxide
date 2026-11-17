@@ -81,7 +81,9 @@ payloads. They grant no independent deletion authority.
 
 ### Passive snapshot and measurement (oxide#128)
 
-Status is read-only. Explicit measurement uses the caller's remaining deadline;
+Status is read-only. Explicit measurement starts its caller deadline before
+passive opening, checks it through setup and uses it for accounting and the
+stability reread; zero supplies no grace period.
 partial or unreadable measurements report unknown capacity. Logical and
 allocated bytes remain distinct, and a sample is not a physical peak.
 

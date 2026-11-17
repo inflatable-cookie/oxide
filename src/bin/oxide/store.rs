@@ -10936,10 +10936,6 @@ mod scratch_internal_tests {
                 && metadata.uid() == unsafe { libc::getuid() }
                 && metadata.mode() & 0o077 == 0
         );
-        let observed = oxide_storage::volume::observe_path(&root).unwrap();
-        let boot = oxide_storage::volume::observe_path(Path::new("/System/Volumes/Data")).unwrap();
-        assert_eq!(observed.fstype, "apfs");
-        assert_eq!((observed.dev, observed.uuid), (boot.dev, boot.uuid));
         let mut name = CString::new(root.join("scratch-unit.XXXXXX").as_os_str().as_bytes())
             .unwrap()
             .into_bytes_with_nul();
@@ -10983,6 +10979,7 @@ mod scratch_internal_tests {
             fs::remove_dir_all(root).unwrap();
             return;
         }
+        let _internal = crate::config::internal_fixture_scope();
         let root = PathBuf::from(std::env::var_os("OXIDE_S3_ROOT").unwrap());
         fs::create_dir(root.join("home")).unwrap();
         let declared = root.join("pool");
@@ -11084,6 +11081,7 @@ mod scratch_internal_tests {
             fs::remove_dir_all(root).unwrap();
             return;
         }
+        let _internal = crate::config::internal_fixture_scope();
         let root = PathBuf::from(std::env::var_os("OXIDE_S3_ROOT").unwrap());
         fs::create_dir(root.join(".git")).unwrap();
         let settings = super::settings().unwrap();

@@ -92,7 +92,10 @@ fn private_env(scratch: &Path, bin: &Path, pool: &Path) -> Command {
         .env("OXIDE_POOL_BACKEND", "directory-budget")
         .env("OXIDE_POOL_CAP", "2MiB")
         .env("CARGO_HOME", scratch.join("cargo-home"))
-        .env("TMPDIR", scratch);
+        .env("OXIDE_SCRATCH_ROOT", scratch)
+        .env("TMPDIR", scratch)
+        .env("TMP", scratch)
+        .env("TEMP", scratch);
     for name in [
         "RUSTUP_HOME",
         "RUSTUP_TOOLCHAIN",

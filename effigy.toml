@@ -55,10 +55,20 @@ minimum_effigy_version = "0.14.0"
   "git diff --check HEAD",
 ]
 
-# Lean adoption uses the same sanctioned covering route, with no named skips.
+# Ordinary covering suite: every fixture stays below the caller's task TMPDIR.
+# Effigy owns admission/deadline handling; no staging or proof supervisor.
 [tasks."rust:barge-adoption"]
 admission = "heavy"
-run = "python3 scripts/rust-test-600.py"
+run = '''adoption_root=$(mktemp -d "${TMPDIR:?}/qa.XXXXXX") || exit 2
+echo "oxide adoption fixtures: $adoption_root"
+TMPDIR="$adoption_root" TMP="$adoption_root" TEMP="$adoption_root" OXIDE_TASK_SCRATCH_ROOT="$adoption_root" OXIDE_TEST_INTERNAL_ROOT="$adoption_root" oxide test --workspace --all-targets --locked
+adoption_exit=$?
+if [ "$adoption_exit" -eq 0 ]; then
+  rm -rf -- "$adoption_root"
+else
+  echo "oxide adoption fixtures retained after exit $adoption_exit" >&2
+fi
+exit "$adoption_exit"'''
 
 # Apply formatting during source authoring; rust:format remains check-only.
 [tasks."rust:format-write"]

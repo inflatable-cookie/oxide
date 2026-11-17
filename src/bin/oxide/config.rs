@@ -1092,6 +1092,10 @@ pub(crate) fn judge_pool_path(path: &Path) -> Result<(), PathRefusal> {
             path.display()
         ))
     })?;
+    #[cfg(test)]
+    if internal_fixture() {
+        return judge_git_work_tree(path, &canonical);
+    }
     if canonical.starts_with("/Volumes") {
         return Err(PathRefusal::ExternalVolume { message: format!(
             "the pool path {} is on an external volume ({}); a removable volume is registered with `oxide pool register-removable`, not used as the internal pool",
@@ -2346,4 +2350,26 @@ mod tests {
         );
         assert_eq!(known.iter().filter(|path| path.ends_with("5")).count(), 1);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static INTERNAL_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+pub(crate) fn internal_fixture() -> bool {
+    INTERNAL_FIXTURE.with(std::cell::Cell::get)
+}
+#[cfg(test)]
+pub(crate) struct InternalFixture(bool);
+#[cfg(test)]
+impl Drop for InternalFixture {
+    fn drop(&mut self) {
+        INTERNAL_FIXTURE.with(|slot| slot.set(self.0));
+    }
+}
+/// Model only boot-volume classification; file operations stay in task TMPDIR.
+#[cfg(test)]
+pub(crate) fn internal_fixture_scope() -> InternalFixture {
+    InternalFixture(INTERNAL_FIXTURE.with(|slot| slot.replace(true)))
 }

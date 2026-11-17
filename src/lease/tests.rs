@@ -622,7 +622,7 @@ fn barge_pruning_retires_workflow_rows_and_uses_fresh_successor_paths() {
 }
 
 #[test]
-fn a_short_measurement_budget_is_applied_and_partial_totals_are_unknown() {
+fn missing_root_measurements_are_partial_and_capacity_is_unknown() {
     let fixture = Fixture::new("short-budget");
     let pool = fixture.pool();
     let project = fixture.dir("project");
@@ -638,11 +638,28 @@ fn a_short_measurement_budget_is_applied_and_partial_totals_are_unknown() {
         .to_path_buf();
     drop(leased);
     managed::release(&pool, &lease_id).expect("release");
-    // A one-millisecond budget must be honoured (no error) and a missing root
-    // makes the total unknown, not a false "not full".
+    // A missing root makes the total unknown, not a false "not full".
+    // Opening deadlines are exercised separately without a timing race.
     std::fs::remove_dir_all(&slot_root).unwrap();
-    let measured = managed::measure_within(&pool, 1).expect("a short budget still measures");
+    let measured = managed::measure_within(&pool, 1_000).expect("measure the missing root");
     assert_eq!(measured.status.coverage, super::AccountingCoverage::Partial);
     assert_eq!(measured.status.full, None);
     assert!(measured.status.payload_logical_bytes.is_none());
+}
+
+#[test]
+fn passive_open_time_consumes_the_callers_measurement_budget() {
+    let fixture = Fixture::new("measurement-open-budget");
+    let pool = fixture.pool();
+    super::pool::with_passive_open_delay(std::time::Duration::from_millis(10), || {
+        assert!(matches!(
+            managed::measure_within(&pool, 1),
+            Err(LeaseError::UnknownAccounting)
+        ));
+    });
+    assert!(matches!(
+        managed::measure_within(&pool, 0),
+        Err(LeaseError::UnknownAccounting)
+    ));
+    assert!(managed::measure_within(&pool, 1_000).is_ok());
 }

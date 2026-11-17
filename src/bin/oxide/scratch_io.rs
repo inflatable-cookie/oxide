@@ -133,17 +133,7 @@ pub(crate) fn evaluate(settings: &Settings, status: bool) -> Result<Option<Strin
             p != r && p.starts_with(r) && fs::canonicalize(r).is_ok_and(|c| c == *r)
         });
     let declared_non_boot_mount = if !status && ordinary.is_ok() && inside {
-        let dev = nearest(pool)
-            .and_then(|(_, p)| fs::metadata(p).ok())
-            .map(|m| m.dev());
-        let boot = fs::metadata(if cfg!(target_os = "macos") {
-            "/private/tmp"
-        } else {
-            "/"
-        })
-        .ok()
-        .map(|m| m.dev());
-        dev.is_none() || boot.is_none() || dev != boot
+        non_boot_device(pool)
     } else {
         false
     };
@@ -542,4 +532,22 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"first");
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+fn non_boot_device(pool: &Path) -> bool {
+    #[cfg(test)]
+    if config::internal_fixture() {
+        return false;
+    }
+    let dev = nearest(pool)
+        .and_then(|(_, p)| fs::metadata(p).ok())
+        .map(|m| m.dev());
+    let boot = fs::metadata(if cfg!(target_os = "macos") {
+        "/private/tmp"
+    } else {
+        "/"
+    })
+    .ok()
+    .map(|m| m.dev());
+    dev.is_none() || boot.is_none() || dev != boot
 }
