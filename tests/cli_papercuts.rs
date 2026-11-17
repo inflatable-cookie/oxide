@@ -412,8 +412,9 @@ fn whole_target_fixture(scratch: &Scratch, bin: &Path) -> (PathBuf, PathBuf, Pat
     let pool = scratch.path().join("fixture-pool");
     created_pool(scratch, bin, &manifest, &pool);
     let control = pool.join("oxide-managed");
-    let mount = scratch.path().join("mount");
-    fs::create_dir_all(&mount).unwrap();
+    // Model positive absence. A present directory with a different UUID is
+    // a wrong-volume refusal, never the local fallback this fixture needs.
+    let mount = scratch.path().join("absent-mount");
     registration_at(&control, &mount);
     let id = checkout_id(&checkout);
     let root = scratch.path().join("owned-root");
