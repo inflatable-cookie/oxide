@@ -74,7 +74,10 @@ impl Watchdog {
 
     /// The removal stop for a removable pool mounted at `mount`.
     pub fn for_volume(mount: &Path) -> Self {
-        let uuid = oxide_storage::storage::OxideOs.volume_identity(mount).ok().flatten();
+        let uuid = oxide_storage::storage::OxideOs
+            .volume_identity(mount)
+            .ok()
+            .flatten();
         let mut watchdog = Self::new(
             Source::Volume {
                 mount: mount.to_path_buf(),
@@ -212,7 +215,9 @@ impl Watchdog {
         match &self.source {
             Source::Statfs(path) => available_bytes(path),
             Source::Volume { mount, uuid } => oxide_storage::storage::OxideOs
-                .volume_identity(mount).ok().flatten()
+                .volume_identity(mount)
+                .ok()
+                .flatten()
                 .filter(|observed| Some(observed.as_str()) == uuid.as_deref())
                 .map(|_| u64::MAX),
             #[cfg(debug_assertions)]

@@ -515,7 +515,14 @@ impl PoolStorage {
     /// Record the front door's registered reserve on this volume, so Barge's
     /// prune target is the operator's reserve rather than zero.
     pub fn set_reserve(&self, reserve_bytes: u64) -> Result<(), String> {
-        if self.backing.reserve_bytes == reserve_bytes {
+        let floor_bytes = if reserve_bytes == 0 {
+            self.backing.floor_bytes
+        } else {
+            self.backing.floor_bytes.min(reserve_bytes)
+        };
+        let volume = self.storage.volume("pool")?;
+        if volume.spec().reserve_bytes == reserve_bytes && volume.spec().floor_bytes == floor_bytes
+        {
             return Ok(());
         }
         self.storage.register_volume(
@@ -524,11 +531,7 @@ impl PoolStorage {
             self.backing.uuid.as_deref(),
             "",
             reserve_bytes,
-            if reserve_bytes == 0 {
-                self.backing.floor_bytes
-            } else {
-                self.backing.floor_bytes.min(reserve_bytes)
-            },
+            floor_bytes,
         )?;
         Ok(())
     }
@@ -1445,6 +1448,9 @@ mod revision_tests {
         .expect("pool");
         pool.set_reserve(20 << 30).expect("reserve");
         assert_eq!(pool.space().expect("space").reserve_bytes, 20 << 30);
+        pool.set_reserve(0).expect("disable reserve pruning");
+        assert_eq!(pool.space().expect("space").reserve_bytes, 0);
+        assert_eq!(pool.space().expect("space").floor_bytes, 10 << 20);
     }
 }
 

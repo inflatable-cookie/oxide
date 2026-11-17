@@ -28,15 +28,14 @@ use crate::process;
 use crate::watchdog::Watchdog;
 pub(crate) use oxide_storage::lease::control::*;
 use oxide_storage::lease::managed::{
-    evict_held_slot, evict_idle_slot, flush_volume, init_budget_pool, lease_measured, ledger_view,
-    measure_within, recover, release, snapshot, status as pool_status,
+    evict_idle_slot, flush_volume, init_budget_pool, lease_measured, ledger_view, measure_within,
+    recover, release, snapshot, status as pool_status,
 };
 use oxide_storage::lease::{
-    AccountingScan, AdmissionClass, HeldEvictionFailure, LeaseError, LeaseRequest, LedgerSlot,
-    LedgerView, MemberPair, MemberSet, OneUseSlice, PoolStatus, Profile as LeaseProfile,
-    RestoreOutcome, ReuseMeasurement, SliceAdmission, SliceReport, SlotLayout, SlotOccupancy,
-    UnmeasuredSlot, VictimPolicy, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
-    VOLUME_BACKEND_APFS_V1,
+    AccountingScan, AdmissionClass, LeaseError, LeaseRequest, LedgerSlot, LedgerView, MemberPair,
+    MemberSet, OneUseSlice, PoolStatus, Profile as LeaseProfile, RestoreOutcome, ReuseMeasurement,
+    SliceAdmission, SliceReport, SlotLayout, SlotOccupancy, UnmeasuredSlot, VictimPolicy,
+    BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, VOLUME_BACKEND_APFS_V1,
 };
 use oxide_storage::volume::Binding;
 use serde::{Deserialize, Serialize};
@@ -2949,14 +2948,6 @@ impl Store {
         };
         store.ensure_control().unwrap();
         store
-    }
-
-    /// Test-only: fence the control exactly as a real command's first
-    /// admission does, so a custody fixture models a pool a prune preview may
-    /// witness (an existing admission lock and fenced state document).
-    #[cfg(test)]
-    pub fn prime_control_for_tests(&self) {
-        self.admission().unwrap();
     }
 
     /// Test-only: an independent handle to the same pool, so a test can hand
@@ -5998,22 +5989,6 @@ fn lease_error(context: &str, error: &LeaseError) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-
-    /// Isolate only fixtures whose oracle requires a just-closed flock to be
-    /// free. Parallel runner process creation can inherit an open description
-    /// until exec, even when the parent has already dropped its File.
-    pub(super) fn fixture_child(test: &str) -> bool {
-        if std::env::var("OXIDE_STORE_FIXTURE_CHILD").as_deref() == Ok(test) {
-            return false;
-        }
-        let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--nocapture"])
-            .env("OXIDE_STORE_FIXTURE_CHILD", test)
-            .status()
-            .expect("fixture child");
-        assert!(result.success(), "fixture child failed: {test}: {result}");
-        true
-    }
 
     #[test]
     fn release_admission_notice_and_budget_are_bounded_and_truthful() {

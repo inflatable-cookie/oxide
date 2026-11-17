@@ -4641,7 +4641,7 @@ oxide#102.
   answer. Each proof stager that relies on the controls checks
   `test_controls: true` before any case runs (`test-account-home.py`,
   `test-everyday-cli.py`, `test-oxide-cli.py`'s debug stager and
-  `test-installed-handoff.py`'s, which `test-outputs-prune.py` reuses); an
+  `test-installed-handoff.py`'s); an
   artifact without them from any other stager refuses its private-`HOME`
   control rather than reach the account. `scripts/test-oxide-cli.py` gives its
   runner and `clean-safety` a private `HOME` with the first control, removes
@@ -6056,7 +6056,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
   Every `diskutil` or `plutil` call is bounded: 5 s each and a 4 MiB output cap. A timeout, oversize output or parse failure counts as unknown. An `Evicting` record in the ledger does not make the drive unavailable: a build's open reconciles it and selects the drive anyway, the same as `oxide`'s selection (`Store::open_removable`, which never refuses on it). `describe` reconciles nothing and reports the count in `pending_reconciliation_slots` instead (oxide#174; before that it was `available: false` with reason `pending_reconciliation`, which blocked consumers at the 128-slot ceiling).
 - **`pending_reconciliation_slots`** is the number of ledger records in `Evicting` (deletions a build's open reconciles), added in schema 1 by oxide#174. It is advisory and never changes `available`: `0` when none is pending, and `null` when the config and ledger were not read (an unreadable registration, or an earlier check refused). A drive with pending records and every other check passing reports `available: true` with a count of `n`.
 - **`pending_reconciliation_slot_ids`** lists those recorded slot IDs as strings, or is `null` when the count is unknown. It is advisory and does not change selection.
-- **`unavailable_reason`** is `null` when available. Otherwise one of: `absent` (nothing mounted at the registered path), `identity_mismatch` (a different volume, container or budget than registered), `volume_unusable` (refused by a selection rule such as the mount parent, read-only, a role or the boot container), `below_reserve`, `metadata_unknown` (a probe failed, timed out, was over cap or could not be parsed), `control_missing` (no internal control directory, config or ledger), or `payload_missing`. `pending_reconciliation` was a reason value before oxide#174 and is no longer emitted; consumers that handled it still see only the values above. Consumers branch on `available`, not on reason strings.
+- **`unavailable_reason`** is `null` when available. Otherwise one of: `absent` (nothing mounted at the registered path), `identity_mismatch` (a different volume, container or budget than registered), `volume_unusable` (refused by a selection rule such as read-only, a role or the boot container), `metadata_unknown` (a probe failed, timed out, was over cap or could not be parsed), `control_missing` (no internal control directory, config or ledger), or `payload_missing`. `pending_reconciliation` was a reason value before oxide#174 and is no longer emitted; consumers that handled it still see only the values above. Consumers branch on `available`, not on reason strings.
 - **`unavailable_detail`** is a human-readable explanation, added in schema 1. Its text is not stable.
 - **`reserve_bytes`** is the registered reserve in bytes, added in schema 1, and `null` when the registration cannot be read. `available` is only a snapshot of free space above it. A writer rechecks the mount, the volume UUID and free space against this value at use time.
 - **`selected`** is the passive preference: `"removable"` when `available` is true, otherwise `"internal"`. It is not a promise of the next build's selection, which stays authoritative inside the build and may differ, for example after its own reconciliation.
@@ -6575,7 +6575,7 @@ requirements are met. Inventory direct consumers in `effigy.toml` and all hash c
 implementation head; update each applicable pin only under its own approved
 scope, with new consumer evidence where required. At this source head explicit
 `fcfda2b0…` checks occur in `test-command-budgets.py`,
-`test-holding-delete.py`, `test-outputs-prune.py`,
+the retired holding-delete/output-prune scripts,
 `test-recorded-slot-accounting.py` and `test-slot-headroom.py`. Older explicit
 checks are `d89115f1…` in `test-accounting-guards.py` and
 `test-status-fast.py`, and `8e379c93…` in `test-accounting-vanished.py`,

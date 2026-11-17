@@ -778,12 +778,26 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
     note_reservation(&mut registry, receipt, &receipt_path, checkout_volume_uuid)?;
     pin_references(control, receipt)?;
     for row in &mut registry.rows {
-        if !row.live() || !row.root.is_dir() { continue; }
-        let selected = Selected { kind: row.root_kind, root: row.root.clone(), volume_uuid: row.volume_uuid.clone(),
-            nonce: row.nonce.clone(), generation: row.generation };
+        if !row.live() || !row.root.is_dir() {
+            continue;
+        }
+        let selected = Selected {
+            kind: row.root_kind,
+            root: row.root.clone(),
+            volume_uuid: row.volume_uuid.clone(),
+            nonce: row.nonce.clone(),
+            generation: row.generation,
+        };
         let area = output_area(control, &selected)?;
-        if let Some(root) = area.list().map_err(|error| error.to_string())?.roots.into_iter()
-            .find(|root| root.path == row.root) { row.barge_id = Some(root.id); }
+        if let Some(root) = area
+            .list()
+            .map_err(|error| error.to_string())?
+            .roots
+            .into_iter()
+            .find(|root| root.path == row.root)
+        {
+            row.barge_id = Some(root.id);
+        }
     }
     write_registry(control, &registry)
 }
@@ -1485,11 +1499,19 @@ fn import_output(
         return Err("a retired output generation cannot adopt its old path".to_owned());
     }
     let area = output_area(control, selected)?;
-    if let Some(id) = read_registry(control)?.and_then(|registry| registry.rows.into_iter()
-        .find(|row| row.root == selected.root() && row.barge_id.is_some()).and_then(|row| row.barge_id))
-    {
-        let root = area.resolve(&id).map_err(|error| format!("the recorded Barge output generation is unavailable: {error}"))?;
-        if root.path != selected.root() { return Err("the recorded Barge output ID moved".to_owned()); }
+    if let Some(id) = read_registry(control)?.and_then(|registry| {
+        registry
+            .rows
+            .into_iter()
+            .find(|row| row.root == selected.root() && row.barge_id.is_some())
+            .and_then(|row| row.barge_id)
+    }) {
+        let root = area.resolve(&id).map_err(|error| {
+            format!("the recorded Barge output generation is unavailable: {error}")
+        })?;
+        if root.path != selected.root() {
+            return Err("the recorded Barge output ID moved".to_owned());
+        }
         return Ok((area, id));
     }
     let mut identity = selected.clone();
@@ -1656,7 +1678,12 @@ fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
             continue;
         }
         let location = sha256_hex(parent.as_os_str().as_encoded_bytes());
-        if !control.join("output-storage").join(location).join("barge/areas").is_dir() {
+        if !control
+            .join("output-storage")
+            .join(location)
+            .join("barge/areas")
+            .is_dir()
+        {
             continue;
         }
         let area = output_area(control, &selected)?;
@@ -1763,20 +1790,33 @@ pub(crate) fn test_output_storage(control: &Path, selected: &Selected) -> (barge
 /// Whether an earlier owned generation occupied this path. A missing or
 /// replaced old marker is never ownership for another generation.
 pub(crate) fn needs_successor(control: &Path, root: &Path) -> Result<bool, String> {
-    let Some(registry) = read_registry(control)? else { return Ok(false); };
+    let Some(registry) = read_registry(control)? else {
+        return Ok(false);
+    };
     for row in registry.rows.iter().filter(|row| row.root == root) {
-        if row.pruned_ms.is_some() { return Ok(true); }
+        if row.pruned_ms.is_some() {
+            return Ok(true);
+        }
         if let Some(id) = &row.barge_id {
-            let selected = Selected { kind: row.root_kind, root: row.root.clone(), volume_uuid: row.volume_uuid.clone(),
-                nonce: row.nonce.clone(), generation: row.generation };
+            let selected = Selected {
+                kind: row.root_kind,
+                root: row.root.clone(),
+                volume_uuid: row.volume_uuid.clone(),
+                nonce: row.nonce.clone(),
+                generation: row.generation,
+            };
             match output_area(control, &selected)?.resolve(id) {
                 Ok(found) if found.path == root => {}
                 Ok(_) => return Ok(true),
                 Err(error) if error.kind() == barge::ErrorKind::NotFound => return Ok(true),
                 Err(error) => return Err(error.to_string()),
             }
-        } else if row.marker_digest.is_some() && fs::symlink_metadata(root.join(outputs::MARKER))
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) { return Ok(true); }
+        } else if row.marker_digest.is_some()
+            && fs::symlink_metadata(root.join(outputs::MARKER))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Ok(true);
+        }
     }
     Ok(false)
 }
@@ -1792,11 +1832,19 @@ pub(crate) fn fresh_output(control: &Path, selected: &Selected) -> Result<barge:
 }
 
 fn record_import(control: &Path, root: &Path, id: &str) -> Result<(), String> {
-    let Some(mut registry) = read_registry(control)? else { return Ok(()); };
+    let Some(mut registry) = read_registry(control)? else {
+        return Ok(());
+    };
     let mut changed = false;
     for row in registry.rows.iter_mut().filter(|row| row.root == root) {
-        if row.barge_id.as_deref() != Some(id) { row.barge_id = Some(id.to_owned()); changed = true; }
+        if row.barge_id.as_deref() != Some(id) {
+            row.barge_id = Some(id.to_owned());
+            changed = true;
+        }
     }
-    if changed { registry.bump()?; write_registry(control, &registry)?; }
+    if changed {
+        registry.bump()?;
+        write_registry(control, &registry)?;
+    }
     Ok(())
 }

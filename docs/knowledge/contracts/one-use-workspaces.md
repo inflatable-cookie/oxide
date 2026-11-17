@@ -2488,9 +2488,8 @@ their own fixed argv, and neither may change a caller's role by default.
   --locked --offline --bin oxide`): the module is imported by eight scripts and
   seven of them call `stage_at`.
 - `scripts/test-installed-handoff.py:191` (`stage_subject`, the
-  installed-handoff recipe with `--bin oxide`) is imported by
-  `scripts/test-outputs-prune.py:1728` (plus its own proof at `:850` and the
-  synthetic `test_dogfood_scripts.py` reference).
+  installed-handoff recipe with `--bin oxide`) is used by its own proof and the synthetic `test_dogfood_scripts.py`
+  reference. The old output-prune consumer was retired with that engine.
 
 Each gains an explicit `features: str | None = None` parameter whose default
 adds **no** feature, so no historical or unrelated role changes by accident.
@@ -2502,7 +2501,6 @@ adds **no** feature, so no historical or unrelated role changes by accident.
 | `test-profile-outputs.py` — candidate `layout.stage_at` call in `run()` | current HEAD **candidate**; fixed `BASE = 4a70b83` | candidate only |
 | `test-oxide-removable-removal.py:358,621` | current HEAD candidate (and boot-closure mode) | candidate only |
 | `test-drive-mode.py:172` | current HEAD candidate; fixture workspace, pool, `HOME`, `CARGO_HOME` and `TMPDIR` under owned scratch (`scripts/test-drive-mode.py:174-230`) | candidate only, plus class/roots for its fixtures |
-| `test-outputs-prune.py:1728` (through `test-installed-handoff.py:191`) | current HEAD candidate with an explicit capability dict | candidate only, plus class/roots; capability assertions updated |
 | `test-freshness-submodules.py:577` | current HEAD candidate | candidate only |
 | `test-init-guidance.py:291` | current HEAD candidate | candidate only |
 

@@ -13,10 +13,10 @@ use crate::config::{self, Facts};
 use crate::process;
 use crate::store::{self, Backend, Store};
 use crate::MIB;
-use oxide_storage::lease::managed::init_volume_pool;
-use oxide_storage::volume::{self, Binding};
-use oxide_storage::storage::{AreaConfig, Storage};
 use barge::Os;
+use oxide_storage::lease::managed::init_volume_pool;
+use oxide_storage::storage::{AreaConfig, Storage};
+use oxide_storage::volume::{self, Binding};
 use serde::{Deserialize, Serialize};
 use std::ffi::{CString, OsString};
 use std::fs::{self, File};
@@ -644,7 +644,8 @@ pub(crate) fn read_registration_at(directory: &File) -> Result<Option<Registrati
     }
     // SAFETY: fd is newly opened and owned by this function.
     let file = unsafe { File::from_raw_fd(fd) };
-    let metadata = file.metadata()
+    let metadata = file
+        .metadata()
         .map_err(|error| format!("cannot read the removable registration: {error}"))?;
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
@@ -656,7 +657,8 @@ pub(crate) fn read_registration_at(directory: &File) -> Result<Option<Registrati
         return Err("the removable registration is not a small owner-only regular file".to_owned());
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_REGISTRATION_BYTES + 1).read_to_end(&mut bytes)
+    file.take(MAX_REGISTRATION_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read the removable registration: {error}"))?;
     if bytes.len() as u64 > MAX_REGISTRATION_BYTES {
         return Err("the removable registration exceeds its byte limit".to_owned());
@@ -740,7 +742,10 @@ fn parse_release_arguments<'a>(arguments: &'a [&'a str]) -> Result<ReleaseArgume
 /// retained instead of receiving new deletion authority.
 fn release_quarantined(arguments: ReleaseArguments<'_>) -> Result<u8, String> {
     if !arguments.confirmed {
-        return Err("--confirm-writers-stopped is required; legacy quarantined roots are retained".to_owned());
+        return Err(
+            "--confirm-writers-stopped is required; legacy quarantined roots are retained"
+                .to_owned(),
+        );
     }
     let _ = arguments.dry_run;
     Err(format!("legacy quarantined slot {} is retained: it has no cooperative Barge hold history; this command cannot establish ownership for deletion", arguments.slot))
@@ -798,7 +803,10 @@ pub fn select(internal: Store) -> Result<Selected, String> {
         },
     };
     if absent {
-        let reason = format!("registered volume {} is absent", registration.mount_point.display());
+        let reason = format!(
+            "registered volume {} is absent",
+            registration.mount_point.display()
+        );
         return Ok(Selected {
             store: internal.with_sibling(&control, false),
             note: Some(format!("internal pool: {reason}")),
@@ -818,7 +826,10 @@ pub fn select(internal: Store) -> Result<Selected, String> {
     )?;
     Ok(Selected {
         store: store.with_sibling(internal.control(), true),
-        note: Some(format!("removable volume {} selected", registration.mount_point.display())),
+        note: Some(format!(
+            "removable volume {} selected",
+            registration.mount_point.display()
+        )),
         removable: true,
         mode: Some(registration.mode),
         fallback_reason: None,
@@ -829,12 +840,18 @@ pub fn select(internal: Store) -> Result<Selected, String> {
 /// Import the caller-validated legacy registration once, then let Barge own
 /// identity and area routing. An absent legacy drive is left untouched until
 /// it returns; a missing identity is an error, never absence.
-fn registered_area(control: &Path, registration: &Registration) -> Result<Option<barge::Area>, String> {
+fn registered_area(
+    control: &Path,
+    registration: &Registration,
+) -> Result<Option<barge::Area>, String> {
     let storage = Storage::open(control)?;
     declare_registered_area(&storage, registration)
 }
 
-fn declare_registered_area(storage: &Storage, registration: &Registration) -> Result<Option<barge::Area>, String> {
+fn declare_registered_area(
+    storage: &Storage,
+    registration: &Registration,
+) -> Result<Option<barge::Area>, String> {
     match storage.known_volume("pool") {
         Ok(volume) => {
             let spec = volume.spec();
@@ -845,18 +862,24 @@ fn declare_registered_area(storage: &Storage, registration: &Registration) -> Re
             }
             if volume.state().map_err(|error| error.to_string())? == barge::VolumeState::Present
                 && (spec.reserve_bytes != registration.reserve_bytes
-                    || spec.floor_bytes != oxide_storage::storage::reserve_floor(registration.reserve_bytes))
+                    || spec.floor_bytes
+                        != oxide_storage::storage::reserve_floor(registration.reserve_bytes))
             {
                 storage.register_volume(
-                    "pool", &registration.mount_point, Some(&registration.volume_uuid), "",
+                    "pool",
+                    &registration.mount_point,
+                    Some(&registration.volume_uuid),
+                    "",
                     registration.reserve_bytes,
                     oxide_storage::storage::reserve_floor(registration.reserve_bytes),
                 )?;
             }
         }
         Err(_) => {
-            if oxide_storage::storage::OxideOs.volume_identity(&registration.mount_point)
-                .map_err(|error| error.to_string())?.is_none()
+            if oxide_storage::storage::OxideOs
+                .volume_identity(&registration.mount_point)
+                .map_err(|error| error.to_string())?
+                .is_none()
             {
                 return Ok(None);
             }
@@ -867,7 +890,9 @@ fn declare_registered_area(storage: &Storage, registration: &Registration) -> Re
         .folder(format!("{PAYLOAD_DIR}/slots"))
         .soft_cap_bytes(Some(registration.cap_bytes))
         .reserve_bytes(registration.reserve_bytes)
-        .floor_bytes(oxide_storage::storage::reserve_floor(registration.reserve_bytes));
+        .floor_bytes(oxide_storage::storage::reserve_floor(
+            registration.reserve_bytes,
+        ));
     storage.declare(&config).map(Some)
 }
 
@@ -880,9 +905,16 @@ fn require_location(area: &barge::Area) -> Result<PathBuf, String> {
 
 /// Recheck Barge's location before a removable child/seed starts. Reserve is
 /// a pruning signal, not a reason to switch to another volume.
-pub(crate) fn verified_registration(control: &Path, registration: &Registration) -> Result<(), String> {
-    let area = registered_area(control, registration)?
-        .ok_or_else(|| format!("registered volume {} is absent", registration.mount_point.display()))?;
+pub(crate) fn verified_registration(
+    control: &Path,
+    registration: &Registration,
+) -> Result<(), String> {
+    let area = registered_area(control, registration)?.ok_or_else(|| {
+        format!(
+            "registered volume {} is absent",
+            registration.mount_point.display()
+        )
+    })?;
     require_location(&area)?;
     if !volume::writable(&registration.mount_point)? {
         return Err("the volume is not writable".to_owned());
@@ -1065,19 +1097,36 @@ mod tests {
             temp.path().join("state"),
             Arc::new(os.clone()),
             Arc::new(barge::ManualClock::new(1)),
-        ).unwrap();
-        storage.register_volume(
-            "pool", &mount, Some(&registration.volume_uuid), "",
-            registration.reserve_bytes, oxide_storage::storage::reserve_floor(registration.reserve_bytes),
-        ).unwrap();
-        let area = declare_registered_area(&storage, &registration).unwrap().unwrap();
-        assert_eq!(require_location(&area).unwrap(), mount.join("oxide-pool/slots"));
+        )
+        .unwrap();
+        storage
+            .register_volume(
+                "pool",
+                &mount,
+                Some(&registration.volume_uuid),
+                "",
+                registration.reserve_bytes,
+                oxide_storage::storage::reserve_floor(registration.reserve_bytes),
+            )
+            .unwrap();
+        let area = declare_registered_area(&storage, &registration)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            require_location(&area).unwrap(),
+            mount.join("oxide-pool/slots")
+        );
         os.set_uuid(&mount, None);
         assert!(require_location(&area).unwrap_err().contains("absent"));
         os.set_uuid(&mount, Some("11111111-2222-3333-4444-555555555555"));
-        assert!(require_location(&area).unwrap_err().contains("not the registered"));
+        assert!(require_location(&area)
+            .unwrap_err()
+            .contains("not the registered"));
         os.set_uuid(&mount, Some(&registration.volume_uuid));
-        assert_eq!(require_location(&area).unwrap(), mount.join("oxide-pool/slots"));
+        assert_eq!(
+            require_location(&area).unwrap(),
+            mount.join("oxide-pool/slots")
+        );
     }
 
     #[test]
@@ -1090,15 +1139,28 @@ mod tests {
         registration.reserve_bytes = 1 << 20;
         let os = barge::FakeOs::with_volume(&mount, &registration.volume_uuid, 0);
         let storage = Storage::open_with(
-            temp.path().join("state"), Arc::new(os.clone()),
+            temp.path().join("state"),
+            Arc::new(os.clone()),
             Arc::new(barge::ManualClock::new(1)),
-        ).unwrap();
-        storage.register_volume(
-            "pool", &mount, Some(&registration.volume_uuid), "",
-            registration.reserve_bytes, oxide_storage::storage::reserve_floor(registration.reserve_bytes),
-        ).unwrap();
-        let area = declare_registered_area(&storage, &registration).unwrap().unwrap();
-        assert_eq!(require_location(&area).unwrap(), mount.join("oxide-pool/slots"));
+        )
+        .unwrap();
+        storage
+            .register_volume(
+                "pool",
+                &mount,
+                Some(&registration.volume_uuid),
+                "",
+                registration.reserve_bytes,
+                oxide_storage::storage::reserve_floor(registration.reserve_bytes),
+            )
+            .unwrap();
+        let area = declare_registered_area(&storage, &registration)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            require_location(&area).unwrap(),
+            mount.join("oxide-pool/slots")
+        );
         assert!(storage.admit("pool").is_err());
     }
 
@@ -1345,7 +1407,10 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.contains("--confirm-writers-stopped"), "{error}");
-        assert!(error.contains("legacy quarantined roots are retained"), "{error}");
+        assert!(
+            error.contains("legacy quarantined roots are retained"),
+            "{error}"
+        );
     }
 
     /// The release grammar is fixed: one slot, each flag at most once, and no

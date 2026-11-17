@@ -348,8 +348,11 @@ fn plan(
                 }
                 continue;
             }
-            if keep_root && depth == 0 && (entry.file_name() == outputs::MARKER
-                || entry.file_name() == barge::root::MARKER_NAME) {
+            if keep_root
+                && depth == 0
+                && (entry.file_name() == outputs::MARKER
+                    || entry.file_name() == barge::root::MARKER_NAME)
+            {
                 // The root's ownership marker is Oxide's, not Cargo's, and it
                 // stays with the root.
                 plan.preserved.push(path);

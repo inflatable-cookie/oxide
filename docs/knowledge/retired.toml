@@ -111,13 +111,7 @@ paths = [
   "scripts/tape-seed-readiness.py",
   "docs/knowledge/contracts/cooperative-qualification.md",
 ]
-# The observation-recorder call sites stay with their recorder module.
-allow = [
-  "docs/knowledge/retired.toml",
-  "src/bin/oxide/tape.rs",
-  "src/bin/oxide/capture_wire.rs",
-  "docs/knowledge/contracts/capture-vectors/v2/invalid/apparatus-diagnostic.json",
-]
+allow = ["docs/knowledge/retired.toml"]
 
 
 [[retired]]

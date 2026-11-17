@@ -599,5 +599,4 @@ mod tests {
         assert!(dir_at(fd.as_fd_ref(), "a/b", true).is_err());
         std::fs::remove_dir_all(parent).unwrap();
     }
-
 }

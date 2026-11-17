@@ -6934,28 +6934,47 @@ fn external_choice(context: &Context) -> Result<Result<removable::Registration, 
         return Ok(Err("the drive is not in permanent mode".to_owned()));
     }
     if let Some(reason) = context.pool_fallback.as_deref() {
-        return Ok(Err(format!("this command's intermediate slot fell back to the internal pool ({reason})")));
+        return Ok(Err(format!(
+            "this command's intermediate slot fell back to the internal pool ({reason})"
+        )));
     }
     let state = removable::removable_control(control);
-    let present = if state.join("barge/areas").is_dir() {
-        let storage = oxide_storage::storage::Storage::open(&state)?;
-        let area = storage.areas()?.into_iter().find(|area| area.key().label() == "oxide/pool")
-            .ok_or("the registered Barge pool area is missing")?;
-        if area.volume().spec().mount != registration.mount_point
-            || !area.volume().spec().uuid.eq_ignore_ascii_case(&registration.volume_uuid) {
-            return Err("the output registration differs from Barge's volume".to_owned());
-        }
-        external_location(&area)?
-    } else {
-        match oxide_storage::storage::OxideOs.volume_identity(&registration.mount_point)
-            .map_err(|error| error.to_string())? {
-            None => false,
-            Some(uuid) if uuid.eq_ignore_ascii_case(&registration.volume_uuid) => true,
-            Some(uuid) => return Err(format!("output volume identity mismatch: expected {}, found {uuid}; refusing fallback", registration.volume_uuid)),
-        }
-    };
+    let present =
+        if state.join("barge/areas").is_dir() {
+            let storage = oxide_storage::storage::Storage::open(&state)?;
+            let area = storage
+                .areas()?
+                .into_iter()
+                .find(|area| area.key().label() == "oxide/pool")
+                .ok_or("the registered Barge pool area is missing")?;
+            if area.volume().spec().mount != registration.mount_point
+                || !area
+                    .volume()
+                    .spec()
+                    .uuid
+                    .eq_ignore_ascii_case(&registration.volume_uuid)
+            {
+                return Err("the output registration differs from Barge's volume".to_owned());
+            }
+            external_location(&area)?
+        } else {
+            match oxide_storage::storage::OxideOs
+                .volume_identity(&registration.mount_point)
+                .map_err(|error| error.to_string())?
+            {
+                None => false,
+                Some(uuid) if uuid.eq_ignore_ascii_case(&registration.volume_uuid) => true,
+                Some(uuid) => return Err(format!(
+                    "output volume identity mismatch: expected {}, found {uuid}; refusing fallback",
+                    registration.volume_uuid
+                )),
+            }
+        };
     if !present {
-        return Ok(Err(format!("registered volume {} is absent", registration.mount_point.display())));
+        return Ok(Err(format!(
+            "registered volume {} is absent",
+            registration.mount_point.display()
+        )));
     }
     if !volume::writable(&registration.mount_point)? {
         return Err("the registered output volume is not writable".to_owned());
@@ -6968,10 +6987,12 @@ fn external_location(area: &barge::Area) -> Result<bool, String> {
     match area.location().map_err(|error| error.to_string())? {
         barge::Location::Volume(_) => Ok(true),
         barge::Location::Fallback(_) => Ok(false),
-        barge::Location::Unavailable(_) => match area.volume().state().map_err(|error| error.to_string())? {
-            barge::VolumeState::Absent => Ok(false),
-            _ => Err("the registered output volume is unavailable".to_owned()),
-        },
+        barge::Location::Unavailable(_) => {
+            match area.volume().state().map_err(|error| error.to_string())? {
+                barge::VolumeState::Absent => Ok(false),
+                _ => Err("the registered output volume is unavailable".to_owned()),
+            }
+        }
     }
 }
 
@@ -7015,7 +7036,9 @@ fn current_or_successor_spec(
         })
     {
         if let Some(control) = context.control() {
-            if crate::prune::needs_successor(control, &selected.root)? { continue; }
+            if crate::prune::needs_successor(control, &selected.root)? {
+                continue;
+            }
         }
         return Ok(spec_for(selected));
     }
@@ -18796,11 +18819,25 @@ mod tests {
         fs::create_dir(&mount).unwrap();
         let uuid = "1E8E7F10-0000-4000-8000-000000000001";
         let os = barge::FakeOs::with_volume(&mount, uuid, 0);
-        let storage = oxide_storage::storage::Storage::open_with(fixture.root.join("barge-state"),
-            Arc::new(os.clone()), Arc::new(barge::ManualClock::new(1000))).unwrap();
-        let area = storage.declare(&oxide_storage::storage::AreaConfig::new("outputs", &mount, "outputs")
-            .uuid(Some(uuid.to_owned())).folder("oxide-outputs").reserve_bytes(1024).floor_bytes(512)).unwrap();
-        assert!(external_location(&area).unwrap(), "low free space never changes output volumes");
+        let storage = oxide_storage::storage::Storage::open_with(
+            fixture.root.join("barge-state"),
+            Arc::new(os.clone()),
+            Arc::new(barge::ManualClock::new(1000)),
+        )
+        .unwrap();
+        let area = storage
+            .declare(
+                &oxide_storage::storage::AreaConfig::new("outputs", &mount, "outputs")
+                    .uuid(Some(uuid.to_owned()))
+                    .folder("oxide-outputs")
+                    .reserve_bytes(1024)
+                    .floor_bytes(512),
+            )
+            .unwrap();
+        assert!(
+            external_location(&area).unwrap(),
+            "low free space never changes output volumes"
+        );
         os.set_uuid(&mount, None);
         assert!(!external_location(&area).unwrap());
         os.set_uuid(&mount, Some("1E8E7F10-0000-4000-8000-000000000002"));
@@ -18808,5 +18845,4 @@ mod tests {
         os.set_uuid(&mount, Some(uuid));
         assert!(external_location(&area).unwrap());
     }
-
 }

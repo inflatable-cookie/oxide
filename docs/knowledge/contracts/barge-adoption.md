@@ -74,7 +74,9 @@ checkout-local root paths, member links and a real `target` directory.
 Selections are pinned before link publication; replaced selections are
 unpinned only after the receipt's durable rename. Existing receipts and markers
 are checked before generic Barge import. A root's stable Barge identity is
-resolved independently of receipt selection generation.
+resolved independently of receipt selection generation and recorded with the
+selection. A recorded missing Barge ID is never re-adopted, even if a stray
+contains a copied old Oxide marker.
 
 Registration imports the existing Oxide policy into Barge when the registered
 volume is positively present; absence defers first import. An existing Barge
@@ -84,9 +86,10 @@ selected prune target. A zero reserve retains Barge's default floor.
 
 ## Holds, pins and prune
 
-- A slot or output root is held with an exclusive `flock` while a command uses
-  it, and a seeding donor is held shared beside the recipient's exclusive
-  hold. The hold's descriptor is made inheritable before the real child
+- A slot is held with an exclusive `flock` while a command uses it, and a
+  seeding donor is held shared beside the recipient's exclusive hold. Output
+  roots use shared holds to preserve concurrent command behavior; their durable
+  selection pins remain independent of running commands. The hold's descriptor is made inheritable before the real child
   launch, so the root stays held until the child that keeps the descriptor
   exits.
 - Holds are cooperative: a child that closes the descriptor, and a process
