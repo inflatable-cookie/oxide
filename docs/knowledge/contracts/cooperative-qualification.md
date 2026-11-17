@@ -225,6 +225,41 @@ limits recorded in [vision](../vision.md#authority-boundaries). It does not
 implement the other suppliers or activate qualification. The real-proof entry
 continues to refuse; existing 309/061/304 holds and all later gates remain.
 
+### Prospective host clock domain
+
+Tom decision `984a3b0a-98ae-48f7-994e-65950020ae83` v2 (2026-11-17,
+10:31:04Z) selects the sleep-counting continuous clock for the future 49a06
+host source tranche. Nucleus's parallel decision `4380ff30-444b-412b-b738-a86677b77474`
+v2 records the same direction by relay; these are one scope choice, not two
+grants. The new domain is `darwin.continuous.ns`, native
+`mach_continuous_time` scaled to integer nanoseconds. Sleep spends the same
+600-second target. No RAW, `Instant`, wall-clock or `CLOCK_MONOTONIC`
+conversion supplies this binding.
+
+The producer must read the declared domain in process before any per-attempt
+persistence, source capture, helper or bootstrap. The reported Nucleus route
+is `process.hrtime.bigint()`; its actual runtime/backend must be positively
+source-bound to this domain, not inferred from the API name or injected tests.
+Effigy's proposed route reads the native primitive and timebase directly with
+checked arithmetic. Both owners must agree their supported interface before
+authoring. A per-attempt clock-reader subprocess and a backdated origin derived
+from another clock are not the selected route. This ruling authorizes no
+long-lived reader, native packaging pipeline, service roll or installation.
+
+The original envelope stays immutable and source-bound; a separately inherited
+effective ceiling can only decrease. Missing or lost caps must refuse rather
+than restore the original allowance. Nanoseconds stay lossless canonical u64
+decimal strings. Boot/origin mismatch, unreadable clocks, overflow, expired or
+non-fitting input refuse; a matching boot never authorizes replay of SPENT work.
+These are source requirements, not implemented or qualified capabilities.
+
+Earlier RAW and epoch-ms receipts keep their original versions and policies.
+Barge's guest 300-second RAW and host 600-second monotonic policies, Rust setup,
+ordinary Effigy defaults, existing native execution briefs and all holds are
+unchanged. Future 309 execution still needs a prospective full brief, supported
+source/readiness and the separate diagnostic/author/reviewer qualification
+ladder. The two source PRs retain 49a06's cumulative limits and previous charges.
+
 ### The nine inputs: owner, seam, evidence, disposition
 
 Every id, requirement string and readiness rule below is Nucleus's declared
@@ -335,10 +370,11 @@ gate and record effects are charged from the original origin even on refusal;
 "no prepare-root writes" does not mean no effects or allocations.
 
 The original-origin consumer binding and predecessor coverage remain
-**UNSUPPORTED, refuse** until their owners supply a source-bound same-timebase
-control. No `CLOCK_UPTIME_RAW` ↔ `Instant`/`CLOCK_MONOTONIC` conversion is
-assumed, and no clock service or inner clock is introduced. An allowance that
-cannot fit is a blocker, never a reset.
+**UNSUPPORTED, refuse** until their owners implement and independently review
+the newly selected continuous-domain source contract above. The existing payload
+facts in this section describe the earlier source and 038 design, not the new
+domain or a conversion route. No clock service or inner clock is introduced. An allowance
+that cannot fit is a blocker, never a reset.
 
 Effigy's sentinel is **MS**; S above remains the Nucleus supervisor/publisher.
 MS holds no wait handle for its siblings W or the selector leader. Its gate or

@@ -366,6 +366,17 @@ checks total at most 20 minutes plus one final-head covering set at most
 owns the boundaries: no other supplier implementation, real qualification,
 installation, consumer activation or existing-hold release follows.
 
+Tom decision `984a3b0a-98ae-48f7-994e-65950020ae83` v2 (2026-11-17,
+10:31:04Z) prospectively changes that host source tranche to the continuous
+clock, so sleep consumes the fixed allowance. Nucleus's relayed decision
+`4380ff30-444b-412b-b738-a86677b77474` v2 records the same choice, with no
+second grant. The [supplier contract](contracts/cooperative-qualification.md#prospective-host-clock-domain)
+owns its direct-domain, original-origin, immutable-envelope and narrowing-cap
+requirements. This amends 49a06's RAW-domain requirement only for the future
+host tranche. Its two-PR source limits, all earlier clock evidence, Barge's
+guest/host policies and every qualification, installation and consumer gate
+remain unchanged.
+
 Tom decision `c6e3e9c8` v2 (2026-11-04) separates capture delivery from
 private launcher qualification for the bounded O2 capture tasks. Their named
 capture-only Cargo selectors cover build and embedded harness behavior; they
