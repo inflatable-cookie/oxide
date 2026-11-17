@@ -1717,7 +1717,9 @@ fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
             let recorded = registry
                 .rows
                 .iter()
-                .filter(|row| row.root == root.path && row.pruned_ms.is_none())
+                .filter(|row| {
+                    row.root == root.path && row.pruned_ms.is_none() && row.barge_id.is_some()
+                })
                 .collect::<Vec<_>>();
             if recorded.is_empty() {
                 continue;
@@ -1977,6 +1979,11 @@ mod plan_identity_tests {
             barge_id: Some(original.id.clone()),
             recipe: "test".to_owned(),
         });
+        // An older unmapped history row supplies no storage authority.
+        let mut historical = registry.rows[0].clone();
+        historical.member = "target".to_owned();
+        historical.barge_id = None;
+        registry.rows.push(historical);
         let plan = preview(&control, &registry).unwrap();
         assert_eq!(plan.roots.len(), 1);
         assert_eq!(plan.roots[0].id, original.id);

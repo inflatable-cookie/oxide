@@ -10963,6 +10963,9 @@ mod scratch_internal_tests {
             .env("OXIDE_POOL_CREATE", "1")
             .env("OXIDE_SCRATCH_ROOT", root)
             .env("OXIDE_S3_ROOT", root)
+            .env("TMPDIR", root)
+            .env("TMP", root)
+            .env("TEMP", root)
             .status()
             .expect("unit child");
         assert!(status.success(), "isolated unit child failed");
@@ -11125,6 +11128,8 @@ mod launch_hold_tests {
                 .env("OXIDE_LAUNCH_HOLD_CHILD", "1")
                 .env("OXIDE_LAUNCH_ROOT", &root)
                 .env("TMPDIR", &root)
+                .env("TMP", &root)
+                .env("TEMP", &root)
                 .status()
                 .expect("isolated child");
             let _ = fs::remove_dir_all(&root);

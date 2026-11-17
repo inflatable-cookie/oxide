@@ -1096,12 +1096,7 @@ pub(crate) fn judge_pool_path(path: &Path) -> Result<(), PathRefusal> {
     if internal_fixture() {
         return judge_git_work_tree(path, &canonical);
     }
-    if canonical.starts_with("/Volumes") {
-        return Err(PathRefusal::ExternalVolume { message: format!(
-            "the pool path {} is on an external volume ({}); a removable volume is registered with `oxide pool register-removable`, not used as the internal pool",
-            path.display(), canonical.display()
-        ), canonical });
-    }
+    refuse_external_prefix(path, &canonical)?;
     if let Some(mount) = mount_point(&canonical).map_err(PathRefusal::Ancestor)? {
         if mount.starts_with("/Volumes") {
             return Err(PathRefusal::ExternalVolume {
@@ -1115,6 +1110,16 @@ pub(crate) fn judge_pool_path(path: &Path) -> Result<(), PathRefusal> {
         }
     }
     judge_git_work_tree(path, &canonical)
+}
+
+fn refuse_external_prefix(path: &Path, canonical: &Path) -> Result<(), PathRefusal> {
+    if canonical.starts_with("/Volumes") {
+        return Err(PathRefusal::ExternalVolume { message: format!(
+            "the pool path {} is on an external volume ({}); a removable volume is registered with `oxide pool register-removable`, not used as the internal pool",
+            path.display(), canonical.display()
+        ), canonical: canonical.to_path_buf() });
+    }
+    Ok(())
 }
 
 pub(crate) fn judge_git_work_tree(path: &Path, canonical: &Path) -> Result<(), PathRefusal> {
@@ -2266,6 +2271,8 @@ mod tests {
 
     #[test]
     fn git_work_trees_and_aliases_refuse() {
+        // Model an ordinary filesystem while all real paths stay in task TMPDIR.
+        let internal = internal_fixture_scope();
         let scratch = Scratch::new("git");
         let repo = scratch.0.join("repo");
         fs::create_dir_all(repo.join(".git")).expect("repo");
@@ -2291,7 +2298,14 @@ mod tests {
         let plain = scratch.0.join("plain");
         fs::create_dir_all(&plain).expect("plain");
         assert_eq!(refuse_unsafe_pool_path(&plain.join("pool")), Ok(()));
-        assert!(refuse_unsafe_pool_path(Path::new("/Volumes/Builds/pool")).is_err());
+        drop(internal);
+        // Pure volume-prefix facts exercise the external refusal without
+        // touching a live mount or requiring an internal-volume fixture.
+        assert!(refuse_external_prefix(
+            Path::new("/Volumes/unit/pool"),
+            Path::new("/Volumes/unit")
+        )
+        .is_err());
         // A missing component followed by .. would only resolve into the
         // work tree after creation: refused before any lookup.
         let traversal = plain.join("missing/../../repo/pool");
