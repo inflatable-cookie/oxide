@@ -396,6 +396,25 @@ documentation here, with earlier receipts, failures, charges and retained
 resources preserved. Consumer changes and historical-resource cleanup are not
 implied by this direction.
 
+Tom decision `25a1cefa-66f6-428c-85e3-7e6ee5532f4e` v2 (2026-11-17,
+11:22:38Z) selects **Run it plainly and remove the scaffolding** for the
+existing 309 task. Replace its qualification bootstrap with a small ordinary
+Effigy entrypoint, retire the cross-project machinery and keep supervisor
+behavior tests. The author runs the complete remaining suite with
+`EFFIGY_RUN_DEADLINE_MS=600000`; the retained reviewer judges the exact source
+and actual evidence, then Queue merges on PASS and accepted review. For 309
+this replaces the separate diagnostic/counted-author/counted-reviewer ladder;
+there are no further design rounds.
+
+The prospective allowance is 60 active author minutes and 30 reviewer minutes;
+source checks have 600 seconds/512 MiB, docs 120 seconds/64 MiB, and the ordinary
+native run 600 seconds/512 MiB within the author total. Use fresh owned Stash
+scratch and the existing 22 GiB reserve threshold, including the suite's tiny
+process/image fixtures. Earlier charges and failures stay permanent. Source
+and documentation cleanup leaves old retained resources untouched; installation,
+full QA and live consumer changes are excluded. 061/304 wait for actual 309
+PASS/publication and retain their own runtime prerequisites and guest/host bounds.
+
 Tom decision `c6e3e9c8` v2 (2026-11-04) separates capture delivery from
 private launcher qualification for the bounded O2 capture tasks. Their named
 capture-only Cargo selectors cover build and embedded harness behavior; they
