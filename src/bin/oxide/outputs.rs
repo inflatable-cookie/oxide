@@ -588,11 +588,6 @@ impl Receipt {
         &self.checkout_id
     }
 
-    /// Whether this receipt currently selects a root.
-    pub(crate) fn selects(&self) -> bool {
-        self.state == ReceiptState::Committed
-    }
-
     /// Whether the selected placement is still live: a committed receipt and
     /// a prepared transition both keep their committed root selected.
     pub(crate) fn holds_selection(&self) -> bool {
@@ -1411,14 +1406,6 @@ impl Marker {
 
     pub(crate) fn kind(&self) -> RootKind {
         self.kind
-    }
-
-    pub(crate) fn checkout(&self) -> &Path {
-        &self.checkout
-    }
-
-    pub(crate) fn checkout_id(&self) -> &str {
-        &self.checkout_id
     }
 
     pub(crate) fn volume_uuid(&self) -> Option<&str> {
@@ -4463,10 +4450,21 @@ pub fn bind_for_command(
     guarded: Option<&LocalOutputs<'_>>,
 ) -> Result<OutputBinding, String> {
     let owned = guarded.is_none();
-    let mut binding = bind_for_command_inner(store, checkout, own_record, expected,
-        pool_fallback, repair_absent_members, guarded)?;
+    let mut binding = bind_for_command_inner(
+        store,
+        checkout,
+        own_record,
+        expected,
+        pool_fallback,
+        repair_absent_members,
+        guarded,
+    )?;
     let id = identity::digest(&checkout.to_string_lossy());
-    if let Some(receipt) = if owned { read_receipt(store.owner_control(), checkout, &id)? } else { None } {
+    if let Some(receipt) = if owned {
+        read_receipt(store.owner_control(), checkout, &id)?
+    } else {
+        None
+    } {
         binding._holds = crate::prune::hold_outputs(store.owner_control(), &receipt)?;
     }
     Ok(binding)
@@ -4514,7 +4512,7 @@ fn bind_for_command_inner(
         return Ok(OutputBinding {
             outcome,
             _lock: Some(lock),
-        _holds: Vec::new(),
+            _holds: Vec::new(),
         });
     }
     if context.receipt()?.is_none() {
@@ -4536,7 +4534,7 @@ fn bind_for_command_inner(
             return Ok(OutputBinding {
                 outcome: unconverted_outcome(),
                 _lock: Some(lock),
-        _holds: Vec::new(),
+                _holds: Vec::new(),
             });
         };
         keyed_state_matches(Some(&receipt), expected)?;
@@ -4566,7 +4564,7 @@ fn bind_for_command_inner(
                 return Ok(OutputBinding {
                     outcome,
                     _lock: Some(lock),
-        _holds: Vec::new(),
+                    _holds: Vec::new(),
                 })
             }
             Bind::Refuse(reason) => return Err(reason),
@@ -6033,11 +6031,24 @@ fn desired_selection(context: &Context, receipt: &Receipt) -> Result<Option<Sele
             None => return Ok(None),
         }
     };
-    let spec = receipt.roots.iter().rev().chain(receipt.links().iter().filter_map(|placement| placement.selected_ref()))
-        .find(|selected| selected.kind == spec.selected(0).kind
-            && selected.volume_uuid == spec.selected(0).volume_uuid
-            && selected.root.parent() == spec.root().parent() && read_marker(&selected.root).is_ok())
-        .map(spec_for).unwrap_or(spec);
+    let spec = receipt
+        .roots
+        .iter()
+        .rev()
+        .chain(
+            receipt
+                .links()
+                .iter()
+                .filter_map(|placement| placement.selected_ref()),
+        )
+        .find(|selected| {
+            selected.kind == spec.selected(0).kind
+                && selected.volume_uuid == spec.selected(0).volume_uuid
+                && selected.root.parent() == spec.root().parent()
+                && read_marker(&selected.root).is_ok()
+        })
+        .map(spec_for)
+        .unwrap_or(spec);
     let marker = read_marker(spec.root()).ok();
     let generation = marker.as_ref().map_or(next, |marker| marker.generation);
     let wanted = spec.selected(generation);
@@ -6950,21 +6961,43 @@ fn external_spec(registration: &removable::Registration, checkout: &Path) -> Roo
     }
 }
 
-fn current_or_successor_spec(context: &Context, receipt: &Receipt, spec: RootSpec) -> Result<RootSpec, String> {
+fn current_or_successor_spec(
+    context: &Context,
+    receipt: &Receipt,
+    spec: RootSpec,
+) -> Result<RootSpec, String> {
     let wanted = spec.selected(0);
-    if let Some(selected) = receipt.roots.iter().rev().chain(receipt.links().iter()
-        .filter_map(|placement| placement.selected_ref()))
-        .find(|selected| selected.kind == wanted.kind && selected.volume_uuid == wanted.volume_uuid
-            && selected.root.parent() == wanted.root.parent() && read_marker(&selected.root).is_ok())
+    if let Some(selected) = receipt
+        .roots
+        .iter()
+        .rev()
+        .chain(
+            receipt
+                .links()
+                .iter()
+                .filter_map(|placement| placement.selected_ref()),
+        )
+        .find(|selected| {
+            selected.kind == wanted.kind
+                && selected.volume_uuid == wanted.volume_uuid
+                && selected.root.parent() == wanted.root.parent()
+                && read_marker(&selected.root).is_ok()
+        })
     {
         return Ok(spec_for(selected));
     }
-    let Some(control) = context.control() else { return Ok(spec); };
-    if !crate::prune::needs_successor(control, spec.root())? { return Ok(spec); }
+    let Some(control) = context.control() else {
+        return Ok(spec);
+    };
+    if !crate::prune::needs_successor(control, spec.root())? {
+        return Ok(spec);
+    }
     let root = crate::prune::fresh_output(control, &wanted)?;
     let replacement = match spec {
         RootSpec::External { uuid, .. } => RootSpec::External {
-            leaf: root.folder, root: root.path, uuid,
+            leaf: root.folder,
+            root: root.path,
+            uuid,
         },
         RootSpec::Local { .. } => RootSpec::Local { root: root.path },
     };
@@ -6972,7 +7005,13 @@ fn current_or_successor_spec(context: &Context, receipt: &Receipt, spec: RootSpe
         RootSpec::External { uuid, .. } => Some(binding_for(context, uuid)?),
         RootSpec::Local { .. } => None,
     };
-    create_marker(context, &replacement, receipt.generation.saturating_add(1), binding.as_ref(), None)?;
+    create_marker(
+        context,
+        &replacement,
+        receipt.generation.saturating_add(1),
+        binding.as_ref(),
+        None,
+    )?;
     Ok(replacement)
 }
 
@@ -7235,7 +7274,11 @@ fn validate_local_ancestry(checkout: &Path, root: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot resolve {}: {error}", checkout.display()))?;
     let canonical = fs::canonicalize(root)
         .map_err(|error| format!("cannot resolve {}: {error}", root.display()))?;
-    if canonical != canonical_checkout.join(LOCAL_DIR).join(root.file_name().ok_or("the local root has no folder")?) {
+    if canonical
+        != canonical_checkout
+            .join(LOCAL_DIR)
+            .join(root.file_name().ok_or("the local root has no folder")?)
+    {
         return Err(format!(
             "{} resolves to {}, outside this checkout",
             root.display(),
@@ -7334,7 +7377,9 @@ fn ensure_root_with(
         Err(error) => Err(format!("cannot inspect {}: {error}", root.display())),
     }?;
     if let Some(control) = context.control() {
-        let selected = spec.selected(marker.generation).with_nonce(marker.nonce.clone());
+        let selected = spec
+            .selected(marker.generation)
+            .with_nonce(marker.nonce.clone());
         crate::prune::pin_output(control, checkout, &context.checkout_id, &selected)?;
     }
     Ok(marker)
@@ -8265,7 +8310,8 @@ fn read_receipt_with(
         return Ok(None);
     };
     let mut bytes = Vec::new();
-    file.take(MAX_RECEIPT_BYTES + 1).read_to_end(&mut bytes)
+    file.take(MAX_RECEIPT_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_RECEIPT_BYTES {
         return Err(format!(
@@ -8355,7 +8401,8 @@ pub(crate) fn marker_digest(root: &Path) -> Result<String, String> {
     let file =
         File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut bytes = Vec::new();
-    file.take(MAX_MARKER_BYTES + 1).read_to_end(&mut bytes)
+    file.take(MAX_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_MARKER_BYTES {
         return Err(format!("{} exceeds its byte limit", path.display()));
@@ -8389,7 +8436,8 @@ fn read_marker(root: &Path) -> Result<Marker, String> {
     let file =
         File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut bytes = Vec::new();
-    file.take(MAX_MARKER_BYTES + 1).read_to_end(&mut bytes)
+    file.take(MAX_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() as u64 > MAX_MARKER_BYTES {
         return Err(format!("{} exceeds its byte limit", path.display()));
@@ -11232,7 +11280,6 @@ mod tests {
     /// The real run's terminal image for an actually pruned version-1 root is
     /// the current receipt shape; it is deterministic, pinned by the caller's
     /// digest, and published only through the existing terminal transaction.
-
 
     /// A committed profile receipt for `debug` and `release` on one root.
     fn profile_receipt(fixture: &Fixture) -> Receipt {
@@ -14343,8 +14390,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn a_profile_receipt_refuses_unsorted_overlapping_or_foreign_members() {
         let fixture = Fixture::new();
@@ -17239,7 +17284,6 @@ mod tests {
     /// refuses the creator, only this writer's unjournaled creation is
     /// rebound, and the terminal receipt needs the same intent.
 
-
     #[test]
     fn paths_in_receipts_are_absolute() {
         assert!(safe_absolute(Path::new("/work/app/target")));
@@ -18665,12 +18709,21 @@ mod tests {
     fn barge_pins_selected_members_and_detach_releases_only_their_pin() {
         let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
         let context = fixture.context();
-        let receipt = Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        let receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
         let (committed, selected, _) = adopt_profile(&context, receipt).unwrap();
         assert!(fs::symlink_metadata(context.link()).unwrap().is_dir());
-        assert!(fs::symlink_metadata(context.link().join("debug")).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(context.link().join("debug"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
         let (area, id) = crate::prune::test_output_storage(&fixture.control, &selected);
-        assert!(area.list().unwrap().roots.iter().any(|root| root.id == id && root.pinned));
+        assert!(area
+            .list()
+            .unwrap()
+            .roots
+            .iter()
+            .any(|root| root.id == id && root.pinned));
         assert!(area.evict(&id).unwrap_err().to_string().contains("pinned"));
         let foreign = fixture.root.join("foreign");
         fs::create_dir(&foreign).unwrap();
@@ -18679,7 +18732,9 @@ mod tests {
         let holds = crate::prune::hold_outputs(&fixture.control, &committed).unwrap();
         let (detached, changed) = detach_profile(&context, &fixture.control, committed).unwrap();
         assert!(changed);
-        assert!(fs::symlink_metadata(context.link().join("debug")).unwrap().is_dir());
+        assert!(fs::symlink_metadata(context.link().join("debug"))
+            .unwrap()
+            .is_dir());
         assert!(area.evict(&id).unwrap_err().to_string().contains("held"));
         drop(holds);
         assert!(area.evict(&id).unwrap().deleted);
@@ -18692,7 +18747,10 @@ mod tests {
         assert_eq!(fs::read(selected.root().join("stray")).unwrap(), b"unowned");
         let (next_area, next_id) = crate::prune::test_output_storage(&fixture.control, &successor);
         assert_ne!(id, next_id);
-        assert!(next_area.evict(&next_id).unwrap_err().to_string().contains("pinned"));
+        assert!(next_area
+            .evict(&next_id)
+            .unwrap_err()
+            .to_string()
+            .contains("pinned"));
     }
-
 }
