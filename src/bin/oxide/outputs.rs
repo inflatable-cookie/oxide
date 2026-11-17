@@ -12726,7 +12726,7 @@ mod tests {
     #[test]
     fn adoption_relinks_to_the_desired_place_instead_of_trusting_the_old_receipt() {
         let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
-        let context = fixture.context();
+        let context = fixture.context().with_pool_fallback(Some("fixture registered drive absent"));
         // An older receipt selects an EXTERNAL root whose member links are
         // live. With no registration the desired place is now the local
         // fallback, so adoption must relink even though the links still match
@@ -15540,7 +15540,7 @@ mod tests {
             let mut receipt = fixture.receipt();
             receipt.state = ReceiptState::Prepared;
             receipt.link_mut().prepared = Some(prepared.clone());
-            write_receipt(&fixture.control, &receipt).unwrap();
+            write_receipt_document(&fixture, &serde_json::to_value(&receipt).unwrap());
             let sibling = sibling_link(&prepared.link, 1);
             symlink(&prepared.to.root, &sibling).unwrap();
             let refused = replay(&context, receipt.clone()).unwrap_err();
@@ -15955,7 +15955,7 @@ mod tests {
                 to: spec.selected(2),
                 link: context.link(),
             });
-            write_receipt(&fixture.control, &receipt).unwrap();
+            write_receipt_document(&fixture, &serde_json::to_value(&receipt).unwrap());
             symlink(&new_root, context.link()).unwrap();
             let path = receipt_path(&fixture.control, &context.checkout_id);
             let bytes = fs::read(&path).unwrap();
@@ -17101,7 +17101,6 @@ mod tests {
     fn committed_local_profile(fixture: &Fixture, context: &Context) -> Receipt {
         let mut receipt = profile_receipt(fixture);
         receipt.reserved = None;
-        write_receipt(&fixture.control, &receipt).unwrap();
         let selected = receipt.selected().cloned().unwrap();
         let root = selected.root.clone();
         let marker = Marker {
@@ -17132,6 +17131,9 @@ mod tests {
             )
             .unwrap();
         }
+        // Publish only after the owned root exists, as the real transition
+        // does. This fixture then carries its Barge root ID and durable pin.
+        write_receipt(&fixture.control, &receipt).unwrap();
         receipt
     }
 
@@ -17241,16 +17243,17 @@ mod tests {
             fresh, old_nonce,
             "the recovery reused the old committed nonce"
         );
-        assert_eq!(recovered.root(), root.as_path());
+        assert_ne!(recovered.root(), root.as_path());
+        assert!(!root.exists(), "the old path was recreated");
         assert_eq!(
-            read_marker(&root).unwrap().nonce.as_deref(),
+            read_marker(recovered.root()).unwrap().nonce.as_deref(),
             Some(fresh.as_str())
         );
         assert!(committed.reserved().is_none());
         let rows = crate::prune::test_rows(&fixture.control).unwrap();
         let root_rows: Vec<_> = rows
             .iter()
-            .filter(|(row_root, ..)| row_root == &root)
+            .filter(|(row_root, ..)| row_root == recovered.root())
             .collect();
         assert_eq!(root_rows.len(), 2, "{rows:?}");
         assert!(
@@ -17270,7 +17273,7 @@ mod tests {
         .unwrap()
         .unwrap();
         match bind_profile(&context, &store, 0, &committed, Some(&plan), false) {
-            Bind::Bound(outcome) => assert_eq!(outcome.root, Some(root.clone())),
+            Bind::Bound(outcome) => assert_eq!(outcome.root.as_deref(), Some(recovered.root())),
             Bind::Refuse(reason) => panic!("the recovered root did not bind: {reason}"),
             Bind::Wait => panic!("the recovered root waited"),
         }
@@ -18787,7 +18790,7 @@ mod tests {
         fs::write(foreign.join("keep"), b"foreign bytes").unwrap();
         symlink(&foreign, selected.root().join("foreign-link")).unwrap();
         let copied_marker = fs::read(selected.root().join(MARKER)).unwrap();
-        let holds = crate::prune::hold_outputs(&fixture.control, &committed).unwrap();
+        let holds = area.hold(&id, barge::Mode::Shared).unwrap();
         let (detached, changed) = detach_profile(&context, &fixture.control, committed).unwrap();
         assert!(changed);
         assert!(fs::symlink_metadata(context.link().join("debug"))

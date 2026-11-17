@@ -778,7 +778,8 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
     note_reservation(&mut registry, receipt, &receipt_path, checkout_volume_uuid)?;
     pin_references(control, receipt)?;
     for row in &mut registry.rows {
-        if !row.live() || !row.root.is_dir() {
+        if !row.live() || !row.root.is_dir()
+            || (row.barge_id.is_none() && !row.root.join(barge::root::MARKER_NAME).exists()) {
             continue;
         }
         let selected = Selected {
@@ -1468,27 +1469,15 @@ fn output_id(selected: &Selected) -> String {
     sha256_hex(format!("{}:{}", selected.root().display(), selected.generation()).as_bytes())
 }
 
-/// Import only after the caller's Oxide marker and receipt selection agree.
-/// A retired generation can never re-import a stray at its former path.
+/// Re-pin an already owned Barge identity without using mutable Oxide marker
+/// fields as new storage authority. A first import requires the Oxide marker
+/// and selection to agree; a retired ID can never re-import its former path.
 fn import_output(
     control: &Path,
     checkout: &Path,
     checkout_id: &str,
     selected: &Selected,
 ) -> Result<(barge::Area, String), String> {
-    let marker = outputs::read_marker_for_prune(selected.root())?;
-    if !marker.is_owned_by(checkout, checkout_id)
-        || marker.kind() != selected.kind()
-        || marker.volume_uuid() != selected.volume_uuid()
-        || selected
-            .nonce()
-            .is_some_and(|nonce| marker.nonce() != Some(nonce))
-    {
-        return Err(format!(
-            "{} has a foreign output identity; retained",
-            selected.root().display()
-        ));
-    }
     if read_registry(control)?.is_some_and(|registry| {
         registry.rows.iter().any(|row| {
             row.root == selected.root()
@@ -1513,6 +1502,25 @@ fn import_output(
             return Err("the recorded Barge output ID moved".to_owned());
         }
         return Ok((area, id));
+    }
+    // The Barge marker and account can already own this path even before
+    // its first Oxide index row is committed. Re-pinning it is conservative;
+    // the caller still validates every Oxide link and marker before use.
+    let existing = area.list().map_err(|error| error.to_string())?.roots.into_iter()
+        .find(|root| root.path == selected.root());
+    if let Some(root) = existing { return Ok((area, root.id)); }
+    let marker = outputs::read_marker_for_prune(selected.root())?;
+    if !marker.is_owned_by(checkout, checkout_id)
+        || marker.kind() != selected.kind()
+        || marker.volume_uuid() != selected.volume_uuid()
+        || selected
+            .nonce()
+            .is_some_and(|nonce| marker.nonce() != Some(nonce))
+    {
+        return Err(format!(
+            "{} has a foreign output identity; retained",
+            selected.root().display()
+        ));
     }
     let mut identity = selected.clone();
     identity.generation = marker.generation();
@@ -1559,7 +1567,7 @@ fn pin_references(control: &Path, receipt: &Receipt) -> Result<(), String> {
                 Err(error) => return Err(error.to_string()),
                 Ok(_) => {}
             }
-            if pending
+            if (pending || !selected.root().join(barge::root::MARKER_NAME).exists())
                 && fs::symlink_metadata(selected.root().join(outputs::MARKER))
                     .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
             {
@@ -1605,6 +1613,7 @@ pub(crate) fn finish_receipt(control: &Path, receipt: &Receipt) -> Result<(), St
         {
             continue;
         }
+        let Some(id) = row.barge_id.as_deref() else { continue; };
         let selected = Selected {
             kind: row.root_kind,
             root: row.root.clone(),
@@ -1613,7 +1622,6 @@ pub(crate) fn finish_receipt(control: &Path, receipt: &Receipt) -> Result<(), St
             generation: row.generation,
         };
         let area = output_area(control, &selected)?;
-        let id = row.barge_id.clone().unwrap_or_else(|| output_id(&selected));
         match area.unpin(&id) {
             Ok(()) => {}
             Err(error) if error.kind() == barge::ErrorKind::NotFound => {}
