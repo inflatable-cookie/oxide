@@ -3,8 +3,7 @@
 This file keeps the findings from the 2026-10-09 to 2026-10-16 qualification
 work that the proposed [workflow](contracts/workflow.md) builds on. They are
 historical evidence, not a current qualification or execution authority. The
-machinery that produced them was retired on 2026-10-18
-([retirements](retired.toml)); the full narrative stays in Git history and the
+machinery that produced them was retired on 2026-10-18; the full narrative stays in Git history and the
 raw receipts stay under [`evidence/`](evidence/). [Architecture](architecture.md)
 owns the storage invariants, [vision](vision.md) owns authority and
 [questions](questions.md) owns open decisions.

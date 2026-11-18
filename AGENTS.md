@@ -6,7 +6,7 @@ Oxide aims to make Rust development easy and light, with ease of use as its prim
 
 Queue project: `oxide`; repository: `inflatable-cookie/oxide`. Queue owns the plan, lane documents, leads, briefs, tasks, reviews and outcomes. Do not create repository planning/status mirrors. Product implementation requires an explicitly approved Queue brief and independent exact-head review. Small planner knowledge changes may land on main after docs checks.
 
-Tom's scope and authority ruling lives in [vision](docs/knowledge/vision.md); storage invariants live in [architecture](docs/knowledge/architecture.md). Read [questions](docs/knowledge/questions.md) and [retirements](docs/knowledge/retired.toml) before planning.
+Tom's scope and authority ruling lives in [vision](docs/knowledge/vision.md); storage invariants live in [architecture](docs/knowledge/architecture.md). Read [questions](docs/knowledge/questions.md) before planning.
 
 For each pull request, add one short unreleased entry in `changelog.d/<task-or-PR>-<slug>.<type>.md` (`added`, `changed`, `fixed`, `removed` or `security`). Keep `CHANGELOG.md`'s `[Unreleased]` section empty; release preparation folds fragments there. See the [release contract](docs/knowledge/contracts/release.md).
 
@@ -51,7 +51,7 @@ dogfood finding. Preserve the ordinary routing and existing compiler profiles.
 - `rust:compile-linux`: offline compile for the already-installed target only.
 - `rust:barge-adoption-linux`: compile all targets, including the Linux pool
   regression, for that installed target; no linking or runtime claim.
-- `docs:check`: links, retired concepts, changelog and whitespace.
+- `docs:check`: links, changelog and whitespace.
 - `rust:barge-adoption`: ordinary heavy covering workspace unit/integration
   suite for oxide#314, with no named skips and fresh fixtures below task TMPDIR.
 - `rust:test-600`: the separate historical dual-root wrapper; not authorized

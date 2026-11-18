@@ -61,8 +61,7 @@ authority, validation policy), [architecture](../architecture.md#cargo-boundary)
 [whole-target placement](workflow.md#final-outputs-on-the-permanent-drive-oxide117)
 and the [profile-member placement](workflow.md#owned-output-members-at-profile-directories-oxide133)
 it succeeds, [questions](../questions.md) for the open dispositions this
-design records but does not settle, and [retirements](../retired.toml) before
-reusing any name.
+design records but does not settle.
 
 ## Outcome
 
