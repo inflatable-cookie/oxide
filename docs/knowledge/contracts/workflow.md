@@ -3782,8 +3782,8 @@ Do not rehearse these steps; they remove the dogfood artifacts.
 ## Relationship to existing work
 
 Tom approved retiring the earlier machinery on 2026-10-18, on the condition
-that nothing of distinct value is lost. oxide#070 executed it;
-[retirements](../retired.toml) lists the removed terms, paths and features.
+that nothing of distinct value is lost. oxide#070 executed it; Git history
+records the removed terms, paths and features.
 Assessment:
 
 | Keep | Why |
@@ -5950,8 +5950,7 @@ Approved design direction (Tom, 2026-10-20). Not implemented. It applies to buil
   ([Crash recovery](#crash-recovery)); fixture-proven, including the
   `setsid` escape limit. Held on Oxide's own repository in the partial
   [foundation qualification](#qualification-result) record (Q5).
-- **W-5 Retirement execution.** Done in oxide#070; see
-  [retirements](../retired.toml).
+- **W-5 Retirement execution.** Done in oxide#070.
 - **W-6 Linux backend.** [Platform backends](#platform-backends):
   budget-only directory pools with a host-reserve watchdog are implemented,
   the Linux default and opt-in on macOS, fixture-proven on macOS and

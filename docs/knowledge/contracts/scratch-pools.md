@@ -555,8 +555,7 @@ native has never passed simply takes its first run under the new recipe with the
 same requirements.
 
 **S5 — record the retirement (optional, docs-only). STANDARD.** Amend the
-`bd357a4c` paragraph to the keep list and, if the owner retires the exception
-itself, add the `retired.toml` entry in the same change. `effigy docs:check`.
+`bd357a4c` paragraph to the keep list. `effigy docs:check`.
 
 ## Limits of this design
 

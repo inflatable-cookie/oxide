@@ -25,7 +25,7 @@ qualification.
 
 The earlier recommendation, a consumer-owned adapter around familiar commands
 plus an explicit project/workflow opt-in, was retired with the protected route
-on 2026-10-18 ([retirements](../retired.toml)). Its lasting rules carry over:
+on 2026-10-18. Its lasting rules carry over:
 
 - Never point shared Cargo configuration or `CARGO_TARGET_DIR` at an Oxide
   slot. Relocate intermediates per invocation through Cargo's build-directory

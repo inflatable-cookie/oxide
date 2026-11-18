@@ -20,7 +20,7 @@ this question's decision.
 
 ## Q-001 — What implementation shape best supports durable exclusive ownership?
 
-Pointer, 2026-10-18: the daemon prototype and its protocol were retired ([retirements](retired.toml)). The kept same-user ledger is the [local lease CLI](contracts/local-lease.md); containment findings are in [qualification findings](qualification-readiness.md#process-containment). The text below is the original answer.
+Pointer, 2026-10-18: the daemon prototype and its protocol were retired. The kept same-user ledger is the [local lease CLI](contracts/local-lease.md); containment findings are in [qualification findings](qualification-readiness.md#process-containment). The text below is the original answer.
 
 A per-user local daemon remains the recommended production hub for one durable lease ledger, shared consumer integration and bounded observations. The minimal per-invocation lock/journal alternative is compared in [architecture](architecture.md#storage-invariants); it still needs process guardianship and conservative reconciliation. Queue authorized a bounded local prototype of the daemon candidate, described in [architecture](architecture.md#current-facilities); that prototype does not select a production implementation. The selected host's proof that all slot writers and outstanding write capabilities end or are fenced, plus daemon failure/restart mechanics, remain open for qualification.
 
@@ -28,7 +28,7 @@ The reviewed [macOS readiness findings](qualification-readiness.md#process-conta
 
 ## Q-002 — What exact toolchain and checkout-path portability can be supported?
 
-Pointer, 2026-10-18: the mapped-root, source-map and registered collection machinery named below was retired ([retirements](retired.toml)). The condensed findings are in [qualification findings](qualification-readiness.md#cargo-freshness); the proposed cross-checkout gate is W-8 in [workflow](contracts/workflow.md#cross-checkout-freshness). The text below is the original answer.
+Pointer, 2026-10-18: the mapped-root, source-map and registered collection machinery named below was retired. The condensed findings are in [qualification findings](qualification-readiness.md#cargo-freshness); the proposed cross-checkout gate is W-8 in [workflow](contracts/workflow.md#cross-checkout-freshness). The text below is the original answer.
 
 Current lean-route answer: one pinned Nucleus `dev` workflow demonstrated
 registry reuse across fresh checkout paths with current marker/path tests.
@@ -79,7 +79,7 @@ Reviewed [capacity findings](qualification-readiness.md#capacity) include tempor
 
 ## Q-004 — What narrowly scoped pilot may be authorized?
 
-Pointer, 2026-10-18: the experimental qualifier and probes named below were retired ([retirements](retired.toml)); their results are condensed in [qualification findings](qualification-readiness.md). The text below is the original answer.
+Pointer, 2026-10-18: the experimental qualifier and probes named below were retired; their results are condensed in [qualification findings](qualification-readiness.md). The text below is the original answer.
 
 Tom approved the standalone oxide#005 trial on 2026-10-09 after independent native-fixture review. [Vision](vision.md#authority-boundaries) owns its exact source/patch, temporary disk-image authority, local-binding sequence and time limits; the Queue brief owns the executable protocol. Its reviewed result is partial negative qualification: cooperative completion, pilot resource bounds and local evidence binding passed for S1–S3, while strict portability failed and invalidation was incomplete. The original experiment window is closed. A design-only follow-up recommends explicit rustc path remapping for a finite pre-registered root set and proposes a fresh five-scenario pilot: source, configuration and toolchain miss controls first, then one cold-A/different-path-warm-B pair. Tom subsequently accepted the logical-path contract. The Oxide-only qualifier is now implemented with small fixture validation, not a new real-project experiment. Any future pilot needs a separately approved Queue brief, new resources and time scope; do not reuse 005 authority or resources. Actual consumer integration and compiler-wrapper rollout coordination remain separate adoption gates. Require independent exact-head review. See [reviewed evidence](qualification-readiness.md#compiler-and-behavior-paths) and the [portability proposal](qualification-readiness.md#compiler-and-behavior-paths).
 
@@ -129,7 +129,7 @@ Design answer: [project adoption](contracts/project-adoption.md#readiness-admiss
 
 ## Q-012 — How does the consumer bind task admission, storage acquire and host-run scheduling?
 
-Pointer, 2026-10-18: the registered library route and fixture bridge named below were retired ([retirements](retired.toml)); the [Nucleus core reuse record](contracts/nucleus-core-reuse.md) is condensed historical evidence. The text below is the original answer.
+Pointer, 2026-10-18: the registered library route and fixture bridge named below were retired; the [Nucleus core reuse record](contracts/nucleus-core-reuse.md) is condensed historical evidence. The text below is the original answer.
 
 Design answer and exact open owner gates live in the
 [first Nucleus core-test contract](contracts/nucleus-core-reuse.md), with general
@@ -163,7 +163,7 @@ Settled by Tom on 2026-10-09: use 20 GiB as a monitored start/abort threshold, n
 
 ## Q-015 — What does the foundation workflow need settled before implementation?
 
-Pointer, 2026-10-18: W-5 retirement execution is done ([retirements](retired.toml)).
+Pointer, 2026-10-18: W-5 retirement execution is done.
 
 The proposed [workflow](contracts/workflow.md#open-decisions) lists W-1 to W-8: default pool, waiting and concurrency, project file, crash-recovery qualification, retirement execution, Linux backend, command naming and the cross-checkout freshness gate. Crash-recovery and retirement direction are ruled; the rest have recommendations. Owner: [workflow](contracts/workflow.md).
 

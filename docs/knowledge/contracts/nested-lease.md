@@ -767,7 +767,7 @@ Rules that follow and must be tested:
 | Unbounded nesting | A build script that calls `oxide` recurses; depth and fan-out bounds are product constants. |
 | Unbounded wait for a live ticket at outer closeout | Trades a bounded, honest held-slot failure for an unbounded hang; the custody rule already handles it. |
 | Let a nested command run `clean`/`outputs adopt` by waiting | The wait can only be satisfied by the ancestor that spawned it. Refusing is the only non-deadlocking answer. |
-| Mint the permit in a resident helper/daemon | A new service the operator has not approved, and the retired-daemon precedent stands ([retirements](../retired.toml)). |
+| Mint the permit in a resident helper/daemon | A new service the operator has not approved, and the retired-daemon precedent stands. |
 | Trust a same-UID signed token (HMAC with a pool secret) | The secret must be readable by the verifying child, hence by any same-UID process; it adds a key-management surface without changing the cooperative boundary. |
 
 ## 11. Decisions taken here, and what stays open
