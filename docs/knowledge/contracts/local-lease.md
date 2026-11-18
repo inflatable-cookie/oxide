@@ -96,9 +96,9 @@ recent use. It sends one chosen root ID to Barge at a time. A hold or pin
 refusal lets it consider the next candidate. If no eligible root can make
 room, admission reports a capacity refusal.
 
-### Recorded per-slot accounting (oxide#146, restored in oxide#315)
+### Recorded per-slot accounting (oxide#146: implemented, native held)
 
-A size belongs to the lease generation that was observed. A new grant clears
+Oxide#315 restores this admission strategy over Barge. A size belongs to the lease generation that was observed. A new grant clears
 the old observation. Release samples only the closing root, and new-slot
 admission samples only rows without a current record. A complete observation
 is persisted once per generation and refreshed at release. An incomplete
