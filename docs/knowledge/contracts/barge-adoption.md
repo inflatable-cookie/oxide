@@ -17,8 +17,9 @@ and Queue history; no evidence, credit or fixture from them is migrated.
 
 `barge` is a Git dependency pinned by full 40-hex revision in `Cargo.toml` and
 `Cargo.lock`; never a branch or tag. The current pin is the merged lean core
-with its adopted-root seam, `be06c69b4720e4d5c786da331a5615cdcde9f9e0`
-(barge#065 merged as barge#66). Offline
+with its adopted-root seam, atomic identity revalidation and read-only account
+opener, `26caf67e9cf7715b9945d625ac110610aa54e791` (Barge PRs 66, 68 and 67).
+Offline
 builds seed that locked Git source through
 `scripts/offline_seed.py`; a missing candidate is an offline failure, not
 permission to resolve a moving ref.
@@ -197,14 +198,16 @@ not authorization or current proof. The shared supervisor is unchanged.
 
 Prune previews name the Barge area, stable root ID and path, and match the
 recorded ID in the selection registry. Execution resolves and evicts only that
-ID. Matching paths do not substitute for identity. Barge must revalidate the
-expected root marker under its root and area locks immediately before rename;
-an earlier unlocked resolve does not establish that authority. The current
-`be06c69b` eviction resolves before locking and needs that supplier correction.
+ID. Matching paths do not substitute for identity. The pinned Barge revalidates
+the expected root marker's area, ID, label and folder under its root and area
+locks immediately before rename, and checks the expected ID again before
+post-eviction deletion. An earlier unlocked resolve does not establish that
+authority.
 
 Preview uses the passive Oxide store and looks up existing output declarations;
 it never imports roots, reconciles the ledger, sweeps trash or declares an
-area. A missing declaration yields no eligible roots. Barge's current account
-opener can create the areas directory, so an existing-directory precheck alone
-does not close a concurrent-removal race; a genuinely passive Barge opener is
-required before this boundary can be claimed under that race.
+area. A missing declaration yields no eligible roots. The account is opened
+with `Barge::open_read_only_with`, which never creates directories or lock files,
+even when the account is absent or concurrently removed. Its areas reject
+mutations before filesystem access. No existing-directory precheck substitutes
+for that read-only capability.

@@ -1481,10 +1481,7 @@ fn existing_output_area(
     selected: &Selected,
 ) -> Result<Option<barge::Area>, String> {
     let (account, config) = output_area_config(control, selected)?;
-    if !account.join("barge/areas").is_dir() {
-        return Ok(None);
-    }
-    Storage::open(&account)?.existing_area(&config)
+    Storage::open_read_only(&account)?.existing_area(&config)
 }
 
 fn output_id(selected: &Selected) -> String {

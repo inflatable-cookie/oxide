@@ -10,7 +10,7 @@ applied to the facilities that remain after the 2026-10-18 retirement
 ## Storage and ownership
 
 **Barge owns storage mechanics.** The linked library at full pin
-`be06c69b4720e4d5c786da331a5615cdcde9f9e0` owns volume registration and
+`26caf67e9cf7715b9945d625ac110610aa54e791` owns volume registration and
 identity, declared areas and locations, marked roots, cooperative
 shared/exclusive holds, durable selected-output pins, reserve/floor pruning,
 idle LRU eviction and marker-checked trash ([adoption

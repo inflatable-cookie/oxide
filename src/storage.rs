@@ -321,6 +321,19 @@ impl Storage {
         .map_err(|error| format!("cannot open the storage state: {error}"))
     }
 
+    /// Inspect an account without preparing any state, including when the
+    /// account is absent or concurrently removed. Returned areas remain
+    /// read-only, so an accidental mutation refuses before touching disk.
+    pub fn open_read_only(state_root: &Path) -> Result<Self, String> {
+        Barge::open_read_only_with(
+            state_root.join("barge"),
+            Arc::new(OxideOs),
+            Arc::new(barge::SystemClock::new()),
+        )
+        .map(|barge| Self { barge })
+        .map_err(|error| format!("cannot read the storage state: {error}"))
+    }
+
     /// Open with explicit seams, for Oxide's own tests.
     pub fn open_with(
         state_dir: PathBuf,

@@ -858,4 +858,26 @@ fn output_prune_dry_run_preserves_pool_trash_and_partial_output_accounts() {
             b"retained owned bytes"
         );
     }
+    // An entirely absent account must stay absent, rather than acquiring an
+    // empty areas directory during the supposedly passive open.
+    let account = output_storage.state_dir();
+    fs::remove_dir_all(account).unwrap();
+    let before = tree_snapshot(&pool);
+    let preview = run();
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert!(!account.exists(), "preview recreated the absent account");
+    assert_eq!(
+        tree_snapshot(&pool),
+        before,
+        "preview changed an absent account"
+    );
+    assert_eq!(fs::read(root.path.join("keep")).unwrap(), b"output bytes");
+    assert_eq!(
+        fs::read(retained_path.join("keep")).unwrap(),
+        b"retained owned bytes"
+    );
 }
