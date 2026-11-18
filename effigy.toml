@@ -49,7 +49,7 @@ minimum_effigy_version = "0.14.0"
 "changelog:fold" = "python3 scripts/changelog.py fold {args}"
 "changelog:test" = "bash scripts/changelog.test.sh"
 "docs:check" = [
-  "effigy skill run northstar/check-links -- --frozen '^docs/knowledge/architecture[.]md$' --frozen '^docs/knowledge/evidence/'",
+  "effigy skill run northstar-docs/check-links -- --frozen '^docs/knowledge/architecture[.]md$' --frozen '^docs/knowledge/evidence/'",
   "effigy changelog:check",
   "git diff --check HEAD",
 ]
