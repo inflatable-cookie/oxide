@@ -4,11 +4,6 @@
 #[cfg(all(test, unix))]
 mod test_fs;
 
-/// The library-side observation tape for the prune capture harness (X-S1);
-/// see `src/tape.rs` and `docs/knowledge/contracts/barge-adoption.md`.
-#[cfg(all(test, unix))]
-mod tape;
-
 /// Opt-in diagnostics for lease closeout.
 pub mod release_trace;
 
@@ -20,10 +15,9 @@ pub mod inventory;
 #[cfg(unix)]
 pub mod lease;
 
-/// Descriptor-relative deletion of a verified owned tree, with the fixed
-/// Finder-metadata race bound (oxide#155).
+/// Internal directory reads and safe diagnostic names; deletion is Barge's.
 #[cfg(unix)]
-pub mod owned_delete;
+mod fs_util;
 
 /// Debug-only guard for product proof hooks (oxide#155).
 #[cfg(debug_assertions)]
@@ -45,6 +39,12 @@ pub mod seed_source;
 /// Bounded decoder for Cargo's encoded dep-info, kept as input for the
 /// cross-checkout freshness gate.
 pub mod dep_info;
+
+/// Barge-backed storage authority: volumes, areas, marked roots, holds, pins,
+/// pruning, trash and scratch. The one place Oxide declares its areas and
+/// supplies Barge's platform seam.
+#[cfg(unix)]
+pub mod storage;
 
 /// Identity, descriptor binding and flush of a removable APFS volume for the
 /// `apfs-volume-v1` pool backend.

@@ -104,7 +104,7 @@ use super::{
     current_uid, ensure_private_dir, io_error, random_hex, LeaseError, MANAGED_NAME,
     MAX_LEASE_ID_BYTES, MAX_PATH_BYTES,
 };
-use crate::owned_delete::open_directory_at;
+use crate::fs_util::open_directory_at;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
@@ -218,7 +218,7 @@ pub enum SeedOutcome {
     Abandoned(SeedAbandon),
 }
 
-/// The published seed, returned while the pool lock and the donor pin were
+/// The published seed, returned while the pool lock and the donor shared hold were
 /// still held through the final donor check.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SeedReceipt {
@@ -897,6 +897,12 @@ pub fn seed_monitored(
         return Ok(skip(SeedSkipReason::DonorPayloadMissing));
     };
     let (recipient_fd, recipient_slot) = open_slot_dirs(payload_root, payload_device, recipient)?;
+    // The pool/record locks protect workflow facts; Barge's shared root hold
+    // protects the donor bytes against storage eviction for the entire seed.
+    // The caller keeps the recipient's exclusive lease hold throughout.
+    let Some(_donor_hold) = opened.hold_donor(donor, recipient)? else {
+        return Ok(skip(SeedSkipReason::DonorBusy));
+    };
     // The recipient is this command's fresh slot: its `build/` is absent or
     // an empty owned directory. Anything else is refused, never cleaned.
     let recipient_build = open_recipient_build(recipient_fd.as_fd(), payload_device)?;
@@ -930,7 +936,7 @@ pub fn seed_monitored(
         monitor,
     )?;
     test_point(TestPoint::BeforeVerify { pool });
-    // Every donor payload read happens here, under the pin: each planned file
+    // Every donor payload read happens here, under the shared hold: each planned file
     // is opened without following a link, checked against the catalog's
     // recorded size and revalidated against its recorded digest before
     // anything is copied. The `.d` is read bounded, hashed and re-parsed: its
@@ -2147,7 +2153,13 @@ fn open_donor_slot_dirs(
             Ok(Some((fd, root.join(slot.id.to_string()))))
         }
         Some(dir) => {
-            let (folder, leaf) = dir.split_once('/').ok_or_else(slot_custody_error)?;
+            let Some((folder, leaf)) = dir.split_once('/') else {
+                let Some(fd) = open_slot_component_optional(slots.as_fd(), &cstring(dir)?, device)?
+                else {
+                    return Ok(None);
+                };
+                return Ok(Some((fd, root.join(dir))));
+            };
             let Some(folder_fd) =
                 open_slot_component_optional(slots.as_fd(), &cstring(folder)?, device)?
             else {
@@ -2195,12 +2207,19 @@ fn open_slot_dirs(
             let fd = open_slot_component(slots.as_fd(), &name, device)?;
             Ok((fd, root.join(slot.id.to_string())))
         }
-        Some(dir) => {
-            let (folder, leaf) = dir.split_once('/').ok_or_else(slot_custody_error)?;
-            let folder_fd = open_slot_component(slots.as_fd(), &cstring(folder)?, device)?;
-            let leaf_fd = open_slot_component(folder_fd.as_fd(), &cstring(leaf)?, device)?;
-            Ok((leaf_fd, root.join(dir)))
-        }
+        // A Barge root is one level (`<label>-<id>`); a legacy Oxide slot may
+        // sit under its project folder.
+        Some(dir) => match dir.split_once('/') {
+            Some((folder, leaf)) => {
+                let folder_fd = open_slot_component(slots.as_fd(), &cstring(folder)?, device)?;
+                let leaf_fd = open_slot_component(folder_fd.as_fd(), &cstring(leaf)?, device)?;
+                Ok((leaf_fd, root.join(dir)))
+            }
+            None => {
+                let fd = open_slot_component(slots.as_fd(), &cstring(dir)?, device)?;
+                Ok((fd, root.join(dir)))
+            }
+        },
     }
 }
 

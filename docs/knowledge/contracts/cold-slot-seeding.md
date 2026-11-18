@@ -1277,12 +1277,10 @@ neither measures nor claims, §8).
 
 ### 6.5 Failure: abandon before the first clone or on a failed recipient walk; refuse every other post-clone fault
 
-Seeding never renames or deletes inside the recipient, because the library's
-journaled deletion is `Evicting`-only with no lease (`src/lease/pool.rs:1963-1981`),
-an unrecorded `.oxide-capture-*` name is refused (`src/lease/mod.rs:913-928`),
-and owned deletion needs caller-owned durable intent while unjournaled residue
-is never consumed (`src/owned_delete.rs:37-48,580-585`). There is therefore no
-in-slot "reset" path at all. The outcome classes are:
+Seeding never renames or deletes inside the recipient. It holds the recipient
+exclusively and donor shared through Barge. An untrusted recipient is retired
+whole through Barge's marker-checked trash, without an in-slot reset or
+per-entry deletion journal. The outcome classes are:
 
 - **Abandon before the first clone.** A skip (no donor, no overlap, an
   ineligible package, a cap, the seed's own cooperative deadline) or a

@@ -84,3 +84,50 @@ allow = [
   "docs/knowledge/vision.md",
   "scripts/test-oxide-cli.py",
 ]
+
+[[retired]]
+id = "prune-capture-harness-and-comparison"
+retired = "2026-11-18"
+replacement = "Tom's 2026-11-17 lean reset: ordinary Effigy admission, the shared proof supervisor and the lean Barge storage authority, recorded in docs/knowledge/contracts/barge-adoption.md. The prune capture harness, the limited verdict policy, the release comparison harness, the private-build validation gate and the seed-readiness control are deleted with their scripts and selectors; their evidence stays in Git and Queue history."
+owner = "docs/knowledge/contracts/barge-adoption.md"
+terms = [
+  "oxide.capture.apparatus/2",
+  "oxide.capture.embedded-control-observation/1",
+  "tape_prune_eval",
+  "capture_verdict",
+  "tape_harness",
+  "release_comparison_tests",
+  "proof:tape-prune:cover",
+  "rust:release-comparison",
+  "proof:private-build-validation",
+  "proof:seed-readiness",
+]
+paths = [
+  "src/bin/oxide/tape_harness.rs",
+  "src/bin/oxide/capture_verdict.rs",
+  "scripts/test-release-comparison.py",
+  "scripts/test-private-build-validation.py",
+  "scripts/tape-embedded-observation.py",
+  "scripts/tape-seed-readiness.py",
+  "docs/knowledge/contracts/cooperative-qualification.md",
+]
+allow = ["docs/knowledge/retired.toml"]
+
+
+[[retired]]
+id = "oxide-storage-census-and-prune-engine"
+retired = "2026-11-17"
+replacement = "Lean linked Barge roots, cooperative holds, durable output pins and marker-checked trash. Ordinary temporary-fixture tests replace the old storage-native ladders. Legacy uncertain roots are retained."
+owner = "docs/knowledge/contracts/barge-adoption.md"
+paths = [
+  "src/owned_delete.rs",
+  "src/owned_delete_hook.rs",
+  "src/owned_delete_tests.rs",
+  "src/bin/oxide/census.rs",
+  "scripts/test-holding-delete.py",
+  "scripts/test-finder-metadata-race.py",
+  "scripts/test-prune-authority.py",
+  "scripts/test-prune-fresh-custody.py",
+  "scripts/test-prune-absence.py",
+  "scripts/test-outputs-prune.py",
+]

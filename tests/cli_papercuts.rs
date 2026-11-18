@@ -92,7 +92,10 @@ fn private_env(scratch: &Path, bin: &Path, pool: &Path) -> Command {
         .env("OXIDE_POOL_BACKEND", "directory-budget")
         .env("OXIDE_POOL_CAP", "2MiB")
         .env("CARGO_HOME", scratch.join("cargo-home"))
-        .env("TMPDIR", scratch);
+        .env("OXIDE_SCRATCH_ROOT", scratch)
+        .env("TMPDIR", scratch)
+        .env("TMP", scratch)
+        .env("TEMP", scratch);
     for name in [
         "RUSTUP_HOME",
         "RUSTUP_TOOLCHAIN",
@@ -412,8 +415,9 @@ fn whole_target_fixture(scratch: &Scratch, bin: &Path) -> (PathBuf, PathBuf, Pat
     let pool = scratch.path().join("fixture-pool");
     created_pool(scratch, bin, &manifest, &pool);
     let control = pool.join("oxide-managed");
-    let mount = scratch.path().join("mount");
-    fs::create_dir_all(&mount).unwrap();
+    // Model positive absence. A present directory with a different UUID is
+    // a wrong-volume refusal, never the local fallback this fixture needs.
+    let mount = scratch.path().join("absent-mount");
     registration_at(&control, &mount);
     let id = checkout_id(&checkout);
     let root = scratch.path().join("owned-root");
@@ -717,4 +721,163 @@ fn init_and_new_help_skip_the_handoff_check() {
         );
     }
     assert!(!app.join("AGENTS.md").exists(), "help wrote guidance");
+}
+
+/// Preview must not reconcile pool slots, sweep retained trash or publish a
+/// missing output declaration, even when the registry ultimately refuses.
+#[test]
+fn output_prune_dry_run_preserves_pool_trash_and_partial_output_accounts() {
+    use oxide_storage::lease::control::{OutputsInit, State, OWNED_OUTPUTS_FENCE};
+    use oxide_storage::storage::{AreaConfig, Storage};
+
+    let scratch = Scratch::new();
+    let app = scratch.path().join("app");
+    fs::create_dir(&app).unwrap();
+    let app = fs::canonicalize(app).unwrap();
+    let manifest = app.join("Cargo.toml");
+    fs::write(
+        &manifest,
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let (bin, _) = fake_cargo(scratch.path(), &manifest);
+    let pool = scratch.path().join("fixture-pool");
+    created_pool(&scratch, &bin, &manifest, &pool);
+    let control = pool.join("oxide-managed");
+    let storage = Storage::open(&control).unwrap();
+    let pool_area = storage
+        .areas()
+        .unwrap()
+        .into_iter()
+        .find(|area| area.key().label() == "oxide/pool")
+        .unwrap();
+    let retained = pool_area.create_root("retained-trash").unwrap();
+    fs::write(retained.path.join("keep"), b"retained owned bytes").unwrap();
+    let trash = retained.path.parent().unwrap().join(".trash");
+    fs::create_dir_all(&trash).unwrap();
+    // Simulate a crash after Barge's rename, using its actual marked root.
+    let retained_path = trash.join("retained-preview-fixture");
+    fs::rename(&retained.path, &retained_path).unwrap();
+
+    let run = || {
+        private_env(scratch.path(), &bin, &pool)
+            .current_dir(&app)
+            .args(["outputs", "prune", "--dry-run"])
+            .output()
+            .unwrap()
+    };
+    let registry_path = control.join("outputs/registry.json");
+    if registry_path.exists() {
+        fs::remove_file(&registry_path).unwrap();
+    }
+    let before = tree_snapshot(&pool);
+    let refused = run();
+    assert!(!refused.status.success(), "a missing registry was accepted");
+    assert_eq!(
+        tree_snapshot(&pool),
+        before,
+        "a refusing preview changed pool state or trash"
+    );
+
+    let transaction = "a".repeat(32);
+    let state_path = control.join("state.json");
+    let mut state: State = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    state.version = state.version.max(4);
+    state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
+    state.outputs_init = Some(OutputsInit::Ready {
+        transaction: transaction.clone(),
+        ready_ms: 1,
+    });
+    write_private(&state_path, &serde_json::to_vec(&state).unwrap());
+
+    let parent = scratch.path().join("outputs");
+    let location: String = sha2::Sha256::digest(parent.as_os_str().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let output_storage = Storage::open(&control.join("output-storage").join(location)).unwrap();
+    let area = output_storage
+        .declare(
+            &AreaConfig::new("outputs", scratch.path(), "outputs")
+                .folder("outputs")
+                .floor_bytes(0),
+        )
+        .unwrap();
+    let root = area.create_root("output").unwrap();
+    fs::write(root.path.join("keep"), b"output bytes").unwrap();
+    write_private(
+        &registry_path,
+        &serde_json::to_vec(&json!({
+            "version": "oxide.outputs.registry/2", "schema": 2, "revision": 1,
+            "complete": true, "created_by": transaction,
+            "rows": [{"checkout_id": checkout_id(&app), "checkout": app,
+                "receipt": control.join("outputs/fixture.json"), "member": "debug",
+                "root": root.path, "barge_id": root.id, "root_kind": "local",
+                "recipe": "quick", "generation": 1, "selected": false, "pending": false}]
+        }))
+        .unwrap(),
+    );
+
+    let before = tree_snapshot(&pool);
+    let present = run();
+    assert!(
+        present.status.success(),
+        "{}",
+        String::from_utf8_lossy(&present.stderr)
+    );
+    assert_eq!(
+        tree_snapshot(&pool),
+        before,
+        "preview changed a complete account"
+    );
+    let preview: Value = serde_json::from_slice(&present.stdout).unwrap();
+    assert_eq!(preview["roots"][0]["id"], root.id);
+    // Fault the fresh account through both partial states without forging a
+    // root marker or replacing the real Barge parser.
+    let areas = output_storage.state_dir().join("areas");
+    fs::remove_file(areas.join("oxide.outputs.json")).unwrap();
+    for missing_directory in [false, true] {
+        if missing_directory {
+            fs::remove_dir(&areas).unwrap();
+        }
+        let before = tree_snapshot(&pool);
+        let preview = run();
+        assert!(
+            preview.status.success(),
+            "{}",
+            String::from_utf8_lossy(&preview.stderr)
+        );
+        assert_eq!(
+            tree_snapshot(&pool),
+            before,
+            "preview published missing area state"
+        );
+        assert_eq!(fs::read(root.path.join("keep")).unwrap(), b"output bytes");
+        assert_eq!(
+            fs::read(retained_path.join("keep")).unwrap(),
+            b"retained owned bytes"
+        );
+    }
+    // An entirely absent account must stay absent, rather than acquiring an
+    // empty areas directory during the supposedly passive open.
+    let account = output_storage.state_dir();
+    fs::remove_dir_all(account).unwrap();
+    let before = tree_snapshot(&pool);
+    let preview = run();
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert!(!account.exists(), "preview recreated the absent account");
+    assert_eq!(
+        tree_snapshot(&pool),
+        before,
+        "preview changed an absent account"
+    );
+    assert_eq!(fs::read(root.path.join("keep")).unwrap(), b"output bytes");
+    assert_eq!(
+        fs::read(retained_path.join("keep")).unwrap(),
+        b"retained owned bytes"
+    );
 }

@@ -78,7 +78,6 @@ pub enum Reason {
     /// The volume is mounted but is refused by a selection rule: mount
     /// parent, read-only, role, boot/data container or the like.
     VolumeUnusable,
-    BelowReserve,
     /// A probe timed out, its output was over the cap, or it could not be
     /// parsed or read.
     MetadataUnknown,
@@ -93,7 +92,6 @@ impl Reason {
             Self::Absent => "absent",
             Self::IdentityMismatch => "identity_mismatch",
             Self::VolumeUnusable => "volume_unusable",
-            Self::BelowReserve => "below_reserve",
             Self::MetadataUnknown => "metadata_unknown",
             Self::ControlMissing => "control_missing",
             Self::PayloadMissing => "payload_missing",
@@ -273,21 +271,6 @@ fn probe_volume(registration: &Registration) -> Result<Binding, Unavailable> {
     }
     removable::check_identity(&identity, None)
         .map_err(|error| unavailable(Reason::VolumeUnusable, error))?;
-    let available = binding
-        .verify()
-        .map_err(|error| unavailable(Reason::IdentityMismatch, error))?
-        .available_bytes
-        .ok_or_else(|| unavailable(Reason::MetadataUnknown, "the free space is unknown"))?;
-    if available <= registration.reserve_bytes {
-        return Err(unavailable(
-            Reason::BelowReserve,
-            format!(
-                "{} MiB available is not above the {} MiB reserve",
-                available / MIB,
-                registration.reserve_bytes / MIB
-            ),
-        ));
-    }
     Ok(binding)
 }
 
@@ -421,8 +404,6 @@ fn bounded(program: &str, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
     }
     Ok(bytes)
 }
-
-const MIB: u64 = 1024 * 1024;
 
 fn lossy(path: &Path) -> String {
     path.to_string_lossy().into_owned()
@@ -655,7 +636,6 @@ mod tests {
             Reason::Absent,
             Reason::IdentityMismatch,
             Reason::VolumeUnusable,
-            Reason::BelowReserve,
             Reason::MetadataUnknown,
             Reason::ControlMissing,
             Reason::PayloadMissing,
@@ -669,7 +649,6 @@ mod tests {
                 "absent",
                 "identity_mismatch",
                 "volume_unusable",
-                "below_reserve",
                 "metadata_unknown",
                 "control_missing",
                 "payload_missing",

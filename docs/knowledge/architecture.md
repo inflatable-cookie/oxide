@@ -9,17 +9,29 @@ applied to the facilities that remain after the 2026-10-18 retirement
 
 ## Storage and ownership
 
-Persistent bounded cache slots partition by project/component identity, exact
-toolchain, host/target platform, and resolved configuration/profile/features/relevant
-environment. One exclusive durable lease covers compile through test and
-artifact capture. Unknown crash outcomes, lost replies, age and PID
-disappearance do not imply release. Reconciliation must prove safe ownership
-settlement before reuse or eviction. The one exception is Tom's 2026-10-18
-ruling that lets Oxide's own commands recover a lease whose holder lock is
-free and whose Cargo process group is empty
-([vision](vision.md#product-workflow-direction),
-[workflow](contracts/workflow.md#crash-recovery)); leases without an Oxide
-control record never are.
+**Barge owns storage mechanics.** The linked library at full pin
+`26caf67e9cf7715b9945d625ac110610aa54e791` owns volume registration and
+identity, declared areas and locations, marked roots, cooperative
+shared/exclusive holds, durable selected-output pins, reserve/floor pruning,
+idle LRU eviction and marker-checked trash ([adoption
+contract](contracts/barge-adoption.md)). Oxide retains Cargo, lease workflow
+state, compatibility, freshness, recipes/profiles, seeding, output member
+links and exec. There is one storage authority; Oxide's owned-delete,
+descriptor census and output-prune eligibility/journal engines are removed.
+
+A compatible idle slot retains its root path and bytes. The command carries
+its exclusive Barge hold through Oxide's actual child-launch route. Optional
+same-volume seeding also retains a shared donor hold. Selected output roots
+carry durable pins independently of running holds. Children closing inherited
+descriptors and unrelated unheld writers are outside this cooperative guarantee.
+Normal command exit, timeout and process-group handling remain product behavior,
+not a storage custody certificate.
+
+Only positively absent volumes use a warned fallback. Wrong or unreadable
+volume identities refuse; space pressure never silently switches volumes.
+Legacy root import validates Oxide ownership before `Area::adopt_root`; an
+unknown or still-held legacy generation remains retained. Evicted roots get
+fresh successor IDs and paths, never blind adoption of an unmarked stray.
 
 Exact-run final binaries, logs, QA receipts and evidence remain independently
 owned and preserved. Cargo intermediates are internal and may contain test
@@ -50,9 +62,10 @@ ownership or eviction authority and never recommends deletion.
 
 ## Current facilities
 
-- The root library keeps the same-user pool, ledger, lease, recovery and
-  eviction code `oxide` uses, over budget-only directory and removable-volume
-  pools. There is no background storage service or project adapter. The
+- The root library keeps the same-user pool, ledger, lease and recovery state
+  `oxide` uses over budget-only directory and removable-volume pools; the
+  storage mechanics beneath them are Barge's. There is no background storage
+  service or project adapter. The
   standalone lease CLI and the APFS sparse-image backing are retired
   (oxide#102); Nucleus keeps its installed copy until its owner switches.
   UID trust permits a cooperative caller's explicit writer-closed release;
@@ -74,11 +87,11 @@ ownership or eviction authority and never recommends deletion.
    the host-reserve watchdog and the filesystem itself; a registered
    removable volume's own capacity is its only hard limit. No pool claims a
    hard bound.
-2. **Exclusive use.** A lease names one owned slot generation. A second claim
-   cannot use it while ownership is active or uncertain.
-3. **Conservative recovery.** Unknown or uncertain writer state preserves bytes
-   and accounting. Age, a missing reply, or a PID observation is not release
-   evidence. Reclaim requires the proof defined by the lease contract.
+2. **Exclusive use.** A lease names one Barge root generation and carries its
+   exclusive hold throughout use. A competing hold refuses.
+3. **Conservative recovery.** Current generations recover under cooperative
+   Barge holds. A newly created lock proves nothing about a legacy writer
+   that never held it; uncertain legacy generations remain retained.
 4. **Finite capacity.** Admission respects the soft budget and refuses when
    only held slots remain or capacity or ownership cannot be established. Capacity pressure
    produces an actionable refusal and inventory; never delete active or

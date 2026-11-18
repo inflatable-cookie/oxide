@@ -10,7 +10,7 @@ The pool-temp proof currently models `<parent>/oxide-proof.XXXXXXXX/scratch/pt/p
 
 Keep the marker in the exact run root, bind it to run identity, canonical path and device, and keep evidence and all nested case resources within that root. Hosting protection must precede nested windows; only their owner can conclude them. Unclosed or uncertain custody never becomes concluded or eligible for expiry. Any future bounded sweep may recognize the new layout only with the same positive marker, conclusion, age and identity checks and a separately established identity-safe deletion mechanism; it must not sweep old names as part of rollout. A partial or uncertain removal retains the root and evidence. Unknown writers remain unknown. No additional signalling authority follows from a shorter name.
 
-The qualification bootstrap independently checks selected volume, parent, device, marker, evidence topology, hosting and both sweep results; it and `scripts/test-pool-temp-scratch.py` currently pin the old layout and must be updated together with any other consumers found by a source sweep. The latter pins `/private/tmp`, the run prefix, `scratch`, path arithmetic and its selector's explicit parent. `scripts/test-account-home.py`, `scripts/test-outputs-prune.py`, `scripts/test_supervisor.py` sweep fixtures, and the layout descriptions in `AGENTS.md` and `workflow.md` also require review and coordinated updates where their assumptions apply. Other helpers that assume names or containment require the same audit; consumers must use reported paths rather than infer them where possible. Historical receipts keep their original interpretation and credit.
+The qualification bootstrap independently checks selected volume, parent, device, marker, evidence topology, hosting and both sweep results; it and `scripts/test-pool-temp-scratch.py` currently pin the old layout and must be updated together with any other consumers found by a source sweep. The latter pins `/private/tmp`, the run prefix, `scratch`, path arithmetic and its selector's explicit parent. `scripts/test-account-home.py`, `scripts/scripts/test_supervisor.py` sweep fixtures, and the layout descriptions in `AGENTS.md` and `workflow.md` also require review and coordinated updates where their assumptions apply. Other helpers that assume names or containment require the same audit; consumers must use reported paths rather than infer them where possible. Historical receipts keep their original interpretation and credit.
 
 ### Proposed creation and topology protocol
 
@@ -113,9 +113,7 @@ predicate authenticates a supervisor merely from these environment values.
 
 `scripts/test-account-home.py` independently checks the old scratch spelling;
 `scripts/qualify-supervisor.py` is the independent bootstrap oracle, not just
-an ordinary child. `scripts/test-outputs-prune.py` has a separate image-custody
-allocation and synthetic sibling/mode/device tests; its historical layout
-commentary is not itself an authority to relax those checks. Updating these
+an ordinary child. The old output-prune image/custody proof was retired with the storage engine. Updating these
 consumers requires explicitly testing old, new and mixed layouts. This inventory
 is partial: other proof gates and ownership primitives still require audit
 before an implementation contract can be frozen.
@@ -130,7 +128,6 @@ before an implementation contract can be frozen.
 | `scripts/test-command-budgets.py`, `scripts/test-accounting-guards.py` | Receipt writers accept nested evidence or old named siblings. Test new and mixed sibling names and component containment, including character-prefix impostors. |
 | `scripts/test-recorded-slot-accounting.py` | Evidence must be a real sibling outside scratch and not a filesystem-root child; tests include wrong export and both containment directions. Names are not its discriminator; preserve those negative controls. |
 | `scripts/test-profile-outputs.py` | Checks common parent containment and excludes evidence inside scratch; preserve those predicates and their negative controls. |
-| `scripts/test-outputs-prune.py` | Image custody requires canonical sibling paths, owner, non-writable modes and same device; the exact names are not the custody check. Preserve these checks and synthetic refusals. |
 | `scripts/test-pool-temp-scratch.py` | Pins old prefix, child names, and eight-character random spelling in its supervisor topology and socket model; other `scratch` matches describe product slot scratch and must remain unchanged. |
 | `scripts/test_supervisor.py` | Contains old-name sweep roots, negative controls, bootstrap oracles and glob assertions. Retain old fixtures as historical/negative controls while explicitly adding new cases; do not reinterpret old receipts. |
 
@@ -142,8 +139,8 @@ any consumer.
 
 The explicit runner digest checks at this base are catalogued by the
 [replacement-census contract](workflow.md#shared-proof-supervisor):
-`test-command-budgets.py`, `test-holding-delete.py`,
-`test-outputs-prune.py`, `test-recorded-slot-accounting.py` and
+`test-command-budgets.py`,
+ `test-recorded-slot-accounting.py` and
 `test-slot-headroom.py` name `fcfda2b0…`; `test-accounting-guards.py`
 and `test-status-fast.py` name `d89115f1…`;
 `test-accounting-vanished.py`, `test-storage-layout.py` and
@@ -161,9 +158,9 @@ deployed selector command, and a historical receipt are separate facts.
 
 | Consumer class | Source and constraint to preserve |
 | --- | --- |
-| Shared Rust arming and callers | `src/supervisor.rs`, `src/proof.rs`, `src/bin/oxide/admission.rs`, `src/owned_delete_hook.rs`, `src/lease/seed/mod.rs`, `src/bin/oxide/{prune,store,seed_plan}.rs`: arming controls admission reports and proof hooks, while each hook retains its own additional scope. Tests in the shared module and admission exercise nested and sibling cases. |
+| Shared Rust arming and callers | `src/supervisor.rs`, `src/proof.rs`, `src/bin/oxide/admission.rs`, `src/lease/seed/mod.rs`, `src/bin/oxide/{prune,store,seed_plan}.rs`: arming controls admission reports and proof hooks, while each hook retains its own additional scope. Tests in the shared module and admission exercise nested and sibling cases. |
 | Independent Rust gates | `config.rs`, `store.rs`, and `inventory.rs` have the independent restrictions above; do not replace them with mere receipt presence. `prune.rs`, `one_use.rs`, `lease/pool.rs`, `handoff.rs` and `adopt.rs` also use scratch containment for their own test or product controls. Their path boundaries are not blanket proof-root authority. |
-| Scratch and evidence pass-through | `offline_seed.py`, `test-storage-inventory-cli.py`, `test-oxide-cli.py`, `test-status-fast.py`, `test-holding-delete.py`, `test-pool-describe.py`, `test-oxide-wrapper-bypass.py`, `test-installed-handoff.py`, `test-scratch-pool.py`, `test-front-door-accounting.py`, `test-cold-slot-seeding.py` and `test-finder-metadata-race.py` use reported paths, create fixtures under scratch, write evidence, or pass controls into isolated children. Existing canonicality, containment, deadline and digest checks remain effective even where no component spelling is inferred. |
+| Scratch and evidence pass-through | `offline_seed.py`, `test-storage-inventory-cli.py`, `test-oxide-cli.py`, `test-status-fast.py`,  `test-pool-describe.py`, `test-oxide-wrapper-bypass.py`, `test-installed-handoff.py`, `test-scratch-pool.py`, `test-front-door-accounting.py`, `test-cold-slot-seeding.py` and `test-finder-metadata-race.py` use reported paths, create fixtures under scratch, write evidence, or pass controls into isolated children. Existing canonicality, containment, deadline and digest checks remain effective even where no component spelling is inferred. |
 | Guard-presence and temp equality | `test-drive-mode.py`, `test-everyday-cli.py`, `test-init-guidance.py`, `test-freshness-submodules.py`, `test-oxide-pool-layout.py`, `test-oxide-removable-removal.py`, `test-permanent-outputs.py`, `test-profile-outputs.py`, `test-seed-default-off.py`, `test-storage-layout.py`, `test-max-active.py`, `test-slot-headroom.py` and `test-oxide-removable-pool.py` check or propagate scratch/evidence/deadline and, where applicable, temp equality or image custody. Do not convert a presence check into an assertion of provenance. |
 | Synthetic and historical references | `test_supervisor.py`, `test_dogfood_scripts.py`, `test_build_context_comparison.py`, `test-cargo-profiles.py` and the pure seams of the named consumers contain fixture paths or old topology controls. Retain counterfactuals deliberately; change an assertion only when its meaning changes. AGENTS and workflow describe deployed and historical behaviour, not a command to rewrite old receipts. |
 | Qualified bootstrap and route ownership | `qualify-supervisor.py::topology` independently compares suite record, expected selected parent and device; `bounded-test.py` owns selected/fallback routing, receipt, sweep and marker. `rust-test-600.py` owns its two explicitly created roots and passes adopted scratch; it does not own the inherited environment parent. |
@@ -187,21 +184,13 @@ observations alone do not close that gap. The current
 ignore_errors=True)` on its two created roots after a successful child and on
 some setup failures; it is not evidence of identity-atomic cleanup.
 
-`src/owned_delete.rs` supplies a source-grounded alternative building block:
-a same-directory exclusive rename (`renameatx_np(RENAME_EXCL)` on macOS,
-`renameat2(RENAME_NOREPLACE)` on Linux), with bounded collision retries and
-journaled captures. Capturing may itself capture a replacement: its identity
-must be checked *after* capture and a foreign capture retained under journal
-custody, not deleted. Its existence does not prove the Python supervisor has
-an integrated, qualified recursive deletion protocol or exclude a cooperating
-owner moving a name after capture. Until a future design binds every removal
-to a protected captured entry, defines recovery and proves the cooperative
-boundary and mount/writer checks, the short-layout implementation must
-**KEEP and report** rather than use these primitives as claimed proof. It
-must not remove a replacement, retry an ambiguous deletion, or treat an
-unreadable observation as absence. Partial work remains retained and reported.
-This is a precise no-go for the new cleanup mechanism, not a retroactive
-judgment of historical receipts.
+The former per-entry capture/deletion implementation was retired with Oxide's
+storage engine. Barge now owns product root deletion; this does not integrate
+Barge into the Python supervisor or establish identity-atomic cleanup for it.
+A future cleanup design still needs to bind every removal to its protected
+owned entry, define recovery and test its cooperative boundary. Until then it
+must keep and report replacements or unreadable observations. Historical
+receipts retain their original scope.
 
 ## Cleanup ownership
 

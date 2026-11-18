@@ -650,14 +650,7 @@ pub fn config_file(facts: &Facts) -> Result<ConfigFile, String> {
             false,
         ),
     };
-    #[cfg(not(test))]
     let present = match fs::symlink_metadata(&path) {
-        Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
-    };
-    #[cfg(test)]
-    let present = match inspect_metadata_observed("config:config-file:metadata", &path, false) {
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
@@ -970,66 +963,14 @@ fn physical_core_count() -> PhysicalCoreCount {
 
 fn read_config(path: &Path) -> Result<FileConfig, String> {
     let named = |error: String| format!("{}: {error}", path.display());
-    #[cfg(not(test))]
     let metadata = fs::metadata(path).map_err(|error| named(error.to_string()))?;
-    #[cfg(test)]
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => {
-            use std::os::unix::fs::MetadataExt;
-            let saved_errno = crate::prune::tape_errno();
-            crate::tape::read_row_dev(
-                "config:read-config:metadata",
-                path,
-                metadata.dev(),
-                metadata.ino(),
-                crate::tape::TapeOutcome::Opened {
-                    dev: metadata.dev(),
-                    ino: metadata.ino(),
-                },
-                Some(MAX_CONFIG_BYTES),
-            );
-            crate::prune::tape_restore_errno(saved_errno);
-            metadata
-        }
-        Err(error) => {
-            let saved_errno = crate::prune::tape_errno();
-            crate::tape::read_row(
-                "config:read-config:metadata",
-                path,
-                crate::tape::TapeOutcome::Refusal {
-                    reason: error.to_string(),
-                },
-                Some(MAX_CONFIG_BYTES),
-            );
-            crate::prune::tape_restore_errno(saved_errno);
-            return Err(named(error.to_string()));
-        }
-    };
     if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
         return Err(named("not a small regular file".to_owned()));
     }
     let mut text = String::new();
-    #[cfg(not(test))]
     fs::File::open(path)
         .and_then(|file| file.take(MAX_CONFIG_BYTES).read_to_string(&mut text))
         .map_err(|error| named(error.to_string()))?;
-    #[cfg(test)]
-    {
-        let result = fs::File::open(path)
-            .and_then(|file| file.take(MAX_CONFIG_BYTES).read_to_string(&mut text));
-        let saved_errno = crate::prune::tape_errno();
-        let outcome = match &result {
-            Ok(_) => crate::tape::TapeOutcome::Digest {
-                digest: crate::tape::sha256_hex(text.as_bytes()),
-            },
-            Err(error) => crate::tape::TapeOutcome::Refusal {
-                reason: error.to_string(),
-            },
-        };
-        crate::tape::read_row("config:read-config", path, outcome, Some(MAX_CONFIG_BYTES));
-        crate::prune::tape_restore_errno(saved_errno);
-        result.map_err(|error| named(error.to_string()))?;
-    }
     parse_config(&text).map_err(named)
 }
 
@@ -1151,12 +1092,11 @@ pub(crate) fn judge_pool_path(path: &Path) -> Result<(), PathRefusal> {
             path.display()
         ))
     })?;
-    if canonical.starts_with("/Volumes") {
-        return Err(PathRefusal::ExternalVolume { message: format!(
-            "the pool path {} is on an external volume ({}); a removable volume is registered with `oxide pool register-removable`, not used as the internal pool",
-            path.display(), canonical.display()
-        ), canonical });
+    #[cfg(test)]
+    if internal_fixture() {
+        return judge_git_work_tree(path, &canonical);
     }
+    refuse_external_prefix(path, &canonical)?;
     if let Some(mount) = mount_point(&canonical).map_err(PathRefusal::Ancestor)? {
         if mount.starts_with("/Volumes") {
             return Err(PathRefusal::ExternalVolume {
@@ -1170,6 +1110,16 @@ pub(crate) fn judge_pool_path(path: &Path) -> Result<(), PathRefusal> {
         }
     }
     judge_git_work_tree(path, &canonical)
+}
+
+fn refuse_external_prefix(path: &Path, canonical: &Path) -> Result<(), PathRefusal> {
+    if canonical.starts_with("/Volumes") {
+        return Err(PathRefusal::ExternalVolume { message: format!(
+            "the pool path {} is on an external volume ({}); a removable volume is registered with `oxide pool register-removable`, not used as the internal pool",
+            path.display(), canonical.display()
+        ), canonical: canonical.to_path_buf() });
+    }
+    Ok(())
 }
 
 pub(crate) fn judge_git_work_tree(path: &Path, canonical: &Path) -> Result<(), PathRefusal> {
@@ -1238,152 +1188,32 @@ pub enum Found {
     Unknown,
 }
 
-#[cfg(test)]
-fn inspect_metadata_observed(
-    site: &str,
-    path: &Path,
-    follow: bool,
-) -> std::io::Result<fs::Metadata> {
-    use std::os::unix::fs::MetadataExt;
-    let result = if follow {
-        fs::metadata(path)
-    } else {
-        fs::symlink_metadata(path)
-    };
-    let saved_errno = crate::prune::tape_errno();
-    match &result {
-        Ok(metadata) => crate::tape::read_row_dev(
-            site,
-            path,
-            metadata.dev(),
-            metadata.ino(),
-            crate::tape::TapeOutcome::Opened {
-                dev: metadata.dev(),
-                ino: metadata.ino(),
-            },
-            None,
-        ),
-        Err(error) => crate::tape::read_row(
-            site,
-            path,
-            if error.kind() == std::io::ErrorKind::NotFound {
-                crate::tape::TapeOutcome::Absent
-            } else {
-                crate::tape::TapeOutcome::Refusal {
-                    reason: error.to_string(),
-                }
-            },
-            None,
-        ),
-    }
-    crate::prune::tape_restore_errno(saved_errno);
-    result
-}
-
 pub fn inspect(path: &Path) -> Found {
-    #[cfg(not(test))]
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Found::Absent,
         Err(_) => return Found::Unknown,
         Ok(_) => {}
     }
-    #[cfg(test)]
-    match inspect_metadata_observed("config:inspect:initial", path, false) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Found::Absent,
-        Err(_) => return Found::Unknown,
-        Ok(_) => {}
-    }
     // Judge what an alias names, so a symlink to a legacy pool is legacy.
-    #[cfg(not(test))]
     let Ok(resolved) = fs::canonicalize(path) else {
         return Found::Unknown;
     };
-    #[cfg(test)]
-    let resolved = {
-        let result = fs::canonicalize(path);
-        let saved_errno = crate::prune::tape_errno();
-        let outcome = match &result {
-            Ok(resolved) => crate::tape::TapeOutcome::Facts {
-                facts: resolved.display().to_string(),
-            },
-            Err(error) => crate::tape::TapeOutcome::Refusal {
-                reason: error.to_string(),
-            },
-        };
-        crate::tape::read_row("config:inspect:canonicalize", path, outcome, None);
-        crate::prune::tape_restore_errno(saved_errno);
-        let Ok(resolved) = result else {
-            return Found::Unknown;
-        };
-        resolved
-    };
-    #[cfg(not(test))]
     if !fs::metadata(&resolved).is_ok_and(|metadata| metadata.is_dir()) {
         return Found::Unknown;
     }
-    #[cfg(test)]
-    if !inspect_metadata_observed("config:inspect:resolved", &resolved, true)
-        .is_ok_and(|metadata| metadata.is_dir())
-    {
-        return Found::Unknown;
-    }
     let path = resolved.as_path();
-    #[cfg(not(test))]
     if fs::symlink_metadata(path.join("image.sparseimage")).is_ok()
         || fs::symlink_metadata(path.join("receipt.json")).is_ok()
     {
         return Found::LegacyImage;
     }
-    #[cfg(test)]
-    if inspect_metadata_observed(
-        "config:inspect:image",
-        &path.join("image.sparseimage"),
-        false,
-    )
-    .is_ok()
-        || inspect_metadata_observed("config:inspect:receipt", &path.join("receipt.json"), false)
-            .is_ok()
-    {
-        return Found::LegacyImage;
-    }
     let config = path.join("config.json");
-    #[cfg(not(test))]
     match fs::symlink_metadata(&config) {
         Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_CONFIG_BYTES => {}
         _ => return Found::Unknown,
     }
-    #[cfg(test)]
-    match inspect_metadata_observed("config:inspect:config-metadata", &config, false) {
-        Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_CONFIG_BYTES => {}
-        _ => return Found::Unknown,
-    }
-    #[cfg(not(test))]
     let Ok(bytes) = fs::read(&config) else {
         return Found::Unknown;
-    };
-    #[cfg(test)]
-    let bytes = {
-        let result = fs::read(&config);
-        let saved_errno = crate::prune::tape_errno();
-        let outcome = match &result {
-            Ok(bytes) => crate::tape::TapeOutcome::Digest {
-                digest: crate::tape::sha256_hex(bytes),
-            },
-            Err(error) => crate::tape::TapeOutcome::Refusal {
-                reason: error.to_string(),
-            },
-        };
-        crate::tape::read_row(
-            "config:inspect:bytes",
-            &config,
-            outcome,
-            Some(MAX_CONFIG_BYTES),
-        );
-        crate::prune::tape_restore_errno(saved_errno);
-        let Ok(bytes) = result else {
-            return Found::Unknown;
-        };
-        bytes
     };
     let backend = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
@@ -2441,6 +2271,8 @@ mod tests {
 
     #[test]
     fn git_work_trees_and_aliases_refuse() {
+        // Model an ordinary filesystem while all real paths stay in task TMPDIR.
+        let internal = internal_fixture_scope();
         let scratch = Scratch::new("git");
         let repo = scratch.0.join("repo");
         fs::create_dir_all(repo.join(".git")).expect("repo");
@@ -2466,7 +2298,14 @@ mod tests {
         let plain = scratch.0.join("plain");
         fs::create_dir_all(&plain).expect("plain");
         assert_eq!(refuse_unsafe_pool_path(&plain.join("pool")), Ok(()));
-        assert!(refuse_unsafe_pool_path(Path::new("/Volumes/Builds/pool")).is_err());
+        drop(internal);
+        // Pure volume-prefix facts exercise the external refusal without
+        // touching a live mount or requiring an internal-volume fixture.
+        assert!(refuse_external_prefix(
+            Path::new("/Volumes/unit/pool"),
+            Path::new("/Volumes/unit")
+        )
+        .is_err());
         // A missing component followed by .. would only resolve into the
         // work tree after creation: refused before any lookup.
         let traversal = plain.join("missing/../../repo/pool");
@@ -2525,4 +2364,26 @@ mod tests {
         );
         assert_eq!(known.iter().filter(|path| path.ends_with("5")).count(), 1);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static INTERNAL_FIXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+pub(crate) fn internal_fixture() -> bool {
+    INTERNAL_FIXTURE.with(std::cell::Cell::get)
+}
+#[cfg(test)]
+pub(crate) struct InternalFixture(bool);
+#[cfg(test)]
+impl Drop for InternalFixture {
+    fn drop(&mut self) {
+        INTERNAL_FIXTURE.with(|slot| slot.set(self.0));
+    }
+}
+/// Model only boot-volume classification; file operations stay in task TMPDIR.
+#[cfg(test)]
+pub(crate) fn internal_fixture_scope() -> InternalFixture {
+    InternalFixture(INTERNAL_FIXTURE.with(|slot| slot.replace(true)))
 }

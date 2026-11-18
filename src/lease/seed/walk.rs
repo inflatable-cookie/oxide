@@ -17,7 +17,7 @@
 //! describes this slot's own bytes and the seed never creates a link itself.
 
 use super::super::current_uid;
-use crate::owned_delete::open_directory_at;
+use crate::fs_util::open_directory_at;
 use std::ffi::{CStr, CString};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 #[cfg(test)]

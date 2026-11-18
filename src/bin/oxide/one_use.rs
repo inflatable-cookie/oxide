@@ -196,6 +196,10 @@ impl Facts {
                 candidates.push(value);
             }
         }
+        #[cfg(test)]
+        if let Some(roots) = TEST_CANDIDATES.with(|slot| slot.borrow().clone()) {
+            candidates = roots;
+        }
         let config = crate::config::Facts::from_env();
         let mut homes = Vec::new();
         for home in [config.home.as_deref(), config.env_home.as_deref()]
@@ -711,4 +715,29 @@ mod tests {
         assert!(!is_active());
         std::fs::remove_dir_all(&here).unwrap();
     }
+}
+
+// Unit fixtures supply candidate paths without creating literal host temp roots.
+#[cfg(test)]
+thread_local! {
+    static TEST_CANDIDATES: std::cell::RefCell<Option<Vec<OsString>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct CandidateScope(Option<Vec<OsString>>);
+#[cfg(test)]
+impl Drop for CandidateScope {
+    fn drop(&mut self) {
+        TEST_CANDIDATES.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+#[cfg(test)]
+pub(crate) fn candidate_scope(root: &Path) -> CandidateScope {
+    TEST_CANDIDATES.with(|slot| {
+        let previous = slot.borrow().clone();
+        let mut roots = previous.clone().unwrap_or_default();
+        roots.push(root.as_os_str().to_owned());
+        *slot.borrow_mut() = Some(roots);
+        CandidateScope(previous)
+    })
 }

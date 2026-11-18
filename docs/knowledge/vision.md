@@ -194,7 +194,7 @@ operator instruction; the general lean reset is not deletion authority.
 
 ### Storage
 
-- **Barge owns drive management** (approved, staged): volume registration and selection, placement and fallback, owned roots, pruning and scratch move to the separate Barge product ([inflatable-cookie/barge](https://github.com/inflatable-cookie/barge)), which Oxide will use as a library. Oxide keeps Cargo, slots, leases, recipes, freshness and `exec`. Until each part moves, Oxide's current implementation stays authoritative.
+- **Barge owns drive management** (implemented in oxide#314): volume registration and selection, placement and fallback, owned roots, pruning and scratch use the linked lean Barge library ([inflatable-cookie/barge](https://github.com/inflatable-cookie/barge)), which Oxide uses as a pinned library. Oxide keeps Cargo, slots, leases, recipes, freshness and `exec`. Barge holds and selected-output pins replace Oxide's deletion/census/prune engines; Cargo and output-link workflow stay in Oxide.
 - **Pools are budget-only:** a soft admission budget, whole-idle-slot eviction
   and the host-reserve watchdog, with no OS-enforced cap.
 - **Warm reuse redesign** (Tom, 2026-11-05, decision
@@ -281,7 +281,7 @@ operator instruction; the general lean reset is not deletion authority.
   only by an explicit `oxide outputs prune`, never automatically.
 - Tom's 2026-11-05 selected-root protection ruling and its conservative
   alignment boundary are owned by the
-  [controlled decision comparison](contracts/barge-adoption.md#controlled-decision-comparison).
+  the (superseded) controlled decision comparison, recorded in the [lean adoption contract](contracts/barge-adoption.md).
 - **Sharing builds:** slots share warm builds across worktrees, up to 12 per
   project, with least-recently-used idle slots evicted under the byte budget.
 - **Cold slots:** the chosen direction instead of sccache is seeding a cold
@@ -347,8 +347,16 @@ operator instruction; the general lean reset is not deletion authority.
 
 ## Validation policy
 
+Tom's 2026-11-17 lean reset, implemented by oxide#314, uses ordinary bounded
+unit/integration tests on private fixtures and retained independent exact-head
+review for the linked Barge adoption. It removes the supplier/capture/native
+qualification ladders for that change. Existing shared-runner safeguards and
+unrelated product verification stay. Installation and live migration remain
+separate owner actions; old evidence is historical, with no transferred credit.
+
+
 Tom decision `ea8ee47f-adc0-4cd3-b420-aaa30642d623` v2 (2026-11-16)
-adopts the reviewed [cooperative qualification contract](contracts/cooperative-qualification.md)
+adopts the reviewed cooperative qualification contract (retired 2026-11-18)
 as the acceptance target for future 309 work and scopes one independently
 reviewed Nucleus-owned route proposal, without implementation or proof runs.
 The earlier `57374e05` v2 decision authorized drafting and review only. Those
@@ -367,7 +375,7 @@ prospective amendment.
 Tom decision `afae2fc0-f0e2-4ad7-9186-0439d6889715` v2 (2026-11-17)
 scopes the remaining supplier implementation through two bounded source-only
 design PRs, with no implementation, proof run or activation. Oxide's half is
-recorded in the [cooperative qualification contract](contracts/cooperative-qualification.md#qualification-input-suppliers-design-2026-11-17):
+recorded in the cooperative qualification contract (retired 2026-11-18 with the capture programme):
 all nine required inputs mapped to their actual owner, seam, evidence,
 validation and refusal disposition; the real creation graph and its waits; one
 600-second origin with its clock interface; the qualified census and
@@ -392,7 +400,7 @@ identity, original first-effect origin/ceiling and refusal rules. The original
 authorized. Author/reviewer limits are 60/30 active minutes per task, focused
 checks total at most 20 minutes plus one final-head covering set at most
 60 minutes, with 2 GiB owned temporary storage; docs checks stay within
-120 seconds and 64 MiB. The [supplier contract](contracts/cooperative-qualification.md#qualification-input-suppliers-design-2026-11-17)
+120 seconds and 64 MiB. The retired supplier contract (2026-11-18)
 owns the boundaries: no other supplier implementation, real qualification,
 installation, consumer activation or existing-hold release follows.
 
@@ -400,7 +408,7 @@ Tom decision `984a3b0a-98ae-48f7-994e-65950020ae83` v2 (2026-11-17,
 10:31:04Z) prospectively changes that host source tranche to the continuous
 clock, so sleep consumes the fixed allowance. Nucleus's relayed decision
 `4380ff30-444b-412b-b738-a86677b77474` v2 records the same choice, with no
-second grant. The [supplier contract](contracts/cooperative-qualification.md#prospective-host-clock-domain)
+second grant. The retired supplier contract (2026-11-18)
 owns its direct-domain, original-origin, immutable-envelope and narrowing-cap
 requirements. This amends 49a06's RAW-domain requirement only for the future
 host tranche. Its two-PR source limits, all earlier clock evidence, Barge's
@@ -418,7 +426,7 @@ For 309, Nucleus is an ordinary task runner. Proof timing and process handling
 belong to the proof's ordinary Effigy execution, using the existing
 `EFFIGY_RUN_DEADLINE_MS=600000` mechanism. The common-clock work and the
 external envelope, supplier, custody/census certification and capture-delivery
-contracts are no longer prerequisites. The [earlier cooperative target](contracts/cooperative-qualification.md)
+contracts are no longer prerequisites. The earlier cooperative target (retired 2026-11-18)
 is historical. Keep actual supervisor behavior tests, ordinary source/evidence
 review and honest run outcomes; source/native work follows the selected scoped
 Queue brief without further design tranches. Cleanup means obsolete source and
@@ -451,7 +459,7 @@ capture-only Cargo selectors cover build and embedded harness behavior; they
 do not qualify launcher isolation, global live-state invariance or current
 export production. Ordinary Rust selectors continue to use Oxide. Direct
 covering requires the separately activated, qualified-guard route in the
-[barge adoption contract](contracts/barge-adoption.md#oxide-test-only-capture-apparatus).
+[lean Barge adoption contract](contracts/barge-adoption.md) (the capture-only direct-covering route it recorded is retired).
 
 Tom, 2026-10-20: risk-proportionate verification. AGENTS.md "Validate" holds
 the operating rules.

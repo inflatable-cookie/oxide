@@ -13,7 +13,9 @@ use crate::config::{self, Facts};
 use crate::process;
 use crate::store::{self, Backend, Store};
 use crate::MIB;
+use barge::Os;
 use oxide_storage::lease::managed::init_volume_pool;
+use oxide_storage::storage::{AreaConfig, Storage};
 use oxide_storage::volume::{self, Binding};
 use serde::{Deserialize, Serialize};
 use std::ffi::{CString, OsString};
@@ -158,16 +160,9 @@ recover-interrupted releases a slot `oxide status` shows held by an
 interrupted command whose Cargo group was not recorded or whose lease is not
 provably its own. Run it only when nothing still writes in that slot.
 
-release-quarantined releases a slot quarantined in this boot session (a
-removable volume lost while a writer could outlive its command, for example
-an `exec` tool or an allowed rustc wrapper) and deletes its tree whole through
-the holding area, outside the pool lock. --confirm-writers-stopped is always
-required: the command first checks that no process of this account holds a
-file open inside the slot tree, that no process's working directory is inside
-it and that the recorded holder pid is gone or is a different process. Any
-unreadable observation is unknown and refuses; an idempotent state (idle,
-lost with closed writers, closed by a later boot) refuses and names its own
-path. --dry-run prints the census verdict and changes nothing.
+release-quarantined retains legacy quarantined generations. Their writers
+never acquired Barge holds, so a new lock cannot establish closure or permit
+deletion. New generations use cooperative Barge holds and marker-checked trash.
 
 describe --json prints the registered drive as stable, read-only JSON on
 stdout (schema oxide.pool.describe/1). It changes nothing.";
@@ -236,23 +231,6 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
             Ok(0)
         }
         ["release-quarantined", rest @ ..] => release_quarantined(parse_release_arguments(rest)?),
-        // Debug builds only: the focused proof applies the real mount-parent
-        // rule to an owned scratch directory.
-        #[cfg(debug_assertions)]
-        ["debug-check-parent", parent] => match volume::refuse_writable_parent(Path::new(parent)) {
-            Ok(()) => {
-                println!("parent accepted: {parent}");
-                Ok(0)
-            }
-            Err(reason) => {
-                println!("parent refused: {reason}");
-                Ok(1)
-            }
-        },
-        ["-h" | "--help"] | [] => {
-            println!("{USAGE}");
-            Ok(0)
-        }
         _ => Err(USAGE.to_owned()),
     }
 }
@@ -270,7 +248,6 @@ fn register(mount: &Path, reserve: u64, cap: u64, mode: DriveMode) -> Result<u8,
     // and mode are part of that: a group- or other-writable drive root lets
     // another process redirect the pool's payload.
     let binding = Binding::open(mount, None)?;
-    volume::refuse_unclosed_root(&binding)?;
     if !volume::writable(binding.mount_point())? {
         return Err(format!("{} is not writable", mount.display()));
     }
@@ -292,7 +269,6 @@ fn register(mount: &Path, reserve: u64, cap: u64, mode: DriveMode) -> Result<u8,
     }
     // Revalidate the root immediately before the first media write: the
     // registration is refused, not repaired, if it changed.
-    volume::refuse_unclosed_root(&binding)?;
     let facts = binding.verify()?;
     init_volume_pool(&control.join(POOL_DIR), &binding, PAYLOAD_DIR, cap)
         .map_err(|error| format!("cannot create the removable pool: {error}"))?;
@@ -308,6 +284,7 @@ fn register(mount: &Path, reserve: u64, cap: u64, mode: DriveMode) -> Result<u8,
         registered_ms: process::now_ms(),
         mode,
     };
+    registered_area(&removable_control(&control), &registration)?;
     write_registration(&control, &registration)?;
     println!(
         "registered removable pool on {} (volume {}, container {}): reserve {} MiB, admission cap {} MiB; payload {}/{PAYLOAD_DIR}",
@@ -641,22 +618,11 @@ pub(crate) fn read_registration(control: &Path) -> Result<Option<Registration>, 
     let Some(directory) = store::open_control_directory(control)? else {
         return Ok(None);
     };
-    read_registration_at(
-        &directory,
-        #[cfg(test)]
-        control,
-    )
+    read_registration_at(&directory)
 }
 
-/// Read the registration under an already-verified control directory
-/// descriptor, so a caller that pinned that directory witnesses the document
-/// of exactly the pinned control (oxide#235). The read is charged to the
-/// prune authority budget through [`crate::prune::authority_read`] whenever
-/// a window is active.
-pub(crate) fn read_registration_at(
-    directory: &File,
-    #[cfg(test)] control: &Path,
-) -> Result<Option<Registration>, String> {
+/// Read a bounded registration through the verified control descriptor.
+pub(crate) fn read_registration_at(directory: &File) -> Result<Option<Registration>, String> {
     let name = CString::new(REGISTRATION).map_err(|error| error.to_string())?;
     // SAFETY: `name` is a live CString with initialized bytes through its
     // terminator, and `directory` owns a live descriptor that anchors this
@@ -670,76 +636,17 @@ pub(crate) fn read_registration_at(
     };
     if fd < 0 {
         let error = std::io::Error::last_os_error();
-        #[cfg(test)]
-        let saved_errno = crate::tape::observer_errno();
-        #[cfg(test)]
-        crate::tape::read_row(
-            "removable:registration-open",
-            &control.join(REGISTRATION),
-            if error.kind() == std::io::ErrorKind::NotFound {
-                crate::tape::TapeOutcome::Absent
-            } else {
-                crate::tape::TapeOutcome::Refusal {
-                    reason: error.to_string(),
-                }
-            },
-            None,
-        );
-        #[cfg(test)]
-        crate::tape::restore_observer_errno(saved_errno);
         return if error.kind() == std::io::ErrorKind::NotFound {
             Ok(None)
         } else {
             Err(format!("cannot read the removable registration: {error}"))
         };
     }
-    #[cfg(test)]
-    {
-        let saved_errno = crate::tape::observer_errno();
-        crate::tape::read_row(
-            "removable:registration-open",
-            &control.join(REGISTRATION),
-            crate::tape::TapeOutcome::Facts {
-                facts: "opened; descriptor identity pending".to_owned(),
-            },
-            None,
-        );
-        crate::tape::restore_observer_errno(saved_errno);
-    }
-    // SAFETY: `fd` is a newly opened descriptor owned by this function.
+    // SAFETY: fd is newly opened and owned by this function.
     let file = unsafe { File::from_raw_fd(fd) };
-    #[cfg(not(test))]
     let metadata = file
         .metadata()
         .map_err(|error| format!("cannot read the removable registration: {error}"))?;
-    #[cfg(test)]
-    let metadata = {
-        let result = file.metadata();
-        let saved_errno = crate::tape::observer_errno();
-        match &result {
-            Ok(metadata) => crate::tape::read_row_dev(
-                "removable:registration-held",
-                &control.join(REGISTRATION),
-                metadata.dev(),
-                metadata.ino(),
-                crate::tape::TapeOutcome::Opened {
-                    dev: metadata.dev(),
-                    ino: metadata.ino(),
-                },
-                None,
-            ),
-            Err(error) => crate::tape::read_row(
-                "removable:registration-held",
-                &control.join(REGISTRATION),
-                crate::tape::TapeOutcome::Refusal {
-                    reason: error.to_string(),
-                },
-                None,
-            ),
-        }
-        crate::tape::restore_observer_errno(saved_errno);
-        result.map_err(|error| format!("cannot read the removable registration: {error}"))?
-    };
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     if !metadata.is_file()
@@ -750,18 +657,9 @@ pub(crate) fn read_registration_at(
         return Err("the removable registration is not a small owner-only regular file".to_owned());
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    #[cfg(not(test))]
-    crate::prune::authority_read(file.take(MAX_REGISTRATION_BYTES + 1), &mut bytes)
+    file.take(MAX_REGISTRATION_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read the removable registration: {error}"))?;
-    #[cfg(test)]
-    crate::prune::authority_read_observed(
-        &file,
-        &control.join(REGISTRATION),
-        "removable::read_registration",
-        MAX_REGISTRATION_BYTES,
-        &mut bytes,
-    )
-    .map_err(|error| format!("cannot read the removable registration: {error}"))?;
     if bytes.len() as u64 > MAX_REGISTRATION_BYTES {
         return Err("the removable registration exceeds its byte limit".to_owned());
     }
@@ -807,8 +705,6 @@ pub fn previous_registration(internal: &Store) -> Option<PathBuf> {
 
 /// The fixed facts `--confirm-writers-stopped` asserts and the command checks
 /// before any effect.
-const RELEASE_CHECKS: &str = "no process of this account holds a file open inside the slot tree; no process's working directory is inside it; the recorded holder pid is gone or is a different process; and the slot's record is retired, held and quarantined in this boot session";
-
 struct ReleaseArguments<'a> {
     slot: &'a str,
     dry_run: bool,
@@ -841,101 +737,18 @@ fn parse_release_arguments<'a>(arguments: &'a [&'a str]) -> Result<ReleaseArgume
     })
 }
 
-/// Release and delete whole a slot quarantined in this boot session (oxide#196).
-/// The operator's flag is required before anything is read; the descriptor
-/// census and the record verification decide, and every refusal changes
-/// nothing.
+/// Legacy generations did not acquire a Barge hold. A newly acquired lock
+/// cannot establish closure for their earlier writers, so these roots stay
+/// retained instead of receiving new deletion authority.
 fn release_quarantined(arguments: ReleaseArguments<'_>) -> Result<u8, String> {
-    let slot = arguments.slot;
     if !arguments.confirmed {
-        return Err(format!(
-            "refusing to release slot {slot}: --confirm-writers-stopped is required first.\nIt would check that {RELEASE_CHECKS}. Stop every writer, then re-run with --confirm-writers-stopped."
-        ));
-    }
-    if !cfg!(target_os = "macos") {
-        return Err("the removable apfs-volume-v1 backend is macOS-only".to_owned());
-    }
-    // The selected internal pool is read without its lock, reconciliation or
-    // any write: `--dry-run` must change nothing, and the selection only names
-    // the removable control to open.
-    let settings = store::settings()?;
-    let Some(internal) = Store::open_recorded(&settings)? else {
-        return Err("no pool exists".to_owned());
-    };
-    let Some(registration) = registration(&internal)? else {
-        return Err(format!(
-            "slot {slot} is not quarantined: no removable pool is registered in {}",
-            internal.pool.display()
-        ));
-    };
-    // The census reads the slot tree and the recorded holder, so the tree has
-    // to be present: an absent volume is named, never treated as "no
-    // writers".
-    let bound = Binding::open(
-        &registration.mount_point,
-        Some(&registration.volume_uuid),
-    )
-    .map_err(|error| {
-        format!(
-            "the removable volume {} is not attached ({error}); slot {slot}'s tree is not present, so nothing was released",
-            registration.mount_point.display()
-        )
-    })?;
-    drop(bound);
-    let root = internal.control().join(POOL_DIR);
-    // The preflight is read-only in both modes: the record and the census are
-    // read from a passive snapshot and the OS, so an invalid slot or an
-    // UNKNOWN census refuses before the effect store is opened, reconciled or
-    // fenced.
-    let recorded = Store::open_recorded_removable(&root, internal.max_active())?;
-    let (quarantined, summary) =
-        recorded.preflight_release(slot, |path, holder| crate::census::verify(path, holder))?;
-    if arguments.dry_run {
-        println!(
-            "would release quarantined slot {slot} in {}: {}; census: {}; operator confirmed writers stopped; nothing changed",
-            recorded.pool.display(),
-            recorded_size(quarantined.recorded_bytes),
-            census_line(&summary)
+        return Err(
+            "--confirm-writers-stopped is required; legacy quarantined roots are retained"
+                .to_owned(),
         );
-        return Ok(0);
     }
-    // Only a slot that passed the read-only preflight reaches the effect. The
-    // recorded store takes the admission lock without fencing and re-reads the
-    // record under it before any fence, reconciliation or write, so a racing
-    // change refuses with no effect.
-    let released = recorded.release_quarantined(&quarantined)?;
-    println!(
-        "released quarantined slot {} in {}: {}; census: {}; operator confirmed writers stopped",
-        released.slot_id,
-        recorded.pool.display(),
-        recorded_size(released.recorded_bytes),
-        census_line(&summary)
-    );
-    eprintln!(
-        "oxide: deleted slot {} {}",
-        released.slot_id, released.reported
-    );
-    // Delete the renamed tree outside the pool lock, named by this release.
-    // One bounded pass: a tree that cannot finish stays recorded and charged,
-    // and a later command resumes it.
-    let mut sweep =
-        crate::HoldingSweep::start(recorded.pool.clone(), released.holding.first().cloned());
-    sweep.finish();
-    Ok(0)
-}
-
-fn recorded_size(bytes: Option<u64>) -> String {
-    bytes.map_or_else(
-        || "size unknown".to_owned(),
-        |bytes| crate::cargo_home::size(bytes),
-    )
-}
-
-fn census_line(summary: &crate::census::Summary) -> String {
-    format!(
-        "{} same-uid processes, {} descriptors, {} platform-hidden, {} dead handles; {}",
-        summary.processes, summary.descriptors, summary.hidden, summary.dead, summary.holder
-    )
+    let _ = arguments.dry_run;
+    Err(format!("legacy quarantined slot {} is retained: it has no cooperative Barge hold history; this command cannot establish ownership for deletion", arguments.slot))
 }
 
 /// Whether the internal pool holds `slot`; otherwise a removable one may.
@@ -954,12 +767,9 @@ pub fn previous_registration_refusal(previous: &Path) -> String {
     )
 }
 
-/// Decide, when a build starts, whether it uses the removable pool: the
-/// registered volume is the mounted root at its mount point (rechecked on an
-/// open descriptor), `/Volumes` stays non-writable, the volume is writable
-/// and its available space is above the reserve. Otherwise the internal
-/// pool. Nothing is created here; the removable pool was created at
-/// registration and the library rebinds the volume on every open.
+/// Select the registered Barge location. Only positive drive absence uses
+/// the internal pool, with a warning. Identity uncertainty and mismatch
+/// refuse; byte pressure stays on the selected volume.
 pub fn select(internal: Store) -> Result<Selected, String> {
     let Some(registration) = registration(&internal)? else {
         let note = previous_registration(&internal).map(|previous| {
@@ -981,86 +791,142 @@ pub fn select(internal: Store) -> Result<Selected, String> {
         .control()
         .join(POOL_DIR)
         .join(oxide_storage::lease::MANAGED_NAME);
-    match usable(&internal, &registration) {
-        Ok(store) => {
-            let note = format!(
-                "removable volume {} selected",
-                registration.mount_point.display()
-            );
-            Ok(Selected {
-                store: store.with_sibling(internal.control(), true),
-                note: Some(note),
-                removable: true,
-                mode: Some(registration.mode),
-                fallback_reason: None,
-                registration: Some(registration),
-            })
-        }
-        Err(reason) => Ok(Selected {
+    let area = registered_area(&control, &registration)?;
+    let absent = match &area {
+        None => true,
+        Some(area) => match area.volume().state().map_err(|error| error.to_string())? {
+            barge::VolumeState::Absent => true,
+            barge::VolumeState::Present => false,
+            barge::VolumeState::Mismatch { registered, found } => {
+                return Err(format!("removable volume identity mismatch: expected {registered}, found {found}; refusing fallback"));
+            }
+        },
+    };
+    if absent {
+        let reason = format!(
+            "registered volume {} is absent",
+            registration.mount_point.display()
+        );
+        return Ok(Selected {
             store: internal.with_sibling(&control, false),
-            note: Some(format!(
-                "internal pool: removable volume not used ({reason})"
-            )),
+            note: Some(format!("internal pool: {reason}")),
             removable: false,
             mode: Some(registration.mode),
             fallback_reason: Some(reason),
             registration: None,
-        }),
+        });
     }
+    let area = area.ok_or("the removable storage area is unavailable")?;
+    require_location(&area)?;
+    verified_registration(&control, &registration)?;
+    let store = Store::open_removable(
+        &internal.control().join(POOL_DIR),
+        registration.mount_point.join(PAYLOAD_DIR),
+        internal.max_active(),
+    )?;
+    Ok(Selected {
+        store: store.with_sibling(internal.control(), true),
+        note: Some(format!(
+            "removable volume {} selected",
+            registration.mount_point.display()
+        )),
+        removable: true,
+        mode: Some(registration.mode),
+        fallback_reason: None,
+        registration: Some(registration),
+    })
 }
 
-/// The existing checks that decide whether a registered volume is usable for
-/// the next build. They probe the volume and run `diskutil`; `oxide status`
-/// runs them only in measured mode.
-fn verified(internal: &Store, registration: &Registration) -> Result<(), String> {
-    let _ = internal;
-    verified_registration(registration)
+/// Import the caller-validated legacy registration once, then let Barge own
+/// identity and area routing. An absent legacy drive is left untouched until
+/// it returns; a missing identity is an error, never absence.
+fn registered_area(
+    control: &Path,
+    registration: &Registration,
+) -> Result<Option<barge::Area>, String> {
+    let storage = Storage::open(control)?;
+    declare_registered_area(&storage, registration)
 }
 
-/// The same volume checks, without an `internal` store: the seed's removable
-/// start gate re-verifies the mount/volume-UID binding and the registration's
-/// reserve inside its admission lifetime (§8.3), so a volume that vanished or
-/// was remounted after selection refuses before any donor payload is read.
-pub(crate) fn verified_registration(registration: &Registration) -> Result<(), String> {
-    if !cfg!(target_os = "macos") {
-        return Err("the removable backend is macOS-only".to_owned());
+fn declare_registered_area(
+    storage: &Storage,
+    registration: &Registration,
+) -> Result<Option<barge::Area>, String> {
+    match storage.known_volume("pool") {
+        Ok(volume) => {
+            let spec = volume.spec();
+            if spec.mount != registration.mount_point
+                || !spec.uuid.eq_ignore_ascii_case(&registration.volume_uuid)
+            {
+                return Err("the Oxide registration differs from its Barge volume; refusing to reinterpret it".to_owned());
+            }
+            if volume.state().map_err(|error| error.to_string())? == barge::VolumeState::Present
+                && (spec.reserve_bytes != registration.reserve_bytes
+                    || spec.floor_bytes
+                        != oxide_storage::storage::reserve_floor(registration.reserve_bytes))
+            {
+                storage.register_volume(
+                    "pool",
+                    &registration.mount_point,
+                    Some(&registration.volume_uuid),
+                    "",
+                    registration.reserve_bytes,
+                    oxide_storage::storage::reserve_floor(registration.reserve_bytes),
+                )?;
+            }
+        }
+        Err(_) => {
+            if oxide_storage::storage::OxideOs
+                .volume_identity(&registration.mount_point)
+                .map_err(|error| error.to_string())?
+                .is_none()
+            {
+                return Ok(None);
+            }
+        }
     }
-    let binding = Binding::open(&registration.mount_point, Some(&registration.volume_uuid))?;
-    if !volume::writable(binding.mount_point())? {
-        return Err("the volume is not writable".to_owned());
-    }
-    // Container, boot/data and role exclusions again: a registered volume
-    // may since have gained a role or moved. Unknown metadata refuses.
-    let identity = disk_identity(binding.mount_point(), binding.uuid(), &plist)?;
-    check_identity(&identity, Some(&registration.container_uuid))?;
-    let available = binding
-        .verify()?
-        .available_bytes
-        .ok_or("the volume's free space is unknown")?;
-    if available <= registration.reserve_bytes {
-        return Err(format!(
-            "{} MiB available is not above the {} MiB reserve",
-            available / MIB,
-            registration.reserve_bytes / MIB
+    let config = AreaConfig::new("pool", &registration.mount_point, "pool")
+        .uuid(Some(registration.volume_uuid.clone()))
+        .folder(format!("{PAYLOAD_DIR}/slots"))
+        .soft_cap_bytes(Some(registration.cap_bytes))
+        .reserve_bytes(registration.reserve_bytes)
+        .floor_bytes(oxide_storage::storage::reserve_floor(
+            registration.reserve_bytes,
         ));
+    storage.declare(&config).map(Some)
+}
+
+fn require_location(area: &barge::Area) -> Result<PathBuf, String> {
+    match area.location().map_err(|error| error.to_string())? {
+        barge::Location::Volume(path) | barge::Location::Fallback(path) => Ok(path),
+        barge::Location::Unavailable(reason) => Err(reason),
+    }
+}
+
+/// Recheck Barge's location before a removable child/seed starts. Reserve is
+/// a pruning signal, not a reason to switch to another volume.
+pub(crate) fn verified_registration(
+    control: &Path,
+    registration: &Registration,
+) -> Result<(), String> {
+    let area = registered_area(control, registration)?.ok_or_else(|| {
+        format!(
+            "registered volume {} is absent",
+            registration.mount_point.display()
+        )
+    })?;
+    require_location(&area)?;
+    if !volume::writable(&registration.mount_point)? {
+        return Err("the volume is not writable".to_owned());
     }
     Ok(())
 }
 
-/// The removable store if the registered volume is usable now.
-fn usable(internal: &Store, registration: &Registration) -> Result<Store, String> {
-    verified(internal, registration)?;
-    Store::open_removable(
-        &internal.control().join(POOL_DIR),
-        registration.mount_point.join(PAYLOAD_DIR),
-        internal.max_active(),
-    )
-}
-
-/// The recorded removable store if the volume is verified now, opened
-/// without the pool lock and without reconciling anything (oxide#128).
+/// Passive status validates location without running pruning or admission.
 fn usable_recorded(internal: &Store, registration: &Registration) -> Result<Store, String> {
-    verified(internal, registration)?;
+    // Status observes platform facts without importing a registration or
+    // declaring an area. It grants no hold, ownership or deletion authority.
+    Binding::open(&registration.mount_point, Some(&registration.volume_uuid))?.verify()?;
     Store::open_recorded_removable(&internal.control().join(POOL_DIR), internal.max_active())
 }
 
@@ -1072,21 +938,9 @@ pub fn coordinate(internal: Option<Store>) -> Result<Option<Store>, String> {
         return Ok(None);
     };
     if registration(&internal)?.is_none() {
-        #[cfg(test)]
-        crate::tape::classify_row(
-            "removable:coordinate",
-            &internal.control().display().to_string(),
-            "no-registration; internal pool only",
-        );
         return Ok(Some(internal));
     }
     let control = removable_control(internal.control());
-    #[cfg(test)]
-    crate::tape::classify_row(
-        "removable:coordinate",
-        &internal.control().display().to_string(),
-        &format!("sibling-control={}", control.display()),
-    );
     Ok(Some(internal.with_sibling(&control, false)))
 }
 
@@ -1228,6 +1082,86 @@ mod tests {
                 let _ = fs::remove_dir_all(root);
             }
         }
+    }
+
+    #[test]
+    fn registered_barge_location_refuses_absence_and_wrong_volume() {
+        let temp = barge::testing::TempDir::new("oxide-removable-location").unwrap();
+        let mount = temp.path().join("drive");
+        fs::create_dir(&mount).unwrap();
+        let mut registration = registration(DriveMode::Permanent);
+        registration.mount_point = mount.clone();
+        registration.reserve_bytes = 20 << 30;
+        let os = barge::FakeOs::with_volume(&mount, &registration.volume_uuid, 100 << 30);
+        let storage = Storage::open_with(
+            temp.path().join("state"),
+            Arc::new(os.clone()),
+            Arc::new(barge::ManualClock::new(1)),
+        )
+        .unwrap();
+        storage
+            .register_volume(
+                "pool",
+                &mount,
+                Some(&registration.volume_uuid),
+                "",
+                registration.reserve_bytes,
+                oxide_storage::storage::reserve_floor(registration.reserve_bytes),
+            )
+            .unwrap();
+        let area = declare_registered_area(&storage, &registration)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            require_location(&area).unwrap(),
+            mount.join("oxide-pool/slots")
+        );
+        os.set_uuid(&mount, None);
+        assert!(require_location(&area).unwrap_err().contains("absent"));
+        os.set_uuid(&mount, Some("11111111-2222-3333-4444-555555555555"));
+        assert!(require_location(&area)
+            .unwrap_err()
+            .contains("not the registered"));
+        os.set_uuid(&mount, Some(&registration.volume_uuid));
+        assert_eq!(
+            require_location(&area).unwrap(),
+            mount.join("oxide-pool/slots")
+        );
+    }
+
+    #[test]
+    fn low_space_stays_on_registered_volume_and_admission_refuses_at_floor() {
+        let temp = barge::testing::TempDir::new("oxide-removable-floor").unwrap();
+        let mount = temp.path().join("drive");
+        fs::create_dir(&mount).unwrap();
+        let mut registration = registration(DriveMode::Ephemeral);
+        registration.mount_point = mount.clone();
+        registration.reserve_bytes = 1 << 20;
+        let os = barge::FakeOs::with_volume(&mount, &registration.volume_uuid, 0);
+        let storage = Storage::open_with(
+            temp.path().join("state"),
+            Arc::new(os.clone()),
+            Arc::new(barge::ManualClock::new(1)),
+        )
+        .unwrap();
+        storage
+            .register_volume(
+                "pool",
+                &mount,
+                Some(&registration.volume_uuid),
+                "",
+                registration.reserve_bytes,
+                oxide_storage::storage::reserve_floor(registration.reserve_bytes),
+            )
+            .unwrap();
+        let area = declare_registered_area(&storage, &registration)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            require_location(&area).unwrap(),
+            mount.join("oxide-pool/slots")
+        );
+        assert!(storage.admit("pool").is_err());
     }
 
     fn legacy_registration_bytes() -> Vec<u8> {
@@ -1473,8 +1407,10 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.contains("--confirm-writers-stopped"), "{error}");
-        assert!(error.contains("would check"), "{error}");
-        assert!(error.contains("holds a file open"), "{error}");
+        assert!(
+            error.contains("legacy quarantined roots are retained"),
+            "{error}"
+        );
     }
 
     /// The release grammar is fixed: one slot, each flag at most once, and no
