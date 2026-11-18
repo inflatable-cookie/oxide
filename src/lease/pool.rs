@@ -41,12 +41,9 @@ pub struct LeaseRequest {
     /// at creation. It drives admission and whole-idle-slot eviction only;
     /// nothing enforces it while a build writes.
     pub budget_bytes: Option<u64>,
-    /// The registered removable volume's free-space reserve, when the caller
-    /// owns that fact. It is a **reserve** signal, never a pool-budget input:
-    /// an unknown pool size admits on positively measured free space above
-    /// this reserve, and free space at or below it prunes eligible idle whole
-    /// slots until it recovers, with a named hard floor deciding when nothing
-    /// is left to prune.
+    /// The registered removable volume's free-space reserve, separate from
+    /// the pool budget. Below reserve, admission tries idle slots until free
+    /// space recovers or no eligible root remains. The floor decides refusal.
     pub reserve_bytes: Option<u64>,
     /// Where a new slot goes. `None` keeps the legacy `slots/<id>` path.
     pub layout: Option<SlotLayout>,
@@ -1674,16 +1671,12 @@ impl Pool {
             }
         }
         let candidate = self.idle_compatible(&project, request.profile);
-        if self.is_removable() {
-            if candidate.is_some() {
-                // Warm reuse checks the floor without pruning another root.
-                let space = self.volume_space()?;
-                if space.free_bytes < space.floor_bytes {
-                    return Err(LeaseError::Full);
-                }
-            } else {
-                self.evict_for_reserve()?;
-            }
+        if self
+            .storage
+            .as_ref()
+            .is_some_and(crate::storage::PoolStorage::is_removable)
+        {
+            self.evict_for_reserve(candidate.map(|(id, _)| id))?;
         }
         // One-use workspaces are dormant; their bounded slice report is still
         // returned so a caller sees the outcome it supplied.
@@ -2034,10 +2027,6 @@ impl Pool {
     }
 
     /// Whether this pool's roots live on a removable volume.
-    fn is_removable(&self) -> bool {
-        matches!(self.backing, Payload::Volume { .. })
-    }
-
     /// Sweep owned trash a crash left behind.
     fn sweep_trash(&self) -> Result<(), LeaseError> {
         if let Some(storage) = self.storage.as_ref() {
@@ -2154,9 +2143,13 @@ impl Pool {
             .map_err(|_| LeaseError::UnknownAccounting)
     }
 
-    fn evict_for_reserve(&mut self) -> Result<(), LeaseError> {
+    fn evict_for_reserve(&mut self, reuse: Option<u64>) -> Result<(), LeaseError> {
         let mut space = self.volume_space()?;
-        while space.free_bytes < space.reserve_bytes && self.evict_one_idle_with(|_| true)? {
+        // Keep the compatible root the admission is about to claim. Reread
+        // actual free space after every completed eviction.
+        while space.free_bytes < space.reserve_bytes
+            && self.evict_one_idle_with(|id| Some(id) != reuse)?
+        {
             space = self.volume_space()?;
         }
         if space.free_bytes < space.floor_bytes {
@@ -3168,4 +3161,131 @@ pub(super) fn with_passive_open_delay<T>(
     }
     let _restore = Restore(PASSIVE_OPEN_DELAY.with(|slot| slot.replace(delay)));
     body()
+}
+
+#[cfg(test)]
+mod reserve_tests {
+    use super::*;
+    use crate::lease::tests::{request, Fixture};
+    use crate::storage::{count_pool_walks, PoolBacking, PoolStorage, PoolWalk, Storage};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct ScriptedSpace {
+        volume: barge::FakeOs,
+        reads: Mutex<VecDeque<u64>>,
+    }
+
+    impl barge::Os for ScriptedSpace {
+        fn volume_identity(&self, mount: &Path) -> barge::Result<Option<String>> {
+            barge::Os::volume_identity(&self.volume, mount)
+        }
+
+        fn free_bytes(&self, _mount: &Path) -> barge::Result<u64> {
+            self.reads
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| barge::Error::unknown_state("unexpected free-space read"))
+        }
+    }
+
+    #[test]
+    fn removable_admission_reads_space_and_evicts_only_needed_ledger_roots() {
+        const UUID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+        const RESERVE: u64 = 4 << 20;
+        let fixture = Fixture::new("removable-reserve");
+        let pool = fixture.pool();
+        let workspace = fixture.dir("workspace");
+        let mut opened = Pool::open(&pool).unwrap();
+        // Only mount identity and free-space readings are synthetic. The
+        // leases, records, locks and evictions use the real fixture tree.
+        let os = Arc::new(ScriptedSpace {
+            volume: barge::FakeOs::with_volume(pool.clone(), UUID, RESERVE),
+            reads: Mutex::new(VecDeque::new()),
+        });
+        let account = Storage::open_with(
+            fixture.dir("account"),
+            os.clone(),
+            Arc::new(barge::ManualClock::new(1_000)),
+        )
+        .unwrap();
+        let storage = PoolStorage::from_storage(
+            account,
+            &PoolBacking::volume(&pool, UUID, "payload", 8 << 20, RESERVE, RESERVE / 2),
+        )
+        .unwrap();
+        opened.storage = Some(storage.clone());
+
+        *os.reads.lock().unwrap() = [RESERVE / 2 - 1].into();
+        let (refused, walks) = count_pool_walks(|| {
+            opened.lease(&request(&pool, &fixture.dir("floor"), &workspace, "floor"))
+        });
+        assert!(matches!(refused, Err(LeaseError::Full)));
+        assert!(walks.is_empty());
+
+        let mut projects = Vec::new();
+        let mut roots = Vec::new();
+        for i in 0..24 {
+            let project = fixture.dir(&format!("project-{i}"));
+            *os.reads.lock().unwrap() = [RESERVE + 1].into();
+            let leased = opened
+                .lease(&request(&pool, &project, &workspace, "first"))
+                .unwrap();
+            let slot = opened.ledger.slots.last().unwrap();
+            roots.push(slot.root.clone().unwrap());
+            opened.release_or_recover(&leased.grant.lease_id).unwrap();
+            projects.push(project);
+        }
+
+        let new_project = fixture.dir("new");
+        for (project, reused) in [(&projects[0], true), (&new_project, false)] {
+            *os.reads.lock().unwrap() = [RESERVE + 1].into();
+            let (leased, walks) =
+                count_pool_walks(|| opened.lease(&request(&pool, project, &workspace, "above")));
+            let leased = leased.unwrap();
+            assert_eq!(leased.grant.reused_slot, reused);
+            assert!(walks.is_empty());
+            assert!(os.reads.lock().unwrap().is_empty());
+            opened.release_or_recover(&leased.grant.lease_id).unwrap();
+        }
+
+        storage.pin_in(None, &roots[1], "protected").unwrap();
+        let hold = storage.hold(&roots[2]).unwrap();
+        // The first free-space reread is still short. The second reaches
+        // reserve, so the next eligible root must remain untouched.
+        *os.reads.lock().unwrap() = [RESERVE - 2, RESERVE - 1, RESERVE].into();
+        let (warm, walks) =
+            count_pool_walks(|| opened.lease(&request(&pool, &projects[3], &workspace, "below")));
+        let warm = warm.unwrap();
+        assert!(warm.grant.reused_slot);
+        assert_eq!(
+            walks,
+            vec![
+                PoolWalk::Evict(roots[4].clone()),
+                PoolWalk::Evict(roots[5].clone())
+            ]
+        );
+        assert!(os.reads.lock().unwrap().is_empty());
+        opened.release_or_recover(&warm.grant.lease_id).unwrap();
+        drop(warm);
+
+        *os.reads.lock().unwrap() = [RESERVE - 1, RESERVE].into();
+        let (fresh, walks) = count_pool_walks(|| {
+            opened.lease(&request(
+                &pool,
+                &fixture.dir("new-below"),
+                &workspace,
+                "new-below",
+            ))
+        });
+        assert!(!fresh.unwrap().grant.reused_slot);
+        assert_eq!(walks, vec![PoolWalk::Evict(roots[6].clone())]);
+        assert!(os.reads.lock().unwrap().is_empty());
+        for index in [1, 2, 3, 7] {
+            assert!(storage.resolve(&roots[index]).is_ok());
+        }
+        drop(hold);
+    }
 }

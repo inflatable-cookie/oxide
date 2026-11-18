@@ -1,1 +1,1 @@
-Restore recorded slot sizes for build admission and let closed, adopted legacy slots be evicted.
+Restore walk-free slot budget and removable reserve checks, and let closed legacy slots be evicted.

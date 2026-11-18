@@ -59,9 +59,10 @@ after recipient writes, failure cannot publish a trusted origin.
 ## Capacity and eviction
 
 Budgets remain soft admission figures. New-slot admission uses recorded
-logical bytes against the pool budget. It checks removable free space against
-Barge's reserve and floor and rereads free space after each reserve eviction.
-Warm reuse checks the floor without evicting another slot. Low space never
+logical bytes against the pool budget. Both new-slot and warm admission read
+removable free space against Barge's reserve and floor. Below reserve, they can
+evict idle ledger candidates by ID and reread free space after each eviction.
+The intended warm root stays out of that candidate set. Low space never
 silently selects another volume.
 
 Eviction takes an exclusive nonblocking hold and rechecks the durable pin

@@ -723,7 +723,7 @@ impl PoolStorage {
 
     /// Whether the pool's roots are on a removable volume.
     pub fn is_removable(&self) -> bool {
-        self.location.on_volume()
+        self.backing.removable && self.location.on_volume()
     }
 
     /// The declared area, or the sub-area for one project folder.

@@ -151,7 +151,10 @@ New-slot admission reads the Oxide ledger's logical-byte observations and
 walks only rows missing a current observation. Count, byte and reserve
 pressure can choose a ranked idle slot and call Barge eviction for that
 root alone. Barge rechecks the actual hold, pin and marker and handles
-trash. Explicit inventory and output pruning can still use Barge listings.
+trash. Removable admission checks free space through Barge. It only starts
+reserve eviction below the reserve and rereads free space after each eviction.
+Warm reuse above the reserve needs no other root. Explicit inventory and output
+pruning can still use Barge listings.
 
 Selecting a volume, refusing a mismatch, falling back while the drive is away
 and reporting the fallback in status are ordinary behaviour and do not wait on

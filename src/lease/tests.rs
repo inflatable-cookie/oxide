@@ -14,12 +14,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
-struct Fixture {
+pub(super) struct Fixture {
     path: PathBuf,
 }
 
 impl Fixture {
-    fn new(label: &str) -> Self {
+    pub(super) fn new(label: &str) -> Self {
         let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
@@ -33,13 +33,13 @@ impl Fixture {
         Self { path }
     }
 
-    fn pool(&self) -> PathBuf {
+    pub(super) fn pool(&self) -> PathBuf {
         let pool = self.path.join("pool");
         managed::init_budget_pool(&pool, 8 << 20).expect("pool");
         pool
     }
 
-    fn dir(&self, name: &str) -> PathBuf {
+    pub(super) fn dir(&self, name: &str) -> PathBuf {
         let path = self.path.join(name);
         fs::create_dir_all(&path).unwrap();
         path
@@ -52,7 +52,7 @@ impl Drop for Fixture {
     }
 }
 
-fn request(pool: &Path, project: &Path, workspace: &Path, holder: &str) -> LeaseRequest {
+pub(super) fn request(pool: &Path, project: &Path, workspace: &Path, holder: &str) -> LeaseRequest {
     LeaseRequest {
         pool: pool.to_path_buf(),
         project: project.to_path_buf(),
