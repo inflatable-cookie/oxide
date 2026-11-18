@@ -140,8 +140,9 @@ duplicate ID. Importing many old rows into one area can therefore take
 quadratic work. Lease admission, release and status never call adoption.
 
 An eligible idle legacy row is adopted in place without a durable pin.
-Preparation removes the old migration pin on a recorded, unfinished idle
-transition after confirming the former holder is absent. Still-held or
+Preparation can remove the old migration pin after matching the unfinished
+idle transition's root and confirming the former holder is absent. This
+includes an interruption before the root ID was recorded. Still-held or
 unverifiable rows remain unavailable. A refused row stays unowned and an
 unrecorded stray at a retired folder is never adopted. Every transition test
 uses fresh temporary fixtures.

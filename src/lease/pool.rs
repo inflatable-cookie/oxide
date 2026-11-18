@@ -1519,40 +1519,49 @@ impl Pool {
                 .area_for(slot.area_folder())
                 .map_err(|_| LeaseError::UnknownAccounting)?;
             let adopted = match area.resolve(&id) {
-                Ok(root) => root.path == path && root.label == label,
-                Err(error) if error.kind() == barge::ErrorKind::NotFound => {
-                    // A published id is never attached to a replacement path.
-                    if slot.root.is_some() {
-                        continue;
-                    }
-                    match storage.adopt_in(slot.area_folder(), leaf, label, &id) {
-                        Ok(root) => root.path == path,
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                barge::ErrorKind::Refused | barge::ErrorKind::NotFound
-                            ) =>
-                        {
-                            false
-                        }
-                        Err(_) => return Err(LeaseError::UnknownAccounting),
-                    }
-                }
-                Err(_) => return Err(LeaseError::UnknownAccounting),
-            };
-            if adopted {
-                if slot.root.as_deref() == Some(&id) {
-                    // #314 placed a migration pin on these unfinished rows.
-                    // A fresh adoption publishes no pin. Removal uses Barge's
-                    // API and is idempotent if a prior attempt removed it.
+                Ok(root)
+                    if root.path == path
+                        && root.label == label
+                        && slot.root.as_deref().is_none_or(|recorded| recorded == id)
+                        && fs::symlink_metadata(&path).is_ok_and(|metadata| {
+                            metadata.is_dir()
+                                && metadata.uid() == current_uid()
+                                && metadata.mode() & 0o022 == 0
+                        }) =>
+                {
+                    // #314 reserved these unfinished legacy roots for a
+                    // migration pin, which it published before the ledger ID.
+                    // A retry of a newer adoption can find an unpinned root.
                     match area.unpin(&id) {
                         Ok(()) => {}
                         Err(error) if error.kind() == barge::ErrorKind::NotFound => {}
                         Err(_) => return Err(LeaseError::UnknownAccounting),
                     }
-                } else if slot.root.is_some() {
-                    return Err(LeaseError::UnknownAccounting);
+                    true
                 }
+                Ok(_) => false,
+                Err(error) if error.kind() == barge::ErrorKind::NotFound => {
+                    // A published id is never attached to a replacement path.
+                    if slot.root.is_some() {
+                        false
+                    } else {
+                        match storage.adopt_in(slot.area_folder(), leaf, label, &id) {
+                            Ok(root) => root.path == path,
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    barge::ErrorKind::Refused | barge::ErrorKind::NotFound
+                                ) =>
+                            {
+                                false
+                            }
+                            Err(_) => return Err(LeaseError::UnknownAccounting),
+                        }
+                    }
+                }
+                Err(_) => return Err(LeaseError::UnknownAccounting),
+            };
+            if adopted {
                 let slot = &mut self.ledger.slots[index];
                 slot.root = Some(id);
                 slot.owned = true;

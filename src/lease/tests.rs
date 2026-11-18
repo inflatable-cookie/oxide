@@ -573,27 +573,36 @@ fn an_idle_legacy_root_stays_out_of_eviction_while_its_old_holder_lives() {
 
 #[test]
 fn a_previous_migration_pin_is_removed_once_even_without_a_warm_grant() {
-    let fixture = Fixture::new("legacy-pinned");
-    let pool = fixture.pool();
-    let path = slot_dir(&pool, "62");
-    let project = fixture.dir("project");
-    write_legacy_ledger(&pool, "idle", None, 62, project.to_str().unwrap());
-    managed::prepare_pool(&pool).expect("adopt legacy root");
-    let storage = fixture_storage(&pool);
-    let (_, root) = storage.all_roots().unwrap().remove(0);
-    storage.pin_in(None, &root.id, "legacy generation").unwrap();
-    update_ledger(&pool, |ledger| ledger["slots"][0]["owned"] = false.into());
+    // The old version published the pin before it wrote the root ID.
+    for published_root_id in [true, false] {
+        let fixture = Fixture::new("legacy-pinned");
+        let pool = fixture.pool();
+        let path = slot_dir(&pool, "62");
+        let project = fixture.dir("project");
+        write_legacy_ledger(&pool, "idle", None, 62, project.to_str().unwrap());
+        managed::prepare_pool(&pool).expect("adopt legacy root");
+        let storage = fixture_storage(&pool);
+        let (_, root) = storage.all_roots().unwrap().remove(0);
+        storage.pin_in(None, &root.id, "legacy generation").unwrap();
+        update_ledger(&pool, |ledger| {
+            let row = ledger["slots"][0].as_object_mut().unwrap();
+            row.remove("owned");
+            if !published_root_id {
+                row.remove("root");
+            }
+        });
 
-    let (prepared, walks) = count_pool_walks(|| managed::prepare_pool(&pool));
-    prepared.expect("finish the prior transition");
-    assert!(walks.is_empty());
-    assert!(!storage.all_roots().unwrap()[0].1.pinned);
-    storage.pin_in(None, &root.id, "keep").unwrap();
-    managed::prepare_pool(&pool).expect("no further migration");
-    assert!(storage.all_roots().unwrap()[0].1.pinned);
-    storage.unpin_in(None, &root.id).unwrap();
-    managed::evict_idle_slot(&pool, "62").expect("evict after removing the independent pin");
-    assert!(!path.exists());
+        let (prepared, walks) = count_pool_walks(|| managed::prepare_pool(&pool));
+        prepared.expect("finish the prior transition");
+        assert!(walks.is_empty());
+        assert!(!storage.all_roots().unwrap()[0].1.pinned);
+        storage.pin_in(None, &root.id, "keep").unwrap();
+        managed::prepare_pool(&pool).expect("no further migration");
+        assert!(storage.all_roots().unwrap()[0].1.pinned);
+        storage.unpin_in(None, &root.id).unwrap();
+        managed::evict_idle_slot(&pool, "62").expect("evict after removing the independent pin");
+        assert!(!path.exists());
+    }
 }
 
 #[test]
