@@ -544,8 +544,8 @@ pub struct HoldingEntry {
 
 /// Ledger membership of an opened pool, for callers that need no sizes.
 /// It has no byte or coverage fields, so a walk it skipped cannot read as
-/// zero or complete. Opening it is [`managed::status`]'s opening, including
-/// recorded-deletion reconciliation, so it is not side-effect-free.
+/// zero or complete. Its locked open can reconcile recorded evictions and
+/// abandoned holds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LedgerView {
     pub store_id: String,
@@ -580,13 +580,13 @@ pub struct PassiveSnapshot {
     /// never infers that their recorded deletion can finish.
     pub evicting_slot_ids: Vec<String>,
     /// The sum of the *current* recorded per-slot observations (oxide#146), or
-    /// `None` when no idle slot carries a current one. This is the recorded
+    /// `None` when no slot carries a current one. This is the recorded
     /// admission basis, never free space; the oxide#128 sidecar facts are a
     /// separate diagnostic source and are never added to it.
     pub recorded_total: Option<u64>,
-    /// Idle slots whose record is current.
+    /// Slots whose record is current.
     pub recorded_slots: usize,
-    /// Idle slots with no current record: they make `recorded_total` a stated
+    /// Slots with no current record: they make `recorded_total` a stated
     /// lower bound and are walked by the next admission that needs them.
     pub unrecorded_slots: usize,
     /// Held trees pending deletion outside the pool lock (oxide#190). They are
@@ -613,17 +613,15 @@ pub struct MeasuredPool {
     pub status: PoolStatus,
 }
 
-/// A closed per-slot size observation, as recorded in the ledger. It is a
-/// measurement taken at a closing transition, not a claim that the slot's
-/// bytes are immutable, that its writer closed or that a volume is closed.
-/// `current` says only whether it still matches its idle slot generation.
+/// A logical-byte observation of one slot generation, recorded by release
+/// or admission. A matching generation does not make the observation live
+/// or establish writer closure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecordedFact {
-    pub unique_allocated_bytes: u64,
     pub logical_bytes: u64,
     pub entries: u64,
     pub at_ms: u64,
-    /// This record still matches its idle slot generation.
+    /// This record still matches its slot generation.
     pub current: bool,
 }
 
@@ -642,7 +640,7 @@ pub struct LedgerSlot {
     pub dir: Option<String>,
     /// As [`SlotStatus::rank`].
     pub rank: u64,
-    /// The closed size observation this record holds, if any.
+    /// The recorded logical-byte observation, if any.
     pub recorded: Option<RecordedFact>,
 }
 
