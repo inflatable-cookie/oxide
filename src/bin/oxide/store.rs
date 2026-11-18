@@ -29,7 +29,7 @@ use crate::watchdog::Watchdog;
 pub(crate) use oxide_storage::lease::control::*;
 use oxide_storage::lease::managed::{
     evict_idle_slot, flush_volume, init_budget_pool, lease_measured, ledger_view, measure_within,
-    recover, release, snapshot, status as pool_status,
+    prepare_pool, recover, release, snapshot, status as pool_status,
 };
 use oxide_storage::lease::{
     AccountingScan, AdmissionClass, LeaseError, LeaseRequest, LedgerSlot, LedgerView, MemberPair,
@@ -739,11 +739,9 @@ pub enum SlotSize {
         source: ObservationSource,
         lease_id: Option<String>,
     },
-    /// The ledger's own closed observation for this idle slot generation
-    /// (oxide#146). It is the admission basis; the oxide#128 sidecar fact above
-    /// stays a separate diagnostic and the two are never summed.
+    /// The ledger's logical-byte observation for this slot generation.
     LedgerRecorded {
-        allocated_bytes: u64,
+        logical_bytes: u64,
         age: RecordedAge,
         entries: u64,
     },
@@ -797,21 +795,21 @@ impl SlotSize {
                 )
             }
             Self::LedgerRecorded {
-                allocated_bytes,
+                logical_bytes,
                 age,
                 entries,
             } => {
                 let age = match age {
                     RecordedAge::Ago(seconds) => {
-                        format!("recorded {} ago at slot release", age_text(*seconds))
+                        format!("recorded {} ago", age_text(*seconds))
                     }
                     RecordedAge::ClockSkew => {
                         "recorded at a time ahead of this clock, so its age is unknown".to_owned()
                     }
                 };
                 format!(
-                    "{} ({age} over {entries} entries; the admission basis, not free space); may have changed since measurement",
-                    crate::cargo_home::size(*allocated_bytes)
+                    "{} logical ({age} over {entries} entries); may have changed since measurement",
+                    crate::cargo_home::size(*logical_bytes)
                 )
             }
             Self::NotMeasured(reason) => reason.clone(),
@@ -951,12 +949,12 @@ pub struct Report {
     /// holders then read as unknown, never as empty.
     pub state_error: Option<String>,
     /// The sum of the ledger's current per-slot records (oxide#146), or `None`
-    /// when no idle slot has one. This is a recorded admission basis, not free
+    /// when no slot has one. This is a recorded admission basis, not free
     /// space, and never includes an oxide#128 sidecar fact.
     pub recorded_total: Option<u64>,
     /// Idle slots whose ledger record is current.
     pub recorded_slots: usize,
-    /// Idle slots with no current ledger record: they make `recorded_total` a
+    /// Slots with no current ledger record: they make `recorded_total` a
     /// stated lower bound.
     pub unrecorded_slots: usize,
     /// Slot trees already renamed into the payload's holding area and pending
@@ -1967,7 +1965,7 @@ impl Store {
     ) -> Result<Self, String> {
         let pool = fs::canonicalize(root)
             .map_err(|error| format!("cannot open the removable pool: {error}"))?;
-        let view = ledger_view(&pool)
+        let view = prepare_pool(&pool)
             .map_err(|error| lease_error("cannot open the removable pool", &error))?;
         if Backend::recorded(&view.backend)? != Backend::ApfsVolume {
             return Err("the removable pool records another backend".to_owned());
@@ -2131,7 +2129,7 @@ impl Store {
         let pool =
             fs::canonicalize(path).map_err(|error| format!("cannot open the pool: {error}"))?;
         let view =
-            ledger_view(&pool).map_err(|error| lease_error("cannot open the pool", &error))?;
+            prepare_pool(&pool).map_err(|error| lease_error("cannot open the pool", &error))?;
         let backend = Backend::recorded(&view.backend)?;
         if backend != Backend::DirectoryBudget {
             return Err(format!(
@@ -2178,8 +2176,7 @@ impl Store {
         self.max_active
     }
 
-    /// Full accounting: the whole-payload walk and one walk per slot, for
-    /// `oxide status` and readiness only.
+    /// Passive status using recorded slot observations.
     #[allow(dead_code)]
     pub fn status(&self) -> Result<PoolStatus, String> {
         pool_status(&self.pool).map_err(|error| lease_error("cannot read the pool", &error))
@@ -3762,7 +3759,7 @@ impl Store {
                         // stays a separate diagnostic fact.
                         None => match slot.recorded.filter(|fact| fact.current) {
                             Some(fact) => SlotSize::LedgerRecorded {
-                                allocated_bytes: fact.unique_allocated_bytes,
+                                logical_bytes: fact.logical_bytes,
                                 age: if fact.at_ms > now {
                                     RecordedAge::ClockSkew
                                 } else {

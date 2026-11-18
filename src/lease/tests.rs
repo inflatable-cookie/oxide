@@ -7,6 +7,7 @@ use super::{
     managed, AdmissionClass, LeaseError, LeaseRequest, Profile, SlotLayout, SlotOccupancy,
     VictimPolicy,
 };
+use crate::storage::{count_pool_walks, PoolBacking, PoolStorage, PoolWalk};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -257,15 +258,17 @@ fn a_pinned_root_is_not_evicted_by_pressure() {
     let roots = area.all_roots().unwrap();
     let (_, info) = roots.first().expect("one root");
     area.area().pin(&info.id, "selected output").unwrap();
-    // Filling the rest of the budget cannot evict the pinned root.
-    let held =
-        managed::lease_measured(request(&pool, &project, &workspace, "held")).expect("lease");
-    fill(&held, 7 << 20);
-    let status = managed::status(&pool).unwrap();
-    assert!(
-        status.slots.iter().any(|slot| slot.slot_id == "1"),
-        "the pinned slot stays"
-    );
+    let other = fixture.dir("other");
+    let idle =
+        managed::lease_measured(request(&pool, &other, &workspace, "idle-2")).expect("lease");
+    fill(&idle, 5 << 20);
+    let other_path = idle.grant.env.cargo_build_build_dir.clone();
+    managed::release(&pool, &idle.grant.lease_id).unwrap();
+    drop(idle);
+    let admitted = managed::lease(request(&pool, &fixture.dir("next"), &workspace, "next"));
+    assert!(admitted.is_ok(), "pressure can skip the oldest pinned root");
+    assert!(info.path.exists(), "the pinned slot stays");
+    assert!(!other_path.exists(), "the next eligible slot was evicted");
 }
 
 /// Write a ledger with one legacy row, as an older Oxide wrote it, over the
@@ -319,8 +322,8 @@ fn a_held_legacy_row_is_not_reclaimed_by_a_free_barge_lock() {
     fs::write(dir.join("artifact"), b"live").unwrap();
     let project = fixture.dir("project");
     write_legacy_ledger(&pool, "held", None, 41, project.to_str().unwrap());
-    // Opening adopts the directory but must not infer closure: the legacy
-    // writer never held this lock.
+    // A passive view retains the held row. Its old writer never held a
+    // Barge lock.
     let status = managed::status(&pool).unwrap();
     assert_eq!(status.slots.len(), 1);
     assert_eq!(status.slots[0].state, SlotOccupancy::Held);
@@ -349,8 +352,12 @@ fn a_foreign_legacy_root_is_never_reused_or_deleted() {
     .unwrap();
     let project = fixture.dir("project");
     write_legacy_ledger(&pool, "idle", None, 42, project.to_str().unwrap());
-    let status = managed::status(&pool).unwrap();
-    assert_eq!(status.slots.len(), 1);
+    let (prepared, first) = count_pool_walks(|| managed::prepare_pool(&pool));
+    assert_eq!(prepared.unwrap().slots.len(), 1);
+    assert!(matches!(first.as_slice(), [PoolWalk::Adopt(_)]));
+    let (prepared, second) = count_pool_walks(|| managed::prepare_pool(&pool));
+    assert_eq!(prepared.unwrap().slots.len(), 1);
+    assert!(second.is_empty(), "a refused adoption stays refused");
     let workspace = fixture.dir("workspace");
     let outcome = managed::lease(request(&pool, &project, &workspace, "new"));
     assert!(
@@ -379,11 +386,17 @@ fn a_nested_legacy_slot_is_adopted_in_its_area_and_reused_after_a_repeat() {
         3,
         project.to_str().unwrap(),
     );
-    // First open adopts it; a repeat resolves the same root id.
-    let first = managed::status(&pool).unwrap();
-    let second = managed::status(&pool).unwrap();
-    assert_eq!(first.slots.len(), 1);
-    assert_eq!(second.slots.len(), 1);
+    // Status skips adoption. Preparation performs it only once.
+    let (status, walks) = count_pool_walks(|| managed::status(&pool));
+    assert_eq!(status.unwrap().slots.len(), 1);
+    assert!(walks.is_empty());
+    assert!(!dir.join(".barge-root.json").exists());
+    let (prepared, walks) = count_pool_walks(|| managed::prepare_pool(&pool));
+    assert_eq!(prepared.unwrap().slots.len(), 1);
+    assert!(matches!(walks.as_slice(), [PoolWalk::Adopt(_)]));
+    let (prepared, walks) = count_pool_walks(|| managed::prepare_pool(&pool));
+    assert_eq!(prepared.unwrap().slots.len(), 1);
+    assert!(walks.is_empty());
     let workspace = fixture.dir("workspace");
     let reused =
         managed::lease_measured(request(&pool, &project, &workspace, "new")).expect("reuse");
@@ -403,16 +416,9 @@ fn an_evicted_legacy_root_gets_a_fresh_successor_path() {
     let dir = slot_dir(&pool, "44");
     let project = fixture.dir("project");
     write_legacy_ledger(&pool, "idle", None, 44, project.to_str().unwrap());
-    // Adopt, then settle the legacy generation with a real held grant before
-    // evicting it. Opening alone must keep its protection pin in place.
-    managed::status(&pool).unwrap();
+    managed::prepare_pool(&pool).expect("adopt closed legacy root");
     let workspace = fixture.dir("workspace");
-    let settled = managed::lease_measured(request(&pool, &project, &workspace, "settle"))
-        .expect("settle legacy generation");
-    let lease = settled.grant.lease_id.clone();
-    drop(settled);
-    managed::release(&pool, &lease).expect("release settled generation");
-    managed::evict_idle_slot(&pool, "44").expect("evicted");
+    managed::evict_idle_slot(&pool, "44").expect("evicted without a prior grant");
     assert!(!dir.exists(), "the recorded legacy root is deleted whole");
     let fresh =
         managed::lease_measured(request(&pool, &project, &workspace, "new")).expect("admit");
@@ -480,7 +486,7 @@ fn a_held_legacy_root_is_not_adopted_and_stays_out_of_barge_prune_authority() {
     fs::write(dir.join("artifact"), b"live").unwrap();
     let project = fixture.dir("project");
     write_legacy_ledger(&pool, "held", None, 51, project.to_str().unwrap());
-    managed::status(&pool).expect("open");
+    managed::prepare_pool(&pool).expect("prepare");
     // A held legacy generation is never adopted: it stays outside every Barge
     // area, so no prune or eviction decision can see it.
     assert!(
@@ -518,68 +524,213 @@ fn a_second_grant_for_the_same_holder_is_refused_because_it_would_carry_no_hold(
     drop(first);
 }
 
-#[test]
-fn an_adopted_idle_legacy_root_is_pinned_out_of_prune_and_eviction() {
-    let fixture = Fixture::new("legacy-pinned");
-    let pool = fixture.pool();
-    let dir = slot_dir(&pool, "61");
-    fs::write(dir.join("artifact"), b"old").unwrap();
-    let project = fixture.dir("project");
-    write_legacy_ledger(&pool, "idle", None, 61, project.to_str().unwrap());
-    managed::status(&pool).expect("open adopts the idle legacy root");
-    let area = crate::storage::PoolStorage::open(
+fn fixture_storage(pool: &Path) -> PoolStorage {
+    PoolStorage::open(
         &pool.join("oxide-managed"),
-        &crate::storage::PoolBacking::budget(&pool, 8 << 20),
+        &PoolBacking::budget(pool, 8 << 20),
     )
-    .expect("area");
-    let roots = area.all_roots().expect("roots");
-    let (_, info) = roots.first().expect("the legacy root is adopted");
-    assert!(info.pinned, "an unheld legacy generation stays pinned");
-    assert!(
-        area.evict_any(&info.id).is_err(),
-        "the pinned legacy root cannot be evicted"
-    );
-    assert!(dir.join("artifact").is_file());
+    .unwrap()
+}
 
-    // A supported transition can already name the Barge root while its old
-    // generation never acquired a hold. Every open restores its durable pin.
-    area.unpin_in(None, &info.id)
-        .expect("remove pin in fixture");
-    managed::status(&pool).expect("protect already-adopted legacy root");
-    assert!(area.all_roots().unwrap()[0].1.pinned);
-    assert!(area.evict_any(&info.id).is_err());
+fn update_ledger(pool: &Path, change: impl FnOnce(&mut serde_json::Value)) {
+    let path = pool.join("ledger.json");
+    let mut ledger = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    change(&mut ledger);
+    fs::write(path, serde_json::to_vec(&ledger).unwrap()).unwrap();
 }
 
 #[test]
-fn a_failed_legacy_pin_publication_refuses_before_pruning_and_can_retry() {
-    let fixture = Fixture::new("legacy-pin-failure");
+fn an_idle_legacy_root_stays_out_of_eviction_while_its_old_holder_lives() {
+    let fixture = Fixture::new("legacy-live");
     let pool = fixture.pool();
-    let dir = slot_dir(&pool, "62");
-    fs::write(dir.join("artifact"), b"keep").unwrap();
+    let path = slot_dir(&pool, "61");
+    let project = fixture.dir("project");
+    write_legacy_ledger(&pool, "idle", None, 61, project.to_str().unwrap());
+    let mut holder = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    update_ledger(&pool, |ledger| {
+        ledger["slots"][0]["holder"] = format!("oxide-{}-1", holder.id()).into();
+    });
+
+    let (prepared, walks) = count_pool_walks(|| managed::prepare_pool(&pool));
+    prepared.expect("retain the live holder's row");
+    assert!(walks.is_empty());
+    assert!(matches!(
+        managed::evict_idle_slot(&pool, "61"),
+        Err(LeaseError::Busy)
+    ));
+    assert!(!path.join(".barge-root.json").exists());
+
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    managed::prepare_pool(&pool).expect("adopt once the older holder is absent");
+    assert!(!fixture_storage(&pool).all_roots().unwrap()[0].1.pinned);
+    managed::evict_idle_slot(&pool, "61").expect("the now-closed root can be evicted");
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_previous_migration_pin_is_removed_once_even_without_a_warm_grant() {
+    let fixture = Fixture::new("legacy-pinned");
+    let pool = fixture.pool();
+    let path = slot_dir(&pool, "62");
     let project = fixture.dir("project");
     write_legacy_ledger(&pool, "idle", None, 62, project.to_str().unwrap());
-    managed::status(&pool).expect("adopt legacy root");
-    let storage = crate::storage::PoolStorage::open(
-        &pool.join("oxide-managed"),
-        &crate::storage::PoolBacking::budget(&pool, 8 << 20),
-    )
-    .unwrap();
+    managed::prepare_pool(&pool).expect("adopt legacy root");
+    let storage = fixture_storage(&pool);
     let (_, root) = storage.all_roots().unwrap().remove(0);
-    storage.unpin_in(None, &root.id).unwrap();
-    let pin = dir
-        .parent()
-        .unwrap()
-        .join(".barge/pins")
-        .join(format!("{}.json", root.id));
-    fs::create_dir(&pin).unwrap();
-    assert!(matches!(
-        managed::status(&pool),
-        Err(LeaseError::UnknownAccounting)
-    ));
-    assert_eq!(fs::read(dir.join("artifact")).unwrap(), b"keep");
-    fs::remove_dir(&pin).unwrap();
-    managed::status(&pool).expect("retry publishes the required pin");
+    storage.pin_in(None, &root.id, "legacy generation").unwrap();
+    update_ledger(&pool, |ledger| ledger["slots"][0]["owned"] = false.into());
+
+    let (prepared, walks) = count_pool_walks(|| managed::prepare_pool(&pool));
+    prepared.expect("finish the prior transition");
+    assert!(walks.is_empty());
+    assert!(!storage.all_roots().unwrap()[0].1.pinned);
+    storage.pin_in(None, &root.id, "keep").unwrap();
+    managed::prepare_pool(&pool).expect("no further migration");
     assert!(storage.all_roots().unwrap()[0].1.pinned);
+    storage.unpin_in(None, &root.id).unwrap();
+    managed::evict_idle_slot(&pool, "62").expect("evict after removing the independent pin");
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_pool_at_its_slot_ceiling_evicts_the_oldest_adopted_idle_row() {
+    let fixture = Fixture::new("legacy-ceiling");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let workspace = fixture.dir("workspace");
+    let count = super::MAX_SLOTS as u64;
+    write_legacy_ledger(&pool, "idle", None, 1, project.to_str().unwrap());
+    update_ledger(&pool, |ledger| {
+        let template = ledger["slots"][0].clone();
+        let store = ledger["store_id"].as_str().unwrap();
+        let slots: Vec<_> = (1..=count)
+            .map(|id| {
+                let mut row = template.clone();
+                row["id"] = id.into();
+                row["rank"] = (count + 1 - id).into();
+                row["last_lease_id"] = format!("v1.{store}.{id}.1.1").into();
+                // Pre-adoption observations already have the logical-byte field.
+                row["recorded"] = serde_json::json!({
+                    "for_lease": row["last_lease_id"],
+                    "logical_bytes": 2048,
+                    "unique_bytes": 4096,
+                    "entries": 1,
+                    "at_ms": 1,
+                });
+                slot_dir(&pool, &id.to_string());
+                row
+            })
+            .collect();
+        ledger["slots"] = slots.into();
+        ledger["capacity_policy"] = super::RAISED_CAPACITY_POLICY_VERSION.into();
+        ledger["next_slot"] = (count + 1).into();
+        ledger["next_rank"] = (count + 1).into();
+    });
+    let (prepared, walks) = count_pool_walks(|| managed::prepare_pool(&pool));
+    assert_eq!(prepared.unwrap().slots.len(), super::MAX_SLOTS);
+    assert_eq!(walks.len(), super::MAX_SLOTS);
+    assert!(walks.iter().all(|walk| matches!(walk, PoolWalk::Adopt(_))));
+
+    let other = fixture.dir("other");
+    let (admitted, walks) =
+        count_pool_walks(|| managed::lease(request(&pool, &other, &workspace, "new")));
+    assert_eq!(admitted.unwrap().grant.slot_id, (count + 1).to_string());
+    assert!(matches!(walks.as_slice(), [PoolWalk::Evict(_)]));
+    assert!(!pool.join("payload/slots").join(count.to_string()).exists());
+    assert!(pool.join("payload/slots/1").is_dir());
+}
+
+#[test]
+fn admission_release_and_status_only_walk_the_roots_they_need() {
+    let fixture = Fixture::new("walk-count");
+    let pool = fixture.pool();
+    let workspace = fixture.dir("workspace");
+    let mut roots = Vec::new();
+    for i in 0..32 {
+        let project = fixture.dir(&format!("project-{i}"));
+        let lease = managed::lease(request(&pool, &project, &workspace, "build")).unwrap();
+        let path = lease
+            .grant
+            .env
+            .cargo_build_build_dir
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        fs::write(path.join("artifact"), vec![0; 8192]).unwrap();
+        let (released, walks) = count_pool_walks(|| managed::release(&pool, &lease.grant.lease_id));
+        assert!(!released.unwrap().replay);
+        assert_eq!(walks, vec![PoolWalk::Measure(path.clone())]);
+        roots.push(path);
+    }
+    update_ledger(&pool, |ledger| {
+        ledger["slots"][12]
+            .as_object_mut()
+            .unwrap()
+            .remove("recorded");
+    });
+    let (status, walks) = count_pool_walks(|| {
+        managed::status(&pool).unwrap();
+        managed::snapshot(&pool).unwrap()
+    });
+    assert_eq!(status.recorded_slots, 31);
+    assert_eq!(status.unrecorded_slots, 1);
+    assert!(walks.is_empty());
+
+    let project = fixture.dir("new");
+    let (lease, walks) =
+        count_pool_walks(|| managed::lease(request(&pool, &project, &workspace, "new")));
+    let lease = lease.unwrap();
+    assert_eq!(walks, vec![PoolWalk::Measure(roots[12].clone())]);
+    managed::release(&pool, &lease.grant.lease_id).unwrap();
+    drop(lease);
+    assert_eq!(managed::snapshot(&pool).unwrap().recorded_slots, 33);
+
+    let mut eviction = request(&pool, &fixture.dir("pressure"), &workspace, "pressure");
+    let before = managed::snapshot(&pool).unwrap();
+    eviction.budget_bytes = before.recorded_total;
+    let victim = fixture_storage(&pool)
+        .all_roots()
+        .unwrap()
+        .into_iter()
+        .find(|(_, root)| root.path == roots[0])
+        .unwrap()
+        .1;
+    let (lease, walks) = count_pool_walks(|| managed::lease(eviction));
+    let lease = lease.unwrap();
+    assert_eq!(walks, vec![PoolWalk::Evict(victim.id)]);
+    assert!(!roots[0].exists());
+    managed::release(&pool, &lease.grant.lease_id).unwrap();
+
+    let project = fixture.dir("project-12");
+    let (warm, walks) =
+        count_pool_walks(|| managed::lease(request(&pool, &project, &workspace, "warm")));
+    assert!(warm.unwrap().grant.reused_slot);
+    assert!(walks.is_empty());
+}
+
+#[test]
+fn an_unmeasurable_slot_is_charged_without_publishing_zero() {
+    let fixture = Fixture::new("unknown-charge");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let workspace = fixture.dir("workspace");
+    write_legacy_ledger(&pool, "idle", None, 63, project.to_str().unwrap());
+    let other = fixture.dir("other");
+    let mut admission = request(&pool, &other, &workspace, "new");
+    admission.budget_bytes = Some(1);
+    let (outcome, walks) = count_pool_walks(|| managed::lease(admission));
+    assert!(matches!(outcome, Err(LeaseError::Full)));
+    assert_eq!(
+        walks,
+        vec![PoolWalk::Measure(pool.join("payload/slots/63"))]
+    );
+    let snapshot = managed::snapshot(&pool).unwrap();
+    assert_eq!(snapshot.unrecorded_slots, 1);
+    assert_eq!(snapshot.recorded_total, None);
 }
 
 #[test]

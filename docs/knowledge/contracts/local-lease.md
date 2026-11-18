@@ -27,11 +27,11 @@ Compatible idle reuse retains both root path and bytes. A new generation after
 retirement or eviction uses `create_root`, with a fresh ID and path. An
 unrecorded stray at an old path never becomes a successor.
 
-Legacy idle rows are adopted only after Oxide validates their existing
-ownership and selection facts. Matching adoption is idempotent. Unknown,
-foreign, unsupported or still-held legacy generations remain retained and
-unavailable. A lock that old writers never held establishes no closure.
-An adopted legacy root stays pinned until its first protected grant.
+Pool preparation adopts eligible legacy rows before admission. An idle row
+whose previous holder is absent or positively dead can be adopted and
+evicted without a warm grant. A live older holder keeps the row unavailable.
+Held legacy rows still need the existing explicit writer-closure check.
+A free Barge lock gives no closure evidence for a writer that never held it.
 
 ## Oxide front door control directory
 
@@ -44,7 +44,8 @@ formats retain the existing forward refusal and installed-binary handoff.
 ## Commands
 
 Admission takes an exclusive Barge hold before returning a slot. Release
-updates Rust lease state and drops the caller's hold. Recovery uses cooperative
+records a bounded measurement of the closing slot and updates Rust lease
+state before the caller drops its hold. Recovery uses cooperative
 hold availability; normal process-group stop/exit handling remains product
 handling and is not an arbitrary-writer custody certificate. Children inherit
 the actual root hold on Oxide's launch route. A child closing inherited
@@ -57,10 +58,11 @@ after recipient writes, failure cannot publish a trusted origin.
 
 ## Capacity and eviction
 
-Budgets remain soft admission figures; they do not terminate a running build
-for crossing the budget. Barge applies area soft caps and the selected volume's
-reserve/floor policy, considering eligible idle roots in LRU order and
-reporting protected roots. Low space never silently selects another volume.
+Budgets remain soft admission figures. New-slot admission uses recorded
+logical bytes against the pool budget. It checks removable free space against
+Barge's reserve and floor and rereads free space after each reserve eviction.
+Warm reuse checks the floor without evicting another slot. Low space never
+silently selects another volume.
 
 Eviction takes an exclusive nonblocking hold and rechecks the durable pin
 under the area lock before renaming into Barge trash. Deletion requires the
@@ -89,16 +91,20 @@ allocated bytes remain distinct, and a sample is not a physical peak.
 
 ### Slot headroom and ranked idle replacement (oxide#118)
 
-Oxide keeps Rust slot/project headroom and compatibility selection. Storage
-replacement uses Barge holds and pins; an ineligible oldest root does not hide
-later eligible roots. When only protected roots remain, report capacity
-refusal rather than deleting them.
+Oxide keeps Rust slot/project headroom and ranks idle ledger rows by least
+recent use. It sends one chosen root ID to Barge at a time. A hold or pin
+refusal lets it consider the next candidate. If no eligible root can make
+room, admission reports a capacity refusal.
 
-### Recorded per-slot accounting (oxide#146: implemented, native held)
+### Recorded per-slot accounting (oxide#146, restored in oxide#315)
 
-Historical recorded observations remain diagnostic Rust workflow facts.
-Current area accounting and storage pressure come from Barge. Earlier native
-receipts stay bound to their historical sources and confer no new credit.
+A size belongs to the lease generation that was observed. A new grant clears
+the old observation. Release samples only the closing root, and new-slot
+admission samples only rows without a current record. A complete observation
+is persisted once per generation and refreshed at release. An incomplete
+sample carries a positive estimate for that admission and stays out of
+byte-pressure eviction. Status reads ledger observations without walking or
+reconciling. Explicit measurement makes a fresh bounded observation.
 
 ## Reviewed local handover artifact
 

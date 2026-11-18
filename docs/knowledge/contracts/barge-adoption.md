@@ -33,10 +33,12 @@ Barge marker and writes no Barge document except through the library.
 | --- | --- |
 | Volume registration, UUID/mount identity, absence vs a different volume | Barge |
 | Declared areas, their folder, absent-volume policy and soft cap | Barge |
-| Owned roots, their marker, listing, accounting | Barge |
+| Owned roots, their marker and explicit inventory | Barge |
 | Cooperative holds (exclusive/shared, inheritable) | Barge |
 | Durable pins | Barge |
-| Reserve and floor, least-recently-used idle eviction, soft-cap pressure | Barge |
+| Registered volume free space, reserve and floor | Barge |
+| Recorded admission bytes and idle candidate rank | Oxide |
+| Eligibility and execution of each eviction | Barge |
 | Marker-checked trash, deletion bounds (no symlink, no mount crossing) | Barge |
 | Scratch areas and expiry | Barge |
 | Cargo front door, command/exit routing | Oxide |
@@ -129,13 +131,26 @@ caller-owned directory inside a declared area, records the folder in a
 `barge.root/2` marker, refuses a symlink, a group- or other-writable folder, a
 foreign or mismatched marker and a duplicate id, and repeats a matching
 adoption idempotently. Oxide supplies the layout and identity facts; Barge never
-learns an Oxide format. The pool adopts each recorded legacy slot in place,
-keeping its path and bytes, and never adopts an unrecorded stray at a retired
-folder. A row whose adoption is refused stays unowned: it is never reused or
-evicted through a lock this version did not establish, and nothing is moved,
-copied, relabelled or deleted. Every transition test runs on fresh temporary
-legacy fixtures (active, foreign, nested, repeated and successor cases), never
-on a live installation.
+learns an Oxide format. Front-door pool preparation is the one-time
+transition. It resolves a published or interrupted adoption by its recorded
+path and deterministic ID before asking Barge to adopt. It records each
+completed or definitively refused row before moving on. Barge's
+`adopt_root` currently sizes existing roots in the area to check for a
+duplicate ID. Importing many old rows into one area can therefore take
+quadratic work. Lease admission, release and status never call adoption.
+
+An eligible idle legacy row is adopted in place without a durable pin.
+Preparation removes the old migration pin on a recorded, unfinished idle
+transition after confirming the former holder is absent. Still-held or
+unverifiable rows remain unavailable. A refused row stays unowned and an
+unrecorded stray at a retired folder is never adopted. Every transition test
+uses fresh temporary fixtures.
+
+New-slot admission reads the Oxide ledger's logical-byte observations and
+walks only rows missing a current observation. Count, byte and reserve
+pressure can choose a ranked idle slot and call Barge eviction for that
+root alone. Barge rechecks the actual hold, pin and marker and handles
+trash. Explicit inventory and output pruning can still use Barge listings.
 
 Selecting a volume, refusing a mismatch, falling back while the drive is away
 and reporting the fallback in status are ordinary behaviour and do not wait on

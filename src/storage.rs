@@ -517,6 +517,44 @@ impl Storage {
     }
 }
 
+// Barge's recursive accounting is opaque to Oxide. Observe the adapter
+// operations that invoke it, alongside the local per-root walk.
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum PoolWalk {
+    Measure(PathBuf),
+    Evict(String),
+    Inventory,
+    Adopt(String),
+}
+
+#[cfg(test)]
+thread_local! {
+    static POOL_WALKS: std::cell::RefCell<Option<Vec<PoolWalk>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn observe_pool_walk(walk: PoolWalk) {
+    POOL_WALKS.with_borrow_mut(|walks| {
+        if let Some(walks) = walks {
+            walks.push(walk);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn count_pool_walks<T>(action: impl FnOnce() -> T) -> (T, Vec<PoolWalk>) {
+    POOL_WALKS.with_borrow_mut(|walks| {
+        assert!(walks.is_none());
+        *walks = Some(Vec::new());
+    });
+    let result = action();
+    let walks = POOL_WALKS.with_borrow_mut(|walks| walks.take().unwrap());
+    (result, walks)
+}
+
 /// One pool's storage: its own Barge account, its volume and its
 /// `oxide/pool` area.
 ///
@@ -734,10 +772,13 @@ impl PoolStorage {
         folder: &str,
         label: &str,
         id: &str,
-    ) -> Result<barge::Root, String> {
-        let area = self.area_for(project_folder)?;
+    ) -> barge::Result<barge::Root> {
+        let area = self
+            .area_for(project_folder)
+            .map_err(barge::Error::unknown_state)?;
+        #[cfg(test)]
+        observe_pool_walk(PoolWalk::Adopt(id.to_owned()));
         area.adopt_root(folder, label, id)
-            .map_err(|error| format!("cannot adopt {folder}: {error}"))
     }
 
     /// Create one root for a slot (a fresh id and path) in the flat area.
@@ -800,9 +841,13 @@ impl PoolStorage {
         project_folder: Option<&str>,
         id: &str,
     ) -> Result<barge::area::Eviction, String> {
-        self.area_for(project_folder)?
+        let eviction = self
+            .area_for(project_folder)?
             .evict(id)
-            .map_err(|error| format!("cannot evict slot root {id}: {error}"))
+            .map_err(|error| format!("cannot evict slot root {id}: {error}"))?;
+        #[cfg(test)]
+        observe_pool_walk(PoolWalk::Evict(id.to_owned()));
+        Ok(eviction)
     }
 
     /// Evict one root from whichever area holds it.
@@ -819,6 +864,8 @@ impl PoolStorage {
 
     /// The bytes every area of this pool holds.
     pub fn total_bytes(&self) -> Result<u64, String> {
+        #[cfg(test)]
+        observe_pool_walk(PoolWalk::Inventory);
         let mut total = 0_u64;
         for area in self.areas()? {
             total = total.saturating_add(
@@ -832,6 +879,8 @@ impl PoolStorage {
     /// Every owned root of this pool with its area's project folder (the first
     /// component of `folder` is the area, so a root's area is recoverable).
     pub fn all_roots(&self) -> Result<Vec<(Option<String>, barge::RootInfo)>, String> {
+        #[cfg(test)]
+        observe_pool_walk(PoolWalk::Inventory);
         let mut roots = Vec::new();
         for area in self.areas()? {
             let area_folder = area.record().effective_folder();
@@ -883,6 +932,8 @@ impl PoolStorage {
 
     /// Every owned root, with held/pinned/bytes facts.
     pub fn list(&self) -> Result<barge::Listing, String> {
+        #[cfg(test)]
+        observe_pool_walk(PoolWalk::Inventory);
         self.area
             .list()
             .map_err(|error| format!("cannot list the pool area: {error}"))
@@ -898,6 +949,8 @@ impl PoolStorage {
 
     /// The bytes the area's owned roots hold.
     pub fn bytes(&self) -> Result<u64, String> {
+        #[cfg(test)]
+        observe_pool_walk(PoolWalk::Inventory);
         self.area
             .bytes()
             .map_err(|error| format!("cannot account the pool area: {error}"))
@@ -918,11 +971,15 @@ impl PoolStorage {
     /// Prune: soft cap first, then least-recently-used idle unpinned roots
     /// until free space is back above the reserve.
     pub fn prune(&self, dry_run: bool) -> Result<PruneReport, String> {
+        #[cfg(test)]
+        observe_pool_walk(PoolWalk::Inventory);
         self.storage.prune("pool", dry_run)
     }
 
     /// Admit work: prune, then refuse only below the floor.
     pub fn admit(&self) -> Result<PruneReport, String> {
+        #[cfg(test)]
+        observe_pool_walk(PoolWalk::Inventory);
         self.storage.admit("pool")
     }
 }

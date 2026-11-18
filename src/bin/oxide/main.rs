@@ -2420,7 +2420,7 @@ fn print_pool(
                 "  recorded slot sizes (ledger): {}",
                 match report.recorded_total {
                     Some(bytes) => format!(
-                        "{} across {} of {} idle slots{}; the admission basis, not free space",
+                        "{} logical across {} of {} slots{}; used for admission",
                         crate::cargo_home::size(bytes),
                         report.recorded_slots,
                         report.recorded_slots + report.unrecorded_slots,
@@ -2438,7 +2438,7 @@ fn print_pool(
                 }
             );
             println!(
-                "  slot sizes: recorded observations only (a separate diagnostic source from the ledger total above); `oxide status --measure` walks the payload and every slot without reconciling"
+                "  slot sizes: recorded observations; use `oxide status --measure` for a fresh walk"
             );
         }
     }

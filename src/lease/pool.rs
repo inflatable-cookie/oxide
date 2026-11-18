@@ -7,11 +7,11 @@ use super::{
     is_tolerated_metadata_file, persist_private_file, random_hex, read_private_file,
     unexpected_entry, AccountingCoverage, AccountingScan, HeldEvictionFailure, LeaseEnvironment,
     LeaseError, LeaseGrant, Leased, LedgerSlot, LedgerView, MeasuredPool, PassiveSnapshot,
-    PoolStatus, Profile, RecordedVolume, ReleaseReceipt, SlotOccupancy, SlotStatus,
-    CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
-    LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME, MANAGED_NAME, MAX_HOLDER_BYTES,
-    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, PREVIOUS_CAPACITY_POLICY_VERSION,
-    RAISED_CAPACITY_POLICY_VERSION, SLOTS_NAME,
+    PoolStatus, Profile, RecordedFact, RecordedVolume, ReleaseReceipt, SlotOccupancy, SlotStatus,
+    UnmeasuredSlot, ACCOUNTING_MAX_ELAPSED_MS, CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION,
+    LEDGER_NAME, LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME, MANAGED_NAME,
+    MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS,
+    PREVIOUS_CAPACITY_POLICY_VERSION, RAISED_CAPACITY_POLICY_VERSION, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::fs_util::open_directory_at;
@@ -283,79 +283,136 @@ struct SlotRecord {
     /// Oxide slot directory, which Barge does not own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     root: Option<String>,
-    /// True only when this generation's grant took the root's Barge hold. A
-    /// legacy row (written before adoption) is never recovered from a free
-    /// lock: its writer never held that lock, so its closure is unknown.
+    /// This row has completed the Barge transition. On a held row it means
+    /// the grant took a Barge hold, so recovery can test that hold.
     #[serde(default, skip_serializing_if = "is_false")]
     owned: bool,
     /// Idle rank from this pool's monotonic sequence (oxide#118). Legacy
     /// records keep 0 and sort oldest.
     #[serde(default, skip_serializing_if = "is_zero_rank")]
     rank: u64,
-    /// Read-tolerant legacy keys from the retired size observation and
-    /// deletion journal. This version never writes or acts on them; older
-    /// values stay inert so the ledger still parses.
+    /// A permanently refused legacy path is retained outside Barge custody.
+    #[serde(default, skip_serializing_if = "is_false")]
+    adoption_refused: bool,
+    /// A logical-byte observation bound to the lease generation. The former
+    /// allocated-byte field can still be present in an older ledger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recorded: Option<serde_json::Value>,
+    // Read-tolerant retired deletion journal fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     capture: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hold_intent: Option<serde_json::Value>,
 }
 
-/// Logical bytes below `path`, read-only, bounded by a deadline: `None` when
-/// the walk could not finish or an entry could not be read, so an unknown
-/// figure is never reported as a measured one.
-fn barge_tree_bytes_bounded(path: &Path, deadline: std::time::Instant) -> Option<u64> {
-    if std::time::Instant::now() >= deadline {
-        return None;
+impl SlotRecord {
+    fn area_folder(&self) -> Option<&str> {
+        self.dir
+            .as_deref()?
+            .split_once('/')
+            .map(|(folder, _)| folder)
     }
-    fn walk(path: &Path, device: u64, total: &mut u64, deadline: std::time::Instant) -> bool {
-        let entries = match std::fs::read_dir(path) {
-            Ok(entries) => entries,
-            Err(_) => return false,
-        };
-        for entry in entries {
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            let Ok(entry) = entry else {
-                return false;
-            };
-            let child = entry.path();
-            let Ok(metadata) = std::fs::symlink_metadata(&child) else {
-                return false;
-            };
-            let file_type = metadata.file_type();
-            if file_type.is_symlink() {
-                continue;
-            }
-            if file_type.is_dir() {
-                use std::os::unix::fs::MetadataExt;
-                if metadata.dev() == device && !walk(&child, device, total, deadline) {
-                    return false;
-                }
-            } else {
-                *total = total.saturating_add(metadata.len());
-            }
+
+    fn is_idle(&self) -> bool {
+        self.state == SlotPersistState::Idle && self.lease_id.is_none()
+    }
+
+    fn recorded_size(&self) -> Option<RecordedFact> {
+        let record = self.recorded.as_ref()?;
+        if self.state == SlotPersistState::Evicting
+            || record.get("for_lease")?.as_str()? != self.last_lease_id
+        {
+            return None;
         }
-        true
-    }
-    use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    if !metadata.is_dir() {
-        return Some(metadata.len());
-    }
-    let device = metadata.dev();
-    let mut total = 0;
-    if walk(path, device, &mut total, deadline) && std::time::Instant::now() < deadline {
-        Some(total)
-    } else {
-        None
+        Some(RecordedFact {
+            logical_bytes: record.get("logical_bytes")?.as_u64()?,
+            entries: record.get("entries")?.as_u64()?,
+            at_ms: record.get("at_ms")?.as_u64()?,
+            current: true,
+        })
     }
 }
 
-/// A complete scan for a figure Barge's own accounting produced.
+/// An idle legacy row can still name its previous writer. A recognised Oxide
+/// PID must be positively absent. Other holder names are opaque library tokens
+/// and an idle row with no lease has no holder associated with such a token.
+fn legacy_writer_absent(holder: &str) -> bool {
+    let Some(process) = holder.strip_prefix("oxide-") else {
+        return true;
+    };
+    let Some(pid) = process
+        .split_once('-')
+        .and_then(|(pid, _)| pid.parse::<libc::pid_t>().ok())
+    else {
+        return false;
+    };
+    if pid <= 1 {
+        return false;
+    }
+    // SAFETY: signal zero only asks whether this positive PID exists.
+    let result = unsafe { libc::kill(pid, 0) };
+    result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+fn observed_size(slot: &SlotRecord, path: &Path, deadline: Instant) -> Option<serde_json::Value> {
+    let (logical_bytes, entries) = slot_tree_bytes(path, deadline)?;
+    let at_ms = std::time::UNIX_EPOCH.elapsed().ok()?.as_millis();
+    Some(serde_json::json!({
+        "for_lease": slot.last_lease_id,
+        "logical_bytes": logical_bytes,
+        "entries": entries,
+        "at_ms": u64::try_from(at_ms).ok()?,
+    }))
+}
+
+/// Logical bytes below `path`, read-only, bounded by a deadline: `None` when
+/// the walk could not finish or an entry could not be read, so an unknown
+/// figure is never reported as a measured one.
+fn slot_tree_bytes(path: &Path, deadline: Instant) -> Option<(u64, u64)> {
+    #[cfg(test)]
+    crate::storage::observe_pool_walk(crate::storage::PoolWalk::Measure(path.to_path_buf()));
+
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let root = fs::symlink_metadata(path).ok()?;
+    let parent = fs::symlink_metadata(path.parent()?).ok()?;
+    if !root.is_dir() || !parent.is_dir() || parent.dev() != root.dev() {
+        return None;
+    }
+    let device = root.dev();
+    let mut directories = vec![path.to_path_buf()];
+    let mut total = 0_u64;
+    let mut entries = 0_u64;
+    while let Some(directory) = directories.pop() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let metadata = fs::symlink_metadata(&directory).ok()?;
+        if !metadata.is_dir() || metadata.dev() != device {
+            return None;
+        }
+        for entry in fs::read_dir(directory).ok()? {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let child = entry.ok()?.path();
+            let metadata = fs::symlink_metadata(&child).ok()?;
+            if metadata.is_symlink() || metadata.dev() != device {
+                continue;
+            }
+            entries = entries.saturating_add(1);
+            if metadata.is_dir() {
+                directories.push(child);
+            } else {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    (Instant::now() < deadline).then_some((total, entries))
+}
+
+/// Coverage for a complete logical observation, or an unknown figure.
 fn barge_scan(bytes: Option<u64>) -> AccountingScan {
     AccountingScan {
         coverage: if bytes.is_some() {
@@ -650,9 +707,6 @@ pub(super) struct Pool {
     ledger: Ledger,
     /// Admission budget: the recorded one unless the request overrides it.
     budget: u64,
-    /// The caller's registered reserve for a removable pool, when it owns the
-    /// fact. Barge's reserve policy decides when it prunes; this is reported.
-    reserve: Option<u64>,
     /// A bounded note the caller prints when admission had to report a policy
     /// decision (for example a fallback or a warning).
     admission_note: Option<String>,
@@ -878,7 +932,8 @@ pub mod managed {
     /// return the time the flush took. Any doubt about the volume is an
     /// error.
     pub fn flush_volume(pool: &Path) -> Result<Duration, LeaseError> {
-        let opened = crate::release_trace::phase("pool open", || Pool::open_for_release(pool))?;
+        let opened =
+            crate::release_trace::phase("pool open", || Pool::open_for_release(pool, None))?;
         match &opened.backing {
             Payload::Volume { binding, .. } => binding.flush().map_err(LeaseError::Io),
             Payload::Budget(_) => Err(LeaseError::Unsupported(
@@ -943,22 +998,34 @@ pub mod managed {
         lease_measured(request)
     }
 
-    /// [`lease`], with the reuse walk's measurement of the slot it took.
+    /// [`lease`], with this admission's accounting notes.
     pub fn lease_measured(request: LeaseRequest) -> Result<Leased, LeaseError> {
         Pool::open(&request.pool)?.lease(&request)
     }
 
     pub fn release(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
-        crate::release_trace::phase("pool open", || Pool::open_for_release(pool))?
-            .release_or_recover(lease_id, false)
+        crate::release_trace::phase("pool open", || Pool::open_for_release(pool, Some(lease_id)))?
+            .release_or_recover(lease_id)
     }
 
     pub fn recover(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
-        Pool::open(pool)?.release_or_recover(lease_id, true)
+        Pool::open_for_release(pool, Some(lease_id))?.release_or_recover(lease_id)
     }
 
     pub fn status(pool: &Path) -> Result<PoolStatus, LeaseError> {
-        Pool::open(pool)?.accounted()
+        Pool::open_passive(
+            pool,
+            std::time::Instant::now() + Duration::from_millis(ACCOUNTING_MAX_ELAPSED_MS),
+        )?
+        .accounted(false)
+    }
+
+    /// Prepare a pool at the front door before leasing. Only pending legacy
+    /// rows enter the one-time adoption transition.
+    pub fn prepare_pool(pool: &Path) -> Result<LedgerView, LeaseError> {
+        let mut pool = Pool::open(pool)?;
+        pool.adopt_legacy_roots()?;
+        pool.ledger_view()
     }
 
     /// Ledger membership without accounting walks; it takes the pool lock
@@ -1164,11 +1231,11 @@ impl Pool {
     /// recorded backend, including the retired `apfs-sparse-image-v1`,
     /// refuses before anything under the pool is touched.
     pub(super) fn open(root: &Path) -> Result<Self, LeaseError> {
-        Self::open_inner(root, false, true, true)
+        Self::open_inner(root, false, None, true)
     }
 
-    fn open_for_release(root: &Path) -> Result<Self, LeaseError> {
-        Self::open_inner(root, true, true, true)
+    fn open_for_release(root: &Path, lease_id: Option<&str>) -> Result<Self, LeaseError> {
+        Self::open_inner(root, true, lease_id, true)
     }
 
     /// The held eviction's locked open (oxide#196): the pool lock is taken, but
@@ -1177,13 +1244,13 @@ impl Pool {
     /// failure therefore leaves the pool bytes and identity unchanged. A pool
     /// with pending recorded reconciliation refuses in the caller.
     fn open_held_eviction(root: &Path) -> Result<Self, LeaseError> {
-        Self::open_inner(root, false, false, false)
+        Self::open_inner(root, false, None, false)
     }
 
     fn open_inner(
         root: &Path,
         trace_release: bool,
-        _reconcile: bool,
+        releasing: Option<&str>,
         fence_control: bool,
     ) -> Result<Self, LeaseError> {
         let root = canonical_existing_dir(root, true)?;
@@ -1234,15 +1301,9 @@ impl Pool {
             deadline: None,
             budget: ledger.cap_bytes,
             ledger,
-            reserve: None,
             admission_note: None,
         };
-        // A Barge-owned slot's hold is the authority: a held row whose root
-        // can be held again has no live holder, so it returns to idle before
-        // any admission reads the ledger. Existing Oxide roots are adopted in
-        // place first, keeping their path and bytes.
-        pool.adopt_legacy_roots()?;
-        pool.recover_abandoned_holds()?;
+        pool.recover_abandoned_holds(releasing)?;
         pool.retire_missing_idle_roots()?;
         pool.sweep_trash()?;
         Ok(pool)
@@ -1279,7 +1340,6 @@ impl Pool {
             pending_hold: None,
             budget: ledger.cap_bytes,
             ledger,
-            reserve: None,
             admission_note: None,
         })
     }
@@ -1393,13 +1453,13 @@ impl Pool {
     ///
     /// This is the whole crash-recovery rule for a Barge-owned slot: the flock
     /// is the authority, not a process or descriptor census.
-    fn recover_abandoned_holds(&mut self) -> Result<(), LeaseError> {
+    fn recover_abandoned_holds(&mut self, releasing: Option<&str>) -> Result<(), LeaseError> {
         let Some(storage) = self.storage.clone() else {
             return Ok(());
         };
         let mut changed = false;
         for slot in &mut self.ledger.slots {
-            if slot.state != SlotPersistState::Held {
+            if slot.state != SlotPersistState::Held || releasing == slot.lease_id.as_deref() {
                 continue;
             }
             if !slot.owned {
@@ -1432,69 +1492,83 @@ impl Pool {
         Ok(())
     }
 
-    /// Adopt every existing Oxide slot directory as a Barge-owned root,
-    /// keeping its path and bytes. The library writes its own marker and moves
-    /// nothing; a row whose directory has gone, and an unmarked stray at a
-    /// retired folder, are left alone.
+    /// Finish adoption on the front door's preparation path. A recorded
+    /// root is never sent back through Barge's recursive adoption check.
     fn adopt_legacy_roots(&mut self) -> Result<(), LeaseError> {
         let Some(storage) = self.storage.clone() else {
             return Ok(());
         };
-        let mut changed = false;
-        for slot in &mut self.ledger.slots {
-            if let Some(root) = slot.root.as_deref() {
-                if !slot.owned {
-                    let project = slot
-                        .dir
-                        .as_deref()
-                        .and_then(|dir| dir.split_once('/'))
-                        .map(|(folder, _)| folder);
-                    storage
-                        .pin_in(project, root, "legacy generation")
-                        .map_err(|_| LeaseError::UnknownAccounting)?;
+        for index in 0..self.ledger.slots.len() {
+            let slot = &self.ledger.slots[index];
+            if slot.owned
+                || slot.adoption_refused
+                || !slot.is_idle()
+                || !legacy_writer_absent(&slot.holder)
+            {
+                continue;
+            }
+            let path = self.slot_path(slot.id)?;
+            let folder = slot.dir.clone().unwrap_or_else(|| slot.id.to_string());
+            let leaf = folder
+                .rsplit('/')
+                .next()
+                .ok_or(LeaseError::UnknownAccounting)?;
+            let id = legacy_root_id(&folder);
+            let label = slot.profile.as_str();
+            let area = storage
+                .area_for(slot.area_folder())
+                .map_err(|_| LeaseError::UnknownAccounting)?;
+            let adopted = match area.resolve(&id) {
+                Ok(root) => root.path == path && root.label == label,
+                Err(error) if error.kind() == barge::ErrorKind::NotFound => {
+                    // A published id is never attached to a replacement path.
+                    if slot.root.is_some() {
+                        continue;
+                    }
+                    match storage.adopt_in(slot.area_folder(), leaf, label, &id) {
+                        Ok(root) => root.path == path,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                barge::ErrorKind::Refused | barge::ErrorKind::NotFound
+                            ) =>
+                        {
+                            false
+                        }
+                        Err(_) => return Err(LeaseError::UnknownAccounting),
+                    }
                 }
-                continue;
-            }
-            if slot.state != SlotPersistState::Idle || slot.lease_id.is_some() {
-                // A held legacy generation is never adopted: its writer predates
-                // the Barge lock, and adopting it would put an in-use directory
-                // under Barge's prune authority.
-                continue;
-            }
-            let dir = slot.dir.clone().unwrap_or_else(|| slot.id.to_string());
-            let (project_folder, leaf) = match dir.split_once('/') {
-                Some((folder, leaf)) => (Some(folder), leaf.to_owned()),
-                None => (None, dir.clone()),
+                Err(_) => return Err(LeaseError::UnknownAccounting),
             };
-            let label = slot.profile.as_str().to_owned();
-            let id = legacy_root_id(&dir);
-            match storage.adopt_in(project_folder.as_deref(), &leaf, &label, &id) {
-                Ok(root) => {
-                    // A legacy generation never held a Barge lock; pin its root
-                    // so no prune or eviction can delete a directory an older
-                    // writer may still use. The pin is removed when a grant
-                    // takes the root.
-                    storage
-                        .pin_in(project_folder.as_deref(), &root.id, "legacy generation")
-                        .map_err(|_| LeaseError::UnknownAccounting)?;
-                    slot.root = Some(root.id);
-                    changed = true;
+            if adopted {
+                if slot.root.as_deref() == Some(&id) {
+                    // #314 placed a migration pin on these unfinished rows.
+                    // A fresh adoption publishes no pin. Removal uses Barge's
+                    // API and is idempotent if a prior attempt removed it.
+                    match area.unpin(&id) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == barge::ErrorKind::NotFound => {}
+                        Err(_) => return Err(LeaseError::UnknownAccounting),
+                    }
+                } else if slot.root.is_some() {
+                    return Err(LeaseError::UnknownAccounting);
                 }
-                Err(_) => {
-                    // A foreign, symlinked, unreadable or missing root keeps its
-                    // row unowned: it is reported by status and never reused or
-                    // evicted through a lock this version did not establish.
-                }
+                let slot = &mut self.ledger.slots[index];
+                slot.root = Some(id);
+                slot.owned = true;
+            } else {
+                self.ledger.slots[index].adoption_refused = true;
             }
-        }
-        if changed {
+            // Publish each transition before visiting another root. If the
+            // write failed after adoption, the next preparation resolves the
+            // deterministic id above without another recursive adoption.
             self.persist()?;
         }
         Ok(())
     }
 
     /// A completed Barge rename may precede the workflow ledger write. Only a
-    /// positively absent, previously held Barge root can retire its idle row;
+    /// positively absent, transitioned Barge root can retire its idle row;
     /// existing or unreadable paths stay recorded and are never re-adopted.
     fn retire_missing_idle_roots(&mut self) -> Result<(), LeaseError> {
         let mut missing = Vec::new();
@@ -1518,6 +1592,7 @@ impl Pool {
 
     /// Commit Barge's completed evictions to workflow membership before the
     /// next compatible-root lookup. Barge still owns all deletion decisions.
+    #[cfg(test)]
     fn prune_storage(&mut self) -> Result<(), LeaseError> {
         let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
         let report = storage
@@ -1557,7 +1632,6 @@ impl Pool {
             }
             self.budget = budget;
         }
-        self.reserve = request.reserve_bytes;
         if let (Some(storage), Some(reserve)) = (self.storage.as_ref(), request.reserve_bytes) {
             storage
                 .set_reserve(reserve)
@@ -1590,17 +1664,18 @@ impl Pool {
                 return Err(LeaseError::Busy);
             }
         }
-        // The volume's reserve and floor apply to warm reuse as well as a new
-        // slot. Reconcile completed Barge evictions before selecting a root.
+        let candidate = self.idle_compatible(&project, request.profile);
         if self.is_removable() {
-            self.prune_storage()?;
-            let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
-            let space = storage.space().map_err(|_| LeaseError::UnknownAccounting)?;
-            if space.floor_bytes > 0 && space.free_bytes < space.floor_bytes {
-                return Err(LeaseError::Full);
+            if candidate.is_some() {
+                // Warm reuse checks the floor without pruning another root.
+                let space = self.volume_space()?;
+                if space.free_bytes < space.floor_bytes {
+                    return Err(LeaseError::Full);
+                }
+            } else {
+                self.evict_for_reserve()?;
             }
         }
-        let candidate = self.idle_compatible(&project, request.profile);
         // One-use workspaces are dormant; their bounded slice report is still
         // returned so a caller sees the outcome it supplied.
         let slice_report = match request.slice.as_ref() {
@@ -1628,14 +1703,14 @@ impl Pool {
         }
         self.ensure_capacity_policy()?;
         self.next_rank()?;
-        let grant = self.allocate(project, workspace, request)?;
+        let (grant, unmeasured) = self.allocate(project, workspace, request)?;
         Ok(Leased {
             grant,
             hold: None,
             measured: None,
             admission_note: self.admission_note.take(),
             slice: slice_report,
-            unmeasured: Vec::new(),
+            unmeasured,
             holding: Vec::new(),
         })
     }
@@ -1645,11 +1720,7 @@ impl Pool {
         self.ledger
             .slots
             .iter()
-            .find(|slot| {
-                slot.state == SlotPersistState::Idle
-                    && slot.project == project
-                    && slot.profile == profile
-            })
+            .find(|slot| slot.is_idle() && slot.project == project && slot.profile == profile)
             .map(|slot| (slot.id, slot.incarnation))
     }
 
@@ -1667,38 +1738,15 @@ impl Pool {
         let Some(slot) = self.slot(slot_id) else {
             return Err(LeaseError::UnknownAccounting);
         };
-        let Some(root) = slot.root.clone() else {
-            // An unowned legacy directory is never granted: its ownership was
-            // never established, so a writer could still be inside it.
+        let Some(root) = slot.root.as_deref().filter(|_| slot.owned) else {
             return Err(LeaseError::Busy);
         };
-        let legacy = !slot.owned;
-        let area = slot
-            .dir
-            .as_deref()
-            .and_then(|dir| dir.split_once('/'))
-            .map(|(folder, _)| folder.to_owned());
-        let storage = self.storage.clone().ok_or(LeaseError::UnknownAccounting)?;
-        match storage
-            .try_hold_in(area.as_deref(), &root)
+        let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
+        let hold = storage
+            .try_hold_in(slot.area_folder(), root)
             .map_err(|_| LeaseError::UnknownAccounting)?
-        {
-            Some(hold) => {
-                self.pending_hold = Some(hold);
-                let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
-                // This generation now owns the root through its hold; the
-                // legacy protection pin is no longer needed.
-                if legacy {
-                    storage
-                        .unpin_in(area.as_deref(), &root)
-                        .map_err(|_| LeaseError::UnknownAccounting)?;
-                }
-                if let Some(slot) = self.slot_mut(slot_id) {
-                    slot.owned = true;
-                }
-            }
-            None => return Err(LeaseError::Busy),
-        }
+            .ok_or(LeaseError::Busy)?;
+        self.pending_hold = Some(hold);
         let lease_id = self.mint_lease_id(slot_id, incarnation)?;
         {
             let slot = self
@@ -1729,36 +1777,27 @@ impl Pool {
         project: PathBuf,
         workspace: PathBuf,
         request: &LeaseRequest,
-    ) -> Result<LeaseGrant, LeaseError> {
+    ) -> Result<(LeaseGrant, Vec<UnmeasuredSlot>), LeaseError> {
         if let Some(victim) = request.replace_slot {
-            self.replace_idle_slot_for_admission(victim)?;
+            self.retire_idle_slot(victim)?;
         }
-        // Slot headroom only: the pool ceiling is replaced, never exceeded.
-        if self.ledger.slots.len() >= MAX_SLOTS {
-            self.evict_idle_until(MAX_SLOTS - 1)?;
-            if self.ledger.slots.len() >= MAX_SLOTS {
-                return Err(LeaseError::LedgerExhausted);
-            }
+        // Retire count victims before measuring any unrecorded survivors.
+        if self.ledger.slots.len() >= MAX_SLOTS && !self.evict_one_idle_with(|_| true)? {
+            return Err(LeaseError::LedgerExhausted);
         }
-        // Byte pressure and space policy are Barge's: the area's own bytes
-        // against the pool's soft cap, and (on a removable pool) the volume's
-        // reserve and floor. One idle unpinned slot is retired per attempt.
-        if let Some(storage) = self.storage.clone() {
-            let mut used = storage
-                .total_bytes()
-                .map_err(|_| LeaseError::UnknownAccounting)?;
-            // Retire eligible idle roots, least recently used first, until the
-            // area is under the soft cap. Each eviction is one whole root; a
-            // held or pinned root is skipped rather than ending the attempt.
-            let mut rounds = 0_usize;
-            while used >= self.budget {
-                if rounds >= MAX_SLOTS || !self.evict_one_idle_with()? {
-                    return Err(LeaseError::Full);
-                }
-                rounds += 1;
-                used = storage
-                    .total_bytes()
-                    .map_err(|_| LeaseError::UnknownAccounting)?;
+        let (charges, unmeasured) = self.admission_charges()?;
+        while self
+            .ledger
+            .slots
+            .iter()
+            .map(|slot| charges[&slot.id])
+            .fold(0, u64::saturating_add)
+            >= self.budget
+        {
+            if !self.evict_one_idle_with(|id| {
+                !unmeasured.iter().any(|slot| slot.slot_id == id.to_string())
+            })? {
+                return Err(LeaseError::Full);
             }
         }
         let slot_id = self.ledger.next_slot;
@@ -1854,6 +1893,7 @@ impl Pool {
             dir,
             root: root_id,
             owned: true,
+            adoption_refused: false,
             rank: 0,
             recorded: None,
             capture: None,
@@ -1872,14 +1912,10 @@ impl Pool {
             eprintln!("DBG grant_from: {error:?}");
             return Err(error);
         }
-        self.grant_from(slot, false)
+        Ok((self.grant_from(slot, false)?, unmeasured))
     }
 
-    fn release_or_recover(
-        &mut self,
-        lease_id: &str,
-        _recover: bool,
-    ) -> Result<ReleaseReceipt, LeaseError> {
+    fn release_or_recover(&mut self, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
         validate_lease_id(lease_id)?;
         let Some(index) = self.ledger.slots.iter().position(|slot| {
             slot.last_lease_id == lease_id || slot.lease_id.as_deref() == Some(lease_id)
@@ -1906,11 +1942,19 @@ impl Pool {
         // returns without writing, so read-only use never migrates.
         self.ensure_capacity_policy()?;
         self.next_rank()?;
-        // Barge's own accounting is the only size source; release writes no
-        // separate observation.
+        let recorded = crate::release_trace::phase("release walk", || {
+            let slot = &self.ledger.slots[index];
+            self.slot_path(slot.id).ok().and_then(|path| {
+                observed_size(
+                    slot,
+                    &path,
+                    Instant::now() + Duration::from_millis(ACCOUNTING_MAX_ELAPSED_MS),
+                )
+            })
+        });
         self.ledger.slots[index].state = SlotPersistState::Idle;
         self.ledger.slots[index].lease_id = None;
-        self.ledger.slots[index].recorded = None;
+        self.ledger.slots[index].recorded = recorded;
         let released = self.ledger.slots[index].id;
         self.stamp_rank(released)?;
         crate::release_trace::phase("ledger write", || self.persist_revised())?;
@@ -2019,18 +2063,13 @@ impl Pool {
         let Some(slot) = self.slot(id) else {
             return Err(LeaseError::Busy);
         };
-        if slot.state != SlotPersistState::Idle || slot.lease_id.is_some() {
+        if !slot.is_idle() || !slot.owned {
             return Err(LeaseError::Busy);
         }
-        let root = slot.root.clone().ok_or(LeaseError::UnknownAccounting)?;
-        let project = slot
-            .dir
-            .as_deref()
-            .and_then(|dir| dir.split_once('/'))
-            .map(|(f, _)| f.to_owned());
+        let root = slot.root.as_deref().ok_or(LeaseError::UnknownAccounting)?;
         let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
         storage
-            .evict_in(project.as_deref(), &root)
+            .evict_in(slot.area_folder(), root)
             .map_err(|error| {
                 if error.contains("held") || error.contains("pinned") {
                     LeaseError::Busy
@@ -2098,31 +2137,38 @@ impl Pool {
         Ok(Vec::new())
     }
 
-    /// Retire idle slots until at most `max` remain.
-    fn evict_idle_until(&mut self, max: usize) -> Result<(), LeaseError> {
-        while self.ledger.slots.len() > max {
-            if !self.evict_one_idle_with()? {
-                break;
-            }
+    fn volume_space(&self) -> Result<barge::Space, LeaseError> {
+        self.storage
+            .as_ref()
+            .ok_or(LeaseError::UnknownAccounting)?
+            .space()
+            .map_err(|_| LeaseError::UnknownAccounting)
+    }
+
+    fn evict_for_reserve(&mut self) -> Result<(), LeaseError> {
+        let mut space = self.volume_space()?;
+        while space.free_bytes < space.reserve_bytes && self.evict_one_idle_with(|_| true)? {
+            space = self.volume_space()?;
+        }
+        if space.free_bytes < space.floor_bytes {
+            return Err(LeaseError::Full);
         }
         Ok(())
     }
 
-    /// Retire the oldest idle slot, if any. A held or pinned slot is refused
-    /// by Barge and skipped, never forced.
-    fn evict_one_idle_with(&mut self) -> Result<bool, LeaseError> {
+    /// Retire the oldest eligible slot. Barge checks the actual hold and pin
+    /// of the named root, including a hold inherited by a child.
+    fn evict_one_idle_with(&mut self, eligible: impl Fn(u64) -> bool) -> Result<bool, LeaseError> {
         let mut candidates: Vec<(u64, u64)> = self
             .ledger
             .slots
             .iter()
-            .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
+            .filter(|slot| slot.is_idle() && slot.owned && slot.root.is_some() && eligible(slot.id))
             .map(|slot| (slot.rank, slot.id))
             .collect();
         candidates.sort_unstable();
         for (_, id) in candidates {
             match self.retire_idle_slot(id) {
-                // A held or pinned root is skipped; a later eligible root may
-                // still relieve the pressure.
                 Ok(()) => return Ok(true),
                 Err(LeaseError::Busy) => continue,
                 Err(error) => return Err(error),
@@ -2131,47 +2177,75 @@ impl Pool {
         Ok(false)
     }
 
-    /// The front door's count replacement: retire this idle slot.
-    fn replace_idle_slot_for_admission(&mut self, id: u64) -> Result<(), LeaseError> {
-        self.retire_idle_slot(id)
-    }
-    /// The status document: the ledger's membership plus Barge's own per-root
-    /// accounting. There is no separate inventory walk.
-    fn accounted(&self) -> Result<PoolStatus, LeaseError> {
-        // A mutating open can read Barge's own per-root accounting; a passive
-        // measurement has no storage handle and walks the recorded directories
-        // read-only instead. Either way `unique_allocated_bytes` stays `None`:
-        // this version measures logical bytes, not allocated blocks, and never
-        // presents one as the other.
-        let by_id: Option<BTreeMap<String, u64>> = match self.storage.as_ref() {
-            Some(storage) => {
-                let roots = storage
-                    .all_roots()
-                    .map_err(|_| LeaseError::UnknownAccounting)?;
-                Some(
-                    roots
-                        .into_iter()
-                        .map(|(_, info)| (info.id, info.bytes))
-                        .collect(),
-                )
+    /// Sample only slots lacking a current observation, once before pressure
+    /// decisions. Partial walks get a positive, unpublished estimate and
+    /// cannot nominate a byte-pressure victim.
+    fn admission_charges(
+        &mut self,
+    ) -> Result<(BTreeMap<u64, u64>, Vec<UnmeasuredSlot>), LeaseError> {
+        let deadline = Instant::now() + Duration::from_millis(ACCOUNTING_MAX_ELAPSED_MS);
+        let mut charges = BTreeMap::new();
+        let mut missing = Vec::new();
+        let mut changed = false;
+        for index in 0..self.ledger.slots.len() {
+            let slot = &self.ledger.slots[index];
+            if slot.recorded_size().is_none()
+                && slot.state != SlotPersistState::Evicting
+                && Instant::now() < deadline
+            {
+                let record = self
+                    .slot_path(slot.id)
+                    .ok()
+                    .and_then(|path| observed_size(slot, &path, deadline));
+                if let Some(record) = record {
+                    self.ledger.slots[index].recorded = Some(record);
+                    changed = true;
+                }
             }
-            None => None,
-        };
-        // A passive measurement is bounded by the caller's remaining window; a
-        // mutating status uses one short fixed budget.
-        let deadline = self
-            .deadline
-            .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(60));
+            let slot = &self.ledger.slots[index];
+            if let Some(record) = slot.recorded_size() {
+                charges.insert(slot.id, record.logical_bytes);
+            } else {
+                missing.push((
+                    slot.id,
+                    UnmeasuredSlot {
+                        slot_id: slot.id.to_string(),
+                        incarnation: slot.incarnation.to_string(),
+                        dir: slot.dir.clone(),
+                    },
+                ));
+            }
+        }
+        if changed {
+            self.persist_revised()?;
+        }
+        let estimate = charges.values().copied().max().unwrap_or(0).max(1);
+        let unmeasured = missing
+            .into_iter()
+            .map(|(id, slot)| {
+                charges.insert(id, estimate);
+                slot
+            })
+            .collect();
+        Ok((charges, unmeasured))
+    }
+
+    /// Passive status reads recorded sizes. Explicit measurement supplies the
+    /// caller's deadline and walks one recorded slot at a time.
+    fn accounted(&self, measure: bool) -> Result<PoolStatus, LeaseError> {
         let mut slots = Vec::new();
         let mut incomplete = 0_u64;
         let mut total = 0_u64;
         for slot in &self.ledger.slots {
-            let measured = match &by_id {
-                Some(by_id) => slot.root.as_ref().and_then(|root| by_id.get(root).copied()),
-                None => self
-                    .slot_path(slot.id)
-                    .ok()
-                    .and_then(|path| barge_tree_bytes_bounded(&path, deadline)),
+            let measured = if measure {
+                self.deadline.and_then(|deadline| {
+                    self.slot_path(slot.id)
+                        .ok()
+                        .and_then(|path| slot_tree_bytes(&path, deadline))
+                        .map(|(bytes, _)| bytes)
+                })
+            } else {
+                slot.recorded_size().map(|record| record.logical_bytes)
             };
             if measured.is_none() {
                 incomplete += 1;
@@ -2198,7 +2272,6 @@ impl Pool {
         } else {
             AccountingCoverage::Partial
         };
-        // An incomplete total cannot answer whether the pool is full.
         let full = (incomplete == 0).then_some(total >= self.config.cap_bytes);
         Ok(PoolStatus {
             version: LEASE_VERSION,
@@ -2346,20 +2419,21 @@ fn snapshot_of(
     payload: PathBuf,
     volume: Option<RecordedVolume>,
 ) -> PassiveSnapshot {
-    let idle = ledger
-        .slots
-        .iter()
-        .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
-        .count();
+    let mut recorded_slots = 0;
+    let mut total = 0_u64;
+    for record in ledger.slots.iter().filter_map(SlotRecord::recorded_size) {
+        recorded_slots += 1;
+        total = total.saturating_add(record.logical_bytes);
+    }
     PassiveSnapshot {
         store_id: config.store_id.clone(),
         backend: config.backend.clone(),
         cap_bytes: config.cap_bytes,
         payload,
         volume,
-        recorded_slots: 0,
-        unrecorded_slots: idle,
-        recorded_total: None,
+        recorded_slots,
+        unrecorded_slots: ledger.slots.len() - recorded_slots,
+        recorded_total: (recorded_slots > 0).then_some(total),
         holding: Vec::new(),
         slots: ledger.slots.iter().map(ledger_slot).collect(),
         evicting_slot_ids: ledger
@@ -2381,11 +2455,11 @@ fn snapshot_of(
 /// rather than pairing a walk with a different slot generation. Nothing is
 /// repaired or waited for.
 fn measure_within(pool: &Path, max_elapsed_ms: u64) -> Result<MeasuredPool, LeaseError> {
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(max_elapsed_ms.min(60_000));
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(max_elapsed_ms.min(ACCOUNTING_MAX_ELAPSED_MS));
     let opened = Pool::open_passive(pool, deadline)?;
     let snapshot = opened.recorded();
-    let mut status = opened.accounted()?;
+    let mut status = opened.accounted(true)?;
     let stable = match read_consistent_pair_before(&opened.root, Some(deadline)) {
         Ok((config, ledger)) => same_generations(&snapshot, &config, &ledger),
         Err(_) => false,
@@ -2612,7 +2686,7 @@ fn ledger_slot(slot: &SlotRecord) -> LedgerSlot {
         lease_id: slot.lease_id.clone(),
         dir: slot.dir.clone(),
         rank: slot.rank,
-        recorded: None,
+        recorded: slot.recorded_size(),
     }
 }
 fn require_holder(holder: &str) -> Result<(), LeaseError> {
