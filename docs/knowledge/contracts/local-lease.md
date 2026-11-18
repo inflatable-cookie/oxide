@@ -27,11 +27,11 @@ Compatible idle reuse retains both root path and bytes. A new generation after
 retirement or eviction uses `create_root`, with a fresh ID and path. An
 unrecorded stray at an old path never becomes a successor.
 
-Pool preparation adopts eligible legacy rows before admission. An idle row
-whose previous holder is absent or positively dead can be adopted and
-evicted without a warm grant. A live older holder keeps the row unavailable.
-Held legacy rows still need the existing explicit writer-closure check.
-A free Barge lock gives no closure evidence for a writer that never held it.
+Pool preparation adopts idle legacy rows when the kernel confirms that the
+recorded Oxide holder PID is absent. A live or unverifiable holder keeps the
+row unavailable. Held legacy rows still need the existing explicit
+writer-closure check. Adoption creates no pin, so an unpinned root can be
+evicted without a warm grant. Existing pins remain protected by Barge.
 
 ## Oxide front door control directory
 

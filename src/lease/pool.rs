@@ -330,17 +330,21 @@ impl SlotRecord {
     }
 }
 
-/// An idle legacy row can still name its previous writer. A recognised Oxide
-/// PID must be positively absent. Other holder names are opaque library tokens
-/// and an idle row with no lease has no holder associated with such a token.
+/// Only the front door's holder format supplies a PID that can be checked.
+/// An opaque or malformed legacy token supplies no evidence of closure.
 fn legacy_writer_absent(holder: &str) -> bool {
-    let Some(process) = holder.strip_prefix("oxide-") else {
-        return true;
-    };
-    let Some(pid) = process
-        .split_once('-')
-        .and_then(|(pid, _)| pid.parse::<libc::pid_t>().ok())
+    let Some((pid, ticket)) = holder
+        .strip_prefix("oxide-")
+        .and_then(|holder| holder.split_once('-'))
     else {
+        return false;
+    };
+    let canonical_number =
+        |text: &str| !text.starts_with('0') && text.bytes().all(|byte| byte.is_ascii_digit());
+    if !canonical_number(pid) || !canonical_number(ticket) || ticket.parse::<u64>().is_err() {
+        return false;
+    }
+    let Ok(pid) = pid.parse::<libc::pid_t>() else {
         return false;
     };
     if pid <= 1 {
@@ -1516,27 +1520,18 @@ impl Pool {
                 .area_for(slot.area_folder())
                 .map_err(|_| LeaseError::UnknownAccounting)?;
             let adopted = match area.resolve(&id) {
-                Ok(root)
-                    if root.path == path
+                // The pinned Barge API can unpin by ID but cannot compare
+                // pin provenance under its lock. Keep any existing pin.
+                Ok(root) => {
+                    root.path == path
                         && root.label == label
                         && slot.root.as_deref().is_none_or(|recorded| recorded == id)
                         && fs::symlink_metadata(&path).is_ok_and(|metadata| {
                             metadata.is_dir()
                                 && metadata.uid() == current_uid()
                                 && metadata.mode() & 0o022 == 0
-                        }) =>
-                {
-                    // #314 reserved these unfinished legacy roots for a
-                    // migration pin, which it published before the ledger ID.
-                    // A retry of a newer adoption can find an unpinned root.
-                    match area.unpin(&id) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == barge::ErrorKind::NotFound => {}
-                        Err(_) => return Err(LeaseError::UnknownAccounting),
-                    }
-                    true
+                        })
                 }
-                Ok(_) => false,
                 Err(error) if error.kind() == barge::ErrorKind::NotFound => {
                     // A published id is never attached to a replacement path.
                     if slot.root.is_some() {

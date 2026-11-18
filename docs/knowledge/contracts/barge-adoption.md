@@ -139,13 +139,14 @@ completed or definitively refused row before moving on. Barge's
 duplicate ID. Importing many old rows into one area can therefore take
 quadratic work. Lease admission, release and status never call adoption.
 
-An eligible idle legacy row is adopted in place without a durable pin.
-Preparation can remove the old migration pin after matching the unfinished
-idle transition's root and confirming the former holder is absent. This
-includes an interruption before the root ID was recorded. Still-held or
-unverifiable rows remain unavailable. A refused row stays unowned and an
-unrecorded stray at a retired folder is never adopted. Every transition test
-uses fresh temporary fixtures.
+Preparation adopts idle legacy rows in place when the kernel reports their
+recorded Oxide holder PID absent. It creates no durable pin. Opaque or
+malformed holder tokens and still-held rows remain unavailable. Retried
+adoption preserves any existing Barge pin, including pins published before
+the root ID was recorded. The pinned Barge API cannot verify pin provenance
+and remove the pin in one operation, so existing pins need explicit
+maintenance. A refused row stays unowned, and unrecorded strays are retained.
+Every transition test uses fresh temporary fixtures.
 
 New-slot admission reads the Oxide ledger's logical-byte observations and
 walks only rows missing a current observation. Count, byte and reserve

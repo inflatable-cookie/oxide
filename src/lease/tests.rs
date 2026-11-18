@@ -278,6 +278,13 @@ fn write_legacy_ledger(pool: &Path, state: &str, dir: Option<&str>, id: u64, pro
         serde_json::from_slice(&fs::read(pool.join("config.json")).unwrap()).unwrap();
     let store_id = config["store_id"].as_str().unwrap();
     let cap = config["cap_bytes"].as_u64().unwrap();
+    // The kernel reports this out-of-range process ID as absent on both
+    // supported platforms. Held rows can carry an opaque library token.
+    let holder = if state == "idle" {
+        format!("oxide-{}-1", libc::pid_t::MAX)
+    } else {
+        "legacy".to_owned()
+    };
     let row = serde_json::json!({
         "id": id,
         "incarnation": 1,
@@ -285,7 +292,7 @@ fn write_legacy_ledger(pool: &Path, state: &str, dir: Option<&str>, id: u64, pro
         "project": project,
         "workspace": "/fixture/workspace",
         "profile": "dev",
-        "holder": "legacy",
+        "holder": holder,
         "lease_id": if state == "held" { serde_json::json!(format!("v1.{store_id}.{id}.1.1")) } else { serde_json::Value::Null },
         "last_lease_id": format!("v1.{store_id}.{id}.1.1"),
         "dir": dir,
@@ -572,9 +579,40 @@ fn an_idle_legacy_root_stays_out_of_eviction_while_its_old_holder_lives() {
 }
 
 #[test]
-fn a_previous_migration_pin_is_removed_once_even_without_a_warm_grant() {
-    // The old version published the pin before it wrote the root ID.
-    for published_root_id in [true, false] {
+fn an_idle_legacy_root_with_an_unverifiable_holder_stays_outside_eviction() {
+    for holder in [
+        "legacy".to_owned(),
+        format!("oxide-{}-unknown", libc::pid_t::MAX),
+    ] {
+        let fixture = Fixture::new("legacy-unverifiable");
+        let pool = fixture.pool();
+        let path = slot_dir(&pool, "62");
+        let project = fixture.dir("project");
+        fs::write(path.join("artifact"), b"keep").unwrap();
+        write_legacy_ledger(&pool, "idle", None, 62, project.to_str().unwrap());
+        update_ledger(&pool, |ledger| ledger["slots"][0]["holder"] = holder.into());
+
+        let (prepared, walks) = count_pool_walks(|| managed::prepare_pool(&pool));
+        assert_eq!(prepared.unwrap().slots.len(), 1);
+        assert!(walks.is_empty());
+        assert!(!path.join(".barge-root.json").exists());
+        assert!(matches!(
+            managed::evict_idle_slot(&pool, "62"),
+            Err(LeaseError::Busy)
+        ));
+        assert_eq!(fs::read(path.join("artifact")).unwrap(), b"keep");
+    }
+}
+
+#[test]
+fn an_unfinished_legacy_transition_preserves_existing_barge_pins() {
+    // The old version published its pin before it wrote the root ID.
+    for (published_root_id, reason) in [
+        (true, "independent pin"),
+        (false, "independent pin"),
+        (true, "legacy generation"),
+        (false, "legacy generation"),
+    ] {
         let fixture = Fixture::new("legacy-pinned");
         let pool = fixture.pool();
         let path = slot_dir(&pool, "62");
@@ -583,7 +621,8 @@ fn a_previous_migration_pin_is_removed_once_even_without_a_warm_grant() {
         managed::prepare_pool(&pool).expect("adopt legacy root");
         let storage = fixture_storage(&pool);
         let (_, root) = storage.all_roots().unwrap().remove(0);
-        storage.pin_in(None, &root.id, "legacy generation").unwrap();
+        assert!(!root.pinned, "new adoption leaves no pin");
+        storage.pin_in(None, &root.id, reason).unwrap();
         update_ledger(&pool, |ledger| {
             let row = ledger["slots"][0].as_object_mut().unwrap();
             row.remove("owned");
@@ -595,12 +634,14 @@ fn a_previous_migration_pin_is_removed_once_even_without_a_warm_grant() {
         let (prepared, walks) = count_pool_walks(|| managed::prepare_pool(&pool));
         prepared.expect("finish the prior transition");
         assert!(walks.is_empty());
-        assert!(!storage.all_roots().unwrap()[0].1.pinned);
-        storage.pin_in(None, &root.id, "keep").unwrap();
-        managed::prepare_pool(&pool).expect("no further migration");
         assert!(storage.all_roots().unwrap()[0].1.pinned);
+        assert!(matches!(
+            managed::evict_idle_slot(&pool, "62"),
+            Err(LeaseError::Busy)
+        ));
+        assert!(path.is_dir());
         storage.unpin_in(None, &root.id).unwrap();
-        managed::evict_idle_slot(&pool, "62").expect("evict after removing the independent pin");
+        managed::evict_idle_slot(&pool, "62").expect("evict after explicit unpin");
         assert!(!path.exists());
     }
 }
