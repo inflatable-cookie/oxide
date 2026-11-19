@@ -1001,7 +1001,14 @@ fn sweeping_owned_trash_does_not_resample_the_roots_bytes() {
 
     managed::prepare_pool(&pool).unwrap();
     let (_, walked, listed, opaque) = super::admission_cost::latest(&pool);
-    assert_eq!((walked, listed, opaque), (0, 1, false));
+    assert_eq!((walked, listed, opaque), (0, 0, false));
+    assert!(
+        evicted.exists(),
+        "opening under the pool lock must not sweep trash"
+    );
+    let messages = managed::settle_pending_evictions(&pool).unwrap();
+    assert!(messages.is_empty(), "{messages:?}");
+    assert!(super::pool::last_settle_held_no_pool_lock());
     assert!(!evicted.exists());
 }
 

@@ -87,7 +87,8 @@ returns before deciding again, so a reserve eviction stays one inline call. A fu
 record list also falls back to the inline call rather than grow the file.
 
 A mutating open drops a record whose recorded root path is absent, because Barge's
-rename already committed and its trash is the sweep's work. A record whose root is
+rename already committed and its trash is swept by the unlocked settlement pass,
+even when no pending records remain. A record whose root is
 still present stays for a later pass; recovery never deletes it directly.
 
 A held eviction checks the writer generation and exact lease under the pool lock.

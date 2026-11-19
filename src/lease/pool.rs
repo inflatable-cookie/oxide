@@ -1406,8 +1406,7 @@ impl Pool {
                 pool.retire_missing_idle_roots()?;
                 // A decided idle eviction whose root is already gone finished
                 // its Barge rename; its record is only bookkeeping now.
-                pending::drop_completed(&pool.root)?;
-                pool.sweep_trash()
+                pending::drop_completed(&pool.root)
             })?;
         }
         Ok(pool)
@@ -2159,16 +2158,6 @@ impl Pool {
         self.ledger.slots.iter_mut().find(|slot| slot.id == id)
     }
 
-    /// Whether this pool's roots live on a removable volume.
-    /// Sweep owned trash a crash left behind.
-    fn sweep_trash(&self) -> Result<(), LeaseError> {
-        if let Some(storage) = self.storage.as_ref() {
-            storage
-                .sweep_all_trash()
-                .map_err(|_| LeaseError::UnknownAccounting)?;
-        }
-        Ok(())
-    }
     /// A bounded one-use restore observation. The dormant feature's slice
     /// carries its own member set; with no walk in this engine the outcome is
     /// "not needed", which every caller treats as no measurement.

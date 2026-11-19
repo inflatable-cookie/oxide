@@ -204,16 +204,25 @@ pub fn settle(pool: &Path) -> Result<Vec<String>, LeaseError> {
         }
         records
     };
-    if records.is_empty() {
-        return Ok(Vec::new());
-    }
     let backing = pool_backing(pool, &config)?;
     let storage = crate::storage::PoolStorage::open(&pool.join(MANAGED_NAME), &backing)
         .map_err(|_| LeaseError::BackingMismatch)?;
     let mut messages = Vec::new();
-    let mut settled: Vec<PendingEviction> = Vec::new();
+    // Recovery trash may remain even after its pending record was dropped.
+    // Sweep it here, never while opening the pool under its lock.
     #[cfg(test)]
-    POOL_LOCK_FREE.with(|free| free.set(true));
+    POOL_LOCK_FREE.with(|free| free.set(!crate::lease::pool::pool_lock_is_held(pool)));
+    let swept = storage
+        .sweep_all_trash()
+        .map_err(|_| LeaseError::UnknownAccounting)?;
+    for kept in swept.kept {
+        messages.push(format!(
+            "trash at {} was kept: {}",
+            kept.path.display(),
+            kept.reason
+        ));
+    }
+    let mut settled: Vec<PendingEviction> = Vec::new();
     for record in records {
         #[cfg(test)]
         {
