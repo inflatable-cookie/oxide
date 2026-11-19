@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -1639,8 +1639,9 @@ impl Pool {
                 .as_deref()
                 .and_then(|dir| dir.split_once('/'))
                 .map(|(folder, _)| folder.to_owned());
+            // The probe is one non-blocking `flock`, never a byte walk: it
+            // must not be reported as one (oxide#337).
             if let Ok(Some(hold)) = storage.try_hold_in(project.as_deref(), &root) {
-                admission_cost::walked(1);
                 drop(hold);
                 slot.state = SlotPersistState::Idle;
                 slot.lease_id = None;
@@ -2043,13 +2044,22 @@ impl Pool {
         request: &LeaseRequest,
     ) -> Result<(LeaseGrant, Vec<UnmeasuredSlot>), LeaseError> {
         if let Some(victim) = request.replace_slot {
-            self.retire_idle_slot(victim)?;
+            // A committed rename whose trash copy stayed is progress, and the
+            // grant reports what it kept instead of dropping the note
+            // (oxide#337).
+            let kept = self.retire_idle_slot(victim)?;
+            self.note_eviction(kept);
         }
         // Retire count victims before measuring any unrecorded survivors.
         if self.ledger.slots.len() >= MAX_SLOTS {
             admission_cost::in_phase(Phase::Eviction, || self.make_slot_room())?;
         }
         let (charges, unmeasured) = self.admission_charges()?;
+        // One protection listing decides every victim this loop retires:
+        // retiring a root changes nothing about the roots that stay
+        // candidates, so a fresh listing per victim re-read the same inventory
+        // (oxide#337). It is taken only when the loop first needs it.
+        let mut protection: Option<BTreeMap<PathBuf, barge::RootInfo>> = None;
         while self
             .ledger
             .slots
@@ -2058,7 +2068,7 @@ impl Pool {
             .fold(0, u64::saturating_add)
             >= self.budget
         {
-            match self.evict_one_idle_with(Phase::Eviction, |id| {
+            match self.evict_one_idle_listed(Phase::Eviction, &mut protection, |id| {
                 !unmeasured.iter().any(|slot| slot.slot_id == id.to_string())
             })? {
                 Evicted::None => return Err(LeaseError::Full),
@@ -2411,14 +2421,32 @@ impl Pool {
             Some(protection) => require_unprotected(protection, &path, &root)?,
             None => self.require_evictable(&path, &root)?,
         }
-        match pending::push(&self.root, &self.config.store_id, record) {
+        match pending::push(&self.root, &self.config.store_id, record.clone()) {
             Ok(()) => {
                 // The hand-off record is durable. Dropping the row now is the
                 // commit: the root is no longer in the ledger, so nothing can
                 // grant or reuse it while Barge's eviction waits for a free
                 // pool lock.
-                self.ledger.slots.retain(|slot| slot.id != id);
-                self.persist_revised().map(|()| None)
+                let index = self
+                    .ledger
+                    .slots
+                    .iter()
+                    .position(|slot| slot.id == id)
+                    .ok_or(LeaseError::Busy)?;
+                let removed = self.ledger.slots.remove(index);
+                match self.persist_revised() {
+                    Ok(()) => Ok(None),
+                    Err(error) => {
+                        // The row is still durable, so the hand-off record must
+                        // not survive: a settle pass running beside this
+                        // command would otherwise evict a root an admission can
+                        // still grant (oxide#337), exactly as
+                        // `reconcile_pending_evictions` keeps that invariant.
+                        self.ledger.slots.insert(index, removed);
+                        pending::remove_settled(&self.root, &[record])?;
+                        Err(error)
+                    }
+                }
             }
             // A full hand-off list falls back to the inline eviction rather
             // than growing the record file without bound.
@@ -2593,16 +2621,27 @@ impl Pool {
         phase: Phase,
         eligible: impl Fn(u64) -> bool,
     ) -> Result<Evicted, LeaseError> {
+        let mut protection = None;
+        self.evict_one_idle_listed(phase, &mut protection, eligible)
+    }
+
+    /// [`Self::evict_one_idle_with`] over a protection-listing cache the caller
+    /// owns, so a loop that retires several victims lists protection once
+    /// (oxide#337). The listing is still taken only when a candidate exists.
+    fn evict_one_idle_listed(
+        &mut self,
+        phase: Phase,
+        protection: &mut Option<BTreeMap<PathBuf, barge::RootInfo>>,
+        eligible: impl Fn(u64) -> bool,
+    ) -> Result<Evicted, LeaseError> {
         let candidates = self.ranked_idle(eligible);
         if candidates.is_empty() {
             return Ok(Evicted::None);
         }
         let defer = phase != Phase::Reserve;
-        let protection = if defer {
-            Some(self.protection_listing()?)
-        } else {
-            None
-        };
+        if defer && protection.is_none() {
+            *protection = Some(self.protection_listing()?);
+        }
         for (_, id) in candidates {
             match admission_cost::in_phase(phase, || {
                 self.retire_idle_slot_known(id, protection.as_ref(), defer)
@@ -3180,8 +3219,12 @@ fn prepare_new_pool(pool: &Path) -> Result<PathBuf, LeaseError> {
                 .ok_or(LeaseError::InvalidInput("pool has no parent"))?;
             let parent = canonical_existing_dir(parent, false)?;
             let created = parent.join(name);
-            fs::create_dir(&created).map_err(io_error)?;
-            fs::set_permissions(&created, fs::Permissions::from_mode(0o700)).map_err(io_error)?;
+            // The mode is set at creation, never after it: a `create_dir`
+            // followed by `set_permissions` leaves the umask-controlled mode
+            // readable to others until the second call (oxide#337).
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(&created).map_err(io_error)?;
             File::open(parent)
                 .and_then(|directory| directory.sync_all())
                 .map_err(io_error)?;

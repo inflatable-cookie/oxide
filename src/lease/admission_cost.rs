@@ -114,7 +114,9 @@ struct Trace {
 impl Trace {
     fn switch(&mut self, phase: Phase) -> Phase {
         let now = Instant::now();
-        self.sample.phases[self.phase as usize].micros += micros(now.duration_since(self.changed));
+        self.sample.phases[self.phase as usize].micros = self.sample.phases[self.phase as usize]
+            .micros
+            .saturating_add(micros(now.duration_since(self.changed)));
         self.changed = now;
         std::mem::replace(&mut self.phase, phase)
     }

@@ -185,13 +185,22 @@ pub(super) fn remove_settled(pool: &Path, settled: &[PendingEviction]) -> Result
     });
     if records.is_empty() {
         match fs::remove_file(records_path(pool)) {
-            Ok(()) => Ok(()),
+            // The unlink is the durable end of the hand-off list: without this
+            // sync a crash could replay a removal whose deletion already
+            // completed (oxide#337).
+            Ok(()) => sync_control_dir(pool),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(io_error(error)),
         }
     } else {
         write(pool, &store_id, &records)
     }
+}
+
+fn sync_control_dir(pool: &Path) -> Result<(), LeaseError> {
+    fs::File::open(pool.join(MANAGED_NAME))
+        .and_then(|control| control.sync_all())
+        .map_err(io_error)
 }
 
 /// Drop records whose recorded root path is gone: Barge's rename committed, and
@@ -225,6 +234,13 @@ pub(super) fn drop_completed(pool: &Path) -> Result<(), LeaseError> {
 /// itself. Neither the pool nor the front door's admission lock is held here;
 /// only the short reads and the record removal take the pool lock.
 pub fn settle(pool: &Path) -> Result<Vec<String>, LeaseError> {
+    // The pool path and its recorded shape are judged read-only first, before
+    // this pass reads the config or creates and takes the pool lock: a
+    // symlinked, foreign or retired pool must refuse untouched, and no other
+    // window may leave a lock file in one (oxide#337).
+    crate::lease::canonical_existing_dir(pool, false)?;
+    super::refuse_foreign_pool_entries(pool)?;
+    super::refuse_retired_image_pool(pool)?;
     let config = read_config(pool)?;
     let records = {
         let _lock = lock_pool(pool)?;
@@ -243,7 +259,10 @@ pub fn settle(pool: &Path) -> Result<Vec<String>, LeaseError> {
     };
     let backing = pool_backing(pool, &config)?;
     let storage = crate::storage::PoolStorage::open(&pool.join(MANAGED_NAME), &backing)
-        .map_err(|_| LeaseError::BackingMismatch)?;
+        // Barge's own failure keeps its own message: this is custody that could
+        // not be read or changed, never a pool recording another backing
+        // (oxide#337).
+        .map_err(LeaseError::Barge)?;
     let mut messages = Vec::new();
     // Recovery trash may remain even after its pending record was dropped.
     // Sweep it here, never while opening the pool under its lock.
