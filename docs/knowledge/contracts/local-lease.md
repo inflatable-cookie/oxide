@@ -27,7 +27,9 @@ old path never becomes its successor.
 
 Pool preparation adopts an idle legacy row only when the kernel confirms its
 recorded Oxide holder PID is absent. A live or unverifiable holder keeps the row
-unavailable. Adoption creates no pin.
+unavailable. Adoption creates no pin. A Barge error while resolving or adopting
+the row keeps that row out of service permanently and reports the open as
+reconciliation-blocked; it no longer refuses every later command.
 
 ## Front-door control directory
 
@@ -41,7 +43,8 @@ formats keep the existing forward refusal and installed-binary handoff.
 
 - **Admission** takes an exclusive Barge hold before returning a slot.
 - **Release** records a bounded measurement of the closing slot and updates the
-  Rust lease state before the caller drops its hold.
+  Rust lease state before the caller drops its hold. That one walk is bounded well
+  below the pool-lock wait, so no other command waits behind it.
 - **Recovery** uses cooperative hold availability. Normal process-group exit
   handling is product handling, not a certificate that no arbitrary writer
   remains.
@@ -88,7 +91,15 @@ record list also falls back to the inline call rather than grow the file.
 
 A mutating open drops a record whose recorded root path is absent, because Barge's
 rename already committed and its trash is swept by the unlocked settlement pass,
-even when no pending records remain. Barge's trash sweep holds its area lock
+even when no pending records remain. It also rolls a committed decision forward
+when its `(slot, incarnation, root)` row is still recorded — the state a ledger
+save that failed after the record left behind: the row is dropped and saved, and
+the record is removed instead when that save fails, so no record ever names a live
+row. An unreadable `idle-evictions.json` is quarantined beside itself and the open
+continues: no deletion is invented from it, its roots stay as recorded, and the
+library's ledger view reports the open as reconciliation-blocked.
+
+Barge's trash sweep holds its area lock
 while deleting a tree. An admission can therefore wait for that lock while
 holding the pool lock, including when one command's sweep deletes another
 command's in-flight trash from an ordinary eviction. This limitation is accepted
@@ -100,7 +111,9 @@ never deletes it directly.
 A held eviction checks the writer generation and exact lease under the pool lock.
 It first writes a private, versioned intent bound to the pool, lease, Barge root
 and parent identity. A normal refusal clears the intent and leaves the control
-files and ledger unchanged. When the fence must advance, the fence is published
+files and ledger unchanged; a root another writer still holds or a pin still
+protects is reported busy, and a clear that fails is a pre-commit error rather
+than a settlement. When the fence must advance, the fence is published
 after the rename and before the revised ledger is saved. A settlement failure
 keeps the intent for recovery. If Barge moves the root but cannot delete the trash
 entry, Oxide settles the intent and reports the deletion failure as post-commit.
@@ -109,7 +122,11 @@ On the next locked open or exact retry, Oxide clears an intent whose original ro
 is still present. It retires the matching ledger row only when the original parent
 is verified and both the recorded root ID and its path are absent. It leaves
 unrelated missing roots, substituted paths and uncertain custody alone, and never
-repeats the Barge eviction.
+repeats the Barge eviction. An intent this open cannot prove — a substituted
+parent, another volume, an unreadable root — is quarantined rather than allowed to
+refuse every lease, release and prepare: its row keeps exactly the recorded
+generation and stays unavailable, the intent stays for a later pass, and the open
+reports reconciliation-blocked.
 
 ### Admission observations (oxide#317)
 
@@ -122,8 +139,14 @@ the pool lock.
 
 Count one byte walk per root submitted to a sizing traversal, including incomplete
 or later-failed walks. Barge's eviction counts reclaimed bytes during deletion,
-with no separate sizing walk before rename. A trash sweep likewise reports bytes during deletion.
-Above the reserve, the reserve check enumerates no roots.
+with no separate sizing walk before rename, so a refusal before the rename (a
+hold, a pin, an unreadable marker, a trash that cannot be created) sizes nothing.
+A trash sweep likewise reports bytes during deletion.
+Above the reserve, the reserve check enumerates no roots. A committed rename whose
+trash copy stayed is progress, not a refusal: the caller re-reads free space and
+reports the kept tree. Held rows are never walked under the pool lock — their tree
+is still being written — so admission charges them the largest current observation
+instead of publishing a mid-build figure.
 
 At the slot ceiling, one bytes-free inventory identifies held or pinned candidates
 before any candidate is committed, and the oldest eligible row is retired; the

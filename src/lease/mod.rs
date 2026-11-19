@@ -4,11 +4,11 @@
 //! A short-lived OS lock plus an atomic local ledger, no resident daemon,
 //! HMAC, issuer, callback service or Cargo invocation. Same-UID callers are
 //! trusted cooperators; private paths and safety checks still refuse foreign
-//! paths and symlinked roots. A durably recorded idle deletion unlinks an
-//! owned nested symlink entry without following its target. The standalone
-//! lease CLI and the APFS sparse-image backend are retired (oxide#102); a
-//! pool recording that backend refuses to open. Owning contract:
-//! `docs/knowledge/contracts/workflow.md`.
+//! paths and symlinked roots. Barge owns every deletion: an idle slot's root is
+//! evicted by Barge's own marker, hold and pin checks, and the ledger only
+//! records the decision. The standalone lease CLI and the APFS sparse-image
+//! backend are retired (oxide#102); a pool recording that backend refuses to
+//! open. Owning contract: `docs/knowledge/contracts/workflow.md`.
 
 pub mod admission_cost;
 mod backing;
@@ -244,13 +244,13 @@ pub enum LeaseError {
     /// A bounded accounting walk that admission, reuse or eviction needed
     /// did not complete. Same reason and exit code as `UnknownAccounting`.
     AccountingIncomplete(Box<AccountingScan>, Option<AccountingContext>),
-    /// Capacity could not admit this admission because the slots a partial
-    /// walk left unmeasured are charged conservatively and are never evicted on
-    /// that charge (oxide#186). A bounded capacity refusal: exit code 3, the
-    /// same capacity class as [`LeaseError::Full`], and never
-    /// `unknown_accounting`, because no shared authority is unknown. It names
-    /// at most [`MAX_REFUSAL_SLOTS`] slots and counts the rest, so one refusal
-    /// line stays bounded at the slot ceiling.
+    /// Capacity could not admit this admission because slots without a current
+    /// observation are charged the largest current observation instead of being
+    /// walked, and are never evicted on that charge (oxide#186). A bounded
+    /// capacity refusal: exit code 3, the same capacity class as
+    /// [`LeaseError::Full`], and never `unknown_accounting`, because no shared
+    /// authority is unknown. It names at most [`MAX_REFUSAL_SLOTS`] slots and
+    /// counts the rest, so one refusal line stays bounded at the slot ceiling.
     CapacityCharged {
         /// The conservative pool figure and its budget for a byte-pressure
         /// refusal, or `None` when the refusal is that a requested idle-slot
@@ -273,6 +273,11 @@ pub enum LeaseError {
     HolderConflict,
     NotFound,
     BackingMismatch,
+    /// A Barge custody operation failed, carrying Barge's own message so the
+    /// refusal names the operation and root instead of a bare class. Same
+    /// reason and exit code as [`LeaseError::UnknownAccounting`]: this pool's
+    /// custody of its roots could not be read or changed.
+    Barge(String),
     LedgerExhausted,
     SlotCeiling(String),
     LegacyAdoptionPending(u64),
@@ -312,6 +317,7 @@ impl LeaseError {
             Self::WriterUpdated => 76,
             Self::Full
             | Self::UnknownAccounting
+            | Self::Barge(_)
             | Self::ControlState(_)
             | Self::WriterFenceBusy
             | Self::UnexpectedEntry { .. }
@@ -336,6 +342,7 @@ impl LeaseError {
             Self::WriterUpdated => "writer_updated",
             Self::Full => "full",
             Self::UnknownAccounting
+            | Self::Barge(_)
             | Self::UnexpectedEntry { .. }
             | Self::AccountingIncomplete(..)
             | Self::EvictionIncomplete(_) => "unknown_accounting",
@@ -369,6 +376,7 @@ impl std::fmt::Display for LeaseError {
             Self::UnknownAccounting => {
                 formatter.write_str("owned accounting is unknown or a foreign entry is present")
             }
+            Self::Barge(message) => formatter.write_str(message),
             Self::ControlState(message) => formatter.write_str(message),
             Self::WriterFenceBusy => {
                 formatter.write_str("the admission lock is held during the writer generation upgrade")
@@ -985,16 +993,26 @@ fn read_private_file(path: &Path) -> Result<Vec<u8>, LeaseError> {
 }
 
 fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseError> {
-    let metadata = fs::symlink_metadata(path).map_err(io_error)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_file()
+    // The entry's own type is judged first, then the descriptor decides every
+    // other fact: `O_NOFOLLOW` refuses a replacement that swapped a symlink in
+    // between, so the shape checked and the bytes read name one file.
+    let entry = fs::symlink_metadata(path).map_err(io_error)?;
+    if !entry.file_type().is_file() {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(io_error)?;
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.is_file()
         || metadata.permissions().mode() & 0o077 != 0
         || metadata.uid() != current_uid()
         || metadata.len() > max
     {
         return Err(LeaseError::UnknownAccounting);
     }
-    let file = File::open(path).map_err(io_error)?;
     let mut bytes = Vec::new();
     file.take(max + 1)
         .read_to_end(&mut bytes)
@@ -1017,10 +1035,11 @@ pub const CONTROL_RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
 pub const CONTROL_EVICTION_ACCOUNTING_FENCE: &str = "oxide.eviction-accounting/1";
 pub const CONTROL_SLOT_CEILING_FENCE: &str = "oxide.slots/256";
 pub const CONTROL_ONE_USE_FENCE: &str = "oxide.one-use/1";
-/// The whole-tree holding fence (oxide#190). A ledger carrying a `holding` row
-/// or a `hold_intent` (the verified identity a rename is bound to), and a pool
-/// whose eviction route renames a slot tree into the payload's private holding
-/// area, is written only after this front-door fence is durable. An older binary
+/// The whole-tree holding fence (oxide#190), kept as a read-only value. The
+/// holding area and its journal are retired: this binary tolerates a `holding`
+/// row or a `hold_intent` only as an inert value an older writer left, never
+/// acts on either, and deletes slot trees only through Barge's trash. The fence
+/// still marks a control state a version-9 writer upgraded, so an older binary
 /// meets version 9 first and hands off to a receipt-matching successor instead
 /// of reading a state it cannot represent.
 pub const CONTROL_HOLDING_FENCE: &str = "oxide.holding/1";

@@ -232,14 +232,6 @@ fn class_is_normal(class: &WorkspaceClass) -> bool {
     *class == WorkspaceClass::Normal
 }
 
-/// The class one front-door command gives the record it creates or reuses
-/// (design §3.6, §5.1).
-///
-/// It is `Normal` for every production command in this slice: the one-use
-/// feature is dormant, so classification is never computed and no command can
-/// ask for `OneUse`. A [`WorkspaceAdmission::one_use`] admission is reachable
-/// from unit tests only, and it is the seam the proof slice's activation uses.
-
 impl Record {
     /// Holds a command now: neither idle nor retired.
     pub fn active(&self) -> bool {
@@ -294,7 +286,6 @@ pub struct Holder {
     pub command: Option<String>,
 }
 
-/// A slot's last recorded build. `mark` is the record's use counter when it
 /// One automatic recovery, kept for `oxide status`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

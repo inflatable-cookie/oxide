@@ -15,7 +15,7 @@
 //! whose path is absent is only dropped because the rename already happened.
 
 use super::{lock_pool, pool_backing, read_config, require_deleted, LeaseError, MANAGED_NAME};
-use crate::lease::io_error;
+use crate::lease::{check_control_writer, io_error, random_hex};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -98,6 +98,37 @@ pub(super) fn read(pool: &Path) -> Result<Vec<PendingEviction>, LeaseError> {
     Ok(records.records)
 }
 
+/// Preserve an unreadable hand-off list beside itself and report that this
+/// open quarantined it. One corrupt file must not refuse every later lease,
+/// release and prepare (the outage-2255 class), and no deletion decision can
+/// be read from it, so its roots stay exactly as they are recorded: nothing
+/// here evicts, and each row it named keeps whatever generation it had.
+pub(super) fn read_quarantining(pool: &Path) -> Result<(Vec<PendingEviction>, bool), LeaseError> {
+    match read(pool) {
+        Ok(records) => Ok((records, false)),
+        Err(error)
+            if matches!(
+                error,
+                LeaseError::UnknownAccounting
+                    | LeaseError::UnexpectedEntry { .. }
+                    | LeaseError::LedgerExhausted
+            ) =>
+        {
+            let aside = pool
+                .join(MANAGED_NAME)
+                .join(format!("{RECORDS_NAME}.quarantine-{}", random_hex(8)?));
+            fs::rename(records_path(pool), aside).map_err(io_error)?;
+            // The rename is durable before any later open can read the list as
+            // empty and decide from it.
+            fs::File::open(pool.join(MANAGED_NAME))
+                .and_then(|control| control.sync_all())
+                .map_err(io_error)?;
+            Ok((Vec::new(), true))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn write(pool: &Path, store_id: &str, records: &[PendingEviction]) -> Result<(), LeaseError> {
     if records.len() > RECORDS_MAX {
         return Err(LeaseError::LedgerExhausted);
@@ -137,7 +168,9 @@ pub(super) fn push(pool: &Path, store_id: &str, record: PendingEviction) -> Resu
     write(pool, store_id, &records)
 }
 
-fn remove_settled(pool: &Path, settled: &[PendingEviction]) -> Result<(), LeaseError> {
+/// Remove the hand-off records `settled` names. The caller holds the pool
+/// lock; every removal is durable before the next command reads the list.
+pub(super) fn remove_settled(pool: &Path, settled: &[PendingEviction]) -> Result<(), LeaseError> {
     let mut records = read(pool)?;
     let store_id = records
         .first()
@@ -195,6 +228,10 @@ pub fn settle(pool: &Path) -> Result<Vec<String>, LeaseError> {
     let config = read_config(pool)?;
     let records = {
         let _lock = lock_pool(pool)?;
+        // The decision was committed at one writer generation; a later binary
+        // must not act on it. This is the same fence every other mutating
+        // open checks, and it runs in the first pool-lock window.
+        check_control_writer(&pool.join(MANAGED_NAME))?;
         let records = read(pool)?;
         if records
             .iter()

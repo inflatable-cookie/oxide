@@ -920,7 +920,11 @@ impl PoolStorage {
             .map_err(barge::Error::unknown_state)?;
         admission_cost::opaque_listing();
         let eviction = area.evict(id);
-        if eviction.is_ok() || eviction.as_ref().err().is_some_and(eviction_walked_bytes) {
+        // Barge measures the tree as it deletes it, so only a completed
+        // eviction or a committed rename that left trash walked bytes. A
+        // refusal before the rename (a hold, a pin, an unreadable marker, a
+        // trash that cannot be created) sizes nothing.
+        if eviction.is_ok() || eviction.as_ref().is_err_and(eviction_moved) {
             admission_cost::walked(1);
             #[cfg(test)]
             observe_pool_walk(PoolWalk::Evict(id.to_owned()));
@@ -1088,17 +1092,17 @@ impl PoolStorage {
     }
 }
 
-/// At the pinned revision these outcomes follow the single sizing walk.
-fn eviction_walked_bytes(error: &barge::Error) -> bool {
-    let message = error.message();
-    match error.kind() {
-        barge::ErrorKind::Refused => message == "root marker changed before eviction",
-        barge::ErrorKind::Io if error.io_kind().is_some() => {
-            message.starts_with("cannot create the trash at ")
-                || message.starts_with("cannot evict the root to ")
-        }
-        _ => eviction_moved(error),
-    }
+/// Whether Barge refused an eviction only because the root is still
+/// cooperatively held or pinned. The pinned revision reports both as
+/// `Refused` with the two exact suffixes below, and
+/// `eviction_refusals_keep_the_pinned_barge_text` fails loudly when a Barge pin
+/// bump rewrites them, so the busy classification can never drift silently.
+pub(crate) fn eviction_protected(error: &barge::Error) -> bool {
+    error.kind() == barge::ErrorKind::Refused
+        && (error.message().ends_with(" is held; refusing to evict it")
+            || error
+                .message()
+                .ends_with(" is pinned; refusing to evict it"))
 }
 
 /// The pinned Barge API reports a post-rename deletion error as source-less
@@ -1403,6 +1407,46 @@ mod tests {
         assert!(listing.roots[0].pinned);
         area.unpin(&root.id).expect("unpin");
         area.evict(&root.id).expect("evicted");
+    }
+
+    #[test]
+    fn eviction_refusals_keep_the_pinned_barge_text() {
+        let fixture = Fixture::new("storage-eviction-text");
+        let area = fixture.storage.declare(&fixture.pool()).expect("area");
+        let held = area.create_root("held").expect("root");
+        let hold = area.hold(&held.id, Mode::Exclusive).expect("hold");
+        let refusal = area.evict(&held.id).expect_err("held root");
+        assert_eq!(refusal.kind(), barge::ErrorKind::Refused);
+        assert_eq!(
+            refusal.message(),
+            format!("root {} is held; refusing to evict it", held.id)
+        );
+        assert!(eviction_protected(&refusal), "{refusal}");
+        drop(hold);
+
+        let pinned = area.create_root("pinned").expect("root");
+        area.pin(&pinned.id, "selected output").expect("pin");
+        let refusal = area.evict(&pinned.id).expect_err("pinned root");
+        assert_eq!(refusal.kind(), barge::ErrorKind::Refused);
+        assert_eq!(
+            refusal.message(),
+            format!("root {} is pinned; refusing to evict it", pinned.id)
+        );
+        assert!(eviction_protected(&refusal), "{refusal}");
+
+        // Only a committed rename carries Barge's trash diagnosis. A failure
+        // before the rename reports a path error and moved nothing.
+        let moved = barge::Error::io_message(
+            "cannot remove the trash copy: permission denied; evicted root remains in trash at /trash/root",
+        );
+        assert!(eviction_moved(&moved), "{moved}");
+        let before_rename = barge::Error::io(
+            "cannot create the trash at",
+            &fixture.mount.join(".trash"),
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert!(!eviction_moved(&before_rename), "{before_rename}");
+        assert!(!eviction_protected(&before_rename));
     }
 
     #[test]
