@@ -35,6 +35,10 @@ pub const SEED_MAX_TEXT_BYTES: usize = 512;
 pub const SEED_MAX_PATH_BYTES: usize = 1024;
 /// Config files in the producer context, in precedence order.
 pub const SEED_MAX_CONFIG_FILES: usize = 16;
+/// Config bytes read across one producer context (§2.1).
+pub const SEED_MAX_CONTEXT_BYTES: u64 = 4 * 1024 * 1024;
+/// Rendered effective context records (§2.1).
+pub const SEED_MAX_CONTEXT_RENDERED_BYTES: usize = 128 * 1024;
 /// Rule targets (rules) recorded for one unit's `.d` (§8.1).
 pub const SEED_MAX_RULES: usize = 4096;
 /// Rule inputs recorded for one unit's `.d` (§8.1: 4,096 per unit).
@@ -378,6 +382,17 @@ impl SeedPackage {
         }
         for unit in &self.units {
             unit.validate()?;
+            // The unit identity is the package's, never a second claim: a
+            // target or a directory name that disagrees with the package is a
+            // mixed unit, and a mixed unit is never offered (§3).
+            if unit.target != self.target {
+                return Err("cold-seed unit target is not its package target");
+            }
+            if fingerprint_layout(&unit.fingerprint_dir)
+                .is_some_and(|(_, literal, _)| literal != self.name)
+            {
+                return Err("cold-seed unit directory is not named by its package");
+            }
         }
         Ok(())
     }
@@ -393,12 +408,12 @@ impl SeedUnit {
         }
         // The profile component of the fingerprint directory is the unit's
         // output subtree: every offered file lives below it, so one unit can
-        // never name a file of another profile or of the slot root.
-        let profile = self
-            .fingerprint_dir
-            .split_once('/')
-            .map(|(profile, _)| profile)
-            .ok_or("cold-seed unit has no profile directory")?;
+        // never name a file of another profile or of the slot root. The
+        // directory's own shape is part of the pinned layout adapter, so a
+        // mixed or unparseable directory is refused rather than guessed at.
+        let Some((profile, _, hex)) = fingerprint_layout(&self.fingerprint_dir) else {
+            return Err("cold-seed unit directory is not <profile>/.fingerprint/<package>-<hex>");
+        };
         // The joining `.d` is part of the unit's own file list and is the
         // unit's one dep-info record: a catalog that names a join it would not
         // clone is not a complete unit, and the join's own digest is that file
@@ -427,6 +442,36 @@ impl SeedUnit {
             .any(|file| file.kind == SeedFileKind::Artifact)
         {
             return Err("cold-seed unit offers no artifact");
+        }
+        // A v1 library unit's artifacts and `.d` are exactly the pinned
+        // layout: one unit identifier across the fingerprint directory, the
+        // artifact stems and the `.d` stem. A producer that records any other
+        // shape (or a different identifier in one place) is not offering a
+        // unit this layer can clone.
+        if self.role == SeedRole::Lib {
+            if dep_info[0].path != format!("{profile}/deps/{}-{hex}.d", self.target) {
+                return Err("cold-seed unit's .d is not named by its own unit identifier");
+            }
+            let mut extensions = std::collections::BTreeSet::new();
+            for artifact in self
+                .files
+                .iter()
+                .filter(|file| file.kind == SeedFileKind::Artifact)
+            {
+                let (stem, extension) = artifact
+                    .path
+                    .rsplit_once('.')
+                    .ok_or("cold-seed artifact has no extension")?;
+                if !matches!(extension, "rmeta" | "rlib") {
+                    return Err("cold-seed artifact is not an rmeta or rlib output");
+                }
+                if stem != format!("{profile}/deps/lib{}-{hex}", self.target) {
+                    return Err("cold-seed artifact is not named by its own unit identifier");
+                }
+                if !extensions.insert(extension) {
+                    return Err("cold-seed unit repeats an artifact kind");
+                }
+            }
         }
         for file in &self.files {
             match file.kind {
@@ -527,6 +572,30 @@ fn require_path(text: &str, absolute: bool) -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+/// The `<profile>/.fingerprint/<literal package>-<16 hex>` shape of a unit
+/// directory from the pinned layout adapter (§3, §10).
+fn fingerprint_layout(dir: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = dir.split('/');
+    let profile = parts.next()?;
+    if !matches!(profile, "debug" | "release") || parts.next()? != ".fingerprint" {
+        return None;
+    }
+    let name = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (literal, hex) = name.rsplit_once('-')?;
+    if literal.is_empty()
+        || hex.len() != 16
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    Some((profile, literal, hex))
 }
 
 /// A recorded join path: an absolute path or a strict relative one.

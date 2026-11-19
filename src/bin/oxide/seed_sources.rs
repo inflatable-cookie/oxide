@@ -38,10 +38,29 @@ struct ManifestLib {
     path: Option<String>,
     #[serde(rename = "proc-macro", default)]
     proc_macro: bool,
+    #[serde(rename = "crate-type", default)]
+    crate_type: Option<Vec<String>>,
 }
 
 fn yes() -> bool {
     true
+}
+
+/// Classify a declared library target from its crate types, which the pinned
+/// layout depends on. A plain Rust library is `lib` (rustc's rlib) or `rlib`;
+/// a proc-macro target is classified as one so the caller never offers it;
+/// every other crate type emits outputs outside the pinned layout, so the
+/// package is ineligible.
+fn lib_target(lib: &ManifestLib) -> Option<(String, bool)> {
+    let path = lib.path.clone().unwrap_or_else(|| "src/lib.rs".to_owned());
+    let declared: &[String] = lib.crate_type.as_deref().unwrap_or(&[]);
+    let single = |kind: &str| matches!(declared, [only] if only == kind);
+    if lib.proc_macro || declared.iter().any(|kind| kind == "proc-macro") {
+        // `proc-macro = true` with a conflicting crate type, or a mixed list,
+        // is not a shape Cargo would build; it is never classified here.
+        return (declared.is_empty() || single("proc-macro")).then_some((path, true));
+    }
+    (declared.is_empty() || single("lib") || single("rlib")).then_some((path, false))
 }
 
 fn manifest_matches(root: &Path, package: &Package) -> Option<bool> {
@@ -80,10 +99,7 @@ fn manifest_matches(root: &Path, package: &Package) -> Option<bool> {
     }
     let normalized = package.name.replace('-', "_");
     let (path, proc_macro) = match manifest.lib {
-        Some(lib) if lib.name.as_deref().is_none_or(|name| name == normalized) => (
-            lib.path.unwrap_or_else(|| "src/lib.rs".into()),
-            lib.proc_macro,
-        ),
+        Some(lib) if lib.name.as_deref().is_none_or(|name| name == normalized) => lib_target(&lib)?,
         Some(_) => return None,
         None if manifest.package.autolib => ("src/lib.rs".into(), false),
         None => return None,
@@ -728,6 +744,46 @@ mod tests {
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].checkout, checkout);
         assert_eq!(hints[0].package_root, root);
+    }
+
+    #[test]
+    fn manifest_matches_honours_crate_types_and_proc_macro() {
+        let fixture = Fixture::new();
+        let package = crate::seed_lock::eligible(
+            b"version = 4\n[[package]]\nname = 'sample'\nversion = '1'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n",
+        )
+        .unwrap()
+        .remove(0);
+        let root = fixture.0.join("sample");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "").unwrap();
+        let with = |lib: &str| {
+            std::fs::write(
+                root.join("Cargo.toml"),
+                format!("[package]\nname='sample'\nversion='1'\n{lib}"),
+            )
+            .unwrap();
+            manifest_matches(&root, &package)
+        };
+        // A plain library is `lib` (rustc's rlib) or `rlib`.
+        assert_eq!(with(""), Some(false));
+        assert_eq!(with("[lib]\ncrate-type=['rlib']\n"), Some(false));
+        // Any other crate type emits outputs outside the pinned layout.
+        assert_eq!(with("[lib]\ncrate-type=['cdylib']\n"), None);
+        assert_eq!(with("[lib]\ncrate-type=['lib','rlib']\n"), None);
+        // A proc macro is classified as one, so v1 never offers it.
+        assert_eq!(with("[lib]\nproc-macro=true\n"), Some(true));
+        assert_eq!(
+            with("[lib]\ncrate-type=['proc-macro']\nproc-macro=true\n"),
+            Some(true)
+        );
+        assert_eq!(with("[lib]\ncrate-type=['proc-macro']\n"), Some(true));
+        // A proc-macro flag with a conflicting crate type is not a shape
+        // Cargo would build, so it is never classified.
+        assert_eq!(
+            with("[lib]\nproc-macro=true\ncrate-type=['cdylib']\n"),
+            None
+        );
     }
 
     #[test]

@@ -7,7 +7,10 @@ use oxide_storage::lease::managed::{
     SeedFile, SeedFileKind, SeedJoin, SeedRejectReason, SeedRejection, SeedRole, SeedSourceKind,
     SeedUnit,
 };
-use oxide_storage::lease::seed::{parse_seed_join, seed_output_rule_proven};
+use oxide_storage::lease::seed::{
+    parse_seed_join, seed_output_rule_proven, MAX_JOIN_BYTES, SEED_MAX_FILES,
+    SEED_MAX_REJECTED_UNITS, SEED_MAX_REJECTIONS, SEED_MAX_UNITS_PER_PACKAGE,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
@@ -16,9 +19,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-const MAX_FILES: usize = 8192;
+/// This producer's own read budget for one window: catalog file entries and
+/// the join file ceiling are the shared catalogue caps; the byte and entry
+/// budgets bound work that has no catalog field of its own.
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_DEP: usize = 1024 * 1024;
 const MAX_ENTRIES: usize = 100_000;
 
 pub(crate) struct Producer {
@@ -118,9 +122,9 @@ impl Producer {
         }
         self.files = self.files.checked_add(1)?;
         self.bytes = self.bytes.checked_add(metadata.len())?;
-        if self.files > MAX_FILES
+        if self.files > SEED_MAX_FILES
             || self.bytes > MAX_BYTES
-            || (keep_bytes && metadata.len() > MAX_DEP as u64)
+            || (keep_bytes && metadata.len() > MAX_JOIN_BYTES as u64)
         {
             return None;
         }
@@ -206,7 +210,9 @@ impl Producer {
         let mut result = Vec::new();
         let mut total = 0u64;
         for ((name, reason), literals) in grouped {
-            if result.len() == 255 {
+            // Keep the whole record inside the catalog cap: the last slot is
+            // the bounded "more than we can name" marker.
+            if result.len() + 1 >= SEED_MAX_REJECTIONS {
                 result.push(SeedRejection {
                     name: "unknown".into(),
                     reason: SeedRejectReason::Cap,
@@ -275,7 +281,7 @@ impl Producer {
             }
             if let Some(value) = count {
                 total = total.saturating_add(u64::from(value));
-                if total > 4096 {
+                if total > SEED_MAX_REJECTED_UNITS {
                     count = None;
                 }
             }
@@ -348,6 +354,10 @@ impl Producer {
             let role = SeedRole::Lib;
             let output_dir = format!("{profile}/deps");
             let dep = format!("{output_dir}/{target}-{hash}.d");
+            // A library unit's outputs are the `.rmeta` and, when the command
+            // emitted one, the `.rlib`: `cargo check` produces the metadata
+            // only, and a check-built donor is a supported donor (§3, §5.1).
+            // Every artifact that does exist is joined through its own rule.
             let mut artifacts = Vec::new();
             for extension in ["rmeta", "rlib"] {
                 let path = format!("{output_dir}/lib{target}-{hash}.{extension}");
@@ -445,7 +455,7 @@ impl Producer {
                 },
                 files,
             });
-            if units.len() > 3 {
+            if units.len() > SEED_MAX_UNITS_PER_PACKAGE {
                 return None;
             }
         }
@@ -608,6 +618,95 @@ mod tests {
             .units("debug", &pm_source)
             .unwrap()
             .is_empty());
+    }
+
+    /// One complete library unit: the fingerprint triple, an rmeta artifact
+    /// and its joined `.d`, all naming one hash and the verified source.
+    fn write_complete_unit(fixture: &Fixture, hash: &str, input: &Path) {
+        let dir = format!("build/debug/.fingerprint/cfg-if-{hash}");
+        for name in ["lib-cfg_if", "lib-cfg_if.json", "dep-lib-cfg_if"] {
+            fixture.write(&format!("{dir}/{name}"), "fingerprint");
+        }
+        let build = fixture.0.join("build");
+        let artifact = format!("build/debug/deps/libcfg_if-{hash}.rmeta");
+        fixture.write(&artifact, "artifact");
+        fixture.write(
+            &format!("build/debug/deps/cfg_if-{hash}.d"),
+            &format!(
+                "{}: {}\n{}: {}\n{}:\n",
+                build.join(format!("debug/deps/cfg_if-{hash}.d")).display(),
+                input.display(),
+                build
+                    .join(format!("debug/deps/libcfg_if-{hash}.rmeta"))
+                    .display(),
+                input.display(),
+                input.display()
+            ),
+        );
+    }
+
+    #[test]
+    fn unknown_fingerprint_entries_and_a_fourth_unit_offer_nothing() {
+        let fixture = Fixture::new();
+        let lock = format!("version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let package = crate::seed_lock::eligible(lock.as_bytes())
+            .unwrap()
+            .remove(0);
+        let source_root = fixture.0.join("source");
+        fixture.write("source/src/lib.rs", "source");
+        let source = VerifiedSource {
+            package,
+            tree_digest: "b".repeat(64),
+            kind: SeedSourceKind::Registry,
+            root: source_root.clone(),
+            verification_root: source_root.clone(),
+            proc_macro: false,
+        };
+        let input = source_root.join("src/lib.rs");
+        let build = fixture.0.join("build");
+        write_complete_unit(&fixture, "aaaaaaaaaaaaaaaa", &input);
+        assert_eq!(
+            Producer::new(&build)
+                .unwrap()
+                .units("debug", &source)
+                .unwrap()
+                .len(),
+            1
+        );
+        // An entry this layer cannot classify makes that directory unusable.
+        fixture.write(
+            "build/debug/.fingerprint/cfg-if-aaaaaaaaaaaaaaaa/unclassified",
+            "x",
+        );
+        assert!(Producer::new(&build)
+            .unwrap()
+            .units("debug", &source)
+            .unwrap()
+            .is_empty());
+        fs::remove_file(
+            fixture
+                .0
+                .join("build/debug/.fingerprint/cfg-if-aaaaaaaaaaaaaaaa/unclassified"),
+        )
+        .unwrap();
+        // Three units are the per-package ceiling; a fourth refuses the whole
+        // package rather than truncating it.
+        for hash in ["bbbbbbbbbbbbbbbb", "cccccccccccccccc"] {
+            write_complete_unit(&fixture, hash, &input);
+        }
+        assert_eq!(
+            Producer::new(&build)
+                .unwrap()
+                .units("debug", &source)
+                .unwrap()
+                .len(),
+            3
+        );
+        write_complete_unit(&fixture, "dddddddddddddddd", &input);
+        assert!(Producer::new(&build)
+            .unwrap()
+            .units("debug", &source)
+            .is_none());
     }
 
     #[test]

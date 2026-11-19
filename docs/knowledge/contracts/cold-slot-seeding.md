@@ -110,7 +110,10 @@ A unit is offered only when its complete set is present:
   `lib-<target>`, `lib-<target>.json` and `dep-lib-<target>`. The package
   directory uses the literal lock name; the unit suffix uses the normalized
   name.
-- Artifacts `<profile>/deps/lib<target>-<hex>.rmeta` and `.rlib`.
+- Artifacts `<profile>/deps/lib<target>-<hex>.rmeta` and, when the producing
+  command emitted one, `.rlib`. `cargo check` emits the metadata only, and a
+  check-built donor is a supported donor, so an rmeta-only unit is offered
+  whole. Every recorded artifact must be joined by its own rule.
 - The join file `<profile>/deps/<target>-<hex>.d`. Every rule is parsed, and
   rule order is irrelevant. Output rules must name the `.d` or an artifact and
   stay inside the unit's output directory, and their prerequisites must lie
@@ -233,7 +236,9 @@ Each is checked read-only. Any failure is a skip, and the command builds cold.
    then the store admission lock. Hold both to the end of the transaction.
 3. **Candidate read.** Under the pool lock alone, confirm the recipient is still
    `Held` by this lease, and read at most 8 generation-checked catalogs chosen by
-   rank. Release the pool lock. Take no donor lock and mutate nothing.
+   rank. An idle slot whose catalog is missing or ineligible is skipped without
+   consuming that budget, and no more idle slots are examined than the pool's
+   slot ceiling. Release the pool lock. Take no donor lock and mutate nothing.
 4. **Selection.** Use catalog data only. Filter by context digest, intersect the
    allowlist, apply the recorded join, and choose one donor by greatest overlap,
    then rank, then slot id. Selection reads no donor payload.
@@ -329,9 +334,15 @@ A command that seeds nothing never samples this gate, so its behaviour is
 unchanged. The seed's gate is a precondition of seeding alone.
 
 **Budgets.** The command's admission and execution budgets are never extended.
-Expiry before the first clone means no seed. Expiry during the clone abandons the
-seed and releases the slot through the ordinary expired-admission path, with no
-trusted origin. The pool's space budget stays soft, as it is for Cargo.
+The seed's own cooperative work budget covers donor revalidation, cloning and
+digest verification; it is a ceiling a caller may lower and never a figure that
+extends admission. Expiry before the first recipient write means no seed and the
+same slot builds cold. Expiry between the first write and the last verified
+clone records `reset` and refuses: the untrusted generation is retained and
+released without a trusted origin, never repaired (section 7). Once every
+planned clone has verified, the work budget no longer refuses a seed, because
+no clone work remains; the post-clone walk keeps its own separate bound. The
+pool's space budget stays soft, as it is for Cargo.
 
 | Item | Bound |
 | --- | --- |
@@ -341,9 +352,10 @@ trusted origin. The pool's space budget stays soft, as it is for Cargo.
 | Producer context config | 16 files, 4 MiB of bytes, 128 KiB rendered |
 | Seed plan | 256 units, 4096 files, 384 MiB logical bytes |
 | Artifact `.d` join file | 1 MiB |
+| Seed work budget | 5 s for donor revalidation, clone and digest verification; a caller may lower it, never raise it |
 | Post-clone walk | 2,000,000 entries, depth 64, 60 s |
 | Source-verification cache | 2048 records, 8 MiB |
-| Seed sidecar family | 24 MiB; at most 8 orphaned sidecars removed per write |
+| Seed sidecar family | 24 MiB of the four known families; at most 8 orphaned sidecars or abandoned temp files removed per write |
 
 ## 9. Persistence and visibility
 
@@ -355,6 +367,11 @@ payload:
 - `<slot-id>.attempt.json`, the per-generation attempt record;
 - `last.json`, the last completed seed (schema `oxide.cold-seed/1`);
 - `sources.json`, the source-verification cache.
+
+An interrupted atomic write leaves one `catalog.tmp-*` file. It is not a
+sidecar: it never counts against the family ceiling, and a later write reaps
+one older than an hour. A newer temp may belong to a concurrent writer and is
+left alone.
 
 Each binds the store id and generation, and is read only when it matches the
 current ledger generation. A missing, oversized, malformed, symlinked,
@@ -378,7 +395,9 @@ it must stop and return to design rather than bump the format.
 - Donor candidates rejected in the producing epoch appear as a bounded skip
   suffix. Unknown counts are reported separately from zero.
 - A miss prints `oxide: seeding skipped: <reason>` with a fixed set of reason
-  tokens.
+  tokens. `unsupported unit` names a plan for a unit v1 never offers (a
+  non-library role, a non-registry source, or a package that is not a unique
+  leaf).
 - `oxide status` shows at most one line from `last.json`, labelled as recorded.
   Default status stays free of walks and locks, and it never reconciles.
 
