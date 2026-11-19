@@ -1275,6 +1275,10 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
                     "oxide: warning: {error}; the program runs without Cargo's full run environment"
                 );
             }
+            // A signal can arrive while the post-build environment queries run.
+            if let Some(signal) = process::received_signal() {
+                return Ok(process::signal_exit_code(signal));
+            }
             let error = command.exec();
             Err(format!(
                 "could not execute {}: {error}",

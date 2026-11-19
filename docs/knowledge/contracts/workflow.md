@@ -135,7 +135,7 @@ digest and the receipt digest are reported under separate labels.
   Cargo's own metadata, so workspace inheritance is resolved), and the loader's
   search path — the program's directory, its `deps`, the toolchain's
   `target-libdir` and `sysroot/lib`, then the caller's own
-  `DYLD_FALLBACK_LIBRARY_PATH` or `LD_LIBRARY_PATH`, or the loader's default. A
+  `DYLD_FALLBACK_LIBRARY_PATH` or `LD_LIBRARY_PATH`, or the loader's default.
   Each post-build metadata and toolchain query has a separate ten-second
   limit with bounded stop and cleanup. If package facts cannot be read, Oxide
   warns and runs the program with the other environment fields it could set.

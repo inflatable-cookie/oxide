@@ -305,7 +305,7 @@ fn fake_run_cargo(scratch: &Path, manifest: &Path) -> (PathBuf, PathBuf) {
 printf '%s\n' "$*" >> "{log}"
 case "$1" in
   locate-project) echo "{manifest}"; exit 0 ;;
-  metadata) if [ -n "$FAKE_CARGO_METADATA_FAIL" ]; then exit 1; fi; cat "{metadata}"; exit 0 ;;
+  metadata) if [ -n "$FAKE_METADATA_MARKER" ]; then printf ready > "$FAKE_METADATA_MARKER"; sleep 2; fi; if [ -n "$FAKE_CARGO_METADATA_FAIL" ]; then exit 1; fi; cat "{metadata}"; exit 0 ;;
 esac
 if [ -n "$FAKE_CARGO_BUILD_SLEEP" ]; then sleep "$FAKE_CARGO_BUILD_SLEEP"; fi
 if [ -n "$FAKE_CARGO_SIGNAL_PARENT" ]; then kill -INT "$PPID"; fi
@@ -587,6 +587,45 @@ fn a_signal_after_cargo_never_launches_the_program() {
     assert!(
         !scratch.path().join("program.env").exists(),
         "the program ran after the signal: {stderr}"
+    );
+}
+
+/// A signal during post-build metadata must stop the release-then-exec path.
+#[test]
+fn a_signal_during_run_metadata_never_launches_the_program() {
+    use std::time::{Duration, Instant};
+
+    let scratch = Scratch::new();
+    let (manifest, program, bin, _) = run_fixture(&scratch);
+    let pool = scratch.path().join("fixture-pool");
+    let marker = scratch.path().join("metadata-started");
+    let mut child = run_command(&scratch, &bin, &pool, &manifest, &program)
+        .env("FAKE_METADATA_MARKER", &marker)
+        .args(["run", "--bin", "demo"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !marker.exists() && child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !marker.exists() {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "metadata did not start: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // SAFETY: child.id() is this test's own live Oxide process.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(130), "{stderr}");
+    assert!(
+        !scratch.path().join("program.env").exists(),
+        "program ran: {stderr}"
     );
 }
 
