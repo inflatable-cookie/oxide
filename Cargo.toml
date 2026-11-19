@@ -16,7 +16,7 @@ publish = false
 # and seeding. Its own dependencies (serde, serde_json, libc) are already pinned
 # here. Offline builds seed this locked Git source through
 # scripts/offline_seed.py.
-barge = { git = "https://github.com/inflatable-cookie/barge", rev = "3aacee23f5b8f9788525b41511cc2345a2066375" }
+barge = { git = "https://github.com/inflatable-cookie/barge", rev = "7c91e356ecf71f90680f6d58870c800132c6d130" }
 basic-toml = "=0.1.10"
 # Cold-slot seeding source verification (oxide#166): a pinned archive reader
 # for registry `.crate` files. `flate2` uses its pure-Rust backend and `tar` is
@@ -34,7 +34,7 @@ sha2 = "=0.11.0"
 tar = { version = "=0.4.46", default-features = false }
 
 [dev-dependencies]
-barge = { git = "https://github.com/inflatable-cookie/barge", rev = "3aacee23f5b8f9788525b41511cc2345a2066375", features = ["testing"] }
+barge = { git = "https://github.com/inflatable-cookie/barge", rev = "7c91e356ecf71f90680f6d58870c800132c6d130", features = ["testing"] }
 
 [[bin]]
 name = "oxide-storage-inventory"
