@@ -88,10 +88,11 @@ record list also falls back to the inline call rather than grow the file.
 
 A mutating open drops a record whose recorded root path is absent, because Barge's
 rename already committed and its trash is swept by the unlocked settlement pass,
-even when no pending records remain. Barge's recovery sweep holds its area lock
-while deleting each leftover tree. An admission can therefore wait for that
-lock while holding the pool lock after an interrupted eviction. This limitation
-is accepted for now; Oxide leaves ownership checks and deletion to Barge.
+even when no pending records remain. Barge's trash sweep holds its area lock
+while deleting a tree. An admission can therefore wait for that lock while
+holding the pool lock, including when one command's sweep deletes another
+command's in-flight trash from an ordinary eviction. This limitation is accepted
+for now; Oxide leaves ownership checks and deletion to Barge.
 A sweep failure is reported and does not prevent settlement of other recorded
 roots. A record whose root is still present stays for a later pass; recovery
 never deletes it directly.
