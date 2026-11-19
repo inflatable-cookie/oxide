@@ -13,8 +13,11 @@ use oxide_storage::lease::seed::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::ffi::{CStr, CString};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -27,6 +30,7 @@ const MAX_ENTRIES: usize = 100_000;
 
 pub(crate) struct Producer {
     root: PathBuf,
+    root_dir: File,
     started: Instant,
     files: usize,
     bytes: u64,
@@ -51,8 +55,21 @@ impl Producer {
         if !checked.is_dir() || checked.dev() != metadata.dev() || checked.ino() != metadata.ino() {
             return None;
         }
+        let root_dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&canonical)
+            .ok()?;
+        let opened = root_dir.metadata().ok()?;
+        if opened.dev() != metadata.dev()
+            || opened.ino() != metadata.ino()
+            || opened.uid() != metadata.uid()
+        {
+            return None;
+        }
         Some(Self {
             root: canonical,
+            root_dir,
             started: Instant::now(),
             files: 0,
             bytes: 0,
@@ -67,40 +84,88 @@ impl Producer {
 
     fn names(&mut self, relative: &Path) -> Option<Vec<String>> {
         self.time()?;
-        let path = self.safe_path(relative)?;
-        if !fs::symlink_metadata(&path).ok()?.is_dir() {
+        let directory = self.open_path(relative, true)?;
+        // fdopendir consumes its own close-on-exec duplicate.
+        let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate < 0 {
             return None;
         }
+        let raw = unsafe { libc::fdopendir(duplicate) };
+        if raw.is_null() {
+            unsafe { libc::close(duplicate) };
+            return None;
+        }
+        struct Stream(*mut libc::DIR);
+        impl Drop for Stream {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+        let stream = Stream(raw);
         let mut names = Vec::new();
-        for entry in fs::read_dir(path).ok()? {
+        loop {
             self.time()?;
+            #[cfg(target_os = "macos")]
+            unsafe {
+                *libc::__error() = 0;
+            }
+            #[cfg(not(target_os = "macos"))]
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            let entry = unsafe { libc::readdir(stream.0) };
+            if entry.is_null() {
+                if std::io::Error::last_os_error().raw_os_error() != Some(0) {
+                    return None;
+                }
+                break;
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }
+                .to_str()
+                .ok()?;
+            if name == "." || name == ".." {
+                continue;
+            }
             self.entries = self.entries.checked_add(1)?;
             if self.entries > MAX_ENTRIES {
                 return None;
             }
-            let entry = entry.ok()?;
-            names.push(entry.file_name().into_string().ok()?);
+            names.push(name.to_owned());
         }
         names.sort();
         Some(names)
     }
 
-    fn safe_path(&self, relative: &Path) -> Option<PathBuf> {
-        let mut path = self.root.clone();
-        for component in relative.components() {
+    fn open_path(&self, relative: &Path, directory: bool) -> Option<File> {
+        let mut current = self.root_dir.try_clone().ok()?;
+        let components: Vec<_> = relative.components().collect();
+        for (index, component) in components.iter().enumerate() {
             let std::path::Component::Normal(name) = component else {
                 return None;
             };
-            path.push(name);
-            let metadata = fs::symlink_metadata(&path).ok()?;
-            if metadata.file_type().is_symlink()
-                || metadata.uid() != unsafe { libc::geteuid() }
+            let name = CString::new(name.as_bytes()).ok()?;
+            let is_dir = index + 1 < components.len() || directory;
+            let flags = libc::O_RDONLY
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK
+                | libc::O_CLOEXEC
+                | if is_dir { libc::O_DIRECTORY } else { 0 };
+            let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                return None;
+            }
+            current = unsafe { File::from_raw_fd(fd) };
+            let metadata = current.metadata().ok()?;
+            if metadata.uid() != unsafe { libc::geteuid() }
                 || metadata.dev() != self.device
+                || (is_dir && !metadata.is_dir())
             {
                 return None;
             }
         }
-        Some(path)
+        Some(current)
     }
 
     fn read_file(
@@ -110,14 +175,12 @@ impl Producer {
         keep_bytes: bool,
     ) -> Option<(SeedFile, Vec<u8>)> {
         self.time()?;
-        let path = self.safe_path(Path::new(relative))?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-            .ok()?;
+        let mut file = self.open_path(Path::new(relative), false)?;
         let metadata = file.metadata().ok()?;
-        if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.dev() != self.device
+        {
             return None;
         }
         self.files = self.files.checked_add(1)?;
@@ -361,7 +424,7 @@ impl Producer {
             let mut artifacts = Vec::new();
             for extension in ["rmeta", "rlib"] {
                 let path = format!("{output_dir}/lib{target}-{hash}.{extension}");
-                if self.safe_path(Path::new(&path)).is_some() {
+                if self.open_path(Path::new(&path), false).is_some() {
                     artifacts.push(path);
                 }
             }
@@ -496,6 +559,25 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn descriptor_walk_refuses_symlinked_parents_and_wrong_device() {
+        let fixture = Fixture::new();
+        fixture.write("good/file", "data");
+        std::os::unix::fs::symlink(fixture.0.join("good"), fixture.0.join("link")).unwrap();
+        let mut producer = Producer::new(&fixture.0).unwrap();
+        assert!(producer
+            .read_file("link/file", SeedFileKind::Artifact, false)
+            .is_none());
+        assert!(producer.names(Path::new("link")).is_none());
+        assert!(producer
+            .read_file("good/file", SeedFileKind::Artifact, false)
+            .is_some());
+        producer.device = producer.device.wrapping_add(1);
+        assert!(producer
+            .read_file("good/file", SeedFileKind::Artifact, false)
+            .is_none());
     }
 
     #[test]

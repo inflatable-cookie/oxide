@@ -43,7 +43,7 @@ import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-HOME = Path(os.environ["HOME"])
+HOME = Path.home()
 DESTINATION = HOME / ".local/bin/oxide"
 RECEIPTS = HOME / ".local/state/oxide/install"
 BUILD = ["cargo", "build", "--release", "--locked", "--offline", "--bin", "oxide"]
@@ -1087,7 +1087,7 @@ def rollback(directory, check=False):
                "started": datetime.datetime.now(datetime.timezone.utc).isoformat()}
     if not check:
         commit_install(saved, saved_hash, receipt, current, expected, directory)
-    print("Before resuming Oxide, follow the 'Downgrading persisted state' step in "
+    print("Before resuming Oxide, follow the 'Persisted state versions and downgrade' step in "
           "docs/knowledge/contracts/workflow.md if the restored binary is from an older generation "
           "or has older format capabilities.")
 

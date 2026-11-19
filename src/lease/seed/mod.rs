@@ -1957,7 +1957,6 @@ fn probe_donor_lock(path: &Path) -> Result<DonorLock, LeaseError> {
     if !metadata.file_type().is_file()
         || metadata.uid() != current_uid()
         || metadata.mode() & 0o077 != 0
-        || metadata.nlink() != 1
     {
         return Err(LeaseError::UnsafePath(
             "the donor record lock is not a private owned regular file",
@@ -2019,18 +2018,13 @@ fn remove_orphan_sidecars(dir: &Path, view: &SeedPoolView) -> Result<(), LeaseEr
         if !metadata.file_type().is_file() || metadata.uid() != current_uid() {
             continue;
         }
-        let keep = if let Some(temp) = text.strip_prefix(SIDECAR_TEMP_PREFIX) {
-            // `catalog.tmp-<hex>`: this module's own temp write. Only an old one
-            // is reaped; a fresh temp is a live writer's.
-            if temp.len() != 16 || !temp.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                true
-            } else {
-                metadata
-                    .modified()
-                    .ok()
-                    .and_then(|modified| now.duration_since(modified).ok())
-                    .is_none_or(|age| age < Duration::from_millis(SEED_SIDECAR_TEMP_MAX_AGE_MS))
-            }
+        let keep = if is_sidecar_temp(text) {
+            // Old temps are inert; a fresh temp may still belong to a writer.
+            metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_none_or(|age| age < Duration::from_millis(SEED_SIDECAR_TEMP_MAX_AGE_MS))
         } else {
             let Some(id) = sidecar_slot_id(text) else {
                 continue;
@@ -2053,6 +2047,22 @@ const LAST_NAME: &str = "last.json";
 const SOURCES_NAME: &str = "sources.json";
 /// The temp-file name prefix [`write_sidecar`] uses for every family.
 const SIDECAR_TEMP_PREFIX: &str = "catalog.tmp-";
+
+fn is_sidecar_temp(name: &str) -> bool {
+    if let Some(suffix) = name.strip_prefix(SIDECAR_TEMP_PREFIX) {
+        return suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    let Some(suffix) = name.strip_prefix(".sources.json.tmp-") else {
+        return false;
+    };
+    let Some((pid, sequence)) = suffix.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && !sequence.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && sequence.bytes().all(|b| b.is_ascii_digit())
+}
 
 /// Whether a directory entry is one of the four sidecar families. Anything
 /// else (a temp file, a stray entry) is neither counted nor adopted.
@@ -2665,6 +2675,14 @@ mod sidecar_regressions {
         assert!(matches!(probe_donor_lock(&lock), Ok(DonorLock::Taken(_))));
         fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap();
         assert!(probe_donor_lock(&lock).is_err());
+    }
+
+    #[test]
+    fn recognises_only_own_sidecar_temp_names() {
+        assert!(is_sidecar_temp(".sources.json.tmp-123-45"));
+        assert!(is_sidecar_temp("catalog.tmp-0123456789abcdef"));
+        assert!(!is_sidecar_temp(".sources.json.tmp-123-45-extra"));
+        assert!(!is_sidecar_temp(".sources.json.tmp-other-45"));
     }
 
     #[test]

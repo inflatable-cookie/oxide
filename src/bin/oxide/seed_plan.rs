@@ -211,8 +211,8 @@ pub(crate) fn select(
                 || (units.len() == old_units.len()
                     && (candidate.rank > old.rank
                         || (candidate.rank == old.rank
-                            && candidate.slot_id.parse::<u64>().ok()
-                                < old.slot_id.parse::<u64>().ok())))
+                            && candidate.slot_id.parse::<u64>().unwrap_or(u64::MAX)
+                                < old.slot_id.parse::<u64>().unwrap_or(u64::MAX))))
         });
         if better {
             best = Some((candidate, units));

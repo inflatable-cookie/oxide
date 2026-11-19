@@ -521,10 +521,8 @@ paths. The summary says `temp: inherited <path>` or `temp: oxide <path>`.
   the reserve starts Barge's reserve pruning and never refuses selection; the floor
   refuses admission only when that space cannot be recovered. A running command
   never switches volumes.
-- **Registration failure:** a registration that fails after the drive's pool is
-  created removes that pool directory and the drive folders it created, so the
-  next attempt is not refused as already registered. Folders that existed before
-  the attempt are left alone.
+- **Registration failure:** paths whose creation by the failed attempt cannot be
+  established are retained and reported for inspection before another attempt.
 - **Modes:** both modes use the same checks. `ephemeral` keeps final outputs local.
   `permanent` places them on the drive (see [final outputs](#final-outputs)). A
   permanent drive that cannot be used produces a warning before admission, with the

@@ -16,6 +16,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub const REGISTRY_VERSION: &str = "oxide.outputs.registry/2";
@@ -777,7 +778,7 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
         row.pending = false;
     }
     note_reservation(&mut registry, receipt, &receipt_path, checkout_volume_uuid)?;
-    pin_references(control, receipt)?;
+    pin_references(control, receipt, &registry)?;
     // A recorded ID is the generation's identity. Backfill missing IDs from
     // Barge's markers once per area, even when many rows share that area.
     let mut roots_by_area = HashMap::new();
@@ -1344,18 +1345,26 @@ fn write_registry(control: &Path, registry: &Registry) -> Result<(), String> {
         return Err("the output registry reached its byte limit".to_owned());
     }
     let path = registry_path(control);
-    let temp = directory.join(format!(".registry.tmp-{}", std::process::id()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temp)
-        .map_err(|error| format!("cannot write {}: {error}", temp.display()))?;
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| format!("cannot write {}: {error}", temp.display()))?;
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let (temp, mut file) = loop {
+        let seq = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temp = directory.join(format!(".registry.tmp-{}-{seq}", std::process::id()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temp)
+        {
+            Ok(file) => break (temp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("cannot write {}: {error}", temp.display())),
+        }
+    };
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("cannot write {}: {error}", temp.display()));
+    }
     drop(file);
     fs::rename(&temp, &path).map_err(|error| {
         let _ = fs::remove_file(&temp);
@@ -1671,8 +1680,7 @@ fn import_output(
     })
 }
 
-fn pin_references(control: &Path, receipt: &Receipt) -> Result<(), String> {
-    let registry = read_registry(control)?;
+fn pin_references(control: &Path, receipt: &Receipt, registry: &Registry) -> Result<(), String> {
     for placement in receipt.links() {
         for (selected, pending) in placement
             .selected_ref()
@@ -1702,7 +1710,7 @@ fn pin_references(control: &Path, receipt: &Receipt) -> Result<(), String> {
             }
             let imported = import_output(
                 control,
-                registry.as_ref(),
+                Some(registry),
                 receipt.checkout(),
                 receipt.checkout_id(),
                 selected,
@@ -1754,11 +1762,13 @@ pub(crate) fn finish_receipt(control: &Path, receipt: &Receipt) -> Result<(), St
             nonce: row.nonce.clone(),
             generation: row.generation,
         };
-        let area = output_area(control, &selected)?;
-        match area.unpin(&id) {
-            Ok(()) => {}
-            Err(error) if error.kind() == barge::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.to_string()),
+        match output_area(control, &selected) {
+            Ok(area) => match area.unpin(id) {
+                Ok(()) => {}
+                Err(error) if error.kind() == barge::ErrorKind::NotFound => {}
+                Err(error) => eprintln!("warning: retained old output pin {id}: {error}"),
+            },
+            Err(error) => eprintln!("warning: retained old output pin {id}: {error}"),
         }
     }
     Ok(())
@@ -2316,6 +2326,16 @@ mod plan_identity_tests {
     }
 
     #[test]
+    fn registry_write_does_not_truncate_a_preexisting_temp() {
+        let fixture = fixture();
+        let temp =
+            registry_dir(&fixture.control).join(format!(".registry.tmp-{}", std::process::id()));
+        fs::write(&temp, b"keep").unwrap();
+        write_registry(&fixture.control, &fixture.registry).unwrap();
+        assert_eq!(fs::read(temp).unwrap(), b"keep");
+    }
+
+    #[test]
     fn registry_write_failure_after_eviction_is_a_failed_execution() {
         let Fixture {
             _temp,
@@ -2594,5 +2614,76 @@ mod plan_identity_tests {
         assert!(recorded.pinned);
         area.unpin(&original.id).unwrap();
         assert!(!import().pinned);
+    }
+}
+
+#[cfg(test)]
+mod script_regressions {
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::process::Command;
+
+    #[test]
+    fn changelog_rejects_incomplete_flags_and_folds_atomically() {
+        let temp = barge::testing::TempDir::new("oxide-changelog-regressions").unwrap();
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/changelog.py");
+        for flag in ["--repo", "--version", "--date"] {
+            let out = Command::new("python3")
+                .arg(&script)
+                .args(["fold", flag])
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(!String::from_utf8_lossy(&out.stderr).contains("Traceback"));
+        }
+        fs::create_dir(temp.path().join("changelog.d")).unwrap();
+        fs::write(
+            temp.path().join("changelog.d/1-example.fixed.md"),
+            "Fixed it.\n",
+        )
+        .unwrap();
+        let path = temp.path().join("CHANGELOG.md");
+        let original = "# Changelog\n\n## [Unreleased]\n\n- existing\n";
+        fs::write(&path, original).unwrap();
+        let run = || {
+            Command::new("python3")
+                .arg(&script)
+                .args(["fold", "--version", "1.0.0", "--repo"])
+                .arg(temp.path())
+                .output()
+                .unwrap()
+        };
+        assert!(!run().status.success());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::write(&path, "# Changelog\n\n## [Unreleased]\n").unwrap();
+        let before = fs::metadata(&path).unwrap().ino();
+        assert!(run().status.success());
+        assert_ne!(before, fs::metadata(&path).unwrap().ino());
+        assert!(fs::read_to_string(&path).unwrap().contains("Fixed it."));
+    }
+
+    #[test]
+    fn installer_import_without_home_is_clean() {
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/oxide-install.py");
+        let output = Command::new("python3")
+            .args([
+                "-c",
+                "import runpy,sys; runpy.run_path(sys.argv[1], run_name='installer_test')",
+            ])
+            .arg(script)
+            .env_remove("HOME")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

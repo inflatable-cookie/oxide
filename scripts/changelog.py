@@ -22,7 +22,7 @@ direct content.
 Exit: 0 clean or folded, 1 problems, 2 usage error.
 Needs Python 3.8+; nothing else.
 """
-import os, re, sys, time
+import os, re, sys, tempfile, time
 
 TYPES = ("added", "changed", "fixed", "removed", "security")
 HEADINGS = {"added": "Added", "changed": "Changed", "fixed": "Fixed",
@@ -42,10 +42,12 @@ def parse_args(argv):
     rest, i = argv[1:], 0
     while i < len(rest):
         a = rest[i]
-        if a == "--repo": i += 1; o["repo"] = rest[i]
+        if a in ("--repo", "--version", "--date") and (a == "--repo" or o["mode"] == "fold"):
+            if i + 1 >= len(rest) or rest[i + 1].startswith("--"):
+                die(f"{a} needs a value")
+            i += 1
+            o[{"--repo": "repo", "--version": "version", "--date": "date"}[a]] = rest[i]
         elif a == "--dry-run": o["dry"] = True
-        elif a == "--version" and o["mode"] == "fold": i += 1; o["version"] = rest[i]
-        elif a == "--date" and o["mode"] == "fold": i += 1; o["date"] = rest[i]
         else: die(f"unexpected argument {a}")
         i += 1
     if o["mode"] == "fold":
@@ -151,6 +153,8 @@ def fold():
     h = unreleased_index(lines)
     if h < 0:
         refuse(["CHANGELOG.md: no `## [Unreleased]` heading; add it"])
+    if unreleased_content(lines, h):
+        refuse(["CHANGELOG.md: [Unreleased] holds direct content; record it as a fragment"])
 
     parsed = sorted(((ftype, fname, entry) for fname in frags
                      for ftype, entry in [parse_fragment(fname)]),
@@ -173,8 +177,20 @@ def fold():
         print(f"changelog: dry run; {len(frags)} fragment(s) would fold into "
               f"[{OPTS['version']}] - {date}", file=sys.stderr)
         return
-    with open(CHANGELOG, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(new) + "\n")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=OPTS["repo"],
+                                         prefix=".changelog-", delete=False) as fh:
+            temporary = fh.name
+            os.fchmod(fh.fileno(), os.stat(CHANGELOG).st_mode & 0o777)
+            fh.write("\n".join(new) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, CHANGELOG)
+        temporary = None
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
     for fname in frags:
         os.remove(os.path.join(FRAGDIR, fname))
     keep = os.path.join(FRAGDIR, ".gitkeep")
