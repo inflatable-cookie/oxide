@@ -86,12 +86,6 @@ const MAX_PLAN_BYTES: usize = 64 * 1024;
 const MAX_ROOTS: usize = 8;
 /// Cooperative holders named in a plan.
 const MAX_HOLDERS: usize = 16;
-/// Debug-only crash injection, naming a write-ahead point.
-#[cfg(debug_assertions)]
-const CRASH_ENVIRONMENT: &str = "OXIDE_TEST_OUTPUTS_CRASH";
-/// Debug-only rollback oracle for an uncommitted layout migration.
-#[cfg(debug_assertions)]
-const ROLLBACK_ENVIRONMENT: &str = "OXIDE_TEST_MIGRATION_ROLLBACK";
 /// Siblings of `<checkout>/target` that a layout migration owns.
 const STAGE_PREFIX: &str = ".target.oxide-new-";
 const BACKUP_PREFIX: &str = ".target.oxide-old-";
@@ -112,6 +106,11 @@ const GIT_REPOSITORY_ENVIRONMENT: [&str; 8] = [
     "GIT_CEILING_DIRECTORIES",
 ];
 
+/// What a historical prune intent means in this build, stated once. The
+/// `resolve-intent` verb is gone: nothing replays or settles an intent, and
+/// the only recovery is manual.
+const PRUNE_INTENT_POSITION: &str = "the recorded intent is kept as evidence; nothing replays or settles it automatically, and the manual recovery path is restoring it and its receipt preimage from the pool's output registry by hand";
+
 const USAGE: &str = "\
 usage: oxide outputs plan      effect-free JSON plan for this checkout (oxide.outputs.plan/2)
        oxide outputs adopt     explicitly convert <checkout>/target to an owned link
@@ -119,7 +118,6 @@ usage: oxide outputs plan      effect-free JSON plan for this checkout (oxide.ou
        oxide outputs detach    restore a real <checkout>/target directory; roots are kept
        oxide outputs status    read-only state of this checkout's owned outputs
        oxide outputs prune     explicitly prune roots whose checkout is gone
-       oxide outputs resolve-intent ID  settle one pending prune intent
 
 Permanent drive mode owns one `<checkout>/target` symlink. Its real root is
 <mount>/oxide-outputs/<project>-<checkout id>/ while the registered volume is
@@ -366,7 +364,8 @@ enum ReceiptState {
     Pruned,
     /// An operator-listed receiptless legacy root of this checkout is being
     /// pruned under the recorded intent (oxide#129). Every bind, adopt,
-    /// automatic adoption, detach, clean and replay refuses until it settles.
+    /// automatic adoption, detach, clean and replay refuses while that intent
+    /// stays unsettled.
     Pruning,
 }
 
@@ -542,6 +541,10 @@ impl Receipt {
         &self.links[0]
     }
 
+    /// The first placement's mutable handle. Every production writer addresses
+    /// placements by member (`place_member`, `detached_receipt`); the tests
+    /// still build single-placement fixtures through it.
+    #[cfg(test)]
     fn link_mut(&mut self) -> &mut LinkPlacement {
         &mut self.links[0]
     }
@@ -875,43 +878,172 @@ impl Receipt {
             _ => None,
         }
     }
+
+    /// Whether this receipt selects no owned destination at all: `Detached`
+    /// (the per-checkout opt-out) or `Pruned` (its root was deleted or settled
+    /// by an explicit prune). Every reader that asks "does this checkout own an
+    /// output root now" answers through this one method, so the two states are
+    /// never classified differently by two call sites.
+    fn selects_nothing(&self) -> bool {
+        matches!(self.state, ReceiptState::Detached | ReceiptState::Pruned)
+    }
 }
 
-/// Ensure the member's real destination directory exists beneath the root.
-/// The root itself is already validated as a real directory owned by this
-/// checkout; a symlink or other entry at the member path is refused, never
-/// followed.
-fn ensure_member_directory(root: &Path, member: &str) -> Result<PathBuf, String> {
-    let destination = member_destination(root, member);
+/// Why an owned-output operation stopped. The kind is decided where the
+/// condition is found, so no caller ever matches on message text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum OutputsError {
+    /// A precondition of the command is not met; nothing was changed.
+    Refused(String),
+    /// A file-system or coordination operation failed.
+    Io(String),
+    /// A publication collided with a concurrent writer and is retried.
+    Retry(String),
+    /// A durable record is malformed or contradicts the live tree.
+    Corrupt(String),
+}
+
+impl OutputsError {
+    fn refused(reason: impl Into<String>) -> Self {
+        Self::Refused(reason.into())
+    }
+
+    fn io(reason: impl Into<String>) -> Self {
+        Self::Io(reason.into())
+    }
+
+    fn corrupt(reason: impl Into<String>) -> Self {
+        Self::Corrupt(reason.into())
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::Refused(reason)
+            | Self::Io(reason)
+            | Self::Retry(reason)
+            | Self::Corrupt(reason) => reason,
+        }
+    }
+}
+
+impl std::fmt::Display for OutputsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl From<OutputsError> for String {
+    fn from(error: OutputsError) -> Self {
+        error.message().to_owned()
+    }
+}
+
+/// A real directory and nothing else: never a symlink.
+fn is_real_dir(metadata: &fs::Metadata) -> bool {
+    metadata.is_dir() && !metadata.file_type().is_symlink()
+}
+
+/// Open one existing real directory through its own descriptor: the final
+/// component is never followed, and a directory swapped for another between
+/// the inspection and the open is refused.
+fn open_real_directory(path: &Path) -> Result<File, OutputsError> {
+    let named = fs::symlink_metadata(path)
+        .map_err(|error| OutputsError::io(format!("cannot inspect {}: {error}", path.display())))?;
+    if !is_real_dir(&named) {
+        return Err(OutputsError::refused(format!(
+            "{} is not a real directory; it is never followed",
+            path.display()
+        )));
+    }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| OutputsError::io(format!("cannot open {}: {error}", path.display())))?;
+    let opened = directory
+        .metadata()
+        .map_err(|error| OutputsError::io(format!("cannot inspect {}: {error}", path.display())))?;
+    if !is_real_dir(&opened) || opened.dev() != named.dev() || opened.ino() != named.ino() {
+        return Err(OutputsError::corrupt(format!(
+            "{} changed while it was being opened",
+            path.display()
+        )));
+    }
+    Ok(directory)
+}
+
+/// Create one directory component beneath `parent` and return its descriptor.
+/// An existing entry is opened only while it really is a directory: a symlink,
+/// a file or any other entry at that name refuses and is never followed.
+fn create_directory_component(
+    parent: &File,
+    component: &str,
+    shown: &Path,
+) -> Result<File, OutputsError> {
+    let name = std::ffi::CString::new(component)
+        .map_err(|_| OutputsError::refused(format!("{component} is not a usable name")))?;
+    // SAFETY: `parent` is a live descriptor and `name` is a live
+    // NUL-terminated string that outlives the calls below.
+    let created = unsafe {
+        libc::mkdirat(
+            std::os::unix::io::AsRawFd::as_raw_fd(parent),
+            name.as_ptr(),
+            0o755,
+        )
+    } == 0;
+    if !created {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(OutputsError::io(format!(
+                "cannot create the member directory {}: {error}",
+                shown.display()
+            )));
+        }
+    }
+    // SAFETY: `parent` is a live descriptor and `name` outlives the call.
+    let opened = unsafe {
+        libc::openat(
+            std::os::unix::io::AsRawFd::as_raw_fd(parent),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if opened < 0 {
+        return Err(OutputsError::refused(format!(
+            "the member entry {} is not a real directory ({}) and is never followed",
+            shown.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: `opened` is a newly owned descriptor.
+    let opened = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(opened) };
+    if created
+        && unsafe { libc::fchmod(std::os::unix::io::AsRawFd::as_raw_fd(&opened), 0o755) } != 0
+    {
+        return Err(OutputsError::io(format!(
+            "cannot set permissions on {}: {}",
+            shown.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(File::from(opened))
+}
+
+/// Ensure the member's real destination directory exists beneath `base` (an
+/// output root, or a profile checkout's real `target`). `base` itself is
+/// already validated as a real directory owned by this checkout. Every
+/// component below it is created one at a time, relative to its parent's
+/// descriptor, so a symlinked intermediate is never followed the way
+/// `create_dir_all` would: a symlink, a file or any other entry at any
+/// component refuses and is left untouched.
+fn ensure_member_directory(base: &Path, member: &str) -> Result<PathBuf, OutputsError> {
+    let destination = member_destination(base, member);
     if member == MEMBER {
         return Ok(destination);
     }
-    match fs::symlink_metadata(&destination) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            return Ok(destination)
-        }
-        Ok(_) => {
-            return Err(format!(
-                "the output root's member entry {} is not a real directory; it is never followed",
-                destination.display()
-            ))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("cannot inspect {}: {error}", destination.display())),
-    }
-    fs::create_dir_all(&destination).map_err(|error| {
-        format!(
-            "cannot create the member directory {}: {error}",
-            destination.display()
-        )
-    })?;
-    let metadata = fs::symlink_metadata(&destination)
-        .map_err(|error| format!("cannot inspect {}: {error}", destination.display()))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(format!(
-            "the created member destination {} is not a real directory",
-            destination.display()
-        ));
+    let mut directory = open_real_directory(base)?;
+    for component in member.split('/') {
+        directory = create_directory_component(&directory, component, &destination)?;
     }
     Ok(destination)
 }
@@ -937,7 +1069,7 @@ fn ensure_member_ancestors(context: &Context, link: &Path) -> Result<(), String>
             target.display()
         )
     })?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !is_real_dir(&metadata) {
         return Err(format!(
             "{} is not a real directory; a profile member is placed only inside one",
             target.display()
@@ -960,7 +1092,7 @@ fn ensure_member_ancestors(context: &Context, link: &Path) -> Result<(), String>
     for component in relative.components() {
         current.push(component.as_os_str());
         match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(metadata) if is_real_dir(&metadata) => {}
             Ok(_) => {
                 return Err(format!(
                     "{} is not a real directory; Oxide never follows or replaces it",
@@ -984,7 +1116,7 @@ fn ensure_member_ancestors(context: &Context, link: &Path) -> Result<(), String>
                         let metadata = fs::symlink_metadata(&current).map_err(|error| {
                             format!("cannot inspect {}: {error}", current.display())
                         })?;
-                        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                        if !is_real_dir(&metadata) {
                             return Err(format!(
                                 "{} is not a real directory; Oxide never follows or replaces it",
                                 current.display()
@@ -1059,7 +1191,7 @@ fn recreate_target_directory(checkout: &Path) -> Result<(), String> {
         // already there — a real directory — or a refusal; a link, a file or
         // any other entry is never replaced or followed.
         return match fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+            Ok(metadata) if is_real_dir(&metadata) => Ok(()),
             Ok(_) => Err(format!(
                 "{} appeared while the missing target directory was being recreated and is not a real directory; it is never replaced",
                 target.display()
@@ -1586,6 +1718,22 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
     }
 }
 
+/// Test-only injection points for a write-ahead crash and a migration
+/// rollback. They live on the one `Context` a test drives, so a parallel
+/// `cargo test` can never inject a crash into another test's fixture, and a
+/// release build carries neither the hook nor its name. Each hook fires once
+/// and then clears itself, so the replay the test drives afterwards runs
+/// uninjected.
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+struct TestHooks {
+    /// Stop at this write-ahead point, exactly as a killed process would.
+    crash: Option<String>,
+    /// Roll a migration back at `1` (its first durable phase) or at one named
+    /// phase instead of continuing.
+    rollback: Option<String>,
+}
+
 /// One checkout's output context. Read-only: a receipt read never creates a
 /// directory.
 struct Context {
@@ -1597,6 +1745,8 @@ struct Context {
     /// the external root: only a removable store supervises the drive's
     /// removal, so a command never writes to it unwatched.
     pool_fallback: Option<String>,
+    #[cfg(test)]
+    hooks: std::cell::RefCell<TestHooks>,
 }
 
 impl Context {
@@ -1614,12 +1764,66 @@ impl Context {
             workspace,
             checkout_id,
             pool_fallback: None,
+            #[cfg(test)]
+            hooks: std::cell::RefCell::new(TestHooks::default()),
         }
     }
 
     fn with_pool_fallback(mut self, reason: Option<&str>) -> Self {
         self.pool_fallback = reason.map(str::to_owned);
         self
+    }
+
+    /// Ask this context to stop at a write-ahead `point`, once.
+    #[cfg(test)]
+    fn inject_crash(&self, point: &str) {
+        self.hooks.borrow_mut().crash = Some(point.to_owned());
+    }
+
+    /// Ask this context's migration to roll back at `phase` (`1` is the first
+    /// durable phase), once.
+    #[cfg(test)]
+    fn inject_rollback(&self, phase: &str) {
+        self.hooks.borrow_mut().rollback = Some(phase.to_owned());
+    }
+
+    /// Stop at a write-ahead point without further state, exactly as a killed
+    /// process would leave the fixture. Only a test's own context can ask for
+    /// it, and only once.
+    fn crash_point(&self, point: &str) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            let mut hooks = self.hooks.borrow_mut();
+            if hooks.crash.as_deref() == Some(point) {
+                hooks.crash = None;
+                return Err(format!(
+                    "outputs: injected transition stop at {point}; the receipt stays prepared"
+                ));
+            }
+        }
+        let _ = point;
+        Ok(())
+    }
+
+    /// Whether this migration restores the exact recorded pre-migration state
+    /// at `phase` instead of continuing. The hook fires at its one phase only.
+    fn migration_rollback_requested(&self, phase: MigrationPhase) -> bool {
+        #[cfg(test)]
+        {
+            let mut hooks = self.hooks.borrow_mut();
+            if let Some(value) = hooks.rollback.clone() {
+                let fire = value == "1"
+                    || (value == "marker" && phase == MigrationPhase::MarkerUpgraded)
+                    || (value == "staged" && phase == MigrationPhase::Staged)
+                    || (value == "swapped" && phase == MigrationPhase::Swapped);
+                if fire {
+                    hooks.rollback = None;
+                }
+                return fire;
+            }
+        }
+        let _ = phase;
+        false
     }
 
     fn control(&self) -> Option<&Path> {
@@ -2274,7 +2478,8 @@ fn adopt_at(
     let guard = barrier(internal, &context.workspace, &mut waits)?;
     if let Some(intent) = crate::prune::unsettled_for(&control, &context.checkout_id)? {
         return Err(format!(
-            "outputs: prune intent {intent} is unsettled for this checkout; `adopt` refuses until it completes or `oxide outputs resolve-intent {intent}` settles it"
+            "outputs: {}; `adopt` refuses while it is unsettled",
+            unsettled_prune_refusal(&intent)
         ));
     }
     let outcome = (|| {
@@ -2488,30 +2693,6 @@ fn migration_members(root: &Path) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// Debug-only: `OXIDE_TEST_MIGRATION_ROLLBACK=1` asks `adopt` to restore the
-/// exact pre-migration state instead of continuing. Absent from release
-/// builds.
-fn migration_rollback_requested(phase: MigrationPhase) -> bool {
-    #[cfg(debug_assertions)]
-    {
-        let Some(value) = std::env::var(ROLLBACK_ENVIRONMENT).ok() else {
-            return false;
-        };
-        // `1` rolls back at the first durable phase; a phase name rolls back
-        // exactly when the journal reaches it, so both marker boundaries and
-        // the pre-P4 target are exercisable.
-        return value == "1"
-            || (value == "marker" && phase == MigrationPhase::MarkerUpgraded)
-            || (value == "staged" && phase == MigrationPhase::Staged)
-            || (value == "swapped" && phase == MigrationPhase::Swapped);
-    }
-    #[allow(unreachable_code)]
-    {
-        let _ = phase;
-        false
-    }
-}
-
 /// SHA-256 of one file's exact bytes.
 fn file_digest(path: &Path) -> Result<String, String> {
     let bytes =
@@ -2674,7 +2855,7 @@ fn verify_marker_backup(migration: &Migration) -> Result<(), String> {
 fn verify_member_links(dir: &Path, migration: &Migration) -> Result<(), String> {
     let metadata = fs::symlink_metadata(dir)
         .map_err(|error| format!("cannot inspect {}: {error}", dir.display()))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !is_real_dir(&metadata) {
         return Err(format!("{} is not a real directory", dir.display()));
     }
     let mut found = Vec::new();
@@ -2713,7 +2894,7 @@ fn verify_member_links(dir: &Path, migration: &Migration) -> Result<(), String> 
         let nested_dir = entry.path();
         let nested_metadata = fs::symlink_metadata(&nested_dir)
             .map_err(|error| format!("cannot inspect {}: {error}", nested_dir.display()))?;
-        if !nested_metadata.is_dir() || nested_metadata.file_type().is_symlink() {
+        if !is_real_dir(&nested_metadata) {
             return Err(format!("{} is not a real directory", nested_dir.display()));
         }
         for child in fs::read_dir(&nested_dir)
@@ -2863,7 +3044,7 @@ fn migrate_layout(
     // P0: the durable journal in the successor format. The whole-target
     // placement stays selected, so its key is unchanged until P4.
     let writing = publish_migration_journal(control, &receipt, migration)?;
-    crash_point("migration-p0")?;
+    context.crash_point("migration-p0")?;
     let done = replay_migration(context, control, writing)?;
     let selected = done
         .selected()
@@ -2911,7 +3092,7 @@ fn replay_migration(
     if migration.phase == MigrationPhase::Committed {
         return finish_migration_cleanup(context, control, receipt, &migration);
     }
-    if migration_rollback_requested(migration.phase) {
+    if context.migration_rollback_requested(migration.phase) {
         return rollback_migration(context, control, receipt, &migration);
     }
     // Every step rechecks the exact identities the journal pinned before it
@@ -2942,7 +3123,7 @@ fn replay_migration(
             .transition
             .clone()
             .ok_or("the migration journal disappeared")?;
-        if migration_rollback_requested(migration.phase) {
+        if context.migration_rollback_requested(migration.phase) {
             return rollback_migration(context, control, current, &migration);
         }
         let (next, patch) = match migration.phase {
@@ -2962,7 +3143,7 @@ fn replay_migration(
             }
         };
         current = advance_migration(control, &current, next, &patch)?;
-        crash_point(&format!("migration-{}", migration_phase_label(next)))?;
+        context.crash_point(&format!("migration-{}", migration_phase_label(next)))?;
     }
 }
 
@@ -3483,7 +3664,7 @@ fn commit_migration(
     committed.transition = Some(journal);
     committed.updated_ms = process::now_ms();
     write_receipt(control, &committed)?;
-    crash_point("migration-p4")?;
+    context.crash_point("migration-p4")?;
     finish_migration_cleanup(context, control, committed, migration)
 }
 
@@ -3496,7 +3677,7 @@ fn commit_migration(
 fn verify_migrated_target(dir: &Path, migration: &Migration) -> Result<(), String> {
     let metadata = fs::symlink_metadata(dir)
         .map_err(|error| format!("cannot inspect {}: {error}", dir.display()))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !is_real_dir(&metadata) {
         return Err(format!("{} is not a real directory", dir.display()));
     }
     for member in &migration.members {
@@ -3764,8 +3945,7 @@ fn rollback_migration(
     for member in migration.created_members.iter().rev() {
         let destination = member_destination(&migration.root.root, member);
         let empty_real_directory = fs::symlink_metadata(&destination).is_ok_and(|metadata| {
-            metadata.is_dir()
-                && !metadata.file_type().is_symlink()
+            is_real_dir(&metadata)
                 && fs::read_dir(&destination)
                     .map(|mut entries| entries.next().is_none())
                     .unwrap_or(false)
@@ -4272,9 +4452,12 @@ fn detach_at(
         let _admission = store::publication_guard(&control)?;
         let receipt = read_receipt(&control, &context.workspace, &context.checkout_id)?
             .ok_or("this checkout has no owned-output receipt; nothing to detach")?;
-        let mut receipt = replay(&context, receipt)?;
+        let receipt = replay(&context, receipt)?;
         if receipt.state == ReceiptState::Detached {
-            return Ok((receipt, false));
+            // The opt-out is already durable. Finish any effect the crash
+            // between that receipt and its real directories may have skipped.
+            let changed = settle_detached(&context, &receipt)?;
+            return Ok((receipt, changed));
         }
         if receipt.layout() == LayoutKind::Profile {
             return detach_profile(&context, &control, receipt);
@@ -4292,26 +4475,17 @@ fn detach_at(
                 selected.root.display()
             ));
         }
-        let link = context.link();
-        fs::remove_file(&link)
-            .map_err(|error| format!("cannot remove the owned link {}: {error}", link.display()))?;
-        if let Err(error) = fs::create_dir(&link) {
-            return Err(format!(
-                "the owned link was removed, but creating the real {} failed: {error}; re-run `oxide outputs adopt` to restore the link",
-                link.display()
-            ));
-        }
-        fs::set_permissions(&link, fs::Permissions::from_mode(0o755))
-            .map_err(|error| format!("cannot set permissions on {}: {error}", link.display()))?;
-        sync_directory(&context.workspace)?;
-        if let Some(previous) = receipt.link_mut().selected.take() {
-            remember_root(&mut receipt, previous);
-        }
-        receipt.state = ReceiptState::Detached;
-        receipt.link_mut().prepared = None;
-        receipt.updated_ms = process::now_ms();
-        write_receipt(&control, &receipt)?;
-        Ok((receipt, true))
+        // Write-ahead: the opt-out is durable before the link goes, so a crash
+        // in the window leaves a Detached receipt the next detach (or binding)
+        // finishes, never a Committed receipt with a missing target that the
+        // next bind would silently re-link.
+        let detached = detached_receipt(&receipt);
+        write_receipt(&control, &detached)?;
+        context.crash_point("detach-receipt")?;
+        // The same effects the crash-window recovery applies: one function
+        // describes what a `Detached` receipt means on disk.
+        settle_detached(&context, &detached)?;
+        Ok((detached, true))
     })();
     release_barrier(&internal, guard)?;
     let (receipt, detached) = outcome?;
@@ -4341,6 +4515,11 @@ fn detach_at(
 /// `oxide outputs detach` for the profile layout: every owned member link
 /// becomes a real empty directory again and `target` stays real. No root is
 /// moved or deleted; the receipt keeps its identity and known roots.
+///
+/// The `Detached` receipt is durable before the first link is converted, so a
+/// crash leaves a checkout whose recorded opt-out the next detach finishes;
+/// the link-removal ordering can never leave a Committed receipt over real
+/// directories that a later bind would silently re-link.
 fn detach_profile(
     context: &Context,
     control: &Path,
@@ -4351,7 +4530,9 @@ fn detach_profile(
             "outputs detach: an interrupted transition is pending; nothing was changed".to_owned(),
         );
     }
-    let mut removals = Vec::new();
+    // Verify every recorded link before the receipt is written: only this
+    // checkout's own link to the root its placement names, or an absent one, is
+    // a detach entry. Anything else refuses with nothing changed.
     for placement in receipt.links() {
         let Some(selected) = placement.selected_ref() else {
             continue;
@@ -4360,10 +4541,7 @@ fn detach_profile(
         match link_state(&link, &context.workspace, &context.checkout_id)? {
             TargetState::Missing => {}
             TargetState::OwnedLink(root)
-                if root == member_destination(selected.root(), placement.member()) =>
-            {
-                removals.push(link);
-            }
+                if root == member_destination(selected.root(), placement.member()) => {}
             state => {
                 return Err(format!(
                     "outputs detach refused: {} is {}, not this checkout's owned link to {}; it is left untouched",
@@ -4375,8 +4553,7 @@ fn detach_profile(
         }
     }
     match context.target()? {
-        TargetState::Missing => create_owned_directory(&context.link())?,
-        TargetState::RealEmpty | TargetState::RealNonEmpty => {}
+        TargetState::Missing | TargetState::RealEmpty | TargetState::RealNonEmpty => {}
         state => {
             return Err(format!(
                 "outputs detach refused: {} is {}; it is left untouched",
@@ -4385,23 +4562,23 @@ fn detach_profile(
             ))
         }
     }
-    for link in &removals {
-        fs::remove_file(link)
-            .map_err(|error| format!("cannot remove the owned link {}: {error}", link.display()))?;
-        create_owned_directory(link)?;
-        fs::set_permissions(link, fs::Permissions::from_mode(0o755))
-            .map_err(|error| format!("cannot set permissions on {}: {error}", link.display()))?;
-    }
-    sync_directory(&context.workspace)?;
-    let mut previous = Vec::new();
-    for placement in receipt.links() {
-        if let Some(selected) = placement.selected_ref() {
-            previous.push(selected.clone());
-        }
-    }
+    let detached = detached_receipt(&receipt);
+    write_receipt(control, &detached)?;
+    context.crash_point("detach-receipt")?;
+    settle_detached(context, &detached)?;
+    Ok((detached, true))
+}
+
+/// The receipt of a checkout that selects nothing: every placement is
+/// cleared, each former root joins the known-root history, and the state
+/// records the opt-out a later automatic conversion never follows.
+fn detached_receipt(receipt: &Receipt) -> Receipt {
     let mut detached = receipt.clone();
+    let mut previous = Vec::new();
     for placement in &mut detached.links {
-        placement.selected = None;
+        if let Some(selected) = placement.selected.take() {
+            previous.push(selected);
+        }
         placement.prepared = None;
     }
     for root in previous {
@@ -4409,8 +4586,91 @@ fn detach_profile(
     }
     detached.state = ReceiptState::Detached;
     detached.updated_ms = process::now_ms();
-    write_receipt(control, &detached)?;
-    Ok((detached, true))
+    detached
+}
+
+/// Turn one owned link into the real empty directory a detach restores. The
+/// caller has already written the `Detached` receipt, so a failure here is
+/// recoverable by re-running `oxide outputs detach`.
+fn replace_link_with_directory(link: &Path) -> Result<(), String> {
+    fs::remove_file(link).map_err(|error| {
+        format!(
+            "cannot remove the owned link {}: {error}; re-run `oxide outputs detach` to finish",
+            link.display()
+        )
+    })?;
+    if let Err(error) = fs::create_dir(link) {
+        return Err(format!(
+            "the owned link {} was removed, but creating the real directory failed: {error}; re-run `oxide outputs detach` to finish",
+            link.display()
+        ));
+    }
+    fs::set_permissions(link, fs::Permissions::from_mode(0o755)).map_err(|error| {
+        format!(
+            "cannot set permissions on {}: {error}; re-run `oxide outputs detach` to finish",
+            link.display()
+        )
+    })
+}
+
+/// Finish a detach whose `Detached` receipt is durable but whose real
+/// directories were not all created: the crash window between the receipt and
+/// the link removals. Only an entry this receipt's known roots still name is
+/// converted; every other entry is left untouched and refused.
+fn settle_detached(context: &Context, receipt: &Receipt) -> Result<bool, String> {
+    let mut changed = settle_detached_entry(context, receipt, MEMBER)?;
+    if receipt.layout() == LayoutKind::Profile {
+        for placement in receipt.links() {
+            if placement.member() == MEMBER {
+                continue;
+            }
+            changed |= settle_detached_entry(context, receipt, placement.member())?;
+        }
+    }
+    if changed {
+        // `target` itself is an entry of the checkout, and every profile member
+        // it holds is an entry of `target`.
+        sync_directory(&context.workspace)?;
+        if receipt.layout() == LayoutKind::Profile && context.link().is_dir() {
+            sync_directory(&context.link())?;
+        }
+    }
+    Ok(changed)
+}
+
+/// One entry of [`settle_detached`]: the whole-target link or one profile
+/// member link.
+fn settle_detached_entry(
+    context: &Context,
+    receipt: &Receipt,
+    member: &str,
+) -> Result<bool, String> {
+    let entry = link_path(&context.workspace, member);
+    match link_state(&entry, &context.workspace, &context.checkout_id)? {
+        TargetState::Missing => {
+            if member == MEMBER {
+                recreate_target_directory(&context.workspace)?;
+            } else {
+                ensure_member_directory(&context.link(), member)?;
+            }
+            Ok(true)
+        }
+        TargetState::RealEmpty | TargetState::RealNonEmpty => Ok(false),
+        TargetState::OwnedLink(root)
+            if receipt
+                .roots
+                .iter()
+                .any(|known| member_destination(&known.root, member) == root) =>
+        {
+            replace_link_with_directory(&entry)?;
+            Ok(true)
+        }
+        state => Err(format!(
+            "outputs detach refused: {} is {} and is not this checkout's owned link to a preserved root; it is left untouched",
+            entry.display(),
+            state.label()
+        )),
+    }
 }
 
 /// A command's bound output destination for the life of its start-up. The
@@ -4438,6 +4698,10 @@ impl OutputBinding {
 /// How long a command waits before re-checking a checkout whose other command
 /// must finish before an output relink.
 const BINDING_POLL: Duration = Duration::from_millis(200);
+
+/// The one notice a binding prints while another command in this checkout may
+/// still be writing, so a relink waits instead of racing it.
+const WAITING_NOTICE: &str = "oxide: waiting for another oxide command in this checkout (a build, an exec tool or a program `oxide run` started) to finish before relinking outputs";
 
 /// A build binds its checkout's output root once, before Cargo starts. The
 /// check and any transition run under the checkout's binding mutex, a plain
@@ -4467,8 +4731,7 @@ pub fn bind_for_command(
     repair_absent_members: bool,
     guarded: Option<&LocalOutputs<'_>>,
 ) -> Result<OutputBinding, String> {
-    let owned = guarded.is_none();
-    let mut binding = bind_for_command_inner(
+    let (mut binding, receipt) = bind_for_command_inner(
         store,
         checkout,
         own_record,
@@ -4477,12 +4740,10 @@ pub fn bind_for_command(
         repair_absent_members,
         guarded,
     )?;
-    let id = identity::digest(&checkout.to_string_lossy());
-    if let Some(receipt) = if owned {
-        read_receipt(store.owner_control(), checkout, &id)?
-    } else {
-        None
-    } {
+    // The running holds come from the very receipt the binding decision used,
+    // never from a second read that a peer transition could have replaced.
+    if let Some(receipt) = receipt {
+        let id = identity::digest(&checkout.to_string_lossy());
         binding._holds = crate::prune::hold_outputs(store.owner_control(), &receipt, |member| {
             // Keep the receipt's durable pin. A member that the command can
             // only reach locally needs no running hold on its former root.
@@ -4495,6 +4756,9 @@ pub fn bind_for_command(
     Ok(binding)
 }
 
+/// The binding decision and the receipt it was taken on. `None` is returned
+/// only where no receipt took part (a guarded workspace or an unconverted
+/// checkout), so no hold is taken either.
 fn bind_for_command_inner(
     store: &Store,
     checkout: &Path,
@@ -4503,7 +4767,7 @@ fn bind_for_command_inner(
     pool_fallback: Option<&str>,
     repair_absent_members: bool,
     guarded: Option<&LocalOutputs<'_>>,
-) -> Result<OutputBinding, String> {
+) -> Result<(OutputBinding, Option<Receipt>), String> {
     let context = Context::new(
         Some(store.owner_control().to_path_buf()),
         checkout.to_path_buf(),
@@ -4515,36 +4779,40 @@ fn bind_for_command_inner(
     // the checkout binding mutex in `bind_local_outputs`, and the command
     // starts with a real local `target`.
     if let Some(local) = guarded {
-        return bind_local_outputs(store, &context, expected, local);
+        return Ok((bind_local_outputs(store, &context, expected, local)?, None));
     }
     if let Some(intent) = crate::prune::unsettled_for(store.owner_control(), &context.checkout_id)?
     {
         return Err(format!(
-            "outputs: prune intent {intent} is unsettled for this checkout; binding refuses until `oxide outputs resolve-intent {intent}` settles it or the exact intent completes"
+            "outputs: {}; binding refuses while it is unsettled",
+            unsettled_prune_refusal(&intent)
         ));
     }
     let mode = context.mode()?;
     if mode != Some(DriveMode::Permanent) {
-        if context.receipt()?.is_none() {
-            keyed_state_matches(None, expected)?;
-            return Ok(OutputBinding::unchecked(Outcome::default()));
-        }
         // A converted checkout's command holds the binding mutex until it is
         // recorded as running, in either mode, so a permanent-mode relink
         // never repoints the link between this check and Cargo's start.
         let lock = store.lock_binding(checkout)?;
-        let outcome = bind_ephemeral(&context, expected)?;
-        return Ok(OutputBinding {
-            outcome,
-            _lock: Some(lock),
-            _holds: Vec::new(),
-            ephemeral: mode == Some(DriveMode::Ephemeral),
-        });
+        let Some(receipt) = context.receipt()? else {
+            keyed_state_matches(None, expected)?;
+            return Ok((OutputBinding::unchecked(Outcome::default()), None));
+        };
+        let (outcome, receipt) = bind_ephemeral(&context, receipt, expected)?;
+        return Ok((
+            OutputBinding {
+                outcome,
+                _lock: Some(lock),
+                _holds: Vec::new(),
+                ephemeral: mode == Some(DriveMode::Ephemeral),
+            },
+            Some(receipt),
+        ));
     }
     if context.receipt()?.is_none() {
         keyed_state_matches(None, expected)?;
         refuse_unowned_link(&context, "outputs")?;
-        return Ok(OutputBinding::unchecked(unconverted_outcome()));
+        return Ok((OutputBinding::unchecked(unconverted_outcome()), None));
     }
     let mut announced = false;
     loop {
@@ -4557,12 +4825,15 @@ fn bind_for_command_inner(
         let Some(receipt) = context.receipt()? else {
             keyed_state_matches(None, expected)?;
             refuse_unowned_link(&context, "outputs")?;
-            return Ok(OutputBinding {
-                outcome: unconverted_outcome(),
-                _lock: Some(lock),
-                _holds: Vec::new(),
-                ephemeral: false,
-            });
+            return Ok((
+                OutputBinding {
+                    outcome: unconverted_outcome(),
+                    _lock: Some(lock),
+                    _holds: Vec::new(),
+                    ephemeral: false,
+                },
+                None,
+            ));
         };
         keyed_state_matches(Some(&receipt), expected)?;
         let receipt = match gated_replay(&context, store, own_record, receipt)? {
@@ -4570,9 +4841,7 @@ fn bind_for_command_inner(
             None => {
                 drop(lock);
                 if !announced {
-                    eprintln!(
-                        "oxide: waiting for another oxide command in this checkout (a build, an exec tool or a program `oxide run` started) to finish before relinking outputs"
-                    );
+                    eprintln!("{WAITING_NOTICE}");
                     announced = true;
                 }
                 std::thread::sleep(BINDING_POLL);
@@ -4587,21 +4856,22 @@ fn bind_for_command_inner(
             expected,
             repair_absent_members,
         ) {
-            Bind::Bound(outcome) => {
-                return Ok(OutputBinding {
-                    outcome,
-                    _lock: Some(lock),
-                    _holds: Vec::new(),
-                    ephemeral: false,
-                })
+            Bind::Bound { outcome, receipt } => {
+                return Ok((
+                    OutputBinding {
+                        outcome,
+                        _lock: Some(lock),
+                        _holds: Vec::new(),
+                        ephemeral: false,
+                    },
+                    Some(receipt),
+                ))
             }
-            Bind::Refuse(reason) => return Err(reason),
+            Bind::Refuse(error) => return Err(error.into()),
             Bind::Wait => {
                 drop(lock);
                 if !announced {
-                    eprintln!(
-                        "oxide: waiting for another oxide command in this checkout (a build, an exec tool or a program `oxide run` started) to finish before relinking outputs"
-                    );
+                    eprintln!("{WAITING_NOTICE}");
                     announced = true;
                 }
                 std::thread::sleep(BINDING_POLL);
@@ -4639,7 +4909,7 @@ fn gated_replay(
 /// waited for admission, the slot's key no longer describes where Cargo
 /// would write: refuse before Cargo so the next attempt keys afresh.
 fn keyed_state_matches(receipt: Option<&Receipt>, expected: Option<&Plan>) -> Result<(), String> {
-    let converted = receipt.is_some_and(|receipt| receipt.state != ReceiptState::Detached);
+    let converted = receipt.is_some_and(|receipt| !receipt.selects_nothing());
     keyed_state_refusal(converted, expected)
 }
 
@@ -4689,21 +4959,21 @@ fn unconverted_outcome() -> Outcome {
 /// converted keeps its owned link, is never relinked automatically, and
 /// refuses when the link no longer matches the receipt or the root's full
 /// identity.
-fn bind_ephemeral(context: &Context, expected: Option<&Plan>) -> Result<Outcome, String> {
+fn bind_ephemeral(
+    context: &Context,
+    receipt: Receipt,
+    expected: Option<&Plan>,
+) -> Result<(Outcome, Receipt), String> {
     let expected_selected = expected.and_then(Plan::selected);
-    let receipt = context.receipt()?;
-    if receipt
-        .as_ref()
-        .is_none_or(|receipt| receipt.state != ReceiptState::Prepared)
-    {
-        keyed_state_matches(receipt.as_ref(), expected)?;
+    if receipt.state != ReceiptState::Prepared {
+        keyed_state_matches(Some(&receipt), expected)?;
     }
-    let Some(receipt) = receipt else {
-        return Ok(Outcome::default());
-    };
     match receipt.state {
-        ReceiptState::Detached | ReceiptState::Pruned => Ok(Outcome::default()),
-        ReceiptState::Pruning => Err("outputs: a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it".to_owned()),
+        // A receipt that selects nothing owns no destination in either mode.
+        ReceiptState::Detached | ReceiptState::Pruned => {
+            Ok((Outcome::default(), receipt))
+        }
+        ReceiptState::Pruning => Err(format!("outputs: {}", pruning_refusal())),
         ReceiptState::Prepared => Err(
             "outputs: an interrupted owned-output transition is pending; restore or set a permanent drive registration, then run `oxide outputs adopt` to replay it before building"
                 .to_owned(),
@@ -4714,7 +4984,10 @@ fn bind_ephemeral(context: &Context, expected: Option<&Plan>) -> Result<Outcome,
                 // profile layout is validated exactly as keyed: each owned
                 // member link selects the receipt's root and real or missing
                 // members are used locally.
-                return bind_profile_sealed(context, &receipt, expected);
+                return Ok((
+                    bind_profile_sealed(context, &receipt, expected)?,
+                    receipt,
+                ));
             }
             let wanted = match expected_selected {
                 Some(expected) => expected.clone(),
@@ -4744,10 +5017,13 @@ fn bind_ephemeral(context: &Context, expected: Option<&Plan>) -> Result<Outcome,
                 root: Some(wanted.root.clone()),
                 ..Outcome::default()
             };
-            Ok(outcome.with_note(format!(
-                "owned outputs {} through an owned link",
-                wanted.root.display()
-            )))
+            Ok((
+                outcome.with_note(format!(
+                    "owned outputs {} through an owned link",
+                    wanted.root.display()
+                )),
+                receipt,
+            ))
         }
     }
 }
@@ -4886,11 +5162,23 @@ fn profile_directory_exists(path: &Path) -> Result<bool, String> {
 
 /// The result of one binding attempt under the mutex.
 enum Bind {
-    Bound(Outcome),
-    Refuse(String),
+    /// The command is bound. The receipt is the one this decision was taken
+    /// on (after any transition it committed), so the caller takes its holds
+    /// from that same read instead of re-reading a peer-mutable document.
+    Bound {
+        outcome: Outcome,
+        receipt: Receipt,
+    },
+    Refuse(OutputsError),
     /// Another command may be writing in this checkout; release the mutex,
     /// wait, and try again.
     Wait,
+}
+
+impl Bind {
+    fn refused(reason: impl Into<String>) -> Self {
+        Self::Refuse(OutputsError::refused(reason))
+    }
 }
 
 fn bind_under_binding(
@@ -4913,51 +5201,43 @@ fn bind_under_binding(
     }
     let expected = expected.and_then(Plan::selected);
     let generation = receipt.generation;
-    let wanted = match receipt.state {
-        ReceiptState::Pruning => return Bind::Refuse("outputs: a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it".to_owned()),
-        ReceiptState::Detached | ReceiptState::Pruned => {
-            return match expected {
-                Some(_) => Bind::Refuse(
-                    "outputs: the receipt says this checkout is detached but its slot was keyed for an owned root; run the command again"
-                        .to_owned(),
-                ),
-                None => match refuse_unowned_link(context, "outputs") {
-                    Err(reason) => Bind::Refuse(reason),
-                    Ok(()) => Bind::Bound(Outcome {
-                    warnings: vec![
-                        "permanent drive mode: this checkout is detached from owned outputs; `oxide outputs adopt` converts it again. Nothing was moved"
-                            .to_owned(),
-                    ],
-                    note: Some("outputs detached".to_owned()),
-                    root: None,
-                }),
-                },
-            }
+    // A receipt that selects nothing owns no destination in either mode: the
+    // command runs locally through the real directory the detach intends.
+    if receipt.selects_nothing() {
+        if expected.is_some() {
+            return Bind::refused(
+                "outputs: the receipt says this checkout selects nothing but its slot was keyed for an owned root; run the command again",
+            );
         }
+        return bind_real_directory(context, receipt);
+    }
+    let wanted = match receipt.state {
+        ReceiptState::Pruning => return Bind::refused(format!("outputs: {}", pruning_refusal())),
         ReceiptState::Prepared => {
-            return Bind::Refuse(
-                "outputs: an interrupted owned-output transition is pending; run `oxide outputs adopt` to replay it before building"
-                    .to_owned(),
+            return Bind::refused(
+                "outputs: an interrupted owned-output transition is pending; run `oxide outputs adopt` to replay it before building",
             )
         }
         ReceiptState::Committed => match expected {
             Some(expected) => expected.clone(),
             None => match desired_selection(context, receipt) {
                 Ok(Some(wanted)) => wanted,
-                Ok(None) => {
-                    return Bind::Refuse("outputs: the receipt selects no root".to_owned());
-                }
-                Err(reason) => return Bind::Refuse(reason),
+                Ok(None) => return Bind::refused("outputs: the receipt selects no root"),
+                Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
             },
         },
+        // `selects_nothing` answered both of these above.
+        ReceiptState::Detached | ReceiptState::Pruned => {
+            return bind_real_directory(context, receipt)
+        }
     };
     let usable = match external_choice(context) {
         Ok(usable) => usable,
-        Err(reason) => return Bind::Refuse(reason),
+        Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
     };
     if wanted.kind == RootKind::External {
         if let Err(reason) = &usable {
-            return Bind::Refuse(format!(
+            return Bind::refused(format!(
                 "outputs: this command's slot is keyed for the external root {} but the registered volume is no longer usable ({reason}); nothing was changed. Run the command again to select the checkout-local root",
                 wanted.root.display()
             ));
@@ -4965,7 +5245,7 @@ fn bind_under_binding(
     }
     let target = match context.target() {
         Ok(target) => target,
-        Err(reason) => return Bind::Refuse(reason),
+        Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
     };
     // The live link must agree with the committed selection: a link to
     // another owned root (an older selection restored by hand) is foreign,
@@ -4973,7 +5253,7 @@ fn bind_under_binding(
     let committed_root = receipt.selected().map(|selected| selected.root.as_path());
     let link_selects_wanted = target.link_root() == Some(wanted.root.as_path());
     if link_selects_wanted && committed_root != Some(wanted.root.as_path()) {
-        return Bind::Refuse(format!(
+        return Bind::refused(format!(
             "outputs: {} selects {}, but the committed receipt selects {}; Oxide treats the link as foreign and changes nothing. Run `oxide outputs status` and restore the link",
             context.link().display(),
             wanted.root.display(),
@@ -4982,7 +5262,10 @@ fn bind_under_binding(
     }
     match check_root(context, generation, &wanted) {
         RootCheck::Valid if link_selects_wanted => {
-            return Bind::Bound(bound_outcome(&usable, &wanted, false));
+            return Bind::Bound {
+                outcome: bound_outcome(&usable, &wanted, false),
+                receipt: receipt.clone(),
+            };
         }
         RootCheck::Valid => {}
         RootCheck::Missing => {
@@ -4990,13 +5273,13 @@ fn bind_under_binding(
             // slot was keyed with: a cancelled, replaced or absent one
             // refuses before Cargo, with no automatic retry.
             if let Err(reason) = reservation_matches(context, receipt, &wanted) {
-                return Bind::Refuse(reason);
+                return Bind::refused(reason);
             }
         }
         RootCheck::Contradiction(reason) => {
-            return Bind::Refuse(format!(
+            return Bind::Refuse(OutputsError::corrupt(format!(
                 "outputs: {reason}; nothing was changed. Run `oxide outputs adopt` to recheck this checkout's owned outputs"
-            ))
+            )))
         }
     }
     // A transition is needed: only this checkout's own link may be replaced.
@@ -5006,15 +5289,15 @@ fn bind_under_binding(
         _ => false,
     };
     if !old_link {
-        return Bind::Refuse(format!(
+        return Bind::refused(format!(
             "outputs: {} is {}, not this checkout's owned link; Oxide will not replace it. Run `oxide outputs detach` or restore the link yourself",
             context.link().display(),
             target.label()
         ));
     }
     match store.checkout_custody(&context.workspace, own_record) {
-        Err(reason) => Bind::Refuse(reason),
-        Ok(CheckoutCustody::Unknown(reason)) => Bind::Refuse(format!(
+        Err(reason) => Bind::Refuse(OutputsError::io(reason)),
+        Ok(CheckoutCustody::Unknown(reason)) => Bind::refused(format!(
             "outputs: refusing to relink {}: {reason}. The owned link and both roots are kept until that custody is resolved",
             context.link().display()
         )),
@@ -5030,14 +5313,14 @@ fn bind_under_binding(
                 NonceAuthority::Keyed(wanted.nonce()),
             ) {
                 Ok(committed) => committed,
-                Err(reason) => return Bind::Refuse(reason),
+                Err(reason) => return Bind::refused(reason),
             };
             let bound = match committed.selected() {
                 Some(bound) => bound.clone(),
-                None => return Bind::Refuse("outputs: the transition committed no root".to_owned()),
+                None => return Bind::refused("outputs: the transition committed no root"),
             };
             if !bound.same_place(&wanted) {
-                return Bind::Refuse(format!(
+                return Bind::refused(format!(
                     "outputs: the transition bound {} but this command's slot was keyed for {}; nothing is built into the wrong root. Run the command again",
                     bound.root.display(),
                     wanted.root.display()
@@ -5046,17 +5329,71 @@ fn bind_under_binding(
             // The root must carry exactly the generation this command's slot
             // was keyed with, whichever generation the transition committed.
             match check_root(context, committed.generation, &wanted) {
-                RootCheck::Valid => Bind::Bound(bound_outcome(&usable, &bound, true)),
-                RootCheck::Missing => Bind::Refuse(format!(
+                RootCheck::Valid => Bind::Bound {
+                    outcome: bound_outcome(&usable, &bound, true),
+                    receipt: committed,
+                },
+                RootCheck::Missing => Bind::refused(format!(
                     "outputs: the transition bound {} but its root is missing; run the command again",
                     bound.root.display()
                 )),
-                RootCheck::Contradiction(reason) => Bind::Refuse(format!(
+                RootCheck::Contradiction(reason) => Bind::refused(format!(
                     "outputs: the transition bound {} but {reason}; run the command again",
                     bound.root.display()
                 )),
             }
         }
+    }
+}
+
+/// The refusal for a link that a receipt selecting nothing still leaves in
+/// place: a detach writes its receipt before it removes the link, so this is
+/// the crash window between the two (or a pruned root's leftover link). The
+/// link is never followed, and the detach is the verb that restores the real
+/// directory.
+fn leftover_link_refusal(link: &Path) -> String {
+    format!(
+        "outputs: {} is a link, but this checkout's receipt selects no root; it is never followed. Run `oxide outputs detach` to restore a real directory. Nothing was built",
+        link.display()
+    )
+}
+
+/// Bind a receipt that selects nothing (`Detached` or `Pruned`): the command
+/// runs locally through real directories. The target a completed detach
+/// restores is created here when it is absent (a detach crash window between
+/// its durable receipt and the directory), and an owned link an interrupted
+/// detach left behind is never followed: it names the verb that finishes the
+/// detach.
+fn bind_real_directory(context: &Context, receipt: &Receipt) -> Bind {
+    match context.target() {
+        Ok(TargetState::RealEmpty | TargetState::RealNonEmpty) => {}
+        Ok(TargetState::Missing) => {
+            if let Err(reason) = recreate_target_directory(&context.workspace) {
+                return Bind::Refuse(OutputsError::io(reason));
+            }
+        }
+        Ok(TargetState::OwnedLink(_) | TargetState::Dangling(_)) => {
+            return Bind::refused(leftover_link_refusal(&context.link()))
+        }
+        Ok(state) => {
+            return Bind::refused(format!(
+                "outputs: {} is {}; a detached checkout keeps a real target directory and the link is never followed. Nothing was changed",
+                context.link().display(),
+                state.label()
+            ))
+        }
+        Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
+    }
+    Bind::Bound {
+        outcome: Outcome {
+            warnings: vec![
+                "permanent drive mode: this checkout is detached from owned outputs; `oxide outputs adopt` converts it again. Nothing was moved"
+                    .to_owned(),
+            ],
+            note: Some("outputs detached".to_owned()),
+            root: None,
+        },
+        receipt: receipt.clone(),
     }
 }
 
@@ -5073,45 +5410,45 @@ fn bind_profile(
     expected: Option<&Plan>,
     repair_absent_members: bool,
 ) -> Bind {
-    // A detached profile receipt owns no destination: the command runs locally
-    // through real directories, exactly as the legacy detached state does
-    // (oxide#160, S1). Nothing is planned, so nothing may be keyed as owned,
-    // and a link at `target` is still never followed.
-    if receipt.state == ReceiptState::Detached {
+    // A profile receipt that selects nothing owns no destination: the command
+    // runs locally through real directories, exactly as the legacy detached
+    // state does (oxide#160, S1). Nothing is planned, so nothing may be keyed
+    // as owned, and a link below `target` is still never followed.
+    if receipt.selects_nothing() {
         if expected.is_some_and(|plan| !plan.members.is_empty()) {
-            return Bind::Refuse(
-                "outputs: the receipt says this checkout is detached but its slot was keyed for an owned root; nothing was built. Run the command again"
-                    .to_owned(),
+            return Bind::refused(
+                "outputs: the receipt says this checkout selects nothing but its slot was keyed for an owned root; nothing was built. Run the command again",
             );
         }
-        return match refuse_unowned_link(context, "outputs") {
-            Err(reason) => Bind::Refuse(reason),
-            Ok(()) => Bind::Bound(Outcome {
-                warnings: vec![
-                    "permanent drive mode: this checkout is detached from owned outputs; `oxide outputs adopt` converts it again. Nothing was moved"
-                        .to_owned(),
-                ],
-                note: Some("outputs detached".to_owned()),
-                root: None,
-            }),
-        };
+        // A detach writes its receipt before it converts the member links, so
+        // a crash can leave one behind; it is never treated as a real
+        // directory, and the detach that produced it is the verb that finishes
+        // it.
+        for placement in receipt.links() {
+            let link = link_path(&context.workspace, placement.member());
+            match link_state(&link, &context.workspace, &context.checkout_id) {
+                Ok(TargetState::OwnedLink(_) | TargetState::Dangling(_)) => {
+                    return Bind::refused(leftover_link_refusal(&link))
+                }
+                Ok(_) => {}
+                Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
+            }
+        }
+        return bind_real_directory(context, receipt);
     }
     let Some(plan) = expected else {
-        return Bind::Refuse(
-            "outputs: this checkout places outputs at profile members but this command's slot was keyed with no owned destination; nothing was built. Run the command again"
-                .to_owned(),
+        return Bind::refused(
+            "outputs: this checkout places outputs at profile members but this command's slot was keyed with no owned destination; nothing was built. Run the command again",
         );
     };
     if plan.whole_target {
-        return Bind::Refuse(
-            "outputs: this checkout changed to profile members while this command waited, so its slot was keyed for the whole target; nothing was built. Run the command again"
-                .to_owned(),
+        return Bind::refused(
+            "outputs: this checkout changed to profile members while this command waited, so its slot was keyed for the whole target; nothing was built. Run the command again",
         );
     }
     if receipt.state != ReceiptState::Committed {
-        return Bind::Refuse(
-            "outputs: this checkout's profile receipt selects no root (it is detached or pending); run `oxide outputs adopt` or the command again"
-                .to_owned(),
+        return Bind::refused(
+            "outputs: this checkout's profile receipt selects no root (it is pending); run `oxide outputs adopt` or the command again",
         );
     }
     let mut needed: Vec<(String, Selected)> = Vec::new();
@@ -5131,19 +5468,19 @@ fn bind_profile(
         Ok(TargetState::RealEmpty | TargetState::RealNonEmpty) => false,
         Ok(TargetState::Missing) => true,
         Ok(state) => {
-            return Bind::Refuse(format!(
+            return Bind::refused(format!(
                 "outputs: this checkout places outputs at profile members inside a real target directory, but {} is {}; it is never replaced or followed. Nothing was changed. Run `oxide outputs adopt` to recheck this checkout's owned outputs",
                 context.link().display(),
                 state.label()
             ))
         }
-        Err(reason) => return Bind::Refuse(reason),
+        Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
     };
     for planned in &plan.members {
         let link = link_path(&context.workspace, &planned.member);
         let state = match link_state(&link, &context.workspace, &context.checkout_id) {
             Ok(state) => state,
-            Err(reason) => return Bind::Refuse(reason),
+            Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
         };
         // P4: this checkout's committed receipt still places the member on an
         // EXTERNAL root, but this command's fresh plan does not (a still-mounted
@@ -5185,7 +5522,7 @@ fn bind_profile(
                         )
                     })
                     .unwrap_or_default();
-                return Bind::Refuse(format!(
+                return Bind::refused(format!(
                     "outputs: {} keeps the external member root {} from this checkout's committed receipt, but this command would place it at {now}{fallback}; Oxide never moves an owned external output to another pool automatically, so nothing was built. Restore the drive, or run `oxide outputs adopt` to recheck this checkout's owned outputs",
                     link.display(),
                     member_destination(&committed.root, &planned.member).display()
@@ -5200,7 +5537,7 @@ fn bind_profile(
                 // never write through an unsupervised external owned link.
                 if wanted.kind == RootKind::External {
                     if let Some(reason) = context.pool_fallback.as_deref() {
-                        return Bind::Refuse(format!(
+                        return Bind::refused(format!(
                             "outputs: this command's intermediate slot fell back to the internal pool ({reason}) while {} selects the external member root {}; the drive's removal is not supervised, so nothing was built. Restore the drive or run `oxide outputs adopt`",
                             link_path(&context.workspace, &planned.member).display(),
                             wanted.root.display()
@@ -5208,7 +5545,7 @@ fn bind_profile(
                     }
                 }
                 if let Err(reason) = check_bound_root(context, receipt.generation, wanted) {
-                    return Bind::Refuse(format!(
+                    return Bind::refused(format!(
                         "outputs: {reason}; nothing was changed. Run `oxide outputs adopt` to recheck this checkout's owned outputs"
                     ));
                 }
@@ -5216,7 +5553,7 @@ fn bind_profile(
             }
             (Some(wanted), TargetState::Missing) => {
                 if let Err(reason) = member_root_authority(context, receipt, wanted) {
-                    return Bind::Refuse(reason);
+                    return Bind::refused(reason);
                 }
                 needed.push((planned.member.clone(), wanted.clone()));
                 owned_root.get_or_insert_with(|| wanted.root.clone());
@@ -5242,7 +5579,7 @@ fn bind_profile(
                 // existing never-transition-automatically refusal.
                 if wanted.kind == RootKind::External {
                     if let Some(reason) = context.pool_fallback.as_deref() {
-                        return Bind::Refuse(format!(
+                        return Bind::refused(format!(
                             "outputs: this command's intermediate slot fell back to the internal pool ({reason}) while {} selects the external member root {}; the drive's removal is not supervised, so nothing was built. Restore the drive or run `oxide outputs adopt`",
                             link.display(),
                             wanted.root.display()
@@ -5250,7 +5587,7 @@ fn bind_profile(
                     }
                 }
                 if let Err(reason) = check_bound_root(context, receipt.generation, wanted) {
-                    return Bind::Refuse(format!(
+                    return Bind::refused(format!(
                         "outputs: {} links to {}, whose owned root {} is not verified ({reason}); an absent member directory is created only under this checkout's verified, committed root. Nothing was built. Run `oxide outputs adopt` to recheck this checkout's owned outputs",
                         link.display(),
                         destination.display(),
@@ -5269,14 +5606,14 @@ fn bind_profile(
                     .as_deref()
                     .map(|reason| format!("; this command's intermediate slot fell back to the internal pool ({reason})"))
                     .unwrap_or_default();
-                return Bind::Refuse(format!(
+                return Bind::refused(format!(
                     "outputs: {} selects the member root {} which is not available now{fallback}; nothing was built. Run `oxide outputs adopt` to recheck this checkout's owned outputs",
                     link.display(),
                     wanted.root.display()
                 ));
             }
             (Some(_), _) => {
-                return Bind::Refuse(format!(
+                return Bind::refused(format!(
                     "outputs: {} is now {}, but this command's slot was keyed for an owned member link; nothing was built. Run the command again",
                     link.display(),
                     state.label()
@@ -5286,7 +5623,7 @@ fn bind_profile(
                 real.push(planned.member.clone());
             }
             (None, _) => {
-                return Bind::Refuse(format!(
+                return Bind::refused(format!(
                     "outputs: {} is now {}, but this command's slot was keyed for a real profile directory; nothing was built. Run the command again",
                     link.display(),
                     state.label()
@@ -5299,9 +5636,9 @@ fn bind_profile(
         // same writer custody as a relink: an unknown writer or a command that
         // may still be writing refuses or waits before the first creation.
         match store.checkout_custody(&context.workspace, own_record) {
-            Err(reason) => return Bind::Refuse(reason),
+            Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
             Ok(CheckoutCustody::Unknown(reason)) => {
-                return Bind::Refuse(format!(
+                return Bind::refused(format!(
                     "outputs: refusing to create the absent profile member directory: {reason}. Nothing was changed"
                 ))
             }
@@ -5313,12 +5650,12 @@ fn bind_profile(
             // kind, volume, nonce, generation and device are all this
             // command's, not merely a directory this path names.
             if let Err(reason) = check_bound_root(context, receipt.generation, wanted) {
-                return Bind::Refuse(format!(
+                return Bind::refused(format!(
                     "outputs: the absent profile member {member} is not created because {reason}; nothing was built. Run `oxide outputs adopt` to recheck this checkout's owned outputs"
                 ));
             }
             if let Err(reason) = ensure_member_directory(&wanted.root, member) {
-                return Bind::Refuse(format!(
+                return Bind::refused(format!(
                     "outputs: cannot create the absent profile member directory for {member}: {reason}; nothing was built"
                 ));
             }
@@ -5332,22 +5669,25 @@ fn bind_profile(
             ) {
                 Ok(TargetState::OwnedLink(live)) if live == destination => {}
                 Ok(state) => {
-                    return Bind::Refuse(format!(
+                    return Bind::refused(format!(
                         "outputs: the absent profile member directory {} was created, but {} is now {}; nothing was built. Run `oxide outputs adopt` to recheck this checkout's owned outputs",
                         destination.display(),
                         link_path(&context.workspace, member).display(),
                         state.label()
                     ))
                 }
-                Err(reason) => return Bind::Refuse(reason),
+                Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
             }
         }
     }
+    // The receipt every member transition advances; without a transition it
+    // stays the one this command was keyed on.
+    let mut current = receipt.clone();
     if !needed.is_empty() {
         match store.checkout_custody(&context.workspace, own_record) {
-            Err(reason) => return Bind::Refuse(reason),
+            Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
             Ok(CheckoutCustody::Unknown(reason)) => {
-                return Bind::Refuse(format!(
+                return Bind::refused(format!(
                     "outputs: refusing to link profile members: {reason}. Nothing was changed"
                 ))
             }
@@ -5360,13 +5700,12 @@ fn bind_profile(
         // and never replaces or follows anything that appeared meanwhile.
         if recreate_target {
             if let Err(reason) = recreate_target_directory(&context.workspace) {
-                return Bind::Refuse(format!(
+                return Bind::refused(format!(
                     "outputs: this checkout's profile members are placed inside the real target directory {}, which is absent and was not recreated: {reason}. Nothing was built",
                     context.link().display()
                 ));
             }
         }
-        let mut current = receipt.clone();
         for (member, wanted) in &needed {
             let spec = spec_for(wanted);
             // The member's keyed nonce is the only future-root authority this
@@ -5381,12 +5720,12 @@ fn bind_profile(
                 NonceAuthority::Keyed(wanted.nonce()),
             ) {
                 Ok(committed) => current = committed,
-                Err(reason) => return Bind::Refuse(reason),
+                Err(reason) => return Bind::refused(reason),
             }
             let bound = match current.selected_for(member) {
                 Some(bound) => bound.clone(),
                 None => {
-                    return Bind::Refuse(format!(
+                    return Bind::refused(format!(
                         "outputs: the transition for {member} committed no root; nothing was built"
                     ))
                 }
@@ -5395,14 +5734,14 @@ fn bind_profile(
                 || bound.generation != wanted.generation
                 || bound.nonce() != wanted.nonce()
             {
-                return Bind::Refuse(format!(
+                return Bind::refused(format!(
                     "outputs: the transition bound {} for {member} but this command's slot was keyed for {}; nothing is built into the wrong root. Run the command again",
                     bound.root.display(),
                     wanted.root.display()
                 ));
             }
             if let Err(reason) = check_bound_root(context, current.generation, &bound) {
-                return Bind::Refuse(format!(
+                return Bind::refused(format!(
                     "outputs: the transition bound {} for {member} but {reason}; run the command again",
                     bound.root.display()
                 ));
@@ -5436,7 +5775,12 @@ fn bind_profile(
             note.push_str(&format!("; real directories kept for {list}"));
         }
     }
-    Bind::Bound(outcome)
+    Bind::Bound {
+        outcome,
+        // The members a transition committed advanced the receipt; every
+        // remaining member kept the one this command was keyed on.
+        receipt: current,
+    }
 }
 
 /// The authority a MISSING member link is created under. A member that joins a
@@ -5529,7 +5873,7 @@ fn check_root(context: &Context, receipt_generation: u64, wanted: &Selected) -> 
         Err(error) => {
             return RootCheck::Contradiction(format!("cannot inspect {}: {error}", root.display()))
         }
-        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+        Ok(metadata) if !is_real_dir(&metadata) => {
             return RootCheck::Contradiction(format!("{} is not a real directory", root.display()))
         }
         Ok(_) => {}
@@ -5907,7 +6251,7 @@ pub fn exec_declaration(
             return Err("outputs: an interrupted owned-output transition is pending; ensure a permanent drive registration, then run `oxide outputs adopt` to replay it before running an exec tool".to_owned())
         }
         ReceiptState::Pruning => {
-            return Err("outputs: a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it".to_owned())
+            return Err(format!("outputs: {}", pruning_refusal()))
         }
         ReceiptState::Pruned => {
             return Err("outputs: this checkout's owned output root was pruned; run `oxide outputs adopt` to convert it again".to_owned())
@@ -6279,7 +6623,7 @@ const CARGO_TARGET_TEMP: &str = "tmp";
 pub fn target_entries(checkout: &Path) -> Option<Vec<String>> {
     let target = checkout.join("target");
     let metadata = fs::symlink_metadata(&target).ok()?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !is_real_dir(&metadata) {
         return None;
     }
     let mut names = Vec::new();
@@ -6334,7 +6678,7 @@ pub fn tool_directories_note(checkout: &Path, before: Option<&[String]>) -> Opti
         .filter(|name| crate::layout::Member::parse(name).is_err())
         .filter(|name| {
             fs::symlink_metadata(checkout.join("target").join(name))
-                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                .is_ok_and(|metadata| is_real_dir(&metadata))
         })
         .collect();
     created.sort();
@@ -6378,7 +6722,8 @@ pub fn reserve(
     // it is unsettled.
     if let Some(intent) = crate::prune::unsettled_for(control, &context.checkout_id)? {
         return Err(format!(
-            "outputs: prune intent {intent} is unsettled for this checkout; nothing is built until the exact intent completes or `oxide outputs resolve-intent {intent}` settles it"
+            "outputs: {}; nothing is built while it is unsettled",
+            unsettled_prune_refusal(&intent)
         ));
     }
     let _binding = store.lock_binding(checkout)?;
@@ -6436,9 +6781,10 @@ pub fn reserve(
         let id = crate::prune::fresh_nonce()?;
         let nonce = crate::prune::fresh_nonce()?;
         let overflow = crate::prune::overflow_tag(control, &id, &nonce)?;
+        let untagged = overflow.is_none();
         *receipt.reserved_mut() = Some(Reservation {
-            id,
-            nonce,
+            id: id.clone(),
+            nonce: nonce.clone(),
             kind: wanted.kind,
             root: wanted.root.clone(),
             volume_uuid: wanted.volume_uuid.clone(),
@@ -6449,11 +6795,36 @@ pub fn reserve(
         receipt.updated_ms = process::now_ms();
         match write_receipt(control, &receipt) {
             Ok(()) => return Ok(()),
-            Err(reason) if reason.contains(crate::prune::OVERFLOW_RETRY) => continue,
-            Err(reason) => return Err(reason),
+            // The durable registry state, never the error text, decides the
+            // one retry: a write that made the registry sticky-incomplete
+            // must be repeated with the overflow tag it now carries.
+            Err(reason) => match reservation_retry(control, &id, &nonce) {
+                Ok(()) if untagged => continue,
+                Ok(()) => return Err(reason),
+                Err(_) => return Err(reason),
+            },
         }
     }
-    Err("outputs: the output registry overflowed twice while reserving a root nonce; nothing was built. Run the command again".to_owned())
+    Err(OutputsError::Retry(
+        "outputs: the output registry overflowed twice while reserving a root nonce; nothing was built. Run the command again"
+            .to_owned(),
+    )
+    .into())
+}
+
+/// Whether a failed reservation publication is the one retry an overflow
+/// takes, decided by the registry's durable state (which the failed write may
+/// just have made sticky-incomplete) instead of by the error's message text.
+fn reservation_retry(control: &Path, id: &str, nonce: &str) -> Result<(), OutputsError> {
+    match crate::prune::overflow_tag(control, id, nonce) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(OutputsError::corrupt(
+            "the output registry is complete, so the failed reservation was not an overflow",
+        )),
+        Err(reason) => Err(OutputsError::corrupt(format!(
+            "cannot confirm the output registry's overflow state: {reason}"
+        ))),
+    }
 }
 
 /// Cancel this checkout's unused reservation (oxide#129). Only under the
@@ -6578,7 +6949,7 @@ pub fn refuse_unknown_layout(
     };
     let context = Context::new(Some(control.to_path_buf()), checkout.to_path_buf());
     let profile = context.receipt()?.is_some_and(|receipt| {
-        receipt.layout() == LayoutKind::Profile && receipt.state != ReceiptState::Detached
+        receipt.layout() == LayoutKind::Profile && !receipt.selects_nothing()
     });
     if profile {
         return Err(format!(
@@ -6746,7 +7117,7 @@ fn guarded_command_precheck(context: &Context, verb: &str) -> Result<(), String>
     // or repairs a listed root either.
     if let Some(receipt) = context.receipt()? {
         if receipt.state == ReceiptState::Pruning {
-            return Err(format!("{verb}: {PRUNING_REFUSAL}"));
+            return Err(format!("{verb}: {}", pruning_refusal()));
         }
     }
     Ok(())
@@ -6767,10 +7138,19 @@ fn guarded_adopt_refusal(context: &Context) -> String {
     }
 }
 
-/// The shipped refusal text for a receipt whose listed legacy root is being
+/// The one refusal text for a receipt whose listed legacy root is being
 /// pruned, reused by the guard so a guarded command refuses before any effect
 /// exactly as it does today.
-const PRUNING_REFUSAL: &str = "a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it";
+fn pruning_refusal() -> String {
+    format!(
+        "a listed legacy root of this checkout is being pruned; {PRUNE_INTENT_POSITION}; nothing changes"
+    )
+}
+
+/// The one refusal text for this checkout's unsettled prune intent.
+fn unsettled_prune_refusal(intent: &str) -> String {
+    format!("prune intent {intent} is unsettled for this checkout; {PRUNE_INTENT_POSITION}")
+}
 
 /// The guarded local-output decision for one leased command (design §4.2),
 /// read-only and effect-free.
@@ -6796,7 +7176,7 @@ fn local_outputs_decision(
                     .map_or_else(|| context.link(), |selected| selected.root.clone());
                 return Err(crate::one_use::committed_refusal(&root));
             }
-            ReceiptState::Pruning => return Err(format!("{prefix}: {PRUNING_REFUSAL}")),
+            ReceiptState::Pruning => return Err(format!("{prefix}: {}", pruning_refusal())),
             // `Detached` and `Pruned` own no selection: the live components
             // below decide, and neither is a repair opportunity.
             ReceiptState::Prepared | ReceiptState::Detached | ReceiptState::Pruned => {}
@@ -6837,7 +7217,7 @@ fn inspect_component(path: &Path, prefix: &str) -> Result<bool, String> {
             shown()
         )),
         Ok(metadata) => {
-            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            if is_real_dir(&metadata) {
                 return Ok(true);
             }
             let kind = if metadata.file_type().is_symlink() {
@@ -6895,19 +7275,19 @@ fn bind_local_outputs(
                     .map_or_else(|| context.link(), |selected| selected.root.clone());
                 return Err(crate::one_use::committed_refusal(&root));
             }
-            ReceiptState::Pruning => return Err(format!("outputs: {PRUNING_REFUSAL}")),
+            ReceiptState::Pruning => return Err(format!("outputs: {}", pruning_refusal())),
             ReceiptState::Prepared | ReceiptState::Detached | ReceiptState::Pruned => {}
         }
     }
     inspect_components(&context.link(), local.members, "outputs")?;
     // A slot is keyed for a local target, so a checkout converted while this
     // command waited still refuses through the shipped key check rather than
-    // binding another destination. `Detached` and `Pruned` receipts select
-    // nothing and are unconverted for this purpose (design §4.2); a
-    // `Committed`, `Prepared` or `Pruning` receipt was refused above.
-    let converted = receipt.as_ref().is_some_and(|receipt| {
-        !matches!(receipt.state, ReceiptState::Detached | ReceiptState::Pruned)
-    });
+    // binding another destination. A receipt that selects nothing is
+    // unconverted for this purpose (design §4.2); a `Committed`, `Prepared` or
+    // `Pruning` receipt was refused above.
+    let converted = receipt
+        .as_ref()
+        .is_some_and(|receipt| !receipt.selects_nothing());
     keyed_state_refusal(converted, expected)?;
     Ok(OutputBinding {
         outcome: local_outcome(local.reason),
@@ -6979,7 +7359,8 @@ fn unsettled_refusal(control: Option<&Path>, checkout_id: &str) -> Result<(), St
     };
     match crate::prune::unsettled_for(control, checkout_id)? {
         Some(intent) => Err(format!(
-            "outputs: prune intent {intent} is unsettled for this checkout; nothing is built until the exact intent completes or `oxide outputs resolve-intent {intent}` settles it"
+            "outputs: {}; nothing is built while it is unsettled",
+            unsettled_prune_refusal(&intent)
         )),
         None => Ok(()),
     }
@@ -7287,7 +7668,7 @@ fn owned_root(checkout: &Path, checkout_id: &str, root: &Path) -> Result<(), Str
     }
     let metadata = fs::symlink_metadata(root)
         .map_err(|error| format!("cannot inspect {}: {error}", root.display()))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !is_real_dir(&metadata) {
         return Err(format!("{} is not a real directory", root.display()));
     }
     let marker = read_marker(root)?;
@@ -7365,7 +7746,7 @@ fn validate_root_device(
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(&selected.root)
         .map_err(|error| format!("cannot inspect {}: {error}", selected.root.display()))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !is_real_dir(&metadata) {
         return Err(format!(
             "{} is not a real directory",
             selected.root.display()
@@ -7436,7 +7817,7 @@ fn validate_local_ancestry(checkout: &Path, root: &Path) -> Result<(), String> {
     }
     let metadata = fs::symlink_metadata(&outer)
         .map_err(|error| format!("cannot inspect {}: {error}", outer.display()))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !is_real_dir(&metadata) {
         return Err(format!("{} is not a real directory", outer.display()));
     }
     let canonical_checkout = fs::canonicalize(checkout)
@@ -7497,7 +7878,7 @@ fn ensure_root_with(
         RootSpec::Local { .. } => None,
     };
     let marker = match fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+        Ok(metadata) if is_real_dir(&metadata) => {
             let marker = match read_marker(root) {
                 Ok(marker) => marker,
                 Err(reason) => {
@@ -7624,7 +8005,7 @@ fn refuse_tracked_local_root(context: &Context) -> Result<(), String> {
 /// Create one owner-only real directory, refusing a symlink or another kind.
 fn create_owned_directory(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => return Ok(()),
+        Ok(metadata) if is_real_dir(&metadata) => return Ok(()),
         Ok(_) => {
             return Err(format!(
                 "{} exists and is not a real directory; it is never replaced",
@@ -7968,7 +8349,7 @@ fn transition_at(
     });
     writing.updated_ms = process::now_ms();
     write_receipt(control, &writing)?;
-    crash_point("prepared")?;
+    context.crash_point("prepared")?;
 
     ensure_root_with(context, spec, generation, to.nonce())?;
     ensure_member_directory(&to.root, member)?;
@@ -8012,7 +8393,7 @@ fn transition_at(
         ));
     }
     sync_directory(link.parent().unwrap_or(&context.workspace))?;
-    crash_point("linked")?;
+    context.crash_point("linked")?;
 
     publish_link(&sibling, &link, exclusive).map_err(|error| {
         format!(
@@ -8026,7 +8407,7 @@ fn transition_at(
         )
     })?;
     sync_directory(link.parent().unwrap_or(&context.workspace))?;
-    crash_point("renamed")?;
+    context.crash_point("renamed")?;
     let prepared = writing
         .prepared_ref()
         .clone()
@@ -8173,23 +8554,10 @@ fn path_c_string(path: &Path) -> std::io::Result<CString> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
-/// Debug-only crash injection: stop at a write-ahead point without further
-/// state, exactly as a killed process would leave the fixture.
-fn crash_point(point: &str) -> Result<(), String> {
-    #[cfg(debug_assertions)]
-    if std::env::var(CRASH_ENVIRONMENT).is_ok_and(|value| value == point) {
-        return Err(format!(
-            "outputs: injected transition stop at {point} ({CRASH_ENVIRONMENT}={point}); the receipt stays prepared"
-        ));
-    }
-    let _ = point;
-    Ok(())
-}
-
 /// Replay a prepared receipt: the exact new/old generations only.
 fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     if receipt.state == ReceiptState::Pruning {
-        return Err("outputs: a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it".to_owned());
+        return Err(format!("outputs: {}", pruning_refusal()));
     }
     if receipt.transition.is_some() {
         return Err(
@@ -9241,9 +9609,7 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
     let guarded = guarded_workspace(control.as_deref(), workspace).is_some();
     let context = Context::new(control, workspace.to_path_buf());
     let receipt = context.receipt()?;
-    let unconverted = receipt
-        .as_ref()
-        .is_none_or(|receipt| receipt.state == ReceiptState::Detached);
+    let unconverted = receipt.as_ref().is_none_or(Receipt::selects_nothing);
     if unconverted && context.mode()? == Some(DriveMode::Permanent) {
         refuse_unowned_link(&context, "clean")?;
     }
@@ -9252,7 +9618,7 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
     };
     match receipt.state {
         ReceiptState::Detached | ReceiptState::Pruned => Ok(None),
-        ReceiptState::Pruning => Err("outputs: a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it".to_owned()),
+        ReceiptState::Pruning => Err(format!("outputs: {}", pruning_refusal())),
         ReceiptState::Prepared => Err(if guarded {
             crate::one_use::PREPARED_GUARDED.to_owned()
         } else {
@@ -9377,17 +9743,22 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
             // replaced drive at the same mount point never lends its contents
             // to a clean.
             let binding = match selected.kind {
-                RootKind::External => Some(binding_for(&context, selected.volume_uuid.as_deref().unwrap_or_default()).map_err(|reason| {
-                    format!(
-                        "clean refused: the registered volume for {} is not usable ({reason})",
-                        selected.root.display()
+                RootKind::External => Some(
+                    binding_for(
+                        &context,
+                        selected.volume_uuid.as_deref().unwrap_or_default(),
                     )
-                })?),
+                    .map_err(|reason| {
+                        format!(
+                            "clean refused: the registered volume for {} is not usable ({reason})",
+                            selected.root.display()
+                        )
+                    })?,
+                ),
                 RootKind::Local => None,
             };
-            validate_root_device(workspace, &selected, binding.as_ref()).map_err(|reason| {
-                format!("clean refused: {reason}")
-            })?;
+            validate_root_device(workspace, &selected, binding.as_ref())
+                .map_err(|reason| format!("clean refused: {reason}"))?;
             let inactive = receipt
                 .roots
                 .iter()
@@ -9411,9 +9782,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    /// The debug-only migration environment is process-global, so the tests
-    /// that set it run one at a time.
-    static MIGRATION_ENVIRONMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// P5: the pinned receipt preimage is a SHA-256 digest and nothing else.
     /// These are pure string-shape assertions and touch no file system.
@@ -9734,7 +10102,6 @@ mod tests {
     /// counterfactual), and reading the receipt writes nothing.
     #[test]
     fn an_explicit_adopt_upgrades_a_committed_version_one_receipt() {
-        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
         let id = context.checkout_id.clone();
@@ -9875,7 +10242,6 @@ mod tests {
     /// call unknown forever.
     #[test]
     fn a_layout_migration_keeps_a_history_row_and_records_the_creation_generation() {
-        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
         let store = pool_store(&fixture.root.join("pool"));
@@ -9952,7 +10318,6 @@ mod tests {
 
     #[test]
     fn explicit_adopt_of_committed_whole_target_never_hits_member_transition_hooks() {
-        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         for hook in ["prepared", "linked", "renamed"] {
             let (fixture, legacy) = legacy_checkout();
             register(&fixture, DriveMode::Permanent);
@@ -9960,9 +10325,8 @@ mod tests {
             let root = legacy.selected().unwrap().root().to_path_buf();
             let nonce = read_marker(&root).unwrap().nonce().unwrap().to_owned();
             let store = Store::for_tests(&fixture.root.join("pool"));
-            std::env::set_var(CRASH_ENVIRONMENT, hook);
+            context.inject_crash(hook);
             let result = adopt_at(&context, || Ok(Some(store)));
-            std::env::remove_var(CRASH_ENVIRONMENT);
             assert_eq!(result, Ok(0), "legacy hook {hook} interrupted migration");
             let receipt = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
                 .unwrap()
@@ -10103,7 +10467,6 @@ mod tests {
     /// migration and the next explicit adopt replays the same exact phases.
     #[test]
     fn a_version_one_upgrade_replays_every_recorded_crash_phase() {
-        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         for boundary in [
             "migration-p0",
             "migration-staged",
@@ -10124,9 +10487,8 @@ mod tests {
                 read_receipt_for_adopt(&fixture.control, &fixture.checkout, &context.checkout_id)
                     .unwrap()
                     .expect("the committed version-1 receipt was not read for adopt");
-            std::env::set_var(CRASH_ENVIRONMENT, boundary);
+            context.inject_crash(boundary);
             let stopped = migrate_layout(&context, &fixture.control, upgraded);
-            std::env::remove_var(CRASH_ENVIRONMENT);
             assert!(
                 stopped.is_err(),
                 "{boundary}: the injected stop did not stop"
@@ -10307,7 +10669,7 @@ mod tests {
         // existing grammar.
         let store = pool_store(&fixture.root.join("pool"));
         let outcome = match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
-            Bind::Bound(outcome) => outcome,
+            Bind::Bound { outcome, .. } => outcome,
             Bind::Refuse(reason) => panic!("a recorded real member refused the command: {reason}"),
             Bind::Wait => panic!("a recorded real member waited"),
         };
@@ -10347,7 +10709,7 @@ mod tests {
         .is_none());
         let store = pool_store(&fixture.root.join("pool"));
         match bind_profile(&context, &store, 0, &receipt, None, false) {
-            Bind::Bound(outcome) => {
+            Bind::Bound { outcome, .. } => {
                 assert!(outcome.root.is_none());
                 assert_eq!(outcome.note.as_deref(), Some("outputs detached"));
             }
@@ -10549,8 +10911,9 @@ mod tests {
         assert!(destination_facts(Some(&plan)).contains("release"));
         let store = pool_store(&fixture.root.join("pool"));
         let outcome = match bind_profile(&context, &store, 0, &receipt, Some(&plan), true) {
-            Bind::Bound(outcome) => outcome,
+            Bind::Bound { outcome, .. } => outcome,
             Bind::Refuse(reason) => {
+                let reason = reason.to_string();
                 panic!("an absent member of the verified root refused: {reason}")
             }
             Bind::Wait => panic!("an absent member of the verified root waited"),
@@ -10571,7 +10934,9 @@ mod tests {
         );
         // A second binding sees the member as an ordinary owned link.
         match bind_profile(&context, &store, 0, &receipt, Some(&plan), true) {
-            Bind::Bound(outcome) => assert_eq!(outcome.root.as_deref(), Some(root.as_path())),
+            Bind::Bound { outcome, .. } => {
+                assert_eq!(outcome.root.as_deref(), Some(root.as_path()))
+            }
             Bind::Refuse(reason) => panic!("the created member refused a second binding: {reason}"),
             Bind::Wait => panic!("the created member waited"),
         }
@@ -10614,7 +10979,7 @@ mod tests {
         );
         let store = pool_store(&fixture.root.join("pool"));
         let outcome = match bind_profile(&context, &store, 0, &committed, Some(&plan), true) {
-            Bind::Bound(outcome) => outcome,
+            Bind::Bound { outcome, .. } => outcome,
             Bind::Refuse(reason) => panic!("a deleted target directory refused: {reason}"),
             Bind::Wait => panic!("a deleted target directory waited"),
         };
@@ -10689,8 +11054,8 @@ mod tests {
         }
         let store = pool_store(&fixture.root.join("pool"));
         let refused = match bind_profile(&context, &store, 0, &receipt, Some(&plan), true) {
-            Bind::Refuse(reason) => reason,
-            Bind::Bound(_) => panic!("another root nonce was accepted"),
+            Bind::Refuse(reason) => reason.to_string(),
+            Bind::Bound { .. } => panic!("another root nonce was accepted"),
             Bind::Wait => panic!("another root nonce waited"),
         };
         assert!(refused.contains("nonce"), "{refused}");
@@ -10974,8 +11339,11 @@ mod tests {
         assert!(destination_facts(Some(&plan)).contains("release"));
         let store = pool_store(&fixture.root.join("pool"));
         match bind_profile(&context, &store, 0, &receipt, Some(&plan), repair) {
-            Bind::Bound(outcome) => assert_eq!(outcome.root.as_deref(), Some(root.as_path())),
+            Bind::Bound { outcome, .. } => {
+                assert_eq!(outcome.root.as_deref(), Some(root.as_path()))
+            }
             Bind::Refuse(reason) => {
+                let reason = reason.to_string();
                 panic!("an absent member of the verified root refused: {reason}")
             }
             Bind::Wait => panic!("an absent member of the verified root waited"),
@@ -11616,10 +11984,6 @@ mod tests {
     /// left exactly where it was.
     #[test]
     fn a_migration_links_discovered_triple_pairs_one_level_down() {
-        // migrate_layout consults the process-global crash-injection
-        // environment, so every caller serializes under the same lock as the
-        // tests that set it.
-        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
         let root = legacy.selected().unwrap().root().to_path_buf();
@@ -11721,9 +12085,6 @@ mod tests {
 
     #[test]
     fn an_explicit_migration_publishes_profile_links_and_resumes() {
-        // Serialize against the crash-environment tests: migrate_layout
-        // consults the process-global OXIDE_TEST_OUTPUTS_CRASH value.
-        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
         let root = legacy.selected().unwrap().root().to_path_buf();
@@ -11792,7 +12153,6 @@ mod tests {
     /// destination is absent here and this test's first assertion fails.
     #[test]
     fn a_migration_creates_every_member_directory_before_its_link() {
-        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
         let root = legacy.selected().unwrap().root().to_path_buf();
@@ -11839,7 +12199,6 @@ mod tests {
 
     #[test]
     fn a_root_one_marker_is_upgraded_once_and_rolled_back_exactly() {
-        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
         let root = legacy.selected().unwrap().root().to_path_buf();
@@ -11857,10 +12216,9 @@ mod tests {
         let old_digest = file_digest(&root.join(MARKER)).unwrap();
         // A pre-P4 rollback at the marker boundary restores the exact old
         // marker, the old whole-target link and the /2 receipt.
-        std::env::set_var(ROLLBACK_ENVIRONMENT, "marker");
+        context.inject_rollback("marker");
         let (restored, selected, _) =
             migrate_layout(&context, &fixture.control, legacy.clone()).unwrap();
-        std::env::remove_var(ROLLBACK_ENVIRONMENT);
         assert_eq!(restored.layout(), LayoutKind::WholeTarget);
         assert_eq!(restored.version, RECEIPT_VERSION);
         assert!(restored.transition.is_none());
@@ -11921,14 +12279,12 @@ mod tests {
 
     #[test]
     fn a_crashed_migration_replays_from_its_recorded_identities() {
-        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         for boundary in ["migration-staged", "migration-marker"] {
             let (fixture, legacy) = legacy_checkout();
             let context = fixture.context();
             make_root_one_marker(&fixture, &legacy);
-            std::env::set_var(CRASH_ENVIRONMENT, boundary);
+            context.inject_crash(boundary);
             let stopped = migrate_layout(&context, &fixture.control, legacy.clone());
-            std::env::remove_var(CRASH_ENVIRONMENT);
             assert!(
                 stopped.is_err(),
                 "{boundary}: the injected stop did not stop"
@@ -11994,13 +12350,11 @@ mod tests {
     /// together with their links.
     #[test]
     fn a_migration_creates_no_member_directory_before_the_journal() {
-        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
         let root = legacy.selected().unwrap().root().to_path_buf();
-        std::env::set_var(CRASH_ENVIRONMENT, "migration-p0");
+        context.inject_crash("migration-p0");
         let stopped = migrate_layout(&context, &fixture.control, legacy.clone());
-        std::env::remove_var(CRASH_ENVIRONMENT);
         assert!(stopped.is_err(), "the injected P0 stop did not stop");
         assert!(!root.join("debug").exists(), "P0 created debug");
         assert!(!root.join("release").exists(), "P0 created release");
@@ -12032,12 +12386,10 @@ mod tests {
     /// rather than being committed.
     #[test]
     fn a_replaced_staging_directory_is_never_swapped_in() {
-        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
-        std::env::set_var(CRASH_ENVIRONMENT, "migration-staged");
+        context.inject_crash("migration-staged");
         let stopped = migrate_layout(&context, &fixture.control, legacy.clone());
-        std::env::remove_var(CRASH_ENVIRONMENT);
         assert!(stopped.is_err(), "the injected stop did not stop");
         let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
             .unwrap()
@@ -12086,12 +12438,10 @@ mod tests {
     /// alone would be taken as a completed swap.
     #[test]
     fn a_lookalike_target_is_not_accepted_as_the_staged_directory() {
-        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
-        std::env::set_var(CRASH_ENVIRONMENT, "migration-staged");
+        context.inject_crash("migration-staged");
         let stopped = migrate_layout(&context, &fixture.control, legacy.clone());
-        std::env::remove_var(CRASH_ENVIRONMENT);
         assert!(stopped.is_err(), "the injected stop did not stop");
         let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
             .unwrap()
@@ -12123,13 +12473,11 @@ mod tests {
     /// pending instead of committing on the target's shape alone.
     #[test]
     fn a_missing_or_substituted_target_backup_blocks_commit() {
-        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         for substitute in [false, true] {
             let (fixture, legacy) = legacy_checkout();
             let context = fixture.context();
-            std::env::set_var(CRASH_ENVIRONMENT, "migration-swapped");
+            context.inject_crash("migration-swapped");
             let stopped = migrate_layout(&context, &fixture.control, legacy.clone());
-            std::env::remove_var(CRASH_ENVIRONMENT);
             assert!(stopped.is_err(), "the injected stop did not stop");
             let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
                 .unwrap()
@@ -12164,14 +12512,12 @@ mod tests {
     /// reach the commit point, because a rollback must stay possible until P4.
     #[test]
     fn a_missing_marker_backup_blocks_commit() {
-        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         for stolen in [false, true] {
             let (fixture, legacy) = legacy_checkout();
             let context = fixture.context();
             make_root_one_marker(&fixture, &legacy);
-            std::env::set_var(CRASH_ENVIRONMENT, "migration-marker");
+            context.inject_crash("migration-marker");
             let stopped = migrate_layout(&context, &fixture.control, legacy.clone());
-            std::env::remove_var(CRASH_ENVIRONMENT);
             assert!(stopped.is_err(), "the injected stop did not stop");
             let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
                 .unwrap()
@@ -12234,13 +12580,11 @@ mod tests {
     /// the pinned marker and cannot unlock the pre-P4 target effects.
     #[test]
     fn a_replaced_marker_backup_blocks_the_pre_p4_effects() {
-        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
         make_root_one_marker(&fixture, &legacy);
-        std::env::set_var(CRASH_ENVIRONMENT, "migration-marker");
+        context.inject_crash("migration-marker");
         let stopped = migrate_layout(&context, &fixture.control, legacy.clone());
-        std::env::remove_var(CRASH_ENVIRONMENT);
         assert!(stopped.is_err(), "the injected stop did not stop");
         let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
             .unwrap()
@@ -13303,8 +13647,8 @@ mod tests {
         let fallback = Context::new(Some(fixture.control.clone()), fixture.checkout.clone())
             .with_pool_fallback(Some("container mismatch"));
         let refused = match bind_profile(&fallback, &store, 0, &receipt, Some(&plan), false) {
-            Bind::Refuse(reason) => reason,
-            Bind::Bound(_) => panic!("a dangling member link was bound"),
+            Bind::Refuse(reason) => reason.to_string(),
+            Bind::Bound { .. } => panic!("a dangling member link was bound"),
             Bind::Wait => panic!("a dangling refusal waited"),
         };
         assert!(refused.contains("not available"), "{refused}");
@@ -13312,8 +13656,8 @@ mod tests {
         assert!(refused.contains("oxide outputs adopt"), "{refused}");
         // Without a fallback it still refuses rather than auto-transitioning.
         let refused = match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
-            Bind::Refuse(reason) => reason,
-            Bind::Bound(_) => panic!("a dangling member link was bound without a fallback"),
+            Bind::Refuse(reason) => reason.to_string(),
+            Bind::Bound { .. } => panic!("a dangling member link was bound without a fallback"),
             Bind::Wait => panic!("a dangling refusal waited"),
         };
         assert!(refused.contains("not available"), "{refused}");
@@ -13374,12 +13718,15 @@ mod tests {
         let store = pool_store(&fixture.root.join("pool"));
         match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
             Bind::Refuse(reason) => {
+                let reason = reason.to_string();
                 assert!(
                     reason.contains("fell back to the internal pool"),
                     "{reason}"
                 )
             }
-            Bind::Bound(_) => panic!("an external member link was bound on an internal fallback"),
+            Bind::Bound { .. } => {
+                panic!("an external member link was bound on an internal fallback")
+            }
             Bind::Wait => panic!("a fallback refusal waited"),
         }
     }
@@ -13431,6 +13778,7 @@ mod tests {
         let store = pool_store(&fixture.root.join("pool"));
         match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
             Bind::Refuse(reason) => {
+                let reason = reason.to_string();
                 assert!(
                     reason.contains(
                         "never moves an owned external output to another pool automatically"
@@ -13452,7 +13800,7 @@ mod tests {
                 );
                 assert!(reason.contains("oxide outputs adopt"), "{reason}");
             }
-            Bind::Bound(_) => panic!("an external member was relinked to the internal pool"),
+            Bind::Bound { .. } => panic!("an external member was relinked to the internal pool"),
             Bind::Wait => panic!("an external-to-local refusal waited"),
         }
         // Nothing changed: the link still names the external member and the
@@ -13471,6 +13819,7 @@ mod tests {
             .with_pool_fallback(Some("the volume is absent"));
         match bind_profile(&fallback, &store, 0, &receipt, Some(&plan), false) {
             Bind::Refuse(reason) => {
+                let reason = reason.to_string();
                 assert!(
                     reason.contains("fell back to the internal pool (the volume is absent)"),
                     "{reason}"
@@ -13483,7 +13832,9 @@ mod tests {
                 );
                 assert!(reason.contains("nothing was built"), "{reason}");
             }
-            Bind::Bound(_) => panic!("a fallback relinked an external member to the internal pool"),
+            Bind::Bound { .. } => {
+                panic!("a fallback relinked an external member to the internal pool")
+            }
             Bind::Wait => panic!("a fallback external-to-local refusal waited"),
         }
         assert_eq!(fs::read_link(&link).unwrap(), destination);
@@ -13567,7 +13918,7 @@ mod tests {
         );
         assert_eq!(wanted.generation, 1, "the planner moved the generation");
         let outcome = match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
-            Bind::Bound(outcome) => outcome,
+            Bind::Bound { outcome, .. } => outcome,
             Bind::Refuse(reason) => panic!("a new member of an owned root was refused: {reason}"),
             Bind::Wait => panic!("a new member of an owned root waited"),
         };
@@ -13689,7 +14040,7 @@ mod tests {
             TargetState::Missing
         );
         let outcome = match bind_profile(&context, &store, 0, &committed, Some(&plan), false) {
-            Bind::Bound(outcome) => outcome,
+            Bind::Bound { outcome, .. } => outcome,
             Bind::Refuse(reason) => panic!("a deleted target directory was refused: {reason}"),
             Bind::Wait => panic!("a deleted target directory waited"),
         };
@@ -13776,8 +14127,8 @@ mod tests {
                 fs::write(&target, b"file").unwrap();
             }
             let refused = match bind_profile(&context, &store, 0, &committed, Some(&plan), false) {
-                Bind::Refuse(reason) => reason,
-                Bind::Bound(_) => panic!("a target that is not a real directory was bound"),
+                Bind::Refuse(reason) => reason.to_string(),
+                Bind::Bound { .. } => panic!("a target that is not a real directory was bound"),
                 Bind::Wait => panic!("a target that is not a real directory waited"),
             };
             assert!(
@@ -13852,7 +14203,7 @@ mod tests {
         let wanted = desired_selection(&context, &receipt).unwrap().unwrap();
         let plan = whole_target_plan(Some(wanted));
         match bind_under_binding(&context, &store, 0, &receipt, Some(&plan), false) {
-            Bind::Bound(outcome) => {
+            Bind::Bound { outcome, .. } => {
                 assert_eq!(outcome.root.as_deref(), Some(whole.local().root()))
             }
             Bind::Refuse(reason) => panic!("a deleted whole-target link refused: {reason}"),
@@ -13940,6 +14291,7 @@ mod tests {
         let store = pool_store(&fixture.root.join("pool"));
         match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
             Bind::Refuse(reason) => {
+                let reason = reason.to_string();
                 assert!(
                     reason.contains(
                         "never moves an owned external output to another pool automatically"
@@ -13952,7 +14304,9 @@ mod tests {
                     "{reason}"
                 );
             }
-            Bind::Bound(_) => panic!("a planner-derived local plan relinked an external member"),
+            Bind::Bound { .. } => {
+                panic!("a planner-derived local plan relinked an external member")
+            }
             Bind::Wait => panic!("a planner-derived refusal waited"),
         }
         assert_eq!(fs::read_link(&link).unwrap(), destination);
@@ -14044,6 +14398,7 @@ mod tests {
         // The command still refuses for the exact P4 reason with no effect.
         match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
             Bind::Refuse(reason) => {
+                let reason = reason.to_string();
                 assert!(
                     reason.contains(
                         "never moves an owned external output to another pool automatically"
@@ -14056,7 +14411,7 @@ mod tests {
                     "{reason}"
                 );
             }
-            Bind::Bound(_) => panic!("a fallback refusal relinked an external member"),
+            Bind::Bound { .. } => panic!("a fallback refusal relinked an external member"),
             Bind::Wait => panic!("a fallback refusal waited"),
         }
         assert_eq!(
@@ -14235,7 +14590,7 @@ mod tests {
             "a whole-target local fallback lost its required reservation"
         );
         match bind_under_binding(&context, &store, 0, &reserved, Some(&plan), false) {
-            Bind::Bound(outcome) => {
+            Bind::Bound { outcome, .. } => {
                 assert_eq!(
                     outcome.root.as_deref(),
                     Some(fixture.local().root()),
@@ -14355,12 +14710,13 @@ mod tests {
             "the external subcommand's future whole-target root has no reservation"
         );
         match bind_under_binding(&context, &store, 0, &reserved, Some(&plan), false) {
-            Bind::Bound(outcome) => assert_eq!(
+            Bind::Bound { outcome, .. } => assert_eq!(
                 outcome.root.as_deref(),
                 Some(fixture.local().root()),
                 "the whole-target fallback did not bind the local root"
             ),
             Bind::Refuse(reason) => {
+                let reason = reason.to_string();
                 panic!("the external subcommand's future whole-target root refused: {reason}")
             }
             Bind::Wait => panic!("the external subcommand's future whole-target root waited"),
@@ -15884,7 +16240,8 @@ mod tests {
         let context = fixture
             .context()
             .with_pool_fallback(Some("container mismatch"));
-        let refused = match bind_ephemeral(&context, Some(&planned)) {
+        let receipt = context.receipt().unwrap().expect("the committed receipt");
+        let refused = match bind_ephemeral(&context, receipt, Some(&planned)) {
             Ok(_) => panic!("an unsupervised external root was bound"),
             Err(reason) => reason,
         };
@@ -15973,9 +16330,10 @@ mod tests {
         let plan = whole_target_plan(Some(expected.clone()));
         match bind_under_binding(&context, &store, 0, &receipt, Some(&plan), false) {
             Bind::Refuse(reason) => {
+                let reason = reason.to_string();
                 assert!(reason.contains("committed receipt selects"), "{reason}")
             }
-            Bind::Bound(_) => panic!("a link contradicting the committed receipt was bound"),
+            Bind::Bound { .. } => panic!("a link contradicting the committed receipt was bound"),
             Bind::Wait => panic!("a contradictory link waited instead of refusing"),
         }
         assert_eq!(fs::read_link(context.link()).unwrap(), expected.root);
@@ -17435,7 +17793,9 @@ mod tests {
         .unwrap()
         .unwrap();
         match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
-            Bind::Refuse(reason) => assert!(reason.contains("not available now"), "{reason}"),
+            Bind::Refuse(reason) => {
+                assert!(reason.message().contains("not available now"), "{reason}")
+            }
             _ => panic!("a dangling member bound"),
         }
         assert_eq!(
@@ -17485,7 +17845,9 @@ mod tests {
         .unwrap()
         .unwrap();
         match bind_profile(&context, &store, 0, &committed, Some(&plan), false) {
-            Bind::Bound(outcome) => assert_eq!(outcome.root.as_deref(), Some(recovered.root())),
+            Bind::Bound { outcome, .. } => {
+                assert_eq!(outcome.root.as_deref(), Some(recovered.root()))
+            }
             Bind::Refuse(reason) => panic!("the recovered root did not bind: {reason}"),
             Bind::Wait => panic!("the recovered root waited"),
         }
@@ -19107,5 +19469,199 @@ mod tests {
         assert!(external_location(&area).is_err());
         os.set_uuid(&mount, Some(uuid));
         assert!(external_location(&area).unwrap());
+    }
+
+    /// A detach makes its opt-out durable before it removes the owned link.
+    /// The crash window therefore leaves a `Detached` receipt over a live
+    /// owned link: the next detach finishes the conversion, and a binding in
+    /// that window refuses (naming the verb that finishes it) instead of
+    /// silently re-linking the root the checkout opted out of.
+    #[test]
+    fn a_whole_target_detach_writes_its_receipt_before_the_link_goes() {
+        let (fixture, receipt) = legacy_checkout();
+        let root = receipt.selected().unwrap().root().to_path_buf();
+        let store = Store::for_tests(&fixture.root.join("pool"));
+        let context = fixture.context();
+        context.inject_crash("detach-receipt");
+        let stopped = detach_at(&context, || Ok(Some(store.handle_for_tests())));
+        assert!(stopped.is_err(), "the injected detach stop did not stop");
+        // The opt-out is durable although the link is still in place.
+        let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        assert!(stored.selects_nothing());
+        assert_eq!(stored.state, ReceiptState::Detached);
+        assert_eq!(fs::read_link(context.link()).unwrap(), root);
+        // The recorded opt-out is never silently re-linked: the link no
+        // committed receipt selects is not followed, and the refusal names
+        // the detach that finishes it.
+        match bind_under_binding(&context, &store, 0, &stored, None, false) {
+            Bind::Refuse(error) => assert!(
+                error.message().contains("`oxide outputs detach`"),
+                "{error}"
+            ),
+            _ => panic!("a leftover detach link was bound"),
+        }
+        // The next detach finishes the crash window and keeps every root.
+        detach_at(&context, || Ok(Some(store.handle_for_tests()))).unwrap();
+        let target = fs::symlink_metadata(context.link()).unwrap();
+        assert!(target.is_dir() && !target.file_type().is_symlink());
+        assert!(fs::read_dir(context.link()).unwrap().next().is_none());
+        assert!(root.is_dir(), "the detach deleted the root");
+        let done = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        assert!(done.selects_nothing());
+        assert!(done.roots.iter().any(|known| known.root == root));
+    }
+
+    /// The other side of the crash window — and a manual `rm -rf target` — is
+    /// a `Detached` receipt over an absent target. A binding creates the real
+    /// directory the detach promises and selects no root: no link is created.
+    #[test]
+    fn a_detached_receipt_creates_its_missing_real_target() {
+        let fixture = Fixture::new();
+        let mut receipt = fixture.receipt();
+        receipt.state = ReceiptState::Detached;
+        write_receipt(&fixture.control, &receipt).unwrap();
+        let context = fixture.context();
+        assert!(matches!(context.target().unwrap(), TargetState::Missing));
+        let store = Store::for_tests(&fixture.root.join("pool"));
+        match bind_under_binding(&context, &store, 0, &receipt, None, false) {
+            Bind::Bound { outcome, .. } => {
+                assert!(outcome.root.is_none());
+                assert_eq!(outcome.note.as_deref(), Some("outputs detached"));
+            }
+            Bind::Refuse(error) => panic!("a detached checkout refused locally: {error}"),
+            Bind::Wait => panic!("a detached checkout waited"),
+        }
+        let target = fs::symlink_metadata(context.link()).unwrap();
+        assert!(target.is_dir() && !target.file_type().is_symlink());
+    }
+
+    /// A profile detach writes the same durable receipt first, so a crash
+    /// leaves owned member links that a binding refuses (they are never read
+    /// as the real directories the opt-out names) and the next detach
+    /// converts.
+    #[test]
+    fn a_profile_detach_writes_its_receipt_before_its_member_links() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let (context, _, root) = host_triple_profile(&fixture);
+        let store = Store::for_tests(&fixture.root.join("pool"));
+        context.inject_crash("detach-receipt");
+        let stopped = detach_at(&context, || Ok(Some(store.handle_for_tests())));
+        assert!(stopped.is_err(), "the injected detach stop did not stop");
+        let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        assert!(stored.selects_nothing());
+        assert_eq!(stored.layout(), LayoutKind::Profile);
+        // Every member is still the committed link in this window.
+        for member in ["debug", "release", "aarch64-apple-darwin/debug"] {
+            assert!(
+                fs::symlink_metadata(fixture.checkout.join("target").join(member))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{member} was converted before the receipt was durable"
+            );
+        }
+        match bind_profile(&context, &store, 0, &stored, None, false) {
+            Bind::Refuse(error) => assert!(
+                error.message().contains("`oxide outputs detach`"),
+                "{error}"
+            ),
+            _ => panic!("a leftover member link was bound"),
+        }
+        detach_at(&context, || Ok(Some(store.handle_for_tests()))).unwrap();
+        for member in ["debug", "release", "aarch64-apple-darwin/debug"] {
+            let metadata =
+                fs::symlink_metadata(fixture.checkout.join("target").join(member)).unwrap();
+            assert!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "{member} is not a real directory after the finished detach"
+            );
+        }
+        assert!(root.is_dir(), "the detach deleted the root");
+    }
+
+    /// `Pruned` selects nothing, exactly as `Detached` does: a slot keyed for
+    /// a local target is not "converted", and an owned key is a real
+    /// mismatch. Two different classifications of the same state used to
+    /// refuse the first case spuriously.
+    #[test]
+    fn a_pruned_receipt_selects_nothing_in_every_reader() {
+        let fixture = Fixture::new();
+        let mut receipt = fixture.receipt();
+        receipt.state = ReceiptState::Pruned;
+        receipt.pruned = Some(PruneRecord {
+            intent: "0123456789abcdef0123456789abcdef".to_owned(),
+            outcome: "deleted".to_owned(),
+            at_ms: 1,
+        });
+        assert!(receipt.selects_nothing());
+        assert!(keyed_state_matches(Some(&receipt), None).is_ok());
+        let plan = whole_target_plan(Some(fixture.local().selected(1)));
+        assert!(keyed_state_matches(Some(&receipt), Some(&plan)).is_err());
+    }
+
+    /// A member directory is created component by component beneath the
+    /// root's own descriptor: a symlinked intermediate is refused and nothing
+    /// is created outside the root, where `create_dir_all` used to walk
+    /// through it.
+    #[test]
+    fn a_member_directory_never_follows_a_symlinked_ancestor() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let spec = fixture.local();
+        ensure_root(&context, &spec, 1).unwrap();
+        let outside = fixture.root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, spec.root().join("aarch64-apple-darwin")).unwrap();
+        let refused = ensure_member_directory(spec.root(), "aarch64-apple-darwin/debug")
+            .expect_err("a symlinked member ancestor was followed");
+        assert!(
+            refused.message().contains("not a real directory"),
+            "{refused}"
+        );
+        assert!(
+            !outside.join("debug").exists(),
+            "the create escaped the owned root"
+        );
+        // The ordinary nested create still works and stays inside the root.
+        let created = ensure_member_directory(spec.root(), "x86_64-unknown-linux-gnu/debug")
+            .expect("a member directory inside the root was refused");
+        assert_eq!(
+            created,
+            spec.root().join("x86_64-unknown-linux-gnu").join("debug")
+        );
+        assert!(created.is_dir());
+    }
+
+    /// The prune-intent instructions state the one real position: the intent
+    /// is retained, nothing replays or settles it, and recovery is manual.
+    #[test]
+    fn prune_intent_instructions_name_the_real_recovery_path() {
+        assert!(!USAGE.contains("resolve-intent"));
+        assert!(PRUNE_INTENT_POSITION.contains("nothing replays or settles it automatically"));
+        assert!(PRUNE_INTENT_POSITION.contains("receipt preimage"));
+        assert!(PRUNE_INTENT_POSITION.contains("by hand"));
+        assert!(pruning_refusal().contains(PRUNE_INTENT_POSITION));
+        let unsettled = unsettled_prune_refusal("abc");
+        assert!(unsettled.contains(PRUNE_INTENT_POSITION));
+        assert!(unsettled.contains("abc"));
+    }
+
+    /// The one overflow retry is decided by the registry's durable state, not
+    /// by an error's message text: a complete registry never reports a retry.
+    #[test]
+    fn a_reservation_retry_is_read_from_the_registry_not_a_message() {
+        let fixture = Fixture::new();
+        let id = "a".repeat(32);
+        let nonce = "b".repeat(32);
+        assert!(matches!(
+            reservation_retry(&fixture.control, &id, &nonce),
+            Err(OutputsError::Corrupt(_))
+        ));
     }
 }
