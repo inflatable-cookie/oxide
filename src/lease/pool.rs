@@ -3104,13 +3104,18 @@ const POOL_LOCK_BOUND_SECONDS: u64 = 120;
 const POOL_LOCK_POLL: Duration = Duration::from_millis(10);
 
 /// The latest instant a pool-lock wait started at `now` may last, and what
-/// bounds it for the message: the command's admission window when one is set,
-/// otherwise [`POOL_LOCK_BOUND_SECONDS`]. Never unbounded: a stale or unknown
-/// holder ends the wait with a refusal naming what it waited on (oxide#325).
+/// bounds it for the message. A command whose admission window is still open
+/// is held to that window; otherwise the wait gets [`POOL_LOCK_BOUND_SECONDS`].
+/// An expired window never refuses a wait by itself: a release after a long
+/// build lands after its window has closed and must still be able to take the
+/// lock. Never unbounded: a stale or unknown holder ends the wait with a
+/// refusal naming what it waited on (oxide#325).
 fn pool_lock_deadline(now: Instant) -> (Instant, &'static str) {
     let default = now + Duration::from_secs(POOL_LOCK_BOUND_SECONDS);
     match crate::lease::admission_deadline() {
-        Some(expires) if expires <= default => (expires, "the admission budget expired"),
+        Some(expires) if expires > now && expires < default => {
+            (expires, "the admission budget expired")
+        }
         _ => (default, "the pool-lock bound was reached"),
     }
 }
@@ -3590,5 +3595,12 @@ mod pool_lock_wait_tests {
         let (deadline, bound) = pool_lock_deadline(Instant::now());
         assert_eq!(bound, "the pool-lock bound was reached");
         assert!(deadline > Instant::now() + Duration::from_secs(100));
+        // A window that has already closed (a release after a long build)
+        // does not refuse the wait: it gets the default bound.
+        crate::lease::set_admission_deadline(Some(Instant::now() - Duration::from_secs(1)));
+        let (deadline, bound) = pool_lock_deadline(Instant::now());
+        assert_eq!(bound, "the pool-lock bound was reached");
+        assert!(deadline > Instant::now() + Duration::from_secs(100));
+        crate::lease::set_admission_deadline(None);
     }
 }
