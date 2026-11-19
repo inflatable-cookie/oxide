@@ -1087,7 +1087,7 @@ def rollback(directory, check=False):
                "started": datetime.datetime.now(datetime.timezone.utc).isoformat()}
     if not check:
         commit_install(saved, saved_hash, receipt, current, expected, directory)
-    print("Before resuming Oxide, follow the 'Persisted state versions and downgrade' step in "
+    print("Downgrading persisted state: before resuming Oxide, follow the 'Persisted state versions and downgrade' section in "
           "docs/knowledge/contracts/workflow.md if the restored binary is from an older generation "
           "or has older format capabilities.")
 
