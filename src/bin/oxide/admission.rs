@@ -46,13 +46,15 @@ const _: () = assert!(MARKER_SOURCE.len() <= TOKEN_MAX);
 static NEXT_COMMAND: AtomicU64 = AtomicU64::new(0);
 
 /// A token is printable, non-empty and bounded, so a report never carries text
-/// the supervisor would have to interpret.
+/// the supervisor would have to interpret. A quote or backslash is refused too:
+/// the reports are written as hand-built JSON, which would not escape them.
 fn token_ok(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= TOKEN_MAX
-        && value
-            .chars()
-            .all(|character| character.is_ascii_graphic() || character == ' ')
+        && value.chars().all(|character| {
+            (character.is_ascii_graphic() && character != '"' && character != '\\')
+                || character == ' '
+        })
 }
 
 /// One bounded identity for this admission attempt, shared by its waiting and
@@ -120,27 +122,27 @@ pub(crate) fn report_waiting(command: &str, reason: &str) {
     let _ = publish(&evidence, WAITING_NAME, body.as_bytes());
 }
 
-/// Write one report by rename, so a reader never sees a partial document. A
-/// failed rename removes its own temporary file and reports the error to the
-/// caller, which drops it.
+/// Write one report by rename, so a reader never sees a partial document. Any
+/// failure, whether the write or the rename, removes the temporary file and
+/// reports the error to the caller, which drops it.
 fn publish(evidence: &Path, name: &str, body: &[u8]) -> std::io::Result<()> {
     let temp = evidence.join(format!(".{name}.{}.tmp", std::process::id()));
+    let published =
+        write_temp(&temp, body).and_then(|()| std::fs::rename(&temp, evidence.join(name)));
+    if published.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    published
+}
+
+fn write_temp(temp: &Path, body: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(&temp)?;
-    file.write_all(body)?;
-    drop(file);
-    let marker = evidence.join(name);
-    match std::fs::rename(&temp, &marker) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = std::fs::remove_file(&temp);
-            Err(error)
-        }
-    }
+        .open(temp)?;
+    file.write_all(body)
 }
 
 #[cfg(all(test, unix))]
@@ -290,10 +292,22 @@ mod tests {
             "line\nbreak",
             "tab\there",
             "\u{00e9}",
+            "quote\"inside",
+            "back\\slash",
             "x".repeat(TOKEN_MAX + 1).as_str(),
         ] {
             assert!(!token_ok(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_failed_rename_leaves_no_temporary_file() {
+        let root = fixture();
+        let evidence = root.join("evidence");
+        // A directory where the report should land makes the rename fail.
+        std::fs::create_dir(evidence.join(MARKER_NAME)).unwrap();
+        assert!(publish(&evidence, MARKER_NAME, b"{}").is_err());
+        assert_eq!(documents(&evidence), vec![MARKER_NAME.to_owned()]);
     }
 
     #[test]

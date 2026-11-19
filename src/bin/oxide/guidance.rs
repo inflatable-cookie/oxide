@@ -4,6 +4,7 @@
 //! workspace's own `AGENTS.md` stands. Covering the workspace is adoption.
 
 use crate::adopt::{self, AGENTS, COVERS_CLOSE, COVERS_OPEN};
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::unix::io::AsRawFd;
@@ -60,12 +61,7 @@ pub fn placement(workspace: &Path) -> Result<Placement, String> {
     command
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(workspace);
-    // Inherited repository and config addressing could point elsewhere.
-    for (name, _) in std::env::vars_os() {
-        if name.as_encoded_bytes().starts_with(b"GIT_") {
-            command.env_remove(name);
-        }
-    }
+    remove_git_environment(&mut command);
     command
         .env("LC_ALL", "C")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -126,6 +122,22 @@ pub fn placement(workspace: &Path) -> Result<Placement, String> {
                 "git rev-parse did not confirm a work tree (exit {}: {first}); nothing was written",
                 code.map_or_else(|| "by signal".to_owned(), |code| code.to_string())
             ))
+        }
+    }
+}
+
+/// Remove every inherited `GIT_*` variable from `command`, so Git addresses
+/// only the directory it runs in. Inherited repository and config addressing
+/// (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_CONFIG_*`) could point
+/// elsewhere.
+pub(crate) fn remove_git_environment(command: &mut Command) {
+    remove_git_environment_named(command, std::env::vars_os().map(|(name, _)| name));
+}
+
+fn remove_git_environment_named(command: &mut Command, names: impl IntoIterator<Item = OsString>) {
+    for name in names {
+        if name.as_encoded_bytes().starts_with(b"GIT_") {
+            command.env_remove(name);
         }
     }
 }
@@ -318,11 +330,10 @@ pub fn merged_covers(
 pub fn adoption(workspace: &Path) -> Adoption {
     let root = match placement(workspace) {
         Ok(Placement::Outside) => {
-            return match adopt::read_bounded(&workspace.join(AGENTS)) {
-                Ok(Some(bytes)) if matches!(adopt::find_block(&bytes), Ok(Some(_))) => {
-                    Adoption::Adopted
-                }
-                _ => Adoption::NotAdopted,
+            return match block_in(&workspace.join(AGENTS)) {
+                Ok(true) => Adoption::Adopted,
+                Ok(false) => Adoption::NotAdopted,
+                Err(reason) => Adoption::Uncertain(reason),
             };
         }
         Ok(Placement::Worktree(root)) => root,
@@ -342,12 +353,21 @@ pub fn adoption(workspace: &Path) -> Adoption {
         Ok(true) => Adoption::Adopted,
         Err(reason) => Adoption::Uncertain(reason),
         Ok(false) if root == workspace => Adoption::NotAdopted,
-        Ok(false) => match adopt::read_bounded(&workspace.join(AGENTS)) {
-            Ok(Some(bytes)) if matches!(adopt::find_block(&bytes), Ok(Some(_))) => {
-                Adoption::LegacyNested(workspace.join(AGENTS))
-            }
-            _ => Adoption::NotAdopted,
+        Ok(false) => match block_in(&workspace.join(AGENTS)) {
+            Ok(true) => Adoption::LegacyNested(workspace.join(AGENTS)),
+            Ok(false) => Adoption::NotAdopted,
+            Err(reason) => Adoption::Uncertain(reason),
         },
+    }
+}
+
+/// Whether the file at `path` holds an Oxide block. A missing file has none; a
+/// file that cannot be read, or whose markers are damaged, is an error. Damage
+/// is neither adoption nor absence, so `init` must not treat it as absence.
+fn block_in(path: &Path) -> Result<bool, String> {
+    match adopt::read_bounded(path)? {
+        None => Ok(false),
+        Some(bytes) => Ok(adopt::find_block(&bytes)?.is_some()),
     }
 }
 
@@ -556,6 +576,36 @@ mod tests {
         assert_eq!(placement(&dir).unwrap(), Placement::Outside);
         assert_eq!(adoption(&dir), Adoption::NotAdopted);
         fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn damaged_guidance_is_uncertain_not_absent() {
+        let dir = scratch("damaged");
+        // A begin marker with no end is damage: `init` must refuse, not write
+        // a second block as if none existed.
+        fs::write(
+            dir.join(AGENTS),
+            "<!-- oxide:begin -->\n<!-- oxide:workspaces: . -->\n",
+        )
+        .expect("damaged guidance");
+        assert!(matches!(adoption(&dir), Adoption::Uncertain(_)));
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn inherited_git_addressing_is_removed_before_git_runs() {
+        let mut command = Command::new("git");
+        let inherited = ["GIT_DIR", "GIT_CONFIG_COUNT", "GIT_INDEX_FILE", "PATH"];
+        remove_git_environment_named(&mut command, inherited.map(OsString::from));
+        let removed = |name: &str| {
+            command
+                .get_envs()
+                .any(|(key, value)| key == name && value.is_none())
+        };
+        assert!(removed("GIT_DIR"));
+        assert!(removed("GIT_CONFIG_COUNT"));
+        assert!(removed("GIT_INDEX_FILE"));
+        assert!(!command.get_envs().any(|(key, _)| key == "PATH"));
     }
 
     #[test]

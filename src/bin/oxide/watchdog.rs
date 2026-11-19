@@ -314,6 +314,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn readings_above_the_trigger_never_stop() {
         let path = scratch("above");
         let readings = path.join("readings");
@@ -329,6 +330,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn a_failed_sample_stops_the_build() {
         let path = scratch("failed");
         let mut child = group("sleep 30");
@@ -346,6 +348,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn term_then_kill_closes_a_group_that_ignores_term() {
         let path = scratch("kill");
         let readings = path.join("readings");

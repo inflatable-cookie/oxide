@@ -322,6 +322,7 @@ fn ensure_local_outputs_ignored(workspace: &Path) -> Result<Ignored, String> {
             file.write_all(&bytes)?;
             file.sync_all()
         })
+        .and_then(|()| copy_mode(&path, &temporary))
         .and_then(|()| fs::rename(&temporary, &path));
     written.map_err(|error| {
         let _ = fs::remove_file(&temporary);
@@ -332,6 +333,16 @@ fn ensure_local_outputs_ignored(workspace: &Path) -> Result<Ignored, String> {
     } else {
         Ignored::Added
     })
+}
+
+/// Give the rewritten file the permission bits of the file it replaces, so an
+/// edit never widens or narrows access. A new file keeps the default.
+fn copy_mode(path: &Path, temporary: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => fs::set_permissions(temporary, metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn ignores_local_outputs(line: &str) -> bool {
@@ -981,6 +992,26 @@ Managed by `oxide init`; edits between these markers are replaced.
             apply_block(Some(inline.as_bytes()), OUTSIDE).unwrap(),
             format!("{inline}\n{OUTSIDE}").into_bytes()
         );
+    }
+
+    #[test]
+    fn rewriting_gitignore_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let workspace = base.join(format!("gitignore-mode-{}", std::process::id()));
+        fs::create_dir_all(&workspace).unwrap();
+        let path = workspace.join(GITIGNORE);
+        fs::write(&path, "target/\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            ensure_local_outputs_ignored(&workspace).unwrap(),
+            Ignored::Added
+        );
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the rewrite must keep the file's mode");
+        fs::remove_dir_all(&workspace).unwrap();
     }
 
     #[test]
