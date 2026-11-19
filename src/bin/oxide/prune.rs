@@ -1551,11 +1551,13 @@ struct Imported {
     pinned: bool,
 }
 
-/// Whether Barge's durable pin record exists for a root. Barge keeps it at
-/// `<root parent>/.barge/pins/<id>.json` and counts its presence as a pin.
-/// That layout is Barge-private, so a test pins through Barge and checks this
-/// reader against it. Only a positively present record answers `true`; a
-/// missing or unreadable one answers `false`, so the caller pins again.
+/// Whether Barge protects a root with its durable pin record, at
+/// `<root parent>/.barge/pins/<id>.json`. This mirrors Barge's own `pin_state`:
+/// only `NotFound` means unpinned, and any other inspection error counts as
+/// pinned, because Barge treats that state as unknown and protected. The
+/// layout is Barge-private, so a test pins through Barge and checks this
+/// reader against it. A root without a parent answers `false`, so the caller
+/// pins and surfaces the error.
 fn pin_record_exists(root: &Path, id: &str) -> bool {
     let Some(parent) = root.parent() else {
         return false;
@@ -1564,7 +1566,10 @@ fn pin_record_exists(root: &Path, id: &str) -> bool {
         .join(".barge")
         .join("pins")
         .join(format!("{id}.json"));
-    fs::symlink_metadata(record).is_ok()
+    match fs::symlink_metadata(record) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Pin a selected root unless Barge already protects it. A second pin only
@@ -2533,6 +2538,21 @@ mod plan_identity_tests {
         assert!(pin_record_exists(&root.path, &root.id));
         area.unpin(&root.id).unwrap();
         assert!(!pin_record_exists(&root.path, &root.id));
+    }
+
+    /// Only `NotFound` reads as unpinned, as in Barge. A record path that cannot
+    /// be inspected for another reason counts as protected, so the skip never
+    /// reaches a pin write on an unknown state.
+    #[test]
+    fn the_pin_record_reader_treats_only_not_found_as_unpinned() {
+        let temp = barge::testing::TempDir::new("oxide-pin-reader-errors").unwrap();
+        let absent = temp.path().join("absent").join("root");
+        assert!(!pin_record_exists(&absent, "any-id"));
+        // A regular file in the parent position makes the record path fail
+        // with NotADirectory, which is not NotFound.
+        let file = temp.path().join("file");
+        fs::write(&file, b"not a folder").unwrap();
+        assert!(pin_record_exists(&file.join("root"), "any-id"));
     }
 
     /// A recorded root reads no inventory, so its pin state must come from its
