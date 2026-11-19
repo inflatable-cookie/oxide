@@ -41,6 +41,7 @@ use crate::wrapper;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
@@ -251,54 +252,32 @@ fn prepare(
                 reported(&path)
             ))
         }
-        Ok(meta) => {
+        Ok(_) => {
             // A directory inside the slot this lease now owns can only be a
             // previous command's leftover: reconcile it when, and only when,
             // its marker binds it to this same slot incarnation.
-            if let Err(reason) = owned_directory(&path, &meta, pool_dev) {
-                return Err(reason);
-            }
-            let text = read_owner(&path)?;
-            let found = parse_owner(&text)
-                .ok_or_else(|| format!("{} has no Oxide ownership marker", reported(&path)))?;
-            if found.binding() != identity.binding() {
-                return Err(format!(
-                    "{} belongs to another slot incarnation, so it is kept",
-                    reported(&path)
-                ));
-            }
-            remove_owned_tree(&path, pool_dev)?;
+            remove(&path, pool_dev, identity)?;
         }
     }
+    // The directory and its marker are built under a staging name, then renamed
+    // into place: a crash can never leave the scratch name without a marker,
+    // which would refuse every later command in this slot.
+    let staging = slot.join(format!("{SCRATCH_NAME}.staging-{}", std::process::id()));
     DirBuilder::new()
         .mode(0o700)
-        .create(&path)
+        .create(&staging)
         .map_err(|error| {
             format!(
                 "cannot create the per-command temporary directory {}: {error}",
                 reported(&path)
             )
         })?;
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path.join(OWNER_NAME))
-        .map_err(|error| {
-            let _ = fs::remove_dir_all(&path);
-            format!(
-                "cannot record the per-command temporary directory {}: {error}",
-                reported(&path)
-            )
-        })?;
-    let text = owner_text(identity);
-    let mut file = file;
-    let written = file
-        .write_all(text.as_bytes())
-        .and_then(|()| file.sync_all());
-    if let Err(error) = written {
-        let _ = fs::remove_dir_all(&path);
+    if let Err(reason) = write_owner(&staging, identity) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(reason);
+    }
+    if let Err(error) = fs::rename(&staging, &path) {
+        let _ = fs::remove_dir_all(&staging);
         return Err(format!(
             "cannot record the per-command temporary directory {}: {error}",
             reported(&path)
@@ -318,67 +297,164 @@ pub(crate) fn discard(owned: &Owned) -> Result<(), String> {
     remove(&owned.path, owned.dev, &owned.identity)
 }
 
-/// Remove this command's scratch, refusing anything that is no longer the
-/// positively identified directory (marker, owner, device, real directory).
-pub(crate) fn remove(path: &std::path::Path, dev: u64, identity: &Identity) -> Result<(), String> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(format!(
-                "cannot read the per-command temporary directory {}: {error}",
-                reported(path)
-            ))
+/// A directory held open for removal. Entries are named relative to it, so a
+/// path that is swapped for a link after the handle was opened cannot redirect
+/// a removal outside the tree the handle names.
+pub(crate) struct Dir(OwnedFd);
+
+/// One entry's identity and kind, read without following a link.
+pub(crate) struct Entry {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) uid: u32,
+    pub(crate) dir: bool,
+}
+
+/// Open flags for a directory handle: a link at the last component is refused.
+const DIR_FLAGS: libc::c_int =
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+impl Dir {
+    /// Open `path` as a directory. Components above the last are resolved as
+    /// any path is; the last one may not be a link.
+    pub(crate) fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        let name = c_string(path.as_os_str())?;
+        // SAFETY: `name` is a valid NUL-terminated path that lives for the call.
+        owned(unsafe { libc::open(name.as_ptr(), DIR_FLAGS) }).map(Self)
+    }
+
+    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
+        self.0.try_clone().map(Self)
+    }
+
+    /// The device and inode of this directory.
+    pub(crate) fn identity(&self) -> std::io::Result<(u64, u64)> {
+        let stat = stat_of(|stat| {
+            // SAFETY: the descriptor is open for the call and `stat` is a valid out-pointer.
+            unsafe { libc::fstat(self.0.as_raw_fd(), stat) }
+        })?;
+        Ok((stat.st_dev as u64, stat.st_ino as u64))
+    }
+
+    /// One entry of this directory, read without following a link.
+    pub(crate) fn entry(&self, name: &OsStr) -> std::io::Result<Entry> {
+        let name = c_string(name)?;
+        let stat = stat_of(|stat| {
+            // SAFETY: the descriptor is open, `name` is NUL-terminated and `stat` is a valid out-pointer.
+            unsafe {
+                libc::fstatat(
+                    self.0.as_raw_fd(),
+                    name.as_ptr(),
+                    stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            }
+        })?;
+        Ok(Entry {
+            dev: stat.st_dev as u64,
+            ino: stat.st_ino as u64,
+            uid: stat.st_uid,
+            dir: stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+        })
+    }
+
+    /// A child directory of this one, refused when the name is a link.
+    pub(crate) fn open_dir(&self, name: &OsStr) -> std::io::Result<Self> {
+        let name = c_string(name)?;
+        // SAFETY: the descriptor is open and `name` is a valid NUL-terminated path.
+        owned(unsafe { libc::openat(self.0.as_raw_fd(), name.as_ptr(), DIR_FLAGS) }).map(Self)
+    }
+
+    /// A regular child file, opened without following a link.
+    pub(crate) fn open_file(&self, name: &OsStr) -> std::io::Result<std::fs::File> {
+        let name = c_string(name)?;
+        // SAFETY: the descriptor is open and `name` is a valid NUL-terminated path.
+        let fd = unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        owned(fd).map(std::fs::File::from)
+    }
+
+    /// Unlink one entry of this directory; `dir` selects the directory form.
+    /// A link is unlinked itself, never followed.
+    pub(crate) fn remove(&self, name: &OsStr, dir: bool) -> std::io::Result<()> {
+        let name = c_string(name)?;
+        let flags = if dir { libc::AT_REMOVEDIR } else { 0 };
+        // SAFETY: the descriptor is open and `name` is a valid NUL-terminated path.
+        if unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), flags) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
         }
-    };
-    owned_directory(path, &meta, dev)?;
-    let text = read_owner(path)?;
-    let found = parse_owner(&text).ok_or_else(|| {
-        format!(
-            "{} has no Oxide ownership marker, so it is kept",
-            reported(path)
-        )
-    })?;
-    if found.binding() != identity.binding() {
-        return Err(format!(
-            "{} belongs to another slot incarnation, so it is kept",
-            reported(path)
-        ));
     }
-    remove_owned_tree(path, dev)
+
+    /// The names in this directory, without `.` and `..`. A read that ends early
+    /// leaves entries behind, so the directory's own removal then refuses.
+    pub(crate) fn names(&self) -> std::io::Result<Vec<OsString>> {
+        // fdopendir takes ownership of its descriptor, so it gets a duplicate.
+        let fd = self.0.try_clone()?.into_raw_fd();
+        // SAFETY: `fd` is an open directory; fdopendir owns it from here on.
+        let dir = unsafe { libc::fdopendir(fd) };
+        if dir.is_null() {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: fdopendir failed, so `fd` is still ours to close.
+            unsafe { libc::close(fd) };
+            return Err(error);
+        }
+        let mut names = Vec::new();
+        loop {
+            // SAFETY: `dir` is open until closedir below.
+            let entry = unsafe { libc::readdir(dir) };
+            if entry.is_null() {
+                break;
+            }
+            // SAFETY: readdir returned a live entry whose name is NUL-terminated.
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let bytes = name.to_bytes();
+            if bytes != b"." && bytes != b".." {
+                names.push(OsStr::from_bytes(bytes).to_owned());
+            }
+        }
+        // SAFETY: `dir` is open and not used after this call.
+        unsafe { libc::closedir(dir) };
+        Ok(names)
+    }
 }
 
-/// A real directory owned by this user, on the expected device.
-fn owned_directory(path: &std::path::Path, meta: &fs::Metadata, dev: u64) -> Result<(), String> {
-    if !meta.is_dir() || meta.file_type().is_symlink() {
-        return Err(format!(
-            "{} is not a real directory, so it is kept",
-            reported(path)
-        ));
-    }
-    if meta.uid() != effective_uid() {
-        return Err(format!(
-            "{} is not owned by this user, so it is kept",
-            reported(path)
-        ));
-    }
-    if meta.dev() != dev {
-        return Err(format!(
-            "{} is not on the pool's device, so it is kept",
-            reported(path)
-        ));
-    }
-    Ok(())
+fn c_string(name: &OsStr) -> std::io::Result<std::ffi::CString> {
+    std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "a path holds a NUL byte")
+    })
 }
 
-/// Read the marker without following a link and without trusting a size the
-/// caller did not write.
-fn read_owner(dir: &std::path::Path) -> Result<String, String> {
-    let path = dir.join(OWNER_NAME);
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
+fn owned(fd: libc::c_int) -> std::io::Result<OwnedFd> {
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a non-negative result from open or openat is a fresh descriptor we own.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn stat_of(call: impl FnOnce(*mut libc::stat) -> libc::c_int) -> std::io::Result<libc::stat> {
+    // SAFETY: an all-zero `stat` is a valid buffer for the kernel to fill.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if call(&mut stat) == 0 {
+        Ok(stat)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Read the marker through a held directory, without following a link and
+/// without trusting a size the caller did not write.
+fn read_owner(dir: &Dir, label: &std::path::Path) -> Result<String, String> {
+    let path = label.join(OWNER_NAME);
+    let file = dir
+        .open_file(OsStr::new(OWNER_NAME))
         .map_err(|error| format!("cannot read the marker {}: {error}", reported(&path)))?;
     let meta = file
         .metadata()
@@ -394,6 +470,26 @@ fn read_owner(dir: &std::path::Path) -> Result<String, String> {
         .read_to_string(&mut text)
         .map_err(|error| format!("cannot read the marker {}: {error}", reported(&path)))?;
     Ok(text)
+}
+
+/// Write and sync the ownership marker of a new directory.
+fn write_owner(dir: &std::path::Path, identity: &Identity) -> Result<(), String> {
+    let record = |error: std::io::Error| {
+        format!(
+            "cannot record the per-command temporary directory {}: {error}",
+            reported(dir)
+        )
+    };
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(OWNER_NAME))
+        .map_err(record)?;
+    file.write_all(owner_text(identity).as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(record)
 }
 
 fn owner_text(identity: &Identity) -> String {
@@ -429,12 +525,23 @@ fn parse_owner(text: &str) -> Option<Identity> {
     })
 }
 
-/// Remove one owned tree without following a link and without crossing to
-/// another device. A child on another device (a mount point inside the
-/// scratch) refuses and is kept.
-fn remove_owned_tree(path: &std::path::Path, dev: u64) -> Result<(), String> {
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries,
+/// Remove this command's scratch, refusing anything that is no longer the
+/// positively identified directory (marker, owner, device, real directory).
+/// The parent is held open and every check and removal names its entry through
+/// that handle, so no path component is followed after the checks.
+pub(crate) fn remove(path: &std::path::Path, dev: u64, identity: &Identity) -> Result<(), String> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(format!("{} has no parent to hold it", reported(path)));
+    };
+    let parent_dir = Dir::open(parent).map_err(|error| {
+        format!(
+            "cannot read the parent of the per-command temporary directory {}: {error}",
+            reported(path)
+        )
+    })?;
+    let entry = match parent_dir.entry(name) {
+        Ok(entry) => entry,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
             return Err(format!(
                 "cannot read the per-command temporary directory {}: {error}",
@@ -442,39 +549,93 @@ fn remove_owned_tree(path: &std::path::Path, dev: u64) -> Result<(), String> {
             ))
         }
     };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                return Err(format!(
-                    "cannot read the per-command temporary directory {}: {error}",
-                    reported(path)
-                ))
-            }
-        };
-        let child = entry.path();
-        let meta = match fs::symlink_metadata(&child) {
-            Ok(meta) => meta,
-            Err(error) => return Err(format!("cannot read {}: {error}", reported(&child))),
-        };
-        if meta.dev() != dev {
-            return Err(format!(
-                "{} is on another device, so the directory is kept",
-                reported(&child)
-            ));
-        }
-        if meta.is_dir() && !meta.file_type().is_symlink() {
-            remove_owned_tree(&child, dev)?;
-        } else if let Err(error) = fs::remove_file(&child) {
-            return Err(format!("cannot remove {}: {error}", reported(&child)));
-        }
+    if !entry.dir {
+        return Err(format!(
+            "{} is not a real directory, so it is kept",
+            reported(path)
+        ));
     }
-    fs::remove_dir(path).map_err(|error| {
+    if entry.uid != effective_uid() {
+        return Err(format!(
+            "{} is not owned by this user, so it is kept",
+            reported(path)
+        ));
+    }
+    if entry.dev != dev {
+        return Err(format!(
+            "{} is not on the pool's device, so it is kept",
+            reported(path)
+        ));
+    }
+    let top = parent_dir
+        .open_dir(name)
+        .map_err(|error| format!("cannot open {}: {error}", reported(path)))?;
+    if top.identity().ok() != Some((entry.dev, entry.ino)) {
+        return Err(format!(
+            "{} changed while it was being checked, so it is kept",
+            reported(path)
+        ));
+    }
+    let text = read_owner(&top, path)?;
+    let found = parse_owner(&text).ok_or_else(|| {
+        format!(
+            "{} has no Oxide ownership marker, so it is kept",
+            reported(path)
+        )
+    })?;
+    if found.binding() != identity.binding() {
+        return Err(format!(
+            "{} belongs to another slot incarnation, so it is kept",
+            reported(path)
+        ));
+    }
+    remove_contents(&top, dev, path)?;
+    parent_dir.remove(name, true).map_err(|error| {
         format!(
             "cannot remove the per-command temporary directory {}: {error}",
             reported(path)
         )
     })
+}
+
+/// Remove everything inside `dir`, children first, refusing any other device.
+fn remove_contents(dir: &Dir, dev: u64, label: &std::path::Path) -> Result<(), String> {
+    let names = dir.names().map_err(|error| {
+        format!(
+            "cannot read the per-command temporary directory {}: {error}",
+            reported(label)
+        )
+    })?;
+    for name in names {
+        let child = label.join(&name);
+        let entry = dir
+            .entry(&name)
+            .map_err(|error| format!("cannot read {}: {error}", reported(&child)))?;
+        if entry.dev != dev {
+            return Err(format!(
+                "{} is on another device, so the directory is kept",
+                reported(&child)
+            ));
+        }
+        if entry.dir {
+            let inner = dir
+                .open_dir(&name)
+                .map_err(|error| format!("cannot open {}: {error}", reported(&child)))?;
+            if inner.identity().ok() != Some((entry.dev, entry.ino)) {
+                return Err(format!(
+                    "{} changed while it was being removed, so it is kept",
+                    reported(&child)
+                ));
+            }
+            remove_contents(&inner, dev, &child)?;
+            dir.remove(&name, true)
+                .map_err(|error| format!("cannot remove {}: {error}", reported(&child)))?;
+        } else {
+            dir.remove(&name, false)
+                .map_err(|error| format!("cannot remove {}: {error}", reported(&child)))?;
+        }
+    }
+    Ok(())
 }
 
 fn effective_uid() -> u32 {
@@ -933,6 +1094,26 @@ mod tests {
         let note = chosen.note();
         assert!(!note.contains('\n'), "{note}");
         assert!(note.starts_with("temp: inherited /some/very/long/\\npath"));
+    }
+
+    #[test]
+    fn held_removal_refuses_links_and_never_leaves_its_tree() {
+        let fixture = Fixture::new("held");
+        let outside = fixture.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"keep").unwrap();
+        let tree = fixture.0.join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("own"), b"own").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
+        let held = Dir::open(&tree).unwrap();
+        assert!(Dir::open(&tree.join("link")).is_err());
+        assert!(held.open_dir(OsStr::new("link")).is_err());
+        let dev = fs::metadata(&tree).unwrap().dev();
+        remove_contents(&held, dev, &tree).unwrap();
+        assert!(fs::symlink_metadata(tree.join("link")).is_err());
+        assert!(fs::symlink_metadata(tree.join("own")).is_err());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"keep");
     }
 
     #[test]

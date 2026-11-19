@@ -627,6 +627,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn injected_answers_drive_each_diagnostic_case() {
         // The injection is read in the child and passed in here, so the
         // formatting and the unknown cases are unit-testable without a

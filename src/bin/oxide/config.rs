@@ -1078,7 +1078,16 @@ pub(crate) fn judge_pool_path(path: &Path) -> Result<(), PathRefusal> {
         )));
     }
     let mut existing = path;
-    while fs::symlink_metadata(existing).is_err() {
+    // Only a missing component moves the check up; any other failure to
+    // inspect one (such as a denied search) refuses rather than being read as
+    // absence.
+    while let Err(error) = fs::symlink_metadata(existing) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(PathRefusal::Ancestor(format!(
+                "cannot inspect the pool path {}: {error}",
+                path.display()
+            )));
+        }
         existing = existing.parent().ok_or_else(|| {
             PathRefusal::Ancestor(format!(
                 "the pool path {} has no existing ancestor",
@@ -2313,6 +2322,24 @@ mod tests {
         linux.macos = false;
         assert_eq!(ignored_legacy_config(&linux), None);
         assert_eq!(settings(&linux).expect("linux").pool, Path::new("/never"));
+    }
+
+    #[test]
+    fn a_denied_ancestor_refuses_instead_of_reading_as_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let _internal = internal_fixture_scope();
+        let scratch = Scratch::new("denied");
+        let locked = scratch.0.join("locked");
+        fs::create_dir_all(&locked).expect("locked");
+        // Without search permission the child cannot be inspected, which is not
+        // the same as the child being absent.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("deny");
+        let result = judge_pool_path(&locked.join("pool"));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("restore");
+        assert!(
+            matches!(&result, Err(PathRefusal::Ancestor(reason)) if reason.contains("cannot inspect")),
+            "{result:?}"
+        );
     }
 
     #[test]

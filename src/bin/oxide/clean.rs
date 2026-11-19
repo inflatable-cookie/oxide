@@ -4,10 +4,13 @@
 //! whole-target clean is planned and removed by Oxide itself: the plan
 //! enumerates every path under `<workspace>/target`, refuses top-level
 //! entries Cargo does not create unless `--include-foreign` is given, and
-//! the dry run prints that same plan. Removal deletes only planned paths and
-//! never follows a symlink. A package, profile or doc selection is passed
+//! the dry run prints that same plan. Removal deletes only planned paths, names
+//! each one through directories held open from the target, and never follows a
+//! symlink in any component, even one swapped in after planning. A package,
+//! profile or doc selection is passed
 //! to Cargo as before. Shared slots are never touched.
 
+use crate::child_temp::Dir;
 use crate::config::Settings;
 use crate::outputs;
 use crate::{apply_storage, cargo_home, cli, identity, process, store, CARGO};
@@ -16,7 +19,7 @@ use oxide_storage::storage::ROOT_MARKER;
 use std::ffi::{OsStr, OsString};
 use std::fs::Metadata;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use store::{CheckoutCustody, Cleaning, Store, WaitAccounting};
 
@@ -173,6 +176,10 @@ struct Plan {
     /// Paths kept in place: an owned output root, its marker and inactive
     /// roots. Nothing here is removed or followed.
     preserved: Vec<PathBuf>,
+    /// The target as planned, and its device and inode, so removal can prove
+    /// it still names the same directory before it deletes beneath it.
+    root: PathBuf,
+    root_identity: (u64, u64),
 }
 
 fn is_file(metadata: &Metadata) -> bool {
@@ -294,7 +301,11 @@ fn plan(
         Ok(metadata) => metadata,
     };
     refuse_pool(target, &root)?;
-    let mut plan = Plan::default();
+    let mut plan = Plan {
+        root: target.to_path_buf(),
+        root_identity: (root.dev(), root.ino()),
+        ..Plan::default()
+    };
     // The target itself is kept when `keep_root` says so, and also when it is
     // explicitly preserved: in the profile layout `target` is a REAL directory
     // that holds this checkout's owned member links, so a whole clean removes
@@ -484,18 +495,41 @@ fn checked_plan(
     }
 }
 
-/// Remove planned paths only, children first. A path that changed type or
-/// gained unplanned content is left and counted, never followed.
+/// Remove planned paths only, children first. Each entry is named through a
+/// directory held open from the target's parent, and every parent is reached one
+/// component at a time without following a link. A path that changed type or
+/// device, or gained unplanned content, is left and counted, never followed.
 fn remove(plan: &Plan) -> Result<(), String> {
+    let held = |error: std::io::Error| {
+        format!(
+            "clean refused: the planned target {} cannot be held for removal ({error}); nothing was removed",
+            plan.root.display()
+        )
+    };
+    let (Some(parent_path), Some(root_name)) = (plan.root.parent(), plan.root.file_name()) else {
+        return Err(held(std::io::Error::other("the target has no parent")));
+    };
+    let parent = Dir::open(parent_path).map_err(held)?;
+    let anchor = parent.open_dir(root_name).map_err(held)?;
+    if anchor.identity().map_err(held)? != plan.root_identity {
+        return Err(format!(
+            "clean refused: {} changed since it was planned; nothing was removed",
+            plan.root.display()
+        ));
+    }
     let mut left = Vec::new();
     for planned in plan.entries.iter().rev() {
         if process::received_signal().is_some() {
             return Err("interrupted; the target is partly removed".to_owned());
         }
-        let removed = if planned.dir {
-            std::fs::remove_dir(&planned.path)
-        } else {
-            std::fs::remove_file(&planned.path)
+        let removed = match planned.path.strip_prefix(&plan.root) {
+            Ok(relative) if relative.as_os_str().is_empty() => {
+                remove_root(&parent, root_name, plan.root_identity)
+            }
+            Ok(relative) => remove_beneath(&anchor, relative, plan.root_identity.0, planned.dir),
+            Err(_) => Err(std::io::Error::other(
+                "the path is outside the planned target",
+            )),
         };
         match removed {
             Ok(()) => {}
@@ -512,6 +546,42 @@ fn remove(plan: &Plan) -> Result<(), String> {
         "{count} planned path(s) were left because they changed or gained entries that were not in the plan: {}",
         left.join(", ")
     ))
+}
+
+/// Remove the target itself from its held parent, if it is still the planned
+/// directory.
+fn remove_root(parent: &Dir, name: &OsStr, identity: (u64, u64)) -> std::io::Result<()> {
+    let entry = parent.entry(name)?;
+    if !entry.dir || (entry.dev, entry.ino) != identity {
+        return Err(std::io::Error::other("changed since it was planned"));
+    }
+    parent.remove(name, true)
+}
+
+/// Remove one planned path beneath the held target. Each parent is opened from
+/// the target handle, one component at a time, so a link anywhere on the way
+/// refuses instead of being followed. The entry must still have the planned
+/// kind and the target's device.
+fn remove_beneath(anchor: &Dir, relative: &Path, dev: u64, dir: bool) -> std::io::Result<()> {
+    let mut names = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(name) => names.push(name),
+            _ => return Err(std::io::Error::other("not a plain path under the target")),
+        }
+    }
+    let Some((name, parents)) = names.split_last() else {
+        return Err(std::io::Error::other("an empty path under the target"));
+    };
+    let mut parent = anchor.try_clone()?;
+    for component in parents {
+        parent = parent.open_dir(component)?;
+    }
+    let entry = parent.entry(name)?;
+    if entry.dir != dir || entry.dev != dev {
+        return Err(std::io::Error::other("changed since it was planned"));
+    }
+    parent.remove(name, dir)
 }
 
 fn run_whole(
@@ -759,7 +829,10 @@ fn run_selected(args: &[OsString], workspace: &Path, settings: &Settings) -> Res
         }
         return Err(reason);
     }
-    let scratch = private_scratch()?;
+    let scratch = match private_scratch() {
+        Ok(scratch) => scratch,
+        Err(reason) => return Err(abandon_clean_after(&store, guard.take(), reason)),
+    };
     let mut cargo = Command::new(CARGO);
     cargo.arg("clean").args(args);
     // Clean compiles nothing; the default recipe keeps Cargo's `dev` name.
@@ -772,9 +845,17 @@ fn run_selected(args: &[OsString], workspace: &Path, settings: &Settings) -> Res
     // The clean barrier must outlive this process if Cargo does: the child
     // inherits the clean lock and runs as a recorded group whose end is
     // awaited before the barrier lifts.
-    if let Some(guard) = &guard {
-        guard.share_with_children()?;
+    if let Some(reason) = guard
+        .as_ref()
+        .and_then(|guard| guard.share_with_children().err())
+    {
+        let _ = std::fs::remove_dir(scratch.join("build"));
+        let _ = std::fs::remove_dir(&scratch);
+        return Err(abandon_clean_after(&store, guard.take(), reason));
     }
+    // Set only once Cargo's group exists: until then no clean ran, so the
+    // checkout keeps its slot affinity.
+    let mut cargo_started = false;
     // The selected clean runs the same supervision as a leased build: the
     // pool's watchdog is polled while the recorded group runs and closure is
     // positively witnessed before the barrier lifts. The removable watchdog
@@ -782,6 +863,7 @@ fn run_selected(args: &[OsString], workspace: &Path, settings: &Settings) -> Res
     // sampler.
     let mut watchdog = store.as_ref().and_then(Store::watchdog);
     let status = process::spawn_group(&mut cargo).and_then(|mut group| {
+        cargo_started = true;
         let recorded = match (&store, &guard) {
             (Some(store), Some(guard)) => store.clean_running(guard, group.id),
             _ => Ok(()),
@@ -833,7 +915,12 @@ fn run_selected(args: &[OsString], workspace: &Path, settings: &Settings) -> Res
     let _ = std::fs::remove_dir(scratch.join("build"));
     let _ = std::fs::remove_dir(&scratch);
     let detached = match (&store, guard) {
-        (Some(store), Some(guard)) => store.finish_clean(guard, workspace)?,
+        (Some(store), Some(guard)) if cargo_started => store.finish_clean(guard, workspace)?,
+        (Some(store), Some(guard)) => {
+            // Cargo never started, so nothing was cleaned and affinity stays.
+            store.abandon_clean(guard)?;
+            0
+        }
         _ => 0,
     };
     let status = status?;
@@ -843,6 +930,23 @@ fn run_selected(args: &[OsString], workspace: &Path, settings: &Settings) -> Res
         );
     }
     Ok(process::exit_code(status))
+}
+
+/// Release the clean barrier after a failure before Cargo's clean ran. The
+/// original reason is returned; a failed release is appended to it, so the
+/// caller never loses the first failure.
+fn abandon_clean_after(
+    store: &Option<Store>,
+    guard: Option<store::CleanGuard>,
+    reason: String,
+) -> String {
+    match (store, guard) {
+        (Some(store), Some(guard)) => match store.abandon_clean(guard) {
+            Ok(()) => reason,
+            Err(abandon) => format!("{reason}; {abandon}"),
+        },
+        _ => reason,
+    }
 }
 
 /// Refuse a clean while this checkout still has unknown writer custody: a
@@ -1007,6 +1111,31 @@ mod tests {
         remove(&plan).unwrap();
         assert!(!target.exists());
         assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"keep");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_parent_swapped_for_a_link_after_planning_is_never_followed() {
+        let root = scratch("swapped");
+        let target = root.join("target");
+        std::fs::create_dir_all(target.join("outer/inner")).unwrap();
+        std::fs::write(target.join("outer/inner/artifact"), "planned").unwrap();
+        let outside = root.join("outside");
+        std::fs::create_dir_all(outside.join("inner")).unwrap();
+        std::fs::write(outside.join("inner/artifact"), "keep").unwrap();
+        let plan = checked_plan(&target, None, true, false, &[], false)
+            .unwrap()
+            .unwrap();
+        // The planned parent is swapped for a link to a directory outside the
+        // target. Removal must leave it, not delete through the link.
+        std::fs::rename(target.join("outer"), root.join("outer-moved")).unwrap();
+        symlink(&outside, target.join("outer")).unwrap();
+        let left = remove(&plan).unwrap_err();
+        assert!(left.contains("left"), "{left}");
+        assert_eq!(
+            std::fs::read(outside.join("inner/artifact")).unwrap(),
+            b"keep"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 

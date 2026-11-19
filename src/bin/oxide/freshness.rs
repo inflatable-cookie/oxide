@@ -483,6 +483,7 @@ fn git_command(dir: &Path, args: &[&str]) -> Command {
         .current_dir(dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0");
+    crate::guidance::remove_git_environment(&mut command);
     command
 }
 
@@ -1120,6 +1121,11 @@ fn hash_objects(git: &mut Git, dir: &Path, paths: &[String]) -> Result<Vec<Strin
     }
     if paths.iter().any(|path| path.contains('\n')) {
         return Err("a listed path contains a newline".to_owned());
+    }
+    // A leading double quote is how Git spells a C-quoted name, so a listed
+    // name that starts with one is refused rather than left to Git's quoting.
+    if paths.iter().any(|path| path.starts_with('"')) {
+        return Err("a listed path starts with a double quote".to_owned());
     }
     let list = paths.join("\n") + "\n";
     let output = git.run(
@@ -2370,6 +2376,14 @@ mod tests {
         for path in ["", "/abs", "../x", "a/../b", "a/./b", "a\nb", "."] {
             assert!(!valid_repo_path(path), "{path}");
         }
+    }
+
+    #[test]
+    fn a_double_quoted_stdin_path_is_refused_before_git_runs() {
+        let mut git = Git::new();
+        let refusal = hash_objects(&mut git, Path::new("."), &["\"quoted.txt".to_owned()])
+            .expect_err("a leading double quote must be refused");
+        assert_eq!(refusal, "a listed path starts with a double quote");
     }
 
     #[test]

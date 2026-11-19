@@ -334,13 +334,7 @@ pub(crate) fn create(settings: &Settings, uuid: &str, budget: u64) -> Result<(),
     )?;
     let leaf =
         oxide_storage::lease::managed::create_scratch_leaf(&pool).map_err(|e| e.to_string())?;
-    let control = pool.join("oxide-managed");
-    use std::os::unix::fs::DirBuilderExt;
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&control)
-        .map_err(|e| e.to_string())?;
-    write_document(&control.join("scratch.json"), &binding, 16384, false)?;
+    mark_leaf(&pool, &binding)?;
     publish_record_or_compensate(&leaf, &binding, record_path(&pool), &record)?;
     volume.verify().map_err(|_| "scratch-binding-mismatch")?;
     eprintln!(
@@ -352,6 +346,32 @@ pub(crate) fn create(settings: &Settings, uuid: &str, budget: u64) -> Result<(),
     })
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Write the binding marker into the leaf this invocation has just created
+/// exclusively. A failed write unwinds what it made: the marker, its directory
+/// and, while still empty, the leaf. A leaf that stays is named in the refusal,
+/// because an unmarked leaf makes every later open refuse with `binding-missing`.
+fn mark_leaf(pool: &Path, binding: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let control = pool.join("oxide-managed");
+    let written = fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&control)
+        .map_err(|e| e.to_string())
+        .and_then(|()| write_document(&control.join("scratch.json"), binding, 16384, false));
+    let Err(reason) = written else {
+        return Ok(());
+    };
+    let _ = fs::remove_file(control.join("scratch.json"));
+    let _ = fs::remove_dir(&control);
+    match fs::remove_dir(pool) {
+        Ok(()) => Err(reason),
+        Err(error) => Err(format!(
+            "{reason}; the unmarked leaf {} remains ({error}); remove it before retrying",
+            pool.display()
+        )),
+    }
 }
 
 /// If host publication fails, remove only the leaf still owned by this invocation.
@@ -409,6 +429,25 @@ mod tests {
         )
         .unwrap();
         leaf
+    }
+
+    #[test]
+    fn a_failed_binding_marker_unwinds_the_new_leaf() {
+        let root = fixture();
+        let pool = root.join("pool");
+        let leaf = oxide_storage::lease::managed::create_scratch_leaf(&pool).unwrap();
+        // Over the marker's bound, so the write fails after the directory exists.
+        let oversized = vec![b'x'; 16385];
+        assert_eq!(
+            mark_leaf(&pool, &oversized).unwrap_err(),
+            "identity document exceeds its bound"
+        );
+        assert!(
+            !pool.exists(),
+            "the empty leaf is removed with its marker dir"
+        );
+        drop(leaf);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

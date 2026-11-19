@@ -176,6 +176,16 @@ fn refuse_environment<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<St
     for name in names {
         let reason = match name {
             "CARGO_NET_RETRY" | "CARGO_REGISTRY_TOKEN" => continue,
+            "RUSTC_WRAPPER"
+            | "RUSTC_WORKSPACE_WRAPPER"
+            | "RUSTC"
+            | "RUSTDOC"
+            | "CARGO_BUILD_RUSTC"
+            | "CARGO_BUILD_RUSTC_WRAPPER"
+            | "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
+            | "CARGO_BUILD_RUSTDOC" => {
+                "a compiler wrapper or rustc/rustdoc override the cleanup does not contain"
+            }
             "CARGO_NET_OFFLINE" => "offline mode disables Cargo's cleanup",
             "CARGO_NET_GIT_FETCH_WITH_CLI" => {
                 "net.git-fetch-with-cli runs the git CLI, which the closed HTTP proxy cannot contain"
@@ -713,6 +723,7 @@ pub fn run_cache_clean(args: &[OsString]) -> Result<u8, String> {
     for name in PROXY_ENVIRONMENT {
         cargo.env_remove(name);
     }
+    crate::wrapper::apply(&mut cargo);
     let mut group = process::spawn_group(&mut cargo)?;
     let stderr = group
         .child
@@ -821,6 +832,18 @@ mod tests {
         assert!(refuse("CARGO_SOURCE_CRATES_IO_REPLACE_WITH").is_some());
         assert!(refuse("CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS").is_some());
         assert!(refuse("CARGO_UNSTABLE_GITOXIDE").is_some());
+        for wrapper in [
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "RUSTC",
+            "RUSTDOC",
+            "CARGO_BUILD_RUSTC",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTDOC",
+        ] {
+            assert!(refuse(wrapper).is_some(), "{wrapper} must refuse");
+        }
         for allowed in [
             "CARGO_NET_RETRY",
             "CARGO_REGISTRY_TOKEN",

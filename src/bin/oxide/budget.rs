@@ -12,9 +12,9 @@
 //! closeout. The optional event channel carries typed records for a caller
 //! that wants machine-readable facts; it never controls a timer.
 //!
-//! Commands without budget options behave exactly as before: every helper in
-//! this module returns "unbudgeted" and the existing blocking/`output()`
-//! paths are used unchanged.
+//! Commands without budget options keep their blocking waits: every helper in
+//! this module returns "unbudgeted", and child capture differs only in that
+//! the output cap and read-error refusal apply there too.
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -819,9 +819,9 @@ pub fn sigpipe_ignored() -> bool {
 // ---------------------------------------------------------------------------
 // Locking under a deadline
 
-/// Take an exclusive `flock`, honouring the admission window. Unbudgeted
-/// commands keep the existing blocking call; budgeted ones poll the existing
-/// nonblocking primitive so an expired window never waits forever.
+/// Take an exclusive `flock`, honouring the admission window. Every command
+/// polls the nonblocking primitive, so no wait outlives the admission window or,
+/// when no window was given, [`UNBUDGETED_LOCK_BOUND`].
 pub fn lock(file: &std::fs::File, what: &str) -> Result<(), String> {
     bounded_lock(file, what, admission_deadline(), UNBUDGETED_LOCK_BOUND)
 }
@@ -877,11 +877,13 @@ pub struct Output {
 
 const OUTPUT_CAP: u64 = 16 * 1024 * 1024;
 
-/// Run a preparation child bounded by the remaining admission window. Without
-/// a budget this is exactly `Command::output()`. With one, the child runs as
-/// its own group so a stop reaches exactly what this step started, then TERM,
-/// grace, KILL, positive reap, reader settlement and group closure all fit
-/// inside the same window.
+/// Run a preparation child bounded by the remaining admission window. Both
+/// paths capture stdout and stderr under the same [`OUTPUT_CAP`] and fail, not
+/// succeed with empty output, when a stream cannot be read. With a budget the
+/// child runs as its own group so a stop reaches exactly what this step started.
+/// The window closes at TERM: the stop then adds up to [`GRACE`] before KILL and
+/// up to [`CLOSE_BOUND`] for reader settlement and group closure, so a stopped
+/// step can end about `GRACE + CLOSE_BOUND` after the admission deadline.
 pub fn output(command: &mut Command) -> std::io::Result<Output> {
     run(command, None)
 }
@@ -891,34 +893,36 @@ pub fn output_with_stdin(command: &mut Command, input: Vec<u8>) -> std::io::Resu
     run(command, Some(input))
 }
 
+/// One stream's capture: which stream (0 stdout, 1 stderr) and its bytes, or
+/// the reason it could not be read.
+type Captured = (u8, Result<Vec<u8>, String>);
+
 fn run(command: &mut Command, input: Option<Vec<u8>>) -> std::io::Result<Output> {
     let deadline = admission_deadline();
-    if deadline.is_none() {
-        if let Some(input) = input {
-            command
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            let mut child = command.spawn()?;
-            if let Some(mut stdin) = child.stdin.take() {
-                std::thread::spawn(move || {
-                    let _ = stdin.write_all(&input);
-                });
-            }
-            let output = child.wait_with_output()?;
-            return Ok(Output {
-                status: output.status,
-                stdout: output.stdout,
-                stderr: output.stderr,
-            });
-        }
-        let output = command.output()?;
-        return Ok(Output {
-            status: output.status,
-            stdout: output.stdout,
-            stderr: output.stderr,
-        });
+    if deadline.is_some() {
+        // The child runs as its own group so a stop reaches exactly what this
+        // step started.
+        command.process_group(0);
     }
+    let mut child = spawn_captured(command, input)?;
+    let receiver = read_streams(&mut child);
+    let Some(deadline) = deadline else {
+        let status = child.wait()?;
+        let [stdout, stderr] = settle(&receiver, None)?;
+        return Ok(Output {
+            status,
+            stdout,
+            stderr,
+        });
+    };
+    supervise(child, &receiver, deadline)
+}
+
+/// Spawn with both streams captured and `input`, if any, fed on a helper thread.
+fn spawn_captured(
+    command: &mut Command,
+    input: Option<Vec<u8>>,
+) -> std::io::Result<std::process::Child> {
     command
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -927,15 +931,18 @@ fn run(command: &mut Command, input: Option<Vec<u8>>) -> std::io::Result<Output>
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.process_group(0).spawn()?;
-    if let Some(bytes) = input {
-        if let Some(mut stdin) = child.stdin.take() {
-            std::thread::spawn(move || {
-                let _ = stdin.write_all(&bytes);
-            });
-        }
+    let mut child = command.spawn()?;
+    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
     }
-    let id = i32::try_from(child.id()).unwrap_or(0);
+    Ok(child)
+}
+
+/// Drain both captured streams on helper threads, each under the output cap.
+fn read_streams(child: &mut std::process::Child) -> mpsc::Receiver<Captured> {
+    let (sender, receiver) = mpsc::channel();
     let streams: [(u8, Option<Box<dyn Read + Send>>); 2] = [
         (
             0,
@@ -952,22 +959,27 @@ fn run(command: &mut Command, input: Option<Vec<u8>>) -> std::io::Result<Output>
                 .map(|stream| Box::new(stream) as Box<dyn Read + Send>),
         ),
     ];
-    let (sender, receiver) = mpsc::channel();
     for (which, stream) in streams {
         let sender = sender.clone();
-        match stream {
-            Some(stream) => {
-                std::thread::spawn(move || {
-                    let _ = sender.send((which, read_capped(stream)));
-                });
-            }
-            None => {
-                let _ = sender.send((which, Err("the child stream was not captured".to_owned())));
-            }
-        }
+        std::thread::spawn(move || {
+            let result = match stream {
+                Some(stream) => read_capped(stream),
+                None => Err("the child stream was not captured".to_owned()),
+            };
+            let _ = sender.send((which, result));
+        });
     }
-    drop(sender);
+    receiver
+}
 
+/// Wait for a budgeted child under `deadline`: TERM at the deadline, KILL after
+/// [`GRACE`], then a bounded settlement of the readers and the group.
+fn supervise(
+    mut child: std::process::Child,
+    receiver: &mpsc::Receiver<Captured>,
+    deadline: Instant,
+) -> std::io::Result<Output> {
+    let id = i32::try_from(child.id()).unwrap_or(0);
     let mut status = None;
     let mut term_at = None;
     let mut kill_at = None;
@@ -978,7 +990,7 @@ fn run(command: &mut Command, input: Option<Vec<u8>>) -> std::io::Result<Output>
             break;
         }
         let now = Instant::now();
-        if now >= deadline.unwrap() && term_at.is_none() {
+        if now >= deadline && term_at.is_none() {
             term_at = Some(now);
             signal_group(id, libc::SIGTERM);
         }
@@ -1013,41 +1025,51 @@ fn run(command: &mut Command, input: Option<Vec<u8>>) -> std::io::Result<Output>
             Instant::now().saturating_duration_since(term).as_millis()
         )));
     }
-    let mut buffer = [None, None];
-    let mut settled = 0;
-    let drain_deadline = deadline.unwrap() + CLOSE_BOUND;
-    while settled < 2 {
-        let left = drain_deadline.saturating_duration_since(Instant::now());
-        let wait = if left.is_zero() {
-            Duration::from_millis(1)
-        } else {
-            left
-        };
-        match receiver.recv_timeout(wait) {
-            Ok((which, Ok(bytes))) => {
-                buffer[usize::from(which)] = Some(bytes);
-                settled += 1;
-            }
-            Ok((_, Err(_))) => settled += 1,
-            Err(_) => {
-                return Err(std::io::Error::other(format!(
-                    "the preparation step's output did not settle inside the admission budget (group {id})"
-                )))
-            }
-        }
-    }
+    let captured = settle(receiver, Some(deadline + CLOSE_BOUND));
     if !group_empty(id) {
         return Err(std::io::Error::other(format!(
             "the preparation step's process group {id} did not close inside the admission budget"
         )));
     }
+    let [stdout, stderr] = captured?;
     Ok(Output {
         status,
-        stdout: buffer[0].take().unwrap_or_default(),
-        stderr: buffer[1].take().unwrap_or_default(),
+        stdout,
+        stderr,
     })
 }
 
+/// Both streams' captures, in stream order. A reader failure is an error, never
+/// an empty capture: a child whose output cannot be read has not succeeded.
+fn settle(
+    receiver: &mpsc::Receiver<Captured>,
+    until: Option<Instant>,
+) -> std::io::Result<[Vec<u8>; 2]> {
+    let mut buffer: [Option<Vec<u8>>; 2] = [None, None];
+    for _ in 0..2 {
+        let (which, result) = match until {
+            None => receiver.recv().map_err(|_| {
+                std::io::Error::other("a child output reader ended without a result")
+            })?,
+            Some(until) => {
+                let left = until
+                    .saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(1));
+                receiver.recv_timeout(left).map_err(|_| {
+                    std::io::Error::other(
+                        "the preparation step's output did not settle inside the admission budget",
+                    )
+                })?
+            }
+        };
+        buffer[usize::from(which)] = Some(result.map_err(std::io::Error::other)?);
+    }
+    let [stdout, stderr] = buffer;
+    Ok([stdout.unwrap_or_default(), stderr.unwrap_or_default()])
+}
+
+/// Read one stream to its end, refusing to keep more than [`OUTPUT_CAP`] bytes.
+/// Returning drops the stream, which closes the pipe and breaks the child's writes.
 fn read_capped(mut stream: impl Read) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 8192];
@@ -1685,6 +1707,28 @@ mod tests {
         let result = output(&mut command).expect("a plain child");
         assert!(result.status.success());
         assert_eq!(result.stdout, b"ready");
+    }
+
+    #[test]
+    fn over_cap_child_output_is_refused_on_both_paths() {
+        for budgeted in [false, true] {
+            reset();
+            if budgeted {
+                guard(Options {
+                    admission: Some(Duration::from_secs(30)),
+                    execution: None,
+                    events: None,
+                });
+            }
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "head -c 17000000 /dev/zero"]);
+            let error = output(&mut command).expect_err("an over-cap stream must be refused");
+            assert!(
+                error.to_string().contains("byte cap"),
+                "budgeted={budgeted}: {error}"
+            );
+            reset();
+        }
     }
 }
 

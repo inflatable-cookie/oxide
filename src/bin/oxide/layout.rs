@@ -197,12 +197,13 @@ pub(crate) fn classify(
         profile_member(profile)
     };
     let mut members = Vec::new();
+    let targets = effective_targets(targets, std::env::var("CARGO_BUILD_TARGET").ok());
     if targets.is_empty() {
         members.push(Member {
             name: member.to_owned(),
         });
     } else {
-        for target in targets {
+        for target in &targets {
             if !plain_triple(target) {
                 return Layout::Unknown(format!(
                     "the target {target:?} is not a plain triple, so its profile output directory is not modelled; Oxide does not guess where a JSON target specification or a configured target writes"
@@ -217,6 +218,20 @@ pub(crate) fn classify(
         Ok(declaration) => Layout::Declared(declaration),
         Err(reason) => Layout::Unknown(reason),
     }
+}
+
+/// The targets whose output directories a command writes: its `--target`
+/// values or, when there are none, the `CARGO_BUILD_TARGET` that the slot key
+/// already resolves. Cargo writes that target's outputs under `<triple>/` too,
+/// so ignoring it would classify a directory Cargo never writes.
+fn effective_targets(targets: &[String], environment: Option<String>) -> Vec<String> {
+    if !targets.is_empty() {
+        return targets.to_vec();
+    }
+    environment
+        .filter(|value| !value.is_empty())
+        .into_iter()
+        .collect()
 }
 
 /// Parse repeated `--output <member>` declarations for `oxide exec`, in the
@@ -350,6 +365,31 @@ mod tests {
             panic!("a plain triple must classify");
         };
         assert_eq!(names(&declaration), ["aarch64-apple-darwin/debug"]);
+    }
+
+    #[test]
+    fn a_configured_target_is_the_one_the_layout_names() {
+        let named = |value: &str| Some(value.to_owned());
+        assert_eq!(
+            effective_targets(&[], named("aarch64-apple-darwin")),
+            vec!["aarch64-apple-darwin".to_owned()]
+        );
+        // A `--target` flag wins over the environment, as Cargo's does.
+        assert_eq!(
+            effective_targets(
+                &["x86_64-unknown-linux-gnu".to_owned()],
+                named("aarch64-apple-darwin")
+            ),
+            vec!["x86_64-unknown-linux-gnu".to_owned()]
+        );
+        assert!(effective_targets(&[], None).is_empty());
+        assert!(effective_targets(&[], named("")).is_empty());
+        // A configured JSON specification is refused, not modelled as a triple.
+        let json = effective_targets(&[], named("custom.json"));
+        assert!(matches!(
+            classify("build", Profile::Quick, false, &json),
+            Layout::Unknown(_)
+        ));
     }
 
     #[test]
