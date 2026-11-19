@@ -1,25 +1,28 @@
-//! Final outputs on a permanent drive: one owned checkout `target` link.
+//! Final outputs on a permanent drive: one owned output root and its profile
+//! member links.
 //!
 //! Owning contract: `docs/knowledge/contracts/workflow.md` (Final outputs on
 //! the permanent drive). Ephemeral drive mode keeps today's real
-//! `<checkout>/target`. Permanent mode needs one explicit conversion
-//! ([`adopt`]): `<checkout>/target` becomes an owned symlink pointing at a
-//! real output root outside the pool payload, either
+//! `<checkout>/target`. Permanent mode keeps `<checkout>/target` a real
+//! directory and replaces each positively identified profile member (`debug`,
+//! `release`, `<triple>/debug`, ...) with an owned symlink into one real output
+//! root outside the pool payload, either
 //! `<mount>/oxide-outputs/<label>-<checkout id>/` on the registered volume or
 //! the checkout-local fallback `<checkout>/.oxide-outputs/local/` while the
 //! volume is absent. `CARGO_TARGET_DIR` stays the lexical
 //! `<checkout>/target`, so `target/debug` and the profiles of #106 keep
-//! working.
+//! working. The older whole-target layout made `target` itself a link; it
+//! changes only through [`adopt`]'s explicit journaled migration.
 //!
 //! Nothing is moved, copied or deleted by a transition. Ownership is a marker
 //! inside the root plus a committed receipt in the internal pool's control
 //! directory; a link whose target does not carry this checkout's marker is
 //! foreign and is never followed, adopted, swapped or cleaned through.
 //! Transitions are written ahead: a `prepared` receipt, then the destination
-//! root and marker, then a unique sibling link, then an atomic rename onto
-//! `target`, then the committed receipt. A crash replays only the exact
-//! generations the receipt and the live links name; any contradiction stops
-//! with both roots retained.
+//! root and marker, then a unique sibling link, then an atomic rename onto the
+//! member's own path, then the committed receipt. A crash replays only the
+//! exact generations the receipt and the live links name; any contradiction
+//! stops with both roots retained.
 //!
 //! The owning lock is the internal pool's existing admission lock, together
 //! with the checkout's existing clean/admission barrier: `oxide clean` and
@@ -113,22 +116,25 @@ const PRUNE_INTENT_POSITION: &str = "the recorded intent is kept as evidence; no
 
 const USAGE: &str = "\
 usage: oxide outputs plan      effect-free JSON plan for this checkout (oxide.outputs.plan/2)
-       oxide outputs adopt     explicitly convert <checkout>/target to an owned link
-                               (or upgrade a committed version-1 whole-target receipt)
+       oxide outputs adopt     explicitly convert this checkout's profile members,
+                               or migrate a committed whole-target link
        oxide outputs detach    restore a real <checkout>/target directory; roots are kept
        oxide outputs status    read-only state of this checkout's owned outputs
        oxide outputs prune     explicitly prune roots whose checkout is gone
 
-Permanent drive mode owns one `<checkout>/target` symlink. Its real root is
+Permanent drive mode keeps `<checkout>/target` a real directory and owns one
+symlink per profile member (`debug`, `release`, `<triple>/debug`, ...). Those
+members select their own subpaths of one real root:
 <mount>/oxide-outputs/<project>-<checkout id>/ while the registered volume is
 usable, else the checkout-local fallback <checkout>/.oxide-outputs/local/.
 `plan` and `adopt` never move, copy or delete an existing target directory or
-an arbitrary symlink: a nonempty real target and a foreign symlink refuse
-without any change. Only an explicit `adopt` converts an empty target. A
-missing target converts by `adopt` or on the first leased build of a fresh
-checkout (no receipt of any state) on the registered permanent drive, with
-one notice. `detach` works in either mode: it restores this checkout's real
-target and keeps every root, and automatic conversion never re-links it.";
+an arbitrary symlink: a nonempty real target, a nonempty real member and a
+foreign symlink refuse without any change. Only an explicit `adopt` converts
+an empty real member. A missing target converts by `adopt` or on the first
+leased build of a fresh checkout (no receipt of any state) on the registered
+permanent drive, with one notice. `detach` works in either mode: it restores
+this checkout's real target and keeps every root, and automatic conversion
+never re-links it.";
 
 /// Which real root a link selects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1700,7 +1706,7 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
         .collect::<Result<_, _>>()?;
     match args.as_slice() {
         ["plan"] => plan_command(),
-        ["prune", ..] | ["resolve-intent", ..] => crate::prune::run(
+        ["prune", ..] => crate::prune::run(
             &args
                 .iter()
                 .map(|arg| OsString::from(*arg))
@@ -1963,7 +1969,7 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
             holders
         }
     };
-    let usable = external_choice(context)?;
+    let usable = external_choice_read_only(context)?;
     let next = next_generation;
     let external = usable
         .as_ref()
@@ -2476,13 +2482,17 @@ fn adopt_at(
     process::install_signal_handlers()?;
     let mut waits = WaitAccounting::default();
     let guard = barrier(internal, &context.workspace, &mut waits)?;
-    if let Some(intent) = crate::prune::unsettled_for(&control, &context.checkout_id)? {
-        return Err(format!(
-            "outputs: {}; `adopt` refuses while it is unsettled",
-            unsettled_prune_refusal(&intent)
-        ));
-    }
     let outcome = (|| {
+        // The unsettled intent is read *inside* the guarded closure: the check
+        // must not leave the checkout's clean mark and waiter lock behind (the
+        // barrier is released on every path), and it must still run while no
+        // command in this checkout can settle the intent underneath it.
+        if let Some(intent) = crate::prune::unsettled_for(&control, &context.checkout_id)? {
+            return Err(format!(
+                "outputs: {}; `adopt` refuses while it is unsettled",
+                unsettled_prune_refusal(&intent)
+            ));
+        }
         refuse_unknown_custody(&internal, &context.workspace, "relink")?;
         // Fence a pre-feature Oxide out of both pools before any link, receipt
         // or registry row can be published: an existing receipt may need a
@@ -3783,6 +3793,48 @@ fn remove_marker_backup(root: &Path, backup: &Path, migration: &Migration) -> Re
     }
 }
 
+/// Remove the empty real `<triple>` directories a staged directory holds for
+/// its nested members, after their member links are gone, so the directory
+/// itself can be removed instead of failing `ENOTEMPTY`.
+///
+/// Only one plain component derived from the journal's own member names is
+/// considered, and only while it is still a real, empty directory: the caller
+/// has already proved the whole tree holds exactly this migration's members,
+/// and anything else is left for that caller's explicit failure.
+fn remove_staged_member_ancestors(dir: &Path, members: &[String]) -> Result<(), String> {
+    let mut triples: Vec<&str> = Vec::new();
+    for member in members {
+        if let Some((triple, _)) = member.split_once('/') {
+            if !triples.contains(&triple) {
+                triples.push(triple);
+            }
+        }
+    }
+    for triple in triples {
+        let ancestor = dir.join(triple);
+        match fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if is_real_dir(&metadata) => {
+                let empty = fs::read_dir(&ancestor)
+                    .map_err(|error| format!("cannot read {}: {error}", ancestor.display()))?
+                    .next()
+                    .is_none();
+                if empty {
+                    fs::remove_dir(&ancestor).map_err(|error| {
+                        format!(
+                            "cannot remove the staged member directory {}: {error}",
+                            ancestor.display()
+                        )
+                    })?;
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot inspect {}: {error}", ancestor.display())),
+        }
+    }
+    Ok(())
+}
+
 /// Restore the exact pre-migration state for an uncommitted journal (the
 /// debug-only rollback oracle). The old marker is restored from its pinned
 /// backup, the old target link returns, and the receipt returns to its
@@ -3828,6 +3880,7 @@ fn rollback_migration(
                         format!("cannot remove the migrated member link: {error}")
                     })?;
                 }
+                remove_staged_member_ancestors(&migration.link, &migration.members)?;
                 fs::remove_dir(&migration.link).map_err(|error| {
                     format!(
                         "cannot remove the migrated target directory {}: {error}",
@@ -3931,6 +3984,7 @@ fn rollback_migration(
             fs::remove_file(migration.stage.join(member))
                 .map_err(|error| format!("cannot remove a staged member link: {error}"))?;
         }
+        remove_staged_member_ancestors(&migration.stage, &migration.members)?;
         fs::remove_dir(&migration.stage)
             .map_err(|error| format!("cannot remove the staging directory: {error}"))?;
         sync_directory(&context.workspace)?;
@@ -4056,7 +4110,7 @@ fn adopt_profile_from(
         TargetState::RealEmpty | TargetState::RealNonEmpty if start == Start::Adopt => {}
         TargetState::OwnedLink(root) => {
             return Err(format!(
-                "{action} refused: {} is an owned whole-target link to {}; it is kept exactly as it is. Migrating a whole-target checkout to profile members is a separate journaled transition and is refused by this build",
+                "{action} refused: {} is an owned whole-target link to {}, but no committed whole-target receipt places one there; it is kept exactly as it is. A committed whole-target checkout migrates through `oxide outputs adopt`'s journaled transition, and an unrecorded link is never adopted",
                 context.link().display(),
                 root.display()
             ))
@@ -7416,6 +7470,22 @@ fn release_barrier(store: &Store, guard: CleanGuard) -> Result<(), String> {
 /// Existing declarations route through Barge's location; a legacy read-only
 /// plan observes its platform seam without importing state as a side effect.
 fn external_choice(context: &Context) -> Result<Result<removable::Registration, String>, String> {
+    external_choice_with(context, false)
+}
+
+/// The read-only form `oxide outputs plan` uses: the recorded Barge account is
+/// opened without preparing it, so a plan never creates a directory or takes
+/// the account's lock on its way to an effect-free answer.
+fn external_choice_read_only(
+    context: &Context,
+) -> Result<Result<removable::Registration, String>, String> {
+    external_choice_with(context, true)
+}
+
+fn external_choice_with(
+    context: &Context,
+    read_only: bool,
+) -> Result<Result<removable::Registration, String>, String> {
     use barge::Os;
     let Some(control) = context.control() else {
         return Ok(Err("no removable drive is registered".to_owned()));
@@ -7433,7 +7503,11 @@ fn external_choice(context: &Context) -> Result<Result<removable::Registration, 
     }
     let state = removable::removable_control(control);
     let present = if state.join("barge/areas").is_dir() {
-        let storage = oxide_storage::storage::Storage::open(&state)?;
+        let storage = if read_only {
+            oxide_storage::storage::Storage::open_read_only(&state)?
+        } else {
+            oxide_storage::storage::Storage::open(&state)?
+        };
         let area = storage
             .areas()?
             .into_iter()
@@ -8003,26 +8077,48 @@ fn refuse_tracked_local_root(context: &Context) -> Result<(), String> {
 }
 
 /// Create one owner-only real directory, refusing a symlink or another kind.
+///
+/// A creator that races this call is accepted only on exactly the terms the
+/// first inspection gives: the entry that appeared must be the same real
+/// directory this call would have made, never a symlink, a file or anything
+/// else that a following write would then be redirected through.
 fn create_owned_directory(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if is_real_dir(&metadata) => return Ok(()),
-        Ok(_) => {
-            return Err(format!(
-                "{} exists and is not a real directory; it is never replaced",
-                path.display()
-            ))
-        }
+        Ok(metadata) => return accept_owned_directory(path, &metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
     }
     match fs::create_dir(path) {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // The path was positively absent a moment ago, so this entry was
+            // created between the inspection and the create. It is verified
+            // as the same real directory the create would have produced;
+            // nothing is replaced or chmod'ed through it.
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+            return accept_owned_directory(path, &metadata);
+        }
         Err(error) => return Err(format!("cannot create {}: {error}", path.display())),
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("cannot set permissions on {}: {error}", path.display()))?;
     sync_directory(path.parent().unwrap_or(path))
+}
+
+/// One existing entry is accepted as an owned directory only while it really
+/// is a directory, never a symlink or a file (the same rule
+/// [`ensure_member_ancestors`] applies when it finds a component already
+/// present).
+fn accept_owned_directory(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
+    if is_real_dir(metadata) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} exists and is not a real directory; it is never replaced",
+            path.display()
+        ))
+    }
 }
 
 /// P3: publish the root/2 successor from the PINNED old marker, changing ONLY
@@ -8091,12 +8187,20 @@ fn publish_successor_marker(
         .join(format!(".{MARKER}.tmp-{}", std::process::id()));
     let _ = fs::remove_file(&temp);
     write_private(&temp, &bytes)?;
-    rename_no_replace(&temp, &path).map_err(|error| {
-        let _ = fs::remove_file(&temp);
-        format!("cannot publish the output root marker: {error}")
-    })?;
+    publish_marker_file(&temp, &path)?;
     sync_directory(spec.root())?;
     Ok(successor)
+}
+
+/// Publish one prepared marker file without replacing anything. Both the fresh
+/// root marker and a migration's successor go through the same no-replace
+/// rename: a path that appeared after the caller's inspection is kept exactly
+/// as it is, and the temporary file is removed.
+fn publish_marker_file(temp: &Path, path: &Path) -> Result<(), String> {
+    rename_no_replace(temp, path).map_err(|error| {
+        let _ = fs::remove_file(temp);
+        format!("cannot publish the output root marker: {error}")
+    })
 }
 
 fn create_marker(
@@ -8145,10 +8249,7 @@ fn create_marker(
     let temp = root.join(format!(".{MARKER}.tmp-{}", std::process::id()));
     let _ = fs::remove_file(&temp);
     write_private(&temp, &bytes)?;
-    fs::rename(&temp, &path).map_err(|error| {
-        let _ = fs::remove_file(&temp);
-        format!("cannot publish the output root marker: {error}")
-    })?;
+    publish_marker_file(&temp, &path)?;
     sync_directory(root)?;
     Ok(marker)
 }
@@ -8932,11 +9033,33 @@ pub(crate) fn read_receipt_for_prune(
     read_receipt_with(LegacyReceiptReading::Read, control, checkout, checkout_id)
 }
 
+/// Open one root marker for reading without ever following a symlink, and
+/// return the descriptor whose own metadata every check applies to. The
+/// bytes and the bytes' identity therefore belong to the same inode, so a
+/// path that is swapped for a symlink (or for a different file) between an
+/// inspection and the read is refused instead of read through.
+fn open_marker_file(path: &Path) -> Result<File, String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not an owner marker file", path.display()));
+    }
+    if metadata.len() > MAX_MARKER_BYTES {
+        return Err(format!("{} exceeds its byte limit", path.display()));
+    }
+    Ok(file)
+}
+
 /// The SHA-256 of the exact marker bytes, for the recorded root identity.
 pub(crate) fn marker_digest(root: &Path) -> Result<String, String> {
     let path = root.join(MARKER);
-    let file =
-        File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let file = open_marker_file(&path)?;
     let mut bytes = Vec::new();
     file.take(MAX_MARKER_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -8962,16 +9085,11 @@ pub(crate) fn read_marker_for_prune(root: &Path) -> Result<Marker, String> {
 
 fn read_marker(root: &Path) -> Result<Marker, String> {
     let path = root.join(MARKER);
-    let metadata = fs::symlink_metadata(&path)
+    // O_NOFOLLOW, and the regular-file and byte-limit checks, all apply to the
+    // opened descriptor: a symlink that appears after any earlier inspection
+    // is never followed.
+    let file = open_marker_file(&path)
         .map_err(|error| format!("{} has no readable owner marker ({error})", root.display()))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(format!("{} is not an owner marker file", path.display()));
-    }
-    if metadata.len() > MAX_MARKER_BYTES {
-        return Err(format!("{} exceeds its byte limit", path.display()));
-    }
-    let file =
-        File::open(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut bytes = Vec::new();
     file.take(MAX_MARKER_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -9462,39 +9580,46 @@ struct GitProbe {
 
 /// Whether Git would track a path inside the checkout. A checkout that is
 /// not a work tree has no tracking risk.
+///
+/// Both questions go through the same bounded, hardened probe the first
+/// conversion uses: an inherited `GIT_DIR`/`GIT_WORK_TREE` or config injection
+/// can never redirect the answer, optional locks and prompts are off, and the
+/// probe is time and byte capped. Every failure refuses: unknown is never
+/// permission, so a spawn error or an unusable `rev-parse` answer never
+/// pretends the path is safe.
 fn git_would_track(checkout: &Path, relative: &str) -> Result<bool, String> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(checkout)
-        .args(["check-ignore", "-q", "--", relative])
-        .status();
-    match status {
-        Err(_) => Ok(false),
-        Ok(status) => match status.code() {
-            Some(0) => Ok(false),
-            Some(1) => Ok(true),
-            _ => {
-                let mut probe_command = Command::new("git");
-                probe_command
-                    .arg("-C")
-                    .arg(checkout)
-                    .args(["rev-parse", "--is-inside-work-tree"]);
-                let probe = crate::budget::output(&mut probe_command);
-                match probe {
-                    Ok(probe)
-                        if probe.status.success()
-                            && String::from_utf8_lossy(&probe.stdout).trim() == "true" =>
-                    {
-                        Err(
-                            "git could not decide whether the local output root is ignored; refusing to create it"
-                                .to_owned(),
-                        )
-                    }
-                    Ok(_) => Ok(false),
-                    Err(_) => Ok(false),
-                }
+    git_would_track_with(|args| git_probe(checkout, args, &[], false), relative)
+}
+
+/// The decision half of [`git_would_track`], with the probe injectable so the
+/// fail-closed answers are exercisable without a broken Git installation.
+fn git_would_track_with(
+    probe: impl Fn(&[&str]) -> Result<GitProbe, String>,
+    relative: &str,
+) -> Result<bool, String> {
+    let check = probe(&["check-ignore", "-q", "--", relative])?;
+    match check.code {
+        // A winning ignore rule: Git would not track the path.
+        Some(0) => Ok(false),
+        // Nothing ignores it: inside a work tree Git would track it.
+        Some(1) => Ok(true),
+        // Any other answer is unknown, and only a positively non-work-tree
+        // checkout makes unknown safe. A spawn failure above and an
+        // unusable `rev-parse` answer here both propagate as refusals.
+        _ => {
+            let inside = probe(&["rev-parse", "--is-inside-work-tree"])?;
+            match inside.code {
+                Some(0) if String::from_utf8_lossy(&inside.stdout).trim() == "true" => Err(
+                    "git could not decide whether the local output root is ignored; refusing to create it"
+                        .to_owned(),
+                ),
+                Some(_) => Ok(false),
+                None => Err(
+                    "git could not decide whether the local output root is ignored; refusing to create it"
+                        .to_owned(),
+                ),
             }
-        },
+        }
     }
 }
 
@@ -19663,5 +19788,455 @@ mod tests {
             reservation_retry(&fixture.control, &id, &nonce),
             Err(OutputsError::Corrupt(_))
         ));
+    }
+
+    /// Round 2-A: a refused `adopt` releases the checkout's clean barrier. The
+    /// unsettled-intent check used to early-return between `barrier(...)` and
+    /// `release_barrier(...)`, leaving the clean mark (and its waiter lock)
+    /// recorded for a verb that changed nothing.
+    #[test]
+    fn an_unsettled_prune_intent_releases_the_adopt_barrier() {
+        let fixture = Fixture::new();
+        let store = pool_store(&fixture.root.join("pool"));
+        register_at(&fixture, store.owner_control(), DriveMode::Permanent);
+        let context = Context::new(
+            Some(store.owner_control().to_path_buf()),
+            fixture.checkout.clone(),
+        );
+        crate::prune::seed_test_intent(store.owner_control(), &context.checkout_id, false);
+        let refused = adopt_at(&context, || Ok(Some(store.handle_for_tests()))).unwrap_err();
+        assert!(refused.contains("unsettled"), "{refused}");
+        assert!(
+            crate::store::active_holders(store.owner_control(), &context.workspace)
+                .unwrap()
+                .is_empty(),
+            "the refused adopt left its clean barrier recorded"
+        );
+        // The next attempt finds no leaked mark of its own: it takes the
+        // barrier again and refuses for the same unsettled intent.
+        let again = adopt_at(&context, || Ok(Some(store.handle_for_tests()))).unwrap_err();
+        assert!(again.contains("unsettled"), "{again}");
+    }
+
+    fn probe_answer(code: Option<i32>, stdout: &[u8]) -> GitProbe {
+        GitProbe {
+            code,
+            stdout: stdout.to_vec(),
+        }
+    }
+
+    /// Round 2-A: the local-root ignore question never fails open and always
+    /// asks the hardened probe. A spawn error, an unusable `rev-parse` answer
+    /// and a signalled probe all refuse; only a positively non-work-tree
+    /// checkout makes an unknown check-ignore answer safe.
+    #[test]
+    fn the_local_root_ignore_check_fails_closed() {
+        let asked: std::cell::RefCell<Vec<Vec<String>>> = std::cell::RefCell::new(Vec::new());
+        let record = |args: &[&str]| {
+            asked
+                .borrow_mut()
+                .push(args.iter().map(|arg| (*arg).to_owned()).collect());
+        };
+        let probe =
+            |answer: fn(&[&str]) -> Result<GitProbe, String>| move |args: &[&str]| answer(args);
+
+        // A spawn failure is never "not tracked".
+        let refused = git_would_track_with(
+            probe(|_| Err("cannot run git check-ignore: No such file".to_owned())),
+            ".oxide-outputs/local",
+        )
+        .unwrap_err();
+        assert!(refused.contains("cannot run git"), "{refused}");
+
+        // check-ignore could not decide, and the checkout IS a work tree.
+        let refused = git_would_track_with(
+            probe(|args| match args.first() {
+                Some(&"check-ignore") => Ok(probe_answer(Some(128), b"")),
+                _ => Ok(probe_answer(Some(0), b"true\n")),
+            }),
+            ".oxide-outputs/local",
+        )
+        .unwrap_err();
+        assert!(refused.contains("could not decide"), "{refused}");
+
+        // The rev-parse probe fails to spawn, or dies: unknown, never safe.
+        for answer in [
+            (|_: &[&str]| -> Result<GitProbe, String> {
+                Err("cannot run git rev-parse".to_owned())
+            }) as fn(&[&str]) -> Result<GitProbe, String>,
+            |_: &[&str]| -> Result<GitProbe, String> { Ok(probe_answer(None, b"")) },
+        ] {
+            let refused = git_would_track_with(
+                |args| match args.first() {
+                    Some(&"check-ignore") => Ok(probe_answer(Some(128), b"")),
+                    _ => answer(args),
+                },
+                ".oxide-outputs/local",
+            )
+            .unwrap_err();
+            assert!(
+                refused.contains("cannot run git") || refused.contains("could not decide"),
+                "{refused}"
+            );
+        }
+
+        // Positively outside a work tree: nothing can be tracked.
+        assert!(!git_would_track_with(
+            |args| match args.first() {
+                Some(&"check-ignore") => Ok(probe_answer(Some(128), b"")),
+                _ => Ok(probe_answer(Some(0), b"false\n")),
+            },
+            ".oxide-outputs/local",
+        )
+        .unwrap());
+        // `rev-parse` refusing outside a repository is that same answer.
+        assert!(!git_would_track_with(
+            |args| match args.first() {
+                Some(&"check-ignore") => Ok(probe_answer(Some(128), b"")),
+                _ => Ok(probe_answer(Some(128), b"")),
+            },
+            ".oxide-outputs/local",
+        )
+        .unwrap());
+
+        // The probe is asked with the exact literal separator, and the two
+        // real answers map to tracked/not tracked.
+        asked.borrow_mut().clear();
+        assert!(!git_would_track_with(
+            |args| {
+                record(args);
+                Ok(probe_answer(Some(0), b""))
+            },
+            ".oxide-outputs/local",
+        )
+        .unwrap());
+        assert!(git_would_track_with(
+            |args| {
+                record(args);
+                Ok(probe_answer(Some(1), b""))
+            },
+            ".oxide-outputs/local",
+        )
+        .unwrap());
+        let asked = asked.borrow();
+        assert_eq!(asked.len(), 2);
+        for args in asked.iter() {
+            assert_eq!(
+                args.as_slice(),
+                ["check-ignore", "-q", "--", ".oxide-outputs/local"]
+            );
+        }
+    }
+
+    /// The same question end to end: a real work tree answers from its own
+    /// ignore rules, and a directory outside every work tree has no tracking
+    /// risk.
+    #[test]
+    fn the_local_root_ignore_check_reads_the_checkout_work_tree() {
+        let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        assert!(!git_would_track(&fixture.checkout, ".oxide-outputs/local").unwrap());
+        assert!(!git_would_track(&fixture.checkout, "target/debug").unwrap());
+        assert!(git_would_track(&fixture.checkout, "not-ignored").unwrap());
+        let outside = fixture.root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        assert!(!git_would_track(&outside, ".oxide-outputs/local").unwrap());
+    }
+
+    /// Round 2-A: a rollback removes the `<triple>` directories a nested-member
+    /// migration made in its staging tree. Without that, `fs::remove_dir` on the
+    /// migrated target (or on the staging directory) fails `ENOTEMPTY` and the
+    /// journal can never settle.
+    #[test]
+    fn a_rolled_back_nested_member_migration_removes_its_staged_triple_directories() {
+        let triple = "aarch64-apple-darwin";
+        for phase in ["staged", "swapped"] {
+            let (fixture, legacy) = legacy_checkout();
+            let context = fixture.context();
+            let root = legacy.selected().unwrap().root().to_path_buf();
+            // The root already holds both plain and nested profile pairs, so
+            // the migration links the nested ones one level down.
+            for profile in ["debug", "release"] {
+                fs::create_dir_all(root.join(triple).join(profile)).unwrap();
+            }
+            fs::write(root.join(triple).join("keep-me"), b"peer").unwrap();
+            make_root_one_marker(&fixture, &legacy);
+            context.inject_rollback(phase);
+            let (restored, selected, _) =
+                migrate_layout(&context, &fixture.control, legacy.clone()).unwrap();
+            assert_eq!(restored.layout(), LayoutKind::WholeTarget, "{phase}");
+            assert!(restored.transition.is_none(), "{phase}");
+            assert_eq!(selected.root(), root.as_path(), "{phase}");
+            // The pre-migration whole-target link is back and both journaled
+            // paths are gone, so no staged `<triple>` directory keeps either
+            // one from being removed.
+            let target = fs::symlink_metadata(context.link()).unwrap();
+            assert!(target.file_type().is_symlink(), "{phase}");
+            assert_eq!(fs::read_link(context.link()).unwrap(), root, "{phase}");
+            assert!(
+                fs::symlink_metadata(
+                    fixture
+                        .checkout
+                        .join(format!("{STAGE_PREFIX}{}", legacy.generation + 1))
+                )
+                .is_err(),
+                "{phase}: the staging directory was kept"
+            );
+            assert!(
+                fs::symlink_metadata(
+                    fixture
+                        .checkout
+                        .join(format!("{BACKUP_PREFIX}{}", legacy.generation + 1))
+                )
+                .is_err(),
+                "{phase}: the target backup was kept"
+            );
+            // The root's own nested pairs and their unowned peer are untouched.
+            for profile in ["debug", "release"] {
+                assert!(
+                    fs::symlink_metadata(root.join(triple).join(profile))
+                        .unwrap()
+                        .is_dir(),
+                    "{phase}: {profile} was removed from the root"
+                );
+            }
+            assert_eq!(
+                fs::read(root.join(triple).join("keep-me")).unwrap(),
+                b"peer",
+                "{phase}"
+            );
+        }
+    }
+
+    /// Every path and metadata a tree holds, for the read-only assertions.
+    fn tree_snapshot(root: &Path) -> Vec<(PathBuf, bool, u64, i64, i64)> {
+        let mut entries = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let path = entry.unwrap().path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                let is_directory = metadata.is_dir();
+                entries.push((
+                    path.clone(),
+                    is_directory,
+                    metadata.len(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                ));
+                if is_directory {
+                    pending.push(path);
+                }
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    /// Register a permanent drive at a real, present fixture directory and
+    /// declare the `oxide/pool` area in its Barge account, so the read-only
+    /// plan reaches the account branch instead of the identity seam.
+    fn register_live_volume(fixture: &Fixture) -> (PathBuf, PathBuf) {
+        let mount = fixture.root.join("live-volume");
+        fs::create_dir(&mount).unwrap();
+        let uuid = {
+            use barge::Os;
+            oxide_storage::storage::OxideOs
+                .volume_identity(&mount)
+                .unwrap()
+                .expect("the fixture directory is on a volume with an identity")
+        };
+        let registration = removable::Registration {
+            version: 2,
+            mount_point: mount.clone(),
+            volume_uuid: uuid.clone(),
+            container_uuid: "66666666-7777-8888-9999-000000000000".to_owned(),
+            reserve_bytes: 1,
+            cap_bytes: 1 << 30,
+            quota_bytes: None,
+            capacity_bytes: None,
+            registered_ms: 1,
+            mode: DriveMode::Permanent,
+        };
+        let path = fixture.control.join("removable.json");
+        fs::write(&path, serde_json::to_vec(&registration).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let state = removable::removable_control(&fixture.control);
+        let storage = oxide_storage::storage::Storage::open(&state).unwrap();
+        storage
+            .declare(
+                &oxide_storage::storage::AreaConfig::new("pool", &mount, "pool")
+                    .uuid(Some(uuid))
+                    .folder("oxide-pool/slots")
+                    .reserve_bytes(1)
+                    .floor_bytes(oxide_storage::storage::reserve_floor(1)),
+            )
+            .unwrap();
+        (mount, state)
+    }
+
+    /// Round 2-A: `oxide outputs plan` opens the recorded Barge account
+    /// read-only. It never prepares the account tree or takes its state lock,
+    /// so the plan's effect-free promise holds at the account boundary too.
+    #[test]
+    fn a_plan_never_prepares_or_locks_the_barge_account() {
+        let fixture = Fixture::new();
+        let (mount, state) = register_live_volume(&fixture);
+        let context = Context::new(Some(fixture.control.clone()), fixture.checkout.clone());
+        let before = tree_snapshot(&state);
+
+        let report = plan_report(&context).unwrap();
+
+        assert_eq!(report.mode, "permanent");
+        assert!(
+            report
+                .proposed_root
+                .as_ref()
+                .is_some_and(|root| root.root.starts_with(&mount)),
+            "the plan did not reach the registered volume: {:?}",
+            report.proposed_root
+        );
+        assert_eq!(
+            tree_snapshot(&state),
+            before,
+            "the plan prepared or locked the Barge account"
+        );
+    }
+
+    /// Round 2-A: an owned directory is created owner-only, and an entry that
+    /// already exists (including a creator that raced the create) is accepted
+    /// only while it really is a directory. A symlink or a file is refused,
+    /// never written through.
+    #[test]
+    fn an_owned_directory_accepts_only_a_real_directory() {
+        let fixture = Fixture::new();
+        let created = fixture.root.join(".oxide-outputs");
+        create_owned_directory(&created).unwrap();
+        assert_eq!(
+            fs::metadata(&created).unwrap().mode() & 0o777,
+            0o700,
+            "the created directory is not owner-only"
+        );
+        // An existing real directory is accepted as it is.
+        create_owned_directory(&created).unwrap();
+
+        let real = fixture.root.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = fixture.root.join("link");
+        symlink(&real, &link).unwrap();
+        let file = fixture.root.join("file");
+        fs::write(&file, b"kept").unwrap();
+
+        for path in [&link, &file] {
+            let refused = create_owned_directory(path).unwrap_err();
+            assert!(
+                refused.contains("is not a real directory"),
+                "{}: {refused}",
+                path.display()
+            );
+            assert!(fs::symlink_metadata(path).is_ok(), "the entry was removed");
+        }
+        assert_eq!(fs::read(&file).unwrap(), b"kept");
+        assert_eq!(fs::read_link(&link).unwrap(), real);
+
+        // The race arm accepts exactly the same shapes as the first
+        // inspection, so a creator that appeared between them cannot redirect a
+        // later write.
+        let real_metadata = fs::symlink_metadata(&real).unwrap();
+        accept_owned_directory(&real, &real_metadata).unwrap();
+        for path in [&link, &file] {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            assert!(accept_owned_directory(path, &metadata).is_err());
+        }
+    }
+
+    /// Round 2-A: a root marker is published with a no-replace rename, exactly
+    /// like a migration successor. A marker that appeared after the caller's
+    /// inspection is kept byte for byte instead of being replaced.
+    #[test]
+    fn a_root_marker_is_published_without_replacing_anything() {
+        let fixture = Fixture::new();
+        let temp = fixture.root.join(".oxide-output.json.tmp");
+        let marker = fixture.root.join(MARKER);
+
+        fs::write(&temp, b"new").unwrap();
+        fs::write(&marker, b"incumbent").unwrap();
+        let refused = publish_marker_file(&temp, &marker).unwrap_err();
+        assert!(refused.contains("cannot publish"), "{refused}");
+        assert_eq!(fs::read(&marker).unwrap(), b"incumbent");
+        assert!(!temp.exists(), "the temporary marker was kept");
+
+        // With nothing at the path the same publish succeeds on macOS; the
+        // no-replace rename is unavailable elsewhere.
+        fs::remove_file(&marker).unwrap();
+        fs::write(&temp, b"new").unwrap();
+        assert_eq!(
+            publish_marker_file(&temp, &marker).is_ok(),
+            cfg!(target_os = "macos")
+        );
+        if cfg!(target_os = "macos") {
+            assert_eq!(fs::read(&marker).unwrap(), b"new");
+            assert!(!temp.exists());
+        }
+    }
+
+    /// Round 2-A: reading a marker or hashing its bytes never follows a
+    /// symlink. The checks (regular file, byte cap) apply to the opened
+    /// descriptor, so a swapped path cannot redirect the read.
+    #[test]
+    fn a_marker_read_or_digest_never_follows_a_symlink() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let spec = fixture.local();
+        let marker = ensure_root(&context, &spec, 1).unwrap();
+        let valid = fs::read(spec.root().join(MARKER)).unwrap();
+
+        // A marker path that is a symlink to a VALID marker document: a plain
+        // open would follow it and digest another root's identity.
+        let root = fixture.root.join("root");
+        fs::create_dir(&root).unwrap();
+        let elsewhere = fixture.root.join("elsewhere.json");
+        fs::write(&elsewhere, &valid).unwrap();
+        symlink(&elsewhere, root.join(MARKER)).unwrap();
+        assert!(read_marker(&root).is_err());
+        let refused = marker_digest(&root).unwrap_err();
+        assert!(refused.contains("cannot read"), "{refused}");
+
+        // A directory at the marker path is refused as well, not read.
+        fs::remove_file(root.join(MARKER)).unwrap();
+        fs::create_dir(root.join(MARKER)).unwrap();
+        assert!(read_marker(&root).is_err());
+        assert!(marker_digest(&root).is_err());
+
+        // The real marker this root publishes still reads and digests.
+        assert_eq!(read_marker(spec.root()).unwrap(), marker);
+        assert_eq!(marker_digest(spec.root()).unwrap().len(), 64);
+    }
+
+    /// Round 2-A: the usage text and the unrecorded-link refusal describe the
+    /// current profile layout, and the retired `resolve-intent` verb is gone
+    /// from the dispatch as well as from the text.
+    #[test]
+    fn the_usage_and_refusals_describe_the_current_profile_layout() {
+        assert!(USAGE.contains("profile member"));
+        assert!(!USAGE.contains("version-1 whole-target receipt"));
+        assert!(!USAGE.contains("owns one `<checkout>/target` symlink"));
+        let words = [OsString::from("resolve-intent"), OsString::from("0123")];
+        assert_eq!(run(&words).unwrap_err(), USAGE);
+
+        let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        let spec = fixture.local();
+        ensure_root(&context, &spec, 1).unwrap();
+        fs::remove_dir(context.link()).ok();
+        symlink(spec.root(), context.link()).unwrap();
+        let receipt = Receipt::first_with(
+            &fixture.checkout,
+            &identity::digest(&fixture.checkout.to_string_lossy()),
+            LayoutKind::Profile,
+        );
+        let refused = adopt_profile(&context, receipt).unwrap_err();
+        assert!(!refused.contains("refused by this build"), "{refused}");
+        assert!(refused.contains("journaled transition"), "{refused}");
+        assert!(refused.contains("never adopted"), "{refused}");
     }
 }
