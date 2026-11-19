@@ -238,7 +238,9 @@ fn containing_volume_identity(path: &Path) -> barge::Result<Option<String>> {
             path.display()
         ))
     })?;
-    Ok(facts.uuid)
+    facts.uuid.map(Some).ok_or_else(|| {
+        barge::Error::unknown_state(format!("volume identity at {} has no UUID", path.display()))
+    })
 }
 
 /// Directory backends on Linux use the kernel filesystem ID, not an APFS UUID.
@@ -443,15 +445,19 @@ impl Storage {
     /// away. A drive that comes back under a different identity is refused
     /// when Barge checks its state, never silently re-registered.
     pub fn declare(&self, config: &AreaConfig) -> Result<Area, String> {
-        if self.volume(&config.volume).is_err() {
-            self.register_volume(
-                &config.volume,
-                &config.mount,
-                config.uuid.as_deref(),
-                &config.root_dir,
-                config.reserve_bytes,
-                config.floor_bytes,
-            )?;
+        match self.barge.volume(&config.volume) {
+            Ok(_) => {}
+            Err(error) if error.kind() == barge::ErrorKind::NotFound => {
+                self.register_volume(
+                    &config.volume,
+                    &config.mount,
+                    config.uuid.as_deref(),
+                    &config.root_dir,
+                    config.reserve_bytes,
+                    config.floor_bytes,
+                )?;
+            }
+            Err(error) => return Err(format!("volume {}: {error}", config.volume)),
         }
         let absent = match &config.fallback {
             Some(path) => Absent::Fallback { path: path.clone() },
@@ -1363,6 +1369,16 @@ mod tests {
         let listing = area.list().expect("list");
         assert_eq!(listing.roots.len(), 1);
         assert!(listing.stragglers.is_empty());
+    }
+
+    #[test]
+    fn declare_preserves_volume_read_errors() {
+        let fixture = Fixture::new("storage-corrupt-volumes");
+        let path = fixture._temp.path().join("state/volumes.json");
+        std::fs::write(&path, b"not json").unwrap();
+        let error = fixture.storage.declare(&fixture.pool()).unwrap_err();
+        assert!(error.starts_with("volume Builds:"), "{error}");
+        assert_eq!(std::fs::read(path).unwrap(), b"not json");
     }
 
     #[test]

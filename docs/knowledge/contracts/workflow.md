@@ -503,8 +503,8 @@ paths. The summary says `temp: inherited <path>` or `temp: oxide <path>`.
   lists pools at other known paths as orphaned. Nothing reclaims them.
 - **Explicit release:** `oxide pool recover-interrupted <slot>` releases an
   interrupted slot. `oxide pool release-quarantined <slot> --confirm-writers-stopped`
-  releases a slot quarantined in this boot session, once its writers are stopped.
-  `--dry-run` prints the census and changes nothing.
+  refuses legacy quarantined generations because they lack cooperative Barge
+  hold history; confirmation and `--dry-run` do not change that refusal.
 
 ## Removable build volume
 
@@ -531,8 +531,8 @@ paths. The summary says `temp: inherited <path>` or `temp: oxide <path>`.
   reason.
 - **Surprise removal:** the watchdog stops the running command on removal, and the
   command reports the lost volume. A slot whose writer closure is unknown stays
-  held or quarantined until `recover-interrupted` or `release-quarantined` settles
-  it. A removable slot is flushed before it goes idle. A failed flush retires the
+  held or quarantined. `recover-interrupted` can release an interrupted slot;
+  legacy quarantined generations remain retained. A removable slot is flushed before it goes idle. A failed flush retires the
   slot.
 - **Previous registrations:** a registration under another pool's control root is
   never moved, adopted or removed. `register-removable` refuses while one exists

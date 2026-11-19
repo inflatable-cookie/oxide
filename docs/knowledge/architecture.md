@@ -2,7 +2,7 @@
 
 These are the production ownership constraints agreed by Tom on 2026-10-09,
 applied to the facilities that remain after the 2026-10-18 retirement. The
-proposed user workflow lives in
+shipped user workflow lives in
 [workflow](contracts/workflow.md); the retained lease library semantics live in
 [local lease](contracts/local-lease.md) and the inventory CLI in
 [storage inventory](contracts/storage-inventory.md).

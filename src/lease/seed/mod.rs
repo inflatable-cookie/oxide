@@ -646,9 +646,7 @@ pub fn write_seed_sources(
     }
     remove_orphan_sidecars(&dir, view)?;
     enforce_family_bytes(&dir, bytes.len() as u64, &recipient.slot_id)?;
-    cache
-        .write(&path)
-        .map_err(|_| LeaseError::Io("cannot publish source cache".to_owned()))
+    write_sidecar_bounded(&path, &bytes, crate::seed_source::MAX_CACHE_BYTES as usize)
 }
 
 /// The one bounded, recorded status summary; its facts are descriptive and
@@ -1943,26 +1941,28 @@ fn probe_donor_lock(path: &Path) -> Result<DonorLock, LeaseError> {
             "the donor record lock path is too long",
         ));
     }
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(DonorLock::Missing)
         }
         Err(error) => return Err(io_error(error)),
     };
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_file()
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.file_type().is_file()
         || metadata.uid() != current_uid()
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
     {
         return Err(LeaseError::UnsafePath(
-            "the donor record lock is not an owned regular file",
+            "the donor record lock is not a private owned regular file",
         ));
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(io_error)?;
     // SAFETY: the descriptor is live for the call.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         return Ok(DonorLock::Taken(file));
@@ -2159,7 +2159,11 @@ fn sidecar_bytes(dir: &Path) -> Result<u64, LeaseError> {
 
 /// Atomic owner-only sidecar write: temp, fsync, rename, fsync the directory.
 fn write_sidecar(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
-    if bytes.len() > SEED_CATALOG_MAX_BYTES {
+    write_sidecar_bounded(path, bytes, SEED_CATALOG_MAX_BYTES)
+}
+
+fn write_sidecar_bounded(path: &Path, bytes: &[u8], limit: usize) -> Result<(), LeaseError> {
+    if bytes.len() > limit {
         return Err(LeaseError::LedgerExhausted);
     }
     let parent = path
@@ -2642,4 +2646,34 @@ enum TestPoint<'a> {
     BeforeWalk { slot: &'a Path },
     /// After the walk, before the final ledger recheck.
     BeforeFinalDonorCheck { pool: &'a Path },
+}
+
+#[cfg(test)]
+mod sidecar_regressions {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn donor_lock_rejects_symlink_and_nonprivate_file() {
+        let temp = barge::testing::TempDir::new("oxide-donor-lock").unwrap();
+        let lock = temp.path().join("lock");
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = temp.path().join("alias");
+        symlink(&lock, &alias).unwrap();
+        assert!(probe_donor_lock(&alias).is_err());
+        assert!(matches!(probe_donor_lock(&lock), Ok(DonorLock::Taken(_))));
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(probe_donor_lock(&lock).is_err());
+    }
+
+    #[test]
+    fn source_sidecar_uses_bounded_atomic_writer() {
+        let temp = barge::testing::TempDir::new("oxide-sources-sidecar").unwrap();
+        let path = temp.path().join(SOURCES_NAME);
+        let bytes = br#"{"schema":"example"}"#;
+        write_sidecar_bounded(&path, bytes, crate::seed_source::MAX_CACHE_BYTES as usize).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
 }
