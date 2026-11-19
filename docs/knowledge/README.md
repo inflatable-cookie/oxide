@@ -25,6 +25,6 @@ Each fact has one owning file.
 - [Build-context policy](contracts/build-context-policy.md) owns the proposed build-context semantics. Production policy stays inert.
 - [Nested lease](contracts/nested-lease.md) owns the proposed nested-lease design. It is not implemented; a nested call takes an independent lease today.
 - [Idle exec sessions](contracts/idle-exec-sessions.md) owns the proposed idle-session and run-slot custody design. It is not implemented.
-- [Exec output inference](contracts/exec-output-inference.md) owns the proposed design for `oxide exec` without a declared output. It is not implemented.
+- [Exec output inference](contracts/exec-output-inference.md) owns how `oxide exec` derives a tool's output members without a declared output. The receipt-derived set is implemented; derived link creation stays open in [Q-019](questions.md#q-019--how-should-oxide-exec-know-a-tools-profile-output-members).
 - [Cold-slot seeding](contracts/cold-slot-seeding.md) owns the seeding of a new leased slot from an idle same-volume donor.
 - [One-use workspaces](contracts/one-use-workspaces.md) owns disposable temporary checkouts beside normal slots.

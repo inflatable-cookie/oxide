@@ -91,6 +91,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -1298,17 +1299,20 @@ def _lock_text(rev: str, checksum: str, *, name: str = "seedcrate", version: str
 def self_test(root: Path | str) -> list[dict]:
     """Run the seeder's synthetic cases; return one record per case.
 
-    Each case gets its own fresh directory under `root`. A failure raises
+    Each run makes a fresh directory under `root`, so repeating a run under the
+    same root never reuses fixtures, and each case gets its own directory within
+    it. A failure raises
     `SeedRefusal`/`AssertionError` with the case name so a proof reports it
     rather than claiming the seeder.
     """
     base = Path(root)
     base.mkdir(parents=True, exist_ok=True)
+    run = Path(tempfile.mkdtemp(prefix="run.", dir=base))
     records: list[dict] = []
     deadline = now_ns() + 120 * 1_000_000_000
 
     def case(name: str, body) -> None:
-        directory = base / name
+        directory = run / name
         directory.mkdir(parents=True)
         try:
             detail = body(directory)
@@ -1745,13 +1749,15 @@ def self_test(root: Path | str) -> list[dict]:
 
 def main(argv: list) -> int:
     if len(argv) in (2, 3) and argv[1] == "--self-test":
-        # Without ROOT the cases go under the supervisor's task scratch root, so
-        # the effigy selector runs inside the bounded runner's owned directory.
-        root = argv[2] if len(argv) == 3 else os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
-        if len(argv) == 2 and root:
-            root = os.path.join(root, "offline-seed")
+        # Without ROOT the cases go under the task scratch root when one is set,
+        # else under the temporary directory (TMPDIR), so the selector runs with
+        # no arguments from a fresh checkout.
+        if len(argv) == 3:
+            root = argv[2]
+        else:
+            root = os.path.join(os.environ.get("OXIDE_TASK_SCRATCH_ROOT") or tempfile.gettempdir(), "offline-seed")
         if not os.path.isabs(root):
-            print("the self-test root must be absolute (ROOT, or an absolute OXIDE_TASK_SCRATCH_ROOT)", file=sys.stderr)
+            print("the self-test root must be absolute (ROOT, or an absolute OXIDE_TASK_SCRATCH_ROOT or TMPDIR)", file=sys.stderr)
             return 2
         records = self_test(root)
         for record in records:

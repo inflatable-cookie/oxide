@@ -42,7 +42,6 @@ tasks` lists the live set.
 - `rust:compile`: `oxide check --workspace --all-targets --locked`.
 - `rust:compile-release`: release compile of the binaries with `RUSTFLAGS='-D warnings'`.
 - `rust:format` / `rust:format-write`: check / apply formatting.
-- `rust:compile-linux`: offline compile for the already-installed Linux target; no link or run.
 - `rust:barge-adoption-linux`: compile all targets for that target; no link or run.
 - `rust:tree-duplicates`: duplicate packages in the normal dependency closure.
 - `rust:barge-adoption`: the covering ordinary workspace unit and integration suite.

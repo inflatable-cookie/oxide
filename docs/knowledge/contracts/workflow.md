@@ -4,8 +4,8 @@ This contract states how `oxide` behaves today. The implementation is
 `src/bin/oxide/`, built on the lease library in `src/lease/`. Storage ownership
 (volumes, roots, holds, pins, eviction and trash) belongs to Barge; see the
 [Barge adoption contract](barge-adoption.md). The lease, ledger and eviction
-rules are in [local lease](local-lease.md), and accounting is in
-[storage inventory](storage-inventory.md). Agent guidance lives in
+rules, and per-slot accounting, are in [local lease](local-lease.md); the
+read-only inventory diagnostic is in [storage inventory](storage-inventory.md). Agent guidance lives in
 [the oxide skill](../../../skills/oxide/SKILL.md). Release and local install
 policy is in [release](release.md).
 
@@ -151,7 +151,7 @@ digest and the receipt digest are reported under separate labels.
   paths in them. A ledger without a directory field works unchanged.
 - Eviction removes only the slot directory. Project folders are left in place.
 - A slot holds Cargo's build directory, the child temporary directory (see
-  [temporary files](#inherited-rustc-wrapper)) and the slot's
+  [temporary files](#child-temporary-files)) and the slot's
   compile origin record.
 
 ### Choosing a slot and waiting
@@ -868,9 +868,8 @@ proof ladders, reviewer-native sessions or qualification selectors exist.
   platform inputs that otherwise need boot-volume paths. Their file operations stay
   in the private fixture. Crash recovery, deletion and removable-media behaviour are
   covered by ordinary regression tests.
-- Linux: `rust:compile-linux` checks offline for the installed target.
-  `rust:barge-adoption-linux` compiles all targets, including the Linux pool
-  regression. It makes no link or runtime claim.
+- Linux: `rust:barge-adoption-linux` compiles all targets offline for the installed
+  target, including the Linux pool regression. It makes no link or runtime claim.
 - Other surviving selectors: `rust:tree-duplicates`, `dogfood:scripts:test` (the
   installer's synthetic install, rollback and canary cases, including the three canary
   modes with a fake staged binary and a check that the format-change run never names

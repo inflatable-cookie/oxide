@@ -25,7 +25,7 @@ Oxide aims to make Rust development easy and light: predictable storage, less bu
 - [Build-context policy](knowledge/contracts/build-context-policy.md): proposed context semantics; production policy inert.
 - [Cold-slot seeding](knowledge/contracts/cold-slot-seeding.md): seeding a new slot from an idle donor.
 - [Idle exec sessions](knowledge/contracts/idle-exec-sessions.md): proposed design for idle sessions and run-slot custody; not implemented.
-- [Exec output inference](knowledge/contracts/exec-output-inference.md): proposed design removing the `exec --output` declaration; not implemented.
+- [Exec output inference](knowledge/contracts/exec-output-inference.md): `oxide exec` derives a tool's output members from the receipt; derived link creation is not implemented.
 - [One-use workspaces](knowledge/contracts/one-use-workspaces.md): disposable checkouts beside normal slots; the lease-library states are implemented but dormant, and admission is not active.
 - [Nucleus core reuse](knowledge/contracts/nucleus-core-reuse.md) and [Nucleus input roots](knowledge/contracts/nucleus-input-roots.md): condensed historical records.
 - [Release contract](knowledge/contracts/release.md): publication restrictions.

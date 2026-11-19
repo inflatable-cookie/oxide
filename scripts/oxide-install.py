@@ -619,6 +619,7 @@ def exercise(built, environment, scratch, scratch_id, payload, arguments, closur
     crate = Path(tempfile.mkdtemp(prefix="oxide-canary.", dir=scratch))
     created = directory_identity(crate)
     missed_limits = []
+    cleanup_refusal = None
     try:
         (crate / "src").mkdir()
         (crate / "target").mkdir()  # Keep final output local in permanent mode.
@@ -648,13 +649,20 @@ def exercise(built, environment, scratch, scratch_id, payload, arguments, closur
             elif slot != cold_slot:
                 raise Refusal("warm check used a different slot")
     finally:
+        # A raise here would replace an exception already in flight, so the
+        # refusal is recorded and raised only after a clean finish.
         if closure["safe"]:
             if directory_identity(scratch) != scratch_id or directory_identity(crate) != created:
-                raise Refusal(f"the canary crate or its scratch directory changed; skipped cleanup of {crate}")
-            shutil.rmtree(crate)
+                cleanup_refusal = f"the canary crate or its scratch directory changed; skipped cleanup of {crate}"
+            else:
+                shutil.rmtree(crate)
         else:
             print(f"Canary crate cleanup skipped because writer closure is unconfirmed: {crate}",
                   file=sys.stderr)
+        if cleanup_refusal is not None:
+            print(cleanup_refusal, file=sys.stderr)
+    if cleanup_refusal is not None:
+        raise Refusal(cleanup_refusal)
     if missed_limits:
         raise Refusal(", ".join(missed_limits))
 
@@ -1084,6 +1092,15 @@ def rollback(directory, check=False):
           "or has older format capabilities.")
 
 
+def remove_staging(path):
+    """Remove a build staging directory. A failure is reported, not raised, so it
+    cannot replace the install's own outcome."""
+    try:
+        shutil.rmtree(path)
+    except OSError as error:
+        print(f"staging {path} not removed: {error}", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--pin", help="commit on origin main (default: OXIDE_INSTALL_PIN, else its tip)")
@@ -1114,6 +1131,7 @@ def main():
     )) or (not arguments.canary and arguments.format_change):
         parser.error("--new-seconds, --warm-seconds, --scratch-root and --format-change require --canary")
     started = datetime.datetime.now(datetime.timezone.utc)
+    staging = None
     try:
         if arguments.rollback:
             if arguments.pin is not None or arguments.require_canary:
@@ -1182,7 +1200,9 @@ def main():
             raise
         print(f"oxide:canary FAIL: {error or 'interrupted'}", file=sys.stderr)
         return 1
-    shutil.rmtree(staging)
+    finally:
+        if staging is not None:
+            remove_staging(staging)
     return 0
 
 

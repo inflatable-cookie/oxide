@@ -38,10 +38,6 @@ Open in part. The design direction (non-reserving, cancellable waiting, advisory
 
 Open. The consumer boundary and first core-test contract are in [Nucleus core reuse](contracts/nucleus-core-reuse.md). Open gates: an installed, authenticated Oxide binding; a qualified source pool; agreement on the opt-in, allocation epochs, bounded retention and exact source identity before root recycling; third-party and native input audit; and a successful live recovery. Storage busy creates no host run.
 
-## Q-015 — What does the foundation workflow need settled before implementation?
-
-Open decisions W-1 to W-8 (default pool, waiting and concurrency, project file, crash-recovery qualification, Linux backend, command naming and the cross-checkout freshness gate) are listed in [workflow](contracts/workflow.md). Retirement execution and crash-recovery direction are settled.
-
 ## Q-016 — How should Oxide proceed after the #086 no-go?
 
 Paused. Tom paused the build-script skip path and withdrew its readers ([vision](vision.md#product-workflow-direction), 2026-10-19). No skip or reader coverage is admitted. The shipped freshness gate is qualified on the Cargo pins listed in the [workflow matrix](contracts/workflow.md#cargo-version-matrix); future Rust qualification covers those shipped features only. The #086 normal-path overhead result is a final no-go.
@@ -56,7 +52,7 @@ Implemented as the frozen v1 budget contract in [workflow](contracts/workflow.md
 
 ## Q-019 — How should `oxide exec` know a tool's profile output members?
 
-Open leanings, not settled. The design in [exec output inference](contracts/exec-output-inference.md) derives the member set from the checkout's committed placement, so `--output` need not be declared. Open: whether a derived member may ever be newly linked (this needs a keyed reservation and a custody change), whether a derived set may exceed the eight-member declaration cap, and whether a later slice adds a `cargo` launcher guard. No code is activated by the design.
+Open, narrowed. The receipt-derived member set is implemented: [exec output inference](contracts/exec-output-inference.md) derives it from the checkout's committed placement, so `--output` need not be declared. Still open: whether a derived member may ever be newly linked (this needs a keyed reservation and a custody change), whether a derived set may exceed the eight-member declaration cap, and whether a later slice adds a `cargo` launcher guard.
 
 ## Q-020 — How should nested Oxide lease joining and permit borrowing work?
 
@@ -64,7 +60,7 @@ Open. The proposal is in [nested lease](contracts/nested-lease.md) and is not im
 
 ## Q-021 — How should Oxide's output roots move to Barge?
 
-Open, with a proposed design in [Barge adoption](contracts/barge-adoption.md). Operator choices remain: the Builds root directory, whether outputs reserve space, release from maintenance, handling of the 91 legacy roots, parity differences D-1 and D-2, pool-slot ownership, declaration authority, and whether to run the read-only census first. Barge-side gaps need the Barge owner's ruling first.
+Open. The lean boundary is recorded in [Barge adoption](contracts/barge-adoption.md). The operator choices this entry used to list are no longer in that contract, so the planner must restate them before a ruling.
 
 ## Q-022 — Can a held zombie establish its group's lifetime?
 
