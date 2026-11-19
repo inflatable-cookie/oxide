@@ -154,7 +154,13 @@ fn main() -> ExitCode {
         return ExitCode::from(code);
     }
     process::started_ms();
-    match run(std::env::args_os().skip(1).collect()) {
+    let result = run(std::env::args_os().skip(1).collect());
+    if store::writer_updated() {
+        let refusal = oxide_storage::lease::LeaseError::WriterUpdated;
+        eprintln!("oxide: {refusal}");
+        return ExitCode::from(refusal.exit_code());
+    }
+    match result {
         Ok(code) => ExitCode::from(code),
         Err(message) => {
             eprintln!("oxide: {message}");

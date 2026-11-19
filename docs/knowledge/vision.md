@@ -4,7 +4,7 @@ Current truth only: Oxide's purpose, direction, ownership and standing authority
 Shipped behaviour lives in the [contracts](contracts/workflow.md). Research lives in
 the [Rust DX landscape](rust-dx-landscape.md). Open questions live in
 [questions](questions.md). Plans, briefs and one-off operational rulings live in
-Queue, whose decisions record Tom's exact words. This file was condensed on
+Nucleus, whose decisions record Tom's exact words. This file was condensed on
 2026-10-21. The dated ruling log it held from 2026-10-09 to 2026-10-21 is
 preserved in git at commit `ecf379e`.
 
@@ -17,14 +17,14 @@ experience. Ease of use is the primary product axis. Shared caching is the
 first step, not the ceiling.
 
 The immediate problem is build churn and disk use. Every fresh project or
-worktree, especially under Paseo with Queue, recreates Rust target directories
+worktree, especially under Paseo with Nucleus, recreates Rust target directories
 and repeats expensive work. Tom's laptop SSD is soldered and non-replaceable,
 so sustained writes to it are the cost to cut. Causes and write volumes are
 measured rather than assumed.
 
 ## Intended experience
 
-- **Who it's for:** Tom's everyday Queue-driven development first, where worker
+- **Who it's for:** Tom's everyday Nucleus-driven development first, where worker
   agents contend for resources and duplicate builds. Eventually anyone who
   develops in Rust.
 - **What it should feel like:** open a project or a fresh worktree, get fast
@@ -84,9 +84,9 @@ An upstream roadmap is never a reason to defer today's relief.
   enters its core (Tom, 2026-10-09). The approved
   [program fallback](#adoption-pattern) is a generic Effigy mechanism, not
   Oxide logic in Effigy.
-- **Queue, and later Nucleus,** own tasks, agents, scheduling and admission,
+- **Nucleus, and later Nucleus,** own tasks, agents, scheduling and admission,
   plus workspace, run and source identity. Oxide never changes Contract 010.
-- **Product architecture** belongs to the appointed Oxide Supervisor; Queue
+- **Product architecture** belongs to the appointed Oxide Supervisor; Nucleus
   operations belong to the operations planner.
 
 ## Product workflow direction
@@ -209,7 +209,7 @@ operator instruction; the general lean reset is not deletion authority.
   authorizes the independently reviewed Normal-only policy: Cargo may encounter
   descendant symlinks or nested mounts without a pregrant scan. Oxide remains a
   cooperative root-bound lease, not a descendant sandbox. Implementation and
-  targeted verification proceed through the scoped Queue brief and independent
+  targeted verification proceed through the scoped Nucleus brief and independent
   review; the ruling itself establishes no runtime or QA readiness.
 - **Internal pool:** `~/Dev/oxide`, with a 100 GB budget. Config follows
   Longhorn's storage-location policy, through Longhorn's own resolver.
@@ -275,7 +275,7 @@ operator instruction; the general lean reset is not deletion authority.
   ([placement](contracts/workflow.md#temporary-scratch-placement)). Internal-
   placement proofs may declare an explicit internal root as the owner-accepted
   narrow exception, with their fixtures beside the pool, never inside it. Both
-  cover Oxide-owned scratch only: CI, Queue worktrees, containers and host
+  cover Oxide-owned scratch only: CI, Nucleus worktrees, containers and host
   settings stay as they are.
 - **Leftover output roots** of checkouts that no longer exist are removed
   only by an explicit `oxide outputs prune`, never automatically.
@@ -296,7 +296,7 @@ operator instruction; the general lean reset is not deletion authority.
   - broader submodule-aware cross-worktree reuse beyond the narrow
     two-state coverage in the workflow contract.
 
-  Details live in their Queue leads and, once built, in the
+  Details live in their Nucleus leads and, once built, in the
   [workflow contract](contracts/workflow.md).
 - **Implemented, native held: cold-slot seeding** (oxide#169): a fresh slot
   is warmed once from matching plain registry library compile units of an idle
@@ -327,10 +327,10 @@ operator instruction; the general lean reset is not deletion authority.
 - **The fallback to Cargo is Effigy's,** through a generic per-program
   fallback that Effigy owns and documents. It replaces per-selector `:cargo`
   escapes and project-side CI switches. Oxide ships no CI shim.
-- **Projects switch by standing rule:** a Rust project switches when Queue
+- **Projects switch by standing rule:** a Rust project switches when Nucleus
   next starts a task in it, and every project with a Paseo workspace is
   switching now. Each project's planner owns its change. Projects on Oxide
-  are tracked in Queue. Nucleus adoption is off.
+  are tracked in Nucleus. Nucleus adoption is off.
 - **Only genuine Cargo uses stay on Cargo:** container or VM guest builds,
   CI, tools that insist on their own target dir, and tests of Cargo itself.
 
@@ -347,13 +347,7 @@ operator instruction; the general lean reset is not deletion authority.
 
 ## Validation policy
 
-Tom's 2026-11-17 lean reset, implemented by oxide#314, uses ordinary bounded
-unit/integration tests on private fixtures and retained independent exact-head
-review for the linked Barge adoption. It removes the supplier/capture/native
-qualification ladders for that change. Existing shared-runner safeguards and
-unrelated product verification stay. Installation and live migration remain
-separate owner actions; old evidence is historical, with no transferred credit.
-
+Tom's 2026-11-17 lean reset ("simplify this across all three projects… without all the ceremony") is the current validation policy for all Oxide work: ordinary bounded unit/integration tests on private fixtures and one independent exact-head review. No native-proof, reviewer-native, diagnostic or qualification ladder is required. Installation and live migration remain separate owner/planner actions. Before installing a storage-affecting binary, time one real admission on the live pool (2026-11-18 incident, decision `d9f8839e`). The rulings below are history; their evidence keeps no transferred credit.
 
 Tom decision `ea8ee47f-adc0-4cd3-b420-aaa30642d623` v2 (2026-11-16)
 adopts the reviewed cooperative qualification contract (retired 2026-11-18)
@@ -393,7 +387,7 @@ state, not readiness.
 Tom decision `49a06e97-ef58-46e4-9cf8-e5ecece6685e` v2 (2026-11-17,
 09:55:46Z) selects the common-clock foundation first: at most one bounded
 source implementation PR in Nucleus and one in Effigy, each through an
-approved Queue brief and independent exact-head review. Before authoring, the
+approved Nucleus brief and independent exact-head review. Before authoring, the
 owners must agree the source-supported clock API, domain, units, boot/origin
 identity, original first-effect origin/ceiling and refusal rules. The original
 `CLOCK_UPTIME_RAW` policy stays; no assumed conversion or fresh clock is
@@ -429,7 +423,7 @@ external envelope, supplier, custody/census certification and capture-delivery
 contracts are no longer prerequisites. The earlier cooperative target (retired 2026-11-18)
 is historical. Keep actual supervisor behavior tests, ordinary source/evidence
 review and honest run outcomes; source/native work follows the selected scoped
-Queue brief without further design tranches. Cleanup means obsolete source and
+Nucleus brief without further design tranches. Cleanup means obsolete source and
 documentation here, with earlier receipts, failures, charges and retained
 resources preserved. Consumer changes and historical-resource cleanup are not
 implied by this direction.
@@ -440,7 +434,7 @@ existing 309 task. Replace its qualification bootstrap with a small ordinary
 Effigy entrypoint, retire the cross-project machinery and keep supervisor
 behavior tests. The author runs the complete remaining suite with
 `EFFIGY_RUN_DEADLINE_MS=600000`; the retained reviewer judges the exact source
-and actual evidence, then Queue merges on PASS and accepted review. For 309
+and actual evidence, then Nucleus merges on PASS and accepted review. For 309
 this replaces the separate diagnostic/counted-author/counted-reviewer ladder;
 there are no further design rounds.
 
@@ -472,7 +466,7 @@ the operating rules.
   reported, not gated.
 - **Proof authoring guidance** (product architect, 2026-10-24; diagnostic
   requirement strengthened 2026-10-25): briefs that author or correct a native
-  proof script, its fixtures or its oracles declare **HIGH** complexity. Queue
+  proof script, its fixtures or its oracles declare **HIGH** complexity. Nucleus
   still selects the models. Before the first counted native, the author must
   execute a separately activated, **uncounted diagnostic** of the fixed proof.
   Use its existing safe keep-going mode; if none exists, add a minimal opt-in
@@ -501,7 +495,7 @@ the operating rules.
     relabelled as diagnostics. Changed proof inputs need the applicable
     diagnostic and review before their counted activation.
 - **Mechanical native-evidence gates** (Supervisor, 2026-10-23): every Oxide
-  brief requiring counted native evidence encodes it in Queue before
+  brief requiring counted native evidence encodes it in Nucleus before
   promotion. Use `reviewVerdicts: true` with a `reviewPassGate` subject such
   as `exact_head_native_evidence`, and/or a `mergeHold` pending that evidence.
   An owner releases the hold only after verifying the required receipts and
@@ -526,11 +520,11 @@ the operating rules.
 - **Standing correction authority** (Tom, 2026-10-10, "Go for it. You have
   blanket approval, you don't need to keep asking me"):
   - covers routine Oxide-only corrections and equivalent bounded retries,
-    through scoped Queue briefs and independent review;
+    through scoped Nucleus briefs and independent review;
   - never resets a running clock or enlarges caps silently;
   - doesn't turn uncertainty into release, or allow evading a host-tool
     denial.
-- **Model routing:** briefs declare task complexity; Queue selects the author
+- **Model routing:** briefs declare task complexity; Nucleus selects the author
   and reviewer models.
 - **Shared recovery simplicity** (Tom, 2026-11-10, decision
   `1d4a7aee-a8e6-4a75-96f0-b142c4176db2` v2): Oxide and Barge must both
@@ -599,6 +593,6 @@ the operating rules.
   - material scope changes.
 - **Nucleus:** never prompt or change active Nucleus work.
 - **Recording rulings:**
-  - Queue decisions record Tom's exact words.
+  - Nucleus decisions record Tom's exact words.
   - A ruling that changes current truth updates its owning knowledge file.
-  - A purely operational ruling stays in Queue.
+  - A purely operational ruling stays in Nucleus.

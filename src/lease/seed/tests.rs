@@ -489,6 +489,10 @@ impl Rig {
         if version >= 9 {
             state["holding"] = serde_json::json!(super::super::CONTROL_HOLDING_FENCE);
         }
+        if version >= super::super::control::WRITER_STATE_VERSION {
+            state["minimum_writer_generation"] =
+                serde_json::json!(super::super::control::WRITER_GENERATION);
+        }
         let path = control.join("state.json");
         fs::write(&path, serde_json::to_vec(&state).expect("control json")).expect("control state");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("state mode");

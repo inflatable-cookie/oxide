@@ -1,0 +1,1 @@
+Recorded the lean validation policy for all Oxide work in AGENTS.md and vision: ordinary tests plus one independent exact-head review, with no native-proof or reviewer-native ladders; older tier and supervisor rules are history.
