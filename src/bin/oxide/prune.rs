@@ -1542,17 +1542,33 @@ fn output_id(selected: &Selected) -> String {
 /// Re-pin an already owned Barge identity without using mutable Oxide marker
 /// fields as new storage authority. A first import requires the Oxide marker
 /// and selection to agree; a retired ID can never re-import its former path.
-/// An imported output root. `pinned` is true only when the Barge inventory
-/// that identified the root already showed a pin, so the caller can skip the
-/// pin write. Every other path reports `false` and pins.
+/// An imported output root. `pinned` is true only when Barge already protects
+/// the root: its inventory showed a pin, or its pin record is present. The
+/// caller then skips the pin write; every other case reports `false` and pins.
 struct Imported {
     area: barge::Area,
     id: String,
     pinned: bool,
 }
 
-/// Pin a selected root unless the inventory that identified it showed a pin.
-/// A second pin only rewrites the pin record and its timestamp.
+/// Whether Barge's durable pin record exists for a root. Barge keeps it at
+/// `<root parent>/.barge/pins/<id>.json` and counts its presence as a pin.
+/// That layout is Barge-private, so a test pins through Barge and checks this
+/// reader against it. Only a positively present record answers `true`; a
+/// missing or unreadable one answers `false`, so the caller pins again.
+fn pin_record_exists(root: &Path, id: &str) -> bool {
+    let Some(parent) = root.parent() else {
+        return false;
+    };
+    let record = parent
+        .join(".barge")
+        .join("pins")
+        .join(format!("{id}.json"));
+    fs::symlink_metadata(record).is_ok()
+}
+
+/// Pin a selected root unless Barge already protects it. A second pin only
+/// rewrites the pin record and its timestamp.
 fn pin_selected(imported: &Imported) -> Result<(), String> {
     if imported.pinned {
         return Ok(());
@@ -1594,12 +1610,10 @@ fn import_output(
         if root.path != selected.root() {
             return Err("the recorded Barge output ID moved".to_owned());
         }
-        // This path reads no inventory, so it cannot know the pin state.
-        return Ok(Imported {
-            area,
-            id,
-            pinned: false,
-        });
+        // This path reads no inventory. Its pin state comes from the pin
+        // record's presence alone, which is cheap and never a listing.
+        let pinned = pin_record_exists(&root.path, &id);
+        return Ok(Imported { area, id, pinned });
     }
     // The Barge marker and account can already own this path even before
     // its first Oxide index row is committed. Re-pinning it is conservative;
@@ -2506,5 +2520,59 @@ mod plan_identity_tests {
         let fresh = import(&plain);
         assert_eq!(fresh.id, plain.id);
         assert!(!fresh.pinned);
+    }
+
+    /// The pin-record reader follows Barge's own pin and unpin. If Barge moves
+    /// its record, this fails before a skip could trust a stale answer.
+    #[test]
+    fn the_pin_record_reader_agrees_with_barge_pins() {
+        let Fixture { _temp, area, .. } = fixture();
+        let root = area.create_root("reader").unwrap();
+        assert!(!pin_record_exists(&root.path, &root.id));
+        area.pin(&root.id, "reader pin").unwrap();
+        assert!(pin_record_exists(&root.path, &root.id));
+        area.unpin(&root.id).unwrap();
+        assert!(!pin_record_exists(&root.path, &root.id));
+    }
+
+    /// A recorded root reads no inventory, so its pin state must come from its
+    /// pin record: an existing pin is skipped, and an unpinned root is pinned.
+    #[test]
+    fn a_recorded_import_reports_the_pin_its_record_shows() {
+        let Fixture {
+            _temp,
+            control,
+            area,
+            original,
+            registry,
+            ..
+        } = fixture();
+        let checkout = _temp.path().join("checkout");
+        let checkout_id = "a".repeat(64);
+        let selected = Selected {
+            kind: RootKind::Local,
+            root: original.path.clone(),
+            volume_uuid: None,
+            nonce: None,
+            generation: 1,
+        };
+        let import = || {
+            import_output(
+                &control,
+                Some(&registry),
+                &checkout,
+                &checkout_id,
+                &selected,
+            )
+            .unwrap()
+        };
+
+        assert!(!import().pinned);
+        area.pin(&original.id, "recorded pin").unwrap();
+        let recorded = import();
+        assert_eq!(recorded.id, original.id);
+        assert!(recorded.pinned);
+        area.unpin(&original.id).unwrap();
+        assert!(!import().pinned);
     }
 }
