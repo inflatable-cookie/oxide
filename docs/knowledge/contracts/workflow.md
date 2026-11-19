@@ -137,9 +137,6 @@ digest and the receipt digest are reported under separate labels.
   `target-libdir` and `sysroot/lib`, then the caller's own
   `DYLD_FALLBACK_LIBRARY_PATH` or `LD_LIBRARY_PATH`, or the loader's default. A
   failure to read the package facts is one warning and the program still runs.
-  The lease-holding `run` path (a bounded run, a converted checkout, an owned
-  temporary directory) keeps `CARGO_MANIFEST_DIR` only, because a metadata query
-  there would consume the run's own execution deadline.
 - `run` needs Cargo's JSON to find the program, so `--message-format` takes a
   json variant (`json`, `json-render-diagnostics`, `json-diagnostic-short`,
   `json-diagnostic-rendered-ansi`): the caller's variant is forwarded as given

@@ -374,11 +374,20 @@ fn environment_file(path: &Path) -> std::collections::HashMap<String, String> {
 /// search path were missing (or inherited from the caller).
 #[test]
 fn run_gives_the_program_cargos_run_environment() {
+    assert_run_environment(&["run", "--bin", "demo"]);
+}
+
+#[test]
+fn bounded_run_gives_the_program_cargos_run_environment() {
+    assert_run_environment(&["run", "--execution-budget", "30s", "--bin", "demo"]);
+}
+
+fn assert_run_environment(args: &[&str]) {
     let scratch = Scratch::new();
     let (manifest, program, bin, _log) = run_fixture(&scratch);
     let pool = scratch.path().join("fixture-pool");
     let output = run_command(&scratch, &bin, &pool, &manifest, &program)
-        .args(["run", "--bin", "demo"])
+        .args(args)
         .output()
         .unwrap();
     assert!(

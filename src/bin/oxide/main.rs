@@ -1104,7 +1104,7 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
             held,
             origin,
             &program.program,
-            program.manifest_dir(),
+            &program.manifest,
             &invocation.program_args,
             execution_started,
             &mut budget_stop,
@@ -1146,7 +1146,7 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
             held,
             origin,
             &program.program,
-            program.manifest_dir(),
+            &program.manifest,
             &invocation.program_args,
             execution_started,
             &mut budget_stop,
@@ -1300,7 +1300,7 @@ fn run_owned_program(
     held: store::Lease,
     origin: Option<freshness::Built>,
     program: &Path,
-    manifest_dir: &Path,
+    manifest: &Path,
     args: &[OsString],
     execution_started: Option<Instant>,
     budget_stop: &mut process::Stop,
@@ -1309,8 +1309,14 @@ fn run_owned_program(
     seed_profile: &str,
 ) -> Result<u8, String> {
     let mut command = Command::new(program);
-    command.args(args).env("CARGO_MANIFEST_DIR", manifest_dir);
+    command.args(args).env(
+        "CARGO_MANIFEST_DIR",
+        manifest.parent().unwrap_or(Path::new("")),
+    );
     child_temp.apply(&mut command);
+    if let Err(error) = identity::apply_run_environment(&mut command, program, manifest) {
+        eprintln!("oxide: warning: {error}; the program runs without Cargo's full run environment");
+    }
     if let Err(error) = store.mark_spawning(&held) {
         store.release(held, origin)?;
         return Err(error);
@@ -1615,13 +1621,6 @@ fn lease_with_gate(
 struct RunProgram {
     program: PathBuf,
     manifest: PathBuf,
-}
-
-impl RunProgram {
-    /// The package directory Cargo names `CARGO_MANIFEST_DIR`.
-    fn manifest_dir(&self) -> &Path {
-        self.manifest.parent().unwrap_or(Path::new(""))
-    }
 }
 
 type RunTarget = Result<RunProgram, String>;
