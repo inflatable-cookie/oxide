@@ -88,9 +88,13 @@ record list also falls back to the inline call rather than grow the file.
 
 A mutating open drops a record whose recorded root path is absent, because Barge's
 rename already committed and its trash is swept by the unlocked settlement pass,
-even when no pending records remain. A sweep failure is reported and does not
-prevent settlement of other recorded roots. A record whose root is
-still present stays for a later pass; recovery never deletes it directly.
+even when no pending records remain. Barge's recovery sweep holds its area lock
+while deleting each leftover tree. An admission can therefore wait for that
+lock while holding the pool lock after an interrupted eviction. This limitation
+is accepted for now; Oxide leaves ownership checks and deletion to Barge.
+A sweep failure is reported and does not prevent settlement of other recorded
+roots. A record whose root is still present stays for a later pass; recovery
+never deletes it directly.
 
 A held eviction checks the writer generation and exact lease under the pool lock.
 It first writes a private, versioned intent bound to the pool, lease, Barge root
@@ -116,8 +120,8 @@ Barge listing count. Default status reads recent per-pool maxima without taking
 the pool lock.
 
 Count one byte walk per root submitted to a sizing traversal, including incomplete
-or later-failed walks. Barge's eviction sizes the root once before rename. A trash
-sweep reports reclaimed bytes during deletion, with no separate sizing traversal.
+or later-failed walks. Barge's eviction counts reclaimed bytes during deletion,
+with no separate sizing walk before rename. A trash sweep likewise reports bytes during deletion.
 Above the reserve, the reserve check enumerates no roots.
 
 At the slot ceiling, one bytes-free inventory identifies held or pinned candidates
