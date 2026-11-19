@@ -6,9 +6,7 @@
 use crate::seed_lock::Package;
 use crate::seed_plan::VerifiedSource;
 use oxide_storage::lease::managed::SeedSourceKind;
-use oxide_storage::seed_source::{
-    GitRefusal, GitVerifier, RegistrySource, SourceCache, SourceLimits,
-};
+use oxide_storage::seed_source::{RegistrySource, SourceCache, SourceLimits};
 use serde::Deserialize;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -134,22 +132,14 @@ fn manifest_matches(root: &Path, package: &Package) -> Option<bool> {
 }
 
 /// A single pass's limits are shared across packages rather than reset for
-/// every adapter call. An unknown git child closure is a refusal, not a miss.
+/// every adapter call. Git sources are never offered (the lock rejects them),
+/// so a pass verifies only registry packages.
 pub(crate) struct Pass {
     started: Instant,
     duration: Duration,
     entries: u64,
     content: u64,
     derived: u64,
-    git: GitVerifier,
-}
-
-/// A discovered Git checkout is only a hint. The adapter still checks its
-/// full locked revision, worktree and manifest before accepting it.
-pub(crate) struct GitHint {
-    pub package: Package,
-    pub checkout: PathBuf,
-    pub package_root: PathBuf,
 }
 
 /// Evidence captured before a producing Cargo command and rechecked after its
@@ -167,7 +157,6 @@ pub(crate) struct Production {
 pub(crate) enum PreparationError {
     Skip(&'static str),
     SkipNamed(String),
-    Refuse(String),
 }
 
 impl Production {
@@ -247,13 +236,7 @@ impl Production {
             .join(oxide_storage::lease::MANAGED_NAME)
             .join("seeds/sources.json");
         let cache = SourceCache::read(&cache_path, &held.store_id);
-        Self::begin(producer, lock, cargo_home, cache).map_err(|reason| {
-            if reason == "git source verification closure unknown" {
-                PreparationError::Refuse(reason.to_owned())
-            } else {
-                PreparationError::Skip(reason)
-            }
-        })
+        Self::begin(producer, lock, cargo_home, cache).map_err(PreparationError::Skip)
     }
 
     pub fn begin(
@@ -332,13 +315,9 @@ fn verify_pass(
     cache: &mut SourceCache,
 ) -> Result<Vec<VerifiedSource>, &'static str> {
     let mut pass = Pass::new(Duration::from_secs(4));
-    let hints = pass
-        .discover_git_hints(cargo_home, packages)
-        .unwrap_or_default();
     pass.locked(
         cargo_home,
         packages,
-        &hints,
         cache,
         unix_seconds(SystemTime::now())?,
     )
@@ -350,30 +329,6 @@ fn unix_seconds(time: SystemTime) -> Result<u64, &'static str> {
         .map_err(|_| "clock before Unix epoch")
 }
 
-fn git_hint<'a>(cargo_home: &Path, package: &Package, hints: &'a [GitHint]) -> Option<&'a GitHint> {
-    let base = cargo_home.join("git/checkouts");
-    let mut found = None;
-    for hint in hints.iter().filter(|hint| hint.package == *package) {
-        let path = &hint.checkout;
-        // Hints are required to be canonical: otherwise a link in a checkout
-        // path could silently redirect Git outside the selected Cargo home.
-        let canonical = std::fs::canonicalize(path).ok()?;
-        let package_root = std::fs::canonicalize(&hint.package_root).ok()?;
-        if canonical != *path
-            || !canonical.starts_with(&base)
-            || canonical == base
-            || package_root != hint.package_root
-            || !package_root.starts_with(&canonical)
-        {
-            return None;
-        }
-        if found.replace(hint).is_some() {
-            return None;
-        }
-    }
-    found
-}
-
 impl Pass {
     pub fn new(duration: Duration) -> Self {
         Self {
@@ -382,119 +337,19 @@ impl Pass {
             entries: 0,
             content: 0,
             derived: 0,
-            git: GitVerifier::new(),
         }
-    }
-
-    /// Discover candidate Cargo Git packages without following links or
-    /// reading a donor slot. These remain hints until `locked` verifies the
-    /// checkout's commit, content and manifest.
-    pub fn discover_git_hints(
-        &mut self,
-        cargo_home: &Path,
-        packages: &[Package],
-    ) -> Result<Vec<GitHint>, &'static str> {
-        if packages.len() > 2048
-            || std::fs::canonicalize(cargo_home).ok().as_deref() != Some(cargo_home)
-        {
-            return Err("unresolved Cargo home");
-        }
-        if !packages.iter().any(|package| {
-            package
-                .source
-                .as_deref()
-                .is_some_and(|s| s.starts_with("git+"))
-        }) {
-            return Ok(Vec::new());
-        }
-        let base = cargo_home.join("git/checkouts");
-        let meta = match std::fs::symlink_metadata(&base) {
-            Ok(meta) => meta,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(_) => return Err("unreadable Git checkouts"),
-        };
-        if !meta.is_dir() || std::fs::canonicalize(&base).ok().as_deref() != Some(base.as_path()) {
-            return Err("unsafe Git checkouts");
-        }
-        let mut checkouts = Vec::new();
-        for repository in self.directories(&base, meta.dev())? {
-            for checkout in self.directories(&repository, meta.dev())? {
-                checkouts.push(checkout);
-                if checkouts.len() > 2048 {
-                    return Err("source cap");
-                }
-            }
-        }
-        let mut hints = Vec::new();
-        for checkout in checkouts {
-            let mut pending = vec![(checkout.clone(), 0usize)];
-            while let Some((directory, depth)) = pending.pop() {
-                if self.limits().is_none() || depth > 64 {
-                    return Err("source cap");
-                }
-                for package in packages.iter().filter(|package| {
-                    package
-                        .source
-                        .as_deref()
-                        .is_some_and(|s| s.starts_with("git+"))
-                }) {
-                    if self.limits().is_none() {
-                        return Err("source cap");
-                    }
-                    if manifest_matches(&directory, package).is_some() {
-                        if hints.len() == 2048 {
-                            return Err("source cap");
-                        }
-                        hints.push(GitHint {
-                            package: package.clone(),
-                            checkout: checkout.clone(),
-                            package_root: directory.clone(),
-                        });
-                    }
-                }
-                for child in self.directories(&directory, meta.dev())?.into_iter().rev() {
-                    if child.file_name() != Some(std::ffi::OsStr::new(".git")) {
-                        pending.push((child, depth + 1));
-                    }
-                }
-            }
-        }
-        Ok(hints)
-    }
-
-    fn directories(&mut self, parent: &Path, device: u64) -> Result<Vec<PathBuf>, &'static str> {
-        let mut result = Vec::new();
-        for entry in std::fs::read_dir(parent).map_err(|_| "unreadable Git checkouts")? {
-            if self.limits().is_none() {
-                return Err("source cap");
-            }
-            self.entries = self.entries.checked_add(1).ok_or("source cap")?;
-            if self.entries > SourceLimits::default().max_entries {
-                return Err("source cap");
-            }
-            let entry = entry.map_err(|_| "unreadable Git checkouts")?;
-            let meta =
-                std::fs::symlink_metadata(entry.path()).map_err(|_| "unreadable Git checkouts")?;
-            if meta.is_dir() && meta.dev() == device && meta.uid() == unsafe { libc::geteuid() } {
-                result.push(entry.path());
-            }
-        }
-        result.sort();
-        Ok(result)
     }
 
     /// Verify eligible locked sources in lock order under one shared pass
-    /// budget. Missing, ambiguous or unverifiable sources are omitted; an
-    /// unconfirmed Git child closure refuses the entire operation.
+    /// budget. Missing, ambiguous or unverifiable sources are omitted.
     pub fn locked(
         &mut self,
         cargo_home: &Path,
         packages: &[Package],
-        git_hints: &[GitHint],
         cache: &mut SourceCache,
         now: u64,
     ) -> Result<Vec<VerifiedSource>, &'static str> {
-        if packages.len() > 2048 || git_hints.len() > 2048 {
+        if packages.len() > 2048 {
             return Err("source cap");
         }
         if std::fs::canonicalize(cargo_home).ok().as_deref() != Some(cargo_home) {
@@ -505,15 +360,7 @@ impl Pass {
             if self.limits().is_none() {
                 break;
             }
-            let source = match package.source.as_deref() {
-                Some(source) if source.starts_with("git+") => {
-                    match git_hint(cargo_home, package, git_hints) {
-                        Some(hint) => self.git(&hint.checkout, &hint.package_root, package)?,
-                        None => None,
-                    }
-                }
-                _ => self.registry(cargo_home, package, cache, now),
-            };
+            let source = self.registry(cargo_home, package, cache, now);
             if let Some(source) = source {
                 verified.push(source);
             }
@@ -539,12 +386,7 @@ impl Pass {
     /// Post-build producing-window check. Every visited entry is charged to
     /// the same pass budget as source verification; symlinks and unreadable
     /// timestamps never become evidence of an unchanged source.
-    pub fn unchanged_since(
-        &mut self,
-        root: &Path,
-        kind: SeedSourceKind,
-        started: SystemTime,
-    ) -> bool {
+    pub fn unchanged_since(&mut self, root: &Path, started: SystemTime) -> bool {
         let Ok(root_metadata) = std::fs::symlink_metadata(root) else {
             return false;
         };
@@ -568,10 +410,7 @@ impl Pass {
                 let Ok(entry) = entry else {
                     return false;
                 };
-                if entry.path().parent() == Some(root)
-                    && (entry.file_name() == ".cargo-ok"
-                        || (kind == SeedSourceKind::Git && entry.file_name() == ".git"))
-                {
+                if entry.path().parent() == Some(root) && entry.file_name() == ".cargo-ok" {
                     continue;
                 }
                 self.entries = match self.entries.checked_add(1) {
@@ -631,51 +470,6 @@ impl Pass {
             proc_macro,
         })
     }
-
-    pub fn git(
-        &mut self,
-        checkout: &Path,
-        package_root: &Path,
-        package: &Package,
-    ) -> Result<Option<VerifiedSource>, &'static str> {
-        let Some(source) = package
-            .source
-            .as_deref()
-            .filter(|source| source.starts_with("git+"))
-        else {
-            return Ok(None);
-        };
-        let Some((_, revision)) = source.rsplit_once('#') else {
-            return Ok(None);
-        };
-        let Some(limits) = self.limits() else {
-            return Ok(None);
-        };
-        let verified = match self.git.verify(checkout, revision, &limits) {
-            Ok(verified) => verified,
-            Err(GitRefusal::Unconfirmed) => return Err("git source verification closure unknown"),
-            Err(_) => return Ok(None),
-        };
-        self.entries = self
-            .entries
-            .checked_add(verified.files)
-            .ok_or("source cap")?;
-        self.content = self
-            .content
-            .checked_add(verified.content_bytes)
-            .ok_or("source cap")?;
-        let Some(proc_macro) = manifest_matches(package_root, package) else {
-            return Ok(None);
-        };
-        Ok(Some(VerifiedSource {
-            package: package.clone(),
-            tree_digest: verified.digest.to_hex(),
-            kind: SeedSourceKind::Git,
-            root: package_root.to_path_buf(),
-            verification_root: checkout.to_path_buf(),
-            proc_macro,
-        }))
-    }
 }
 
 #[cfg(test)]
@@ -701,69 +495,6 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
-    }
-
-    #[test]
-    fn git_hints_must_be_unique_canonical_cargo_checkouts() {
-        let fixture = Fixture::new();
-        let package = crate::seed_lock::test_git_package(
-            "sample",
-            "1",
-            "https://example.invalid/r",
-            &"a".repeat(40),
-        );
-        let root = fixture.0.join("git/checkouts/repo/revision");
-        std::fs::create_dir_all(&root).unwrap();
-        let hint = || GitHint {
-            package: package.clone(),
-            checkout: root.clone(),
-            package_root: root.clone(),
-        };
-        assert_eq!(
-            git_hint(&fixture.0, &package, &[hint()]).map(|value| value.checkout.clone()),
-            Some(root.clone())
-        );
-        assert!(git_hint(&fixture.0, &package, &[hint(), hint()]).is_none());
-        let outside = GitHint {
-            package: package.clone(),
-            checkout: fixture.0.clone(),
-            package_root: fixture.0.clone(),
-        };
-        assert!(git_hint(&fixture.0, &package, &[outside]).is_none());
-        let alias = fixture.0.join("git/checkouts/alias");
-        std::os::unix::fs::symlink(&root, &alias).unwrap();
-        let linked = GitHint {
-            package: package.clone(),
-            checkout: alias,
-            package_root: root.clone(),
-        };
-        assert!(git_hint(&fixture.0, &package, &[linked]).is_none());
-    }
-
-    #[test]
-    fn discovery_finds_nested_packages_and_ignores_symlinked_checkouts() {
-        let fixture = Fixture::new();
-        let package = crate::seed_lock::test_git_package(
-            "sample",
-            "1",
-            "https://example.invalid/r",
-            &"a".repeat(40),
-        );
-        let checkout = fixture.0.join("git/checkouts/repo/revision");
-        let root = checkout.join("member");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname='sample'\nversion='1'\n",
-        )
-        .unwrap();
-        std::fs::write(root.join("src/lib.rs"), "").unwrap();
-        std::os::unix::fs::symlink(&checkout, fixture.0.join("git/checkouts/repo/alias")).unwrap();
-        let mut pass = Pass::new(Duration::from_secs(4));
-        let hints = pass.discover_git_hints(&fixture.0, &[package]).unwrap();
-        assert_eq!(hints.len(), 1);
-        assert_eq!(hints[0].checkout, checkout);
-        assert_eq!(hints[0].package_root, root);
     }
 
     #[test]
@@ -829,11 +560,11 @@ mod tests {
             std::fs::create_dir(&path).unwrap();
         }
         let mut pass = Pass::new(Duration::from_secs(4));
-        assert!(!pass.unchanged_since(&fixture.0, SeedSourceKind::Registry, SystemTime::now()));
+        assert!(!pass.unchanged_since(&fixture.0, SystemTime::now()));
         std::fs::remove_dir_all(fixture.0.join("d")).unwrap();
         std::os::unix::fs::symlink(&fixture.0, fixture.0.join("link")).unwrap();
         let mut pass = Pass::new(Duration::from_secs(4));
-        assert!(!pass.unchanged_since(&fixture.0, SeedSourceKind::Registry, SystemTime::now()));
+        assert!(!pass.unchanged_since(&fixture.0, SystemTime::now()));
     }
 
     #[test]

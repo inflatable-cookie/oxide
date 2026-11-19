@@ -3,8 +3,8 @@
 This contract owns the read-only inventory of one explicitly named directory. It
 is a diagnostic, not a manager. It does not invoke Cargo or the compiler, own or
 evict storage, or recommend deleting anything. It exists as a library function
-and as an unpublished binary, `oxide-storage-inventory`. The package stays
-`publish = false`; product naming is open under
+only: the unpublished `oxide-storage-inventory` binary was retired (red-pen 1,
+oxide#340). The package stays `publish = false`; product naming is open under
 [Q-005](../questions.md#q-005--what-names-are-safe-to-publish).
 
 This is distinct from the [local lease](local-lease.md) `status`, which reads
@@ -16,11 +16,6 @@ semantics and makes no claim on Oxide-managed storage.
 ```rust
 oxide_storage::inventory::inventory_directory(root: &Path, limits: InventoryLimits)
     -> Result<InventoryReport, InventoryError>
-```
-
-```sh
-oxide-storage-inventory --root /path/to/target [--json] \
-    [--max-entries N] [--max-depth N] [--max-output-bytes N] [--max-elapsed-ms N]
 ```
 
 The `oxide` front door calls the library read-only for `status`. It reports

@@ -62,23 +62,6 @@ pub(crate) enum SelectMiss {
 
 /// Select the largest overlap, breaking ties by newer rank then slot id. Caps
 /// reject an entire plan rather than silently truncating a unit or donor.
-/// Debug-only plan-cap control (absent from release builds; armed only under
-/// the shared proof supervisor's own layout): `OXIDE_TEST_SEED_LIMIT` forces
-/// one declared plan bound so the native proof can show each cap skips without
-/// donor mutation.
-#[cfg(debug_assertions)]
-fn proof_limit() -> Option<String> {
-    if oxide_storage::proof::evidence().is_none() {
-        return None;
-    }
-    std::env::var("OXIDE_TEST_SEED_LIMIT").ok()
-}
-
-#[cfg(not(debug_assertions))]
-fn proof_limit() -> Option<String> {
-    None
-}
-
 pub(crate) fn select(
     recipient: &SeedRecipient,
     producer: &SeedProducer,
@@ -86,22 +69,9 @@ pub(crate) fn select(
     sources: &[VerifiedSource],
     candidates: &[SeedCandidate],
 ) -> Result<SeedRequest, SelectMiss> {
-    let limit = proof_limit();
-    let max_units = if limit.as_deref() == Some("units") {
-        0
-    } else {
-        SEED_MAX_PLAN_UNITS
-    };
-    let max_files = if limit.as_deref() == Some("files") {
-        0
-    } else {
-        SEED_MAX_PLAN_FILES
-    };
-    let max_bytes = if limit.as_deref() == Some("bytes") {
-        0
-    } else {
-        SEED_MAX_PLAN_BYTES
-    };
+    let max_units = SEED_MAX_PLAN_UNITS;
+    let max_files = SEED_MAX_PLAN_FILES;
+    let max_bytes = SEED_MAX_PLAN_BYTES;
     let mut best: Option<(&SeedCandidate, Vec<SeedUnitRef>)> = None;
     let mut context_matched = false;
     let mut input_escape = false;
@@ -241,7 +211,7 @@ pub(crate) fn select(
             catalog_digest: candidate.catalog_digest.clone(),
         },
         units,
-        work_budget_ms: (limit.as_deref() == Some("deadline")).then_some(0),
+        work_budget_ms: None,
     })
 }
 

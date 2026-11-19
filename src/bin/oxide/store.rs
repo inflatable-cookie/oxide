@@ -195,75 +195,10 @@ fn unclosed_writers(record: &Record) -> Option<String> {
 /// within the last minute before boot unknown.
 const BOOT_MARGIN_MS: u64 = 60_000;
 
-/// A debug-only proof control naming the boot time a closure decision uses.
-/// A native proof cannot reboot the host to test a previous boot session, so
-/// the qualified shared supervisor's own layout may override the reading.
-/// Release builds have no hook, and outside that layout the variable is
-/// ignored. A present value defines the reading even when it is unusable: an
-/// unparseable or zero value is an unknown boot time, never a fall back to
-/// the real one.
-#[cfg(debug_assertions)]
-const BOOT_HOOK: &str = "OXIDE_TEST_BOOT_MS";
-
-/// The qualified shared supervisor's own layout: a canonical
-/// `OXIDE_TASK_SCRATCH_ROOT` at `<root>/scratch`, its sibling `evidence`
-/// directory and an `OXIDE_PROOF_DEADLINE_NS`, under one `oxide-proof.*`
-/// root.
-#[cfg(debug_assertions)]
-fn supervisor_layout() -> bool {
-    let canonical = |name: &str| {
-        let path = PathBuf::from(std::env::var_os(name)?);
-        let resolved = path.canonicalize().ok()?;
-        (resolved == path && resolved.is_dir()).then_some(resolved)
-    };
-    let (Some(scratch), Some(evidence)) = (
-        canonical("OXIDE_TASK_SCRATCH_ROOT"),
-        canonical("OXIDE_PROOF_EVIDENCE"),
-    ) else {
-        return false;
-    };
-    supervisor_layout_paths(
-        &scratch,
-        &evidence,
-        std::env::var("OXIDE_PROOF_DEADLINE_NS").ok().as_deref(),
-    )
-}
-
-/// The layout rule over already-canonical paths, so the seam's scope is
-/// testable without touching the process environment.
-#[cfg(debug_assertions)]
-fn supervisor_layout_paths(scratch: &Path, evidence: &Path, deadline: Option<&str>) -> bool {
-    let Some(root) = scratch.parent().filter(|root| {
-        scratch.file_name().is_some_and(|name| name == "scratch")
-            && root
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("oxide-proof."))
-    }) else {
-        return false;
-    };
-    evidence == root.join("evidence")
-        && deadline.is_some_and(|deadline| deadline.parse::<u64>().is_ok())
-}
-
-/// Parse a boot-time override: `None` when there is none, `Some(None)` when
-/// one is present but unusable.
-#[cfg(debug_assertions)]
-fn boot_override(value: Option<&str>) -> Option<Option<u64>> {
-    Some(value?.parse::<u64>().ok().filter(|ms| *ms > 0))
-}
-
 /// The boot session's start for a closure decision, or `None` when unknown.
 /// Unknown is the safe answer: it never closes a slot.
 fn boot_session() -> Option<u64> {
-    #[cfg(debug_assertions)]
-    if supervisor_layout() {
-        let value = std::env::var_os(BOOT_HOOK).map(|value| value.to_string_lossy().into_owned());
-        if let Some(injected) = boot_override(value.as_deref()) {
-            return injected;
-        }
-    }
-    let boot = process::boot_ms();
-    boot
+    process::boot_ms()
 }
 
 /// Whether the record's holder started before the current boot session, so a
@@ -1352,22 +1287,6 @@ pub fn admission_budget(settings: &Settings) -> u64 {
     settings.budget
 }
 
-/// A source-verification failure inside the admission lifetime. A failure
-/// before the first clone skips the seed and the command builds cold; only an
-/// unknown Git closure refuses, because its custody is unknown (§6.5, §13).
-pub(crate) enum SourceFailure {
-    Skip(&'static str),
-    Refuse(String),
-}
-
-pub(crate) fn source_failure(reason: &'static str) -> SourceFailure {
-    if reason == "git source verification closure unknown" {
-        SourceFailure::Refuse(reason.to_owned())
-    } else {
-        SourceFailure::Skip(reason)
-    }
-}
-
 /// The post-Cargo source may stand in for a pre-Cargo entry only when every
 /// recorded identity fact is unchanged. A newly appearing source has no
 /// pre-Cargo entry and is accepted after the release-time unchanged-since check.
@@ -1426,11 +1345,7 @@ impl Store {
                 })
                 .cloned()
                 .collect();
-            let git_hints = pass
-                .discover_git_hints(cargo_home, &offered)
-                .unwrap_or_default();
-            pass.locked(cargo_home, &offered, &git_hints, cache, process::now_ms())
-                .map_err(source_failure)
+            pass.locked(cargo_home, &offered, cache, process::now_ms())
         })
     }
 
@@ -1505,7 +1420,7 @@ impl Store {
                     continue;
                 }
             }
-            if !pass.unchanged_since(&post.verification_root, post.kind, started) {
+            if !pass.unchanged_since(&post.verification_root, started) {
                 continue;
             }
             let Some(units) = classifier.units(profile, post) else {
@@ -1570,7 +1485,7 @@ impl Store {
         verify_sources: impl FnOnce(
             &[oxide_storage::lease::managed::SeedCandidate],
         )
-            -> Result<Vec<crate::seed_plan::VerifiedSource>, SourceFailure>,
+            -> Result<Vec<crate::seed_plan::VerifiedSource>, &'static str>,
     ) -> Result<SeedRun, String> {
         self.seed_with(
             held,
@@ -1591,7 +1506,7 @@ impl Store {
         verify_sources: impl FnOnce(
             &[oxide_storage::lease::managed::SeedCandidate],
         )
-            -> Result<Vec<crate::seed_plan::VerifiedSource>, SourceFailure>,
+            -> Result<Vec<crate::seed_plan::VerifiedSource>, &'static str>,
         transaction: impl FnOnce(
             &Path,
             &oxide_storage::lease::managed::SeedRequest,
@@ -1630,8 +1545,7 @@ impl Store {
         }
         let sources = match verify_sources(&candidates.candidates) {
             Ok(sources) => sources,
-            Err(SourceFailure::Skip(reason)) => return Ok(SeedRun::Skipped(reason)),
-            Err(SourceFailure::Refuse(reason)) => return Err(reason),
+            Err(reason) => return Ok(SeedRun::Skipped(reason)),
         };
         // Selection exposes its own miss reason; the front door's user-facing
         // mapping is a separate change, so this call still reports the one
@@ -1646,12 +1560,6 @@ impl Store {
             Ok(request) => request,
             Err(_miss) => return Ok(SeedRun::Skipped("no eligible donor")),
         };
-        // Debug-only proof pause, ordered between call 1 (the candidate read)
-        // and call 2 (the donor pin). Absent from release builds and armed only
-        // under the shared proof supervisor's own layout, so a competing
-        // command can lease or evict the selected donor while this one waits.
-        #[cfg(debug_assertions)]
-        seed_proof_pause("between-calls");
         let rejected = candidates
             .candidates
             .iter()
@@ -1843,9 +1751,6 @@ impl Store {
     /// root (oxide#182); the config file and the built-in default are
     /// unchanged.
     ///
-    /// The debug-only `handoff_trace::phase` calls partition the guarded
-    /// creation path for the installed-handoff proof; each wraps exactly one
-    /// existing step and changes no statement, order, result or branch.
     pub fn open_or_create() -> Result<Self, String> {
         let settings = settings()?;
         let path = settings.pool.clone();
@@ -1855,10 +1760,7 @@ impl Store {
         // ordinary directory both get the hint instead of the generic open
         // error (oxide#182).
         config::pool_annotation_refused(&path, source)?;
-        let scratch = crate::handoff_trace::phase("scratch-evaluate", || {
-            crate::scratch_io::evaluate(&settings, false)
-        })
-        .map_err(|error| {
+        let scratch = { crate::scratch_io::evaluate(&settings, false) }.map_err(|error| {
             if matches!(source, config::Source::Environment("OXIDE_POOL")) {
                 format!("OXIDE_POOL names {}: {error}", path.display())
             } else {
@@ -1880,9 +1782,7 @@ impl Store {
                     if available < HOST_RESERVE_BYTES {
                         return Err("refusing to create the pool: host free space is below the 20 GiB reserve".into());
                     }
-                    crate::handoff_trace::phase("scratch-create", || {
-                        crate::scratch_io::create(&settings, uuid, admission_budget(&settings))
-                    })?;
+                    { crate::scratch_io::create(&settings, uuid, admission_budget(&settings)) }?;
                 } else {
                     create_pool(&path, admission_budget(&settings))?;
                 }
@@ -1891,32 +1791,27 @@ impl Store {
             Found::Directory | Found::Unknown => {}
         }
         if let Some(uuid) = &scratch {
-            crate::handoff_trace::phase("scratch-repair", || {
-                crate::scratch_io::repair(&settings, uuid)
-            })?;
+            { crate::scratch_io::repair(&settings, uuid) }?;
         }
-        let store =
-            match crate::handoff_trace::phase("store-open", || Self::open_at(&path, &settings)) {
-                Ok(store) => store,
-                // An explicit path that exists but holds no recognizable Oxide
-                // pool is still this command's pool: name it in the refusal
-                // (oxide#182), so a typo or a non-pool directory is actionable.
-                Err(error)
-                    if matches!(
-                        settings.pool_source,
-                        config::Source::Environment("OXIDE_POOL")
-                    ) =>
-                {
-                    return Err(format!("OXIDE_POOL names {}: {error}", path.display()))
-                }
-                Err(error) => return Err(error),
-            };
-        if !crate::handoff_trace::phase("sticky-exclusion", || {
-            config::has_sticky_exclusion(&store.pool)
-        }) {
-            match crate::handoff_trace::phase("backup-exclude", || {
+        let store = match Self::open_at(&path, &settings) {
+            Ok(store) => store,
+            // An explicit path that exists but holds no recognizable Oxide
+            // pool is still this command's pool: name it in the refusal
+            // (oxide#182), so a typo or a non-pool directory is actionable.
+            Err(error)
+                if matches!(
+                    settings.pool_source,
+                    config::Source::Environment("OXIDE_POOL")
+                ) =>
+            {
+                return Err(format!("OXIDE_POOL names {}: {error}", path.display()))
+            }
+            Err(error) => return Err(error),
+        };
+        if !{ config::has_sticky_exclusion(&store.pool) } {
+            match {
                 config::exclude_from_backup(&store.pool)
-            }) {
+            } {
                 Backup::Excluded | Backup::NotApplicable => {}
                 Backup::NotExcluded(reason) => {
                     return Err(format!(
@@ -1927,13 +1822,11 @@ impl Store {
             }
         }
         if !matches!(settings.pool_source, config::Source::Environment(_)) {
-            if let Err(error) = crate::handoff_trace::phase("remember-pool", || {
-                config::remember_pool(&Facts::from_env(), &store.pool)
-            }) {
+            if let Err(error) = { config::remember_pool(&Facts::from_env(), &store.pool) } {
                 eprintln!("oxide: could not record the pool path for status: {error}");
             }
         }
-        crate::handoff_trace::phase("ensure-control", || store.ensure_control())?;
+        store.ensure_control()?;
         Ok(store)
     }
 
@@ -2203,9 +2096,6 @@ impl Store {
         waits: &mut WaitAccounting,
     ) -> Result<Acquired, String> {
         let max_active = self.max_active;
-        let admission_started = Instant::now();
-        let admission_command = crate::admission::command_token();
-        let mut reported_waiting = false;
         let ticket = self.register_ticket()?;
         loop {
             // End the polling interval before doing any admission work. A
@@ -2238,23 +2128,9 @@ impl Store {
                         self.release(lease, origin)?;
                         return Ok(Acquired::AdmissionExpired);
                     }
-                    // Report this command's own admission wait to a supervising
-                    // proof, best effort: unarmed or unwritable means the wait is
-                    // simply not reported (oxide#192).
-                    crate::admission::report_wait(&admission_command, admission_started.elapsed());
                     return Ok(Acquired::Lease(lease));
                 }
                 Ok(Err(wait)) => {
-                    // One bounded report at the start of the wait, so a wait that
-                    // never ends before a supervising proof stops is still
-                    // classified; it grants nothing (oxide#192).
-                    if !reported_waiting {
-                        reported_waiting = true;
-                        crate::admission::report_waiting(
-                            &admission_command,
-                            wait.category().label(),
-                        );
-                    }
                     waits.observe(&wait, max_active, Instant::now());
                     std::thread::sleep(WAIT_POLL);
                 }
@@ -6014,31 +5890,6 @@ pub(crate) fn statfs(path: &Path) -> Option<libc::statfs> {
     (result == 0).then(|| unsafe { sample.assume_init() })
 }
 
-/// Debug-only proof pause (absent from release builds): under the shared proof
-/// supervisor's layout, `OXIDE_TEST_SEED_PAUSE=<point>:<gate>` writes
-/// `<gate>.<point>-<pid>` and waits (at most 120 s) for `<gate>`.
-#[cfg(debug_assertions)]
-fn seed_proof_pause(point: &str) {
-    if oxide_storage::proof::evidence().is_none() {
-        return;
-    }
-    let Some(gate) = std::env::var("OXIDE_TEST_SEED_PAUSE")
-        .ok()
-        .and_then(|value| value.strip_prefix(&format!("{point}:")).map(str::to_owned))
-    else {
-        return;
-    };
-    let marker = format!("{gate}.{point}-{}", std::process::id());
-    let staged = format!("{gate}.staging-{point}-{}", std::process::id());
-    if std::fs::write(&staged, b"paused").is_ok() {
-        let _ = std::fs::rename(&staged, &marker);
-    }
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while !Path::new(&gate).exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 fn lease_error(context: &str, error: &LeaseError) -> String {
     if *error == LeaseError::WriterUpdated {
         WRITER_UPDATED.set(true);
@@ -8305,15 +8156,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_source_failure_before_the_first_clone_skips_and_only_unknown_closure_refuses() {
-        assert!(matches!(
-            source_failure("injected source failure"),
-            SourceFailure::Skip("injected source failure")
-        ));
-        assert!(matches!(
-            source_failure("git source verification closure unknown"),
-            SourceFailure::Refuse(reason) if reason == "git source verification closure unknown"
-        ));
+    fn a_source_failure_before_the_first_clone_skips_and_changes_nothing() {
         let (root, store, _donor_key, lock, producer) = front_door_donor();
         let recipient_checkout = root.join("recipient");
         fs::create_dir(&recipient_checkout).unwrap();
@@ -8328,7 +8171,7 @@ pub(crate) mod tests {
         // the command builds cold in the same empty slot.
         let skipped = store
             .seed(&recipient, &producer, &lock, |_| {
-                Err(SourceFailure::Skip("injected source failure"))
+                Err("injected source failure")
             })
             .unwrap();
         assert!(matches!(
@@ -8341,20 +8184,10 @@ pub(crate) mod tests {
             .join("seeds")
             .join(format!("{}.attempt.json", recipient.slot_id))
             .exists());
-        // Only an unknown Git closure refuses, and it still changes nothing.
-        let refused = store.seed(&recipient, &producer, &lock, |_| {
-            Err(SourceFailure::Refuse(
-                "git source verification closure unknown".into(),
-            ))
-        });
-        assert_eq!(
-            refused.err(),
-            Some("git source verification closure unknown".to_owned())
-        );
-        assert_eq!(fs::read(store.control.join("state.json")).unwrap(), before);
         store.release(recipient, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
+
     /// Second-slot rule: a busy slot of this checkout's key sends a further
     /// command to another idle compatible slot or a new one; a slot whose
     /// holder died while its group lives is never reused; with no safely
@@ -8679,75 +8512,6 @@ pub(crate) mod tests {
             &record(Phase::Idle, None, None),
             Some(boot)
         ));
-    }
-
-    /// The boot override works only inside the shared supervisor's own
-    /// scratch/evidence/deadline layout; anything else leaves the real
-    /// reading in force.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn the_boot_override_needs_the_supervisors_own_layout() {
-        let root = Path::new("/scratch/oxide-proof.unit");
-        let scratch = root.join("scratch");
-        let evidence = root.join("evidence");
-        assert!(supervisor_layout_paths(
-            &scratch,
-            &evidence,
-            Some("1900000000000")
-        ));
-        for (label, scratch, evidence, deadline) in [
-            (
-                "evidence elsewhere",
-                scratch.clone(),
-                root.join("other"),
-                Some("1"),
-            ),
-            (
-                "nested evidence",
-                scratch.clone(),
-                scratch.join("evidence"),
-                Some("1"),
-            ),
-            ("absent deadline", scratch.clone(), evidence.clone(), None),
-            (
-                "unparseable deadline",
-                scratch.clone(),
-                evidence.clone(),
-                Some("soon"),
-            ),
-            (
-                "not the supervisor leaf",
-                root.to_path_buf(),
-                evidence.clone(),
-                Some("1"),
-            ),
-            (
-                "not an oxide-proof root",
-                Path::new("/scratch/other/scratch").to_path_buf(),
-                Path::new("/scratch/other/evidence").to_path_buf(),
-                Some("1"),
-            ),
-        ] {
-            assert!(
-                !supervisor_layout_paths(&scratch, &evidence, deadline),
-                "{label}"
-            );
-        }
-    }
-
-    /// The debug proof control defines the reading only when it is present,
-    /// and a present but unusable value is unknown rather than the real boot.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn a_present_boot_override_is_read_or_unknown_but_never_ignored() {
-        assert_eq!(boot_override(None), None);
-        assert_eq!(
-            boot_override(Some("1900000000000")),
-            Some(Some(1_900_000_000_000))
-        );
-        for unusable in ["unreadable", "0", "", "1900000000000 "] {
-            assert_eq!(boot_override(Some(unusable)), Some(None), "{unusable:?}");
-        }
     }
 
     fn held(holder: &str, lease_id: &str) -> LedgerSlot {
@@ -10026,15 +9790,6 @@ pub(crate) mod tests {
             && row.recorded.is_none()));
         store.release(warm, None).unwrap();
         fs::remove_dir_all(root).unwrap();
-        if std::env::var_os("OXIDE_WARM_REUSE_FIXTURE").is_some() {
-            let evidence =
-                PathBuf::from(std::env::var_os("OXIDE_PROOF_EVIDENCE").expect("proof evidence"));
-            fs::write(
-                evidence.join("warm-reuse-frontdoor.json"),
-                b"{\"passed\":true}\n",
-            )
-            .unwrap();
-        }
     }
 
     fn class_state_bytes(store: &Store) -> Vec<u8> {
@@ -10167,8 +9922,8 @@ pub(crate) mod tests {
     /// absent: the next locked open keeps the record and starts no journal,
     /// and renaming it back lets the following open journal and conclude. The
     /// fixture carries a version-5 control state (the recorded-accounting fence
-    /// without the raised fence). Nothing in it is unreadable, so the shared
-    /// supervisor's scratch measurement can always walk it. Returns the fixture
+    /// without the raised fence). Nothing in it is unreadable, so a scratch
+    /// measurement can always walk it. Returns the fixture
     /// root, the store, the key, the recorded slot root and the hidden path.
     fn pending_deletion_fixture(label: &str) -> (PathBuf, Store, SlotKey, PathBuf, PathBuf) {
         let (root, store, key) = class_fixture(label);

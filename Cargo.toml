@@ -14,16 +14,14 @@ publish = false
 # byte-pressure pruning, idle LRU eviction, marker-checked trash and scratch;
 # Oxide keeps its Cargo front door, slots, leases, recipes, output member links
 # and seeding. Its own dependencies (serde, serde_json, libc) are already pinned
-# here. Offline builds seed this locked Git source through
-# scripts/offline_seed.py.
+# here.
 barge = { git = "https://github.com/inflatable-cookie/barge", rev = "7c91e356ecf71f90680f6d58870c800132c6d130" }
 basic-toml = "=0.1.10"
 # Cold-slot seeding source verification (oxide#166): a pinned archive reader
 # for registry `.crate` files. `flate2` uses its pure-Rust backend and `tar` is
 # used only for decompression and entry iteration; neither is fetched, run as
 # a process, or configured at runtime. The lock adds exactly these registry
-# packages, which the shared bounded offline seeder derives from `Cargo.lock`
-# in the one supported crates.io sparse namespace: flate2, miniz_oxide,
+# packages in the one supported crates.io sparse namespace: flate2, miniz_oxide,
 # adler2, simd-adler32, crc32fast, tar and filetime (cfg-if and libc already).
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
 libc = "=0.2.190"
@@ -35,10 +33,6 @@ tar = { version = "=0.4.46", default-features = false }
 
 [dev-dependencies]
 barge = { git = "https://github.com/inflatable-cookie/barge", rev = "7c91e356ecf71f90680f6d58870c800132c6d130", features = ["testing"] }
-
-[[bin]]
-name = "oxide-storage-inventory"
-path = "src/bin/storage_inventory.rs"
 
 [[bin]]
 name = "oxide"

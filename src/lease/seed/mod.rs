@@ -954,30 +954,13 @@ pub fn seed_monitored(
         return Ok(skip(SeedSkipReason::DonorPayloadMissing));
     };
     // Plan from the re-read catalog's own recorded file lists.
-    let mut plan = match plan_units(&catalog, &request.units) {
+    let plan = match plan_units(&catalog, &request.units) {
         Ok(plan) => plan,
         Err(reason) => return Ok(skip(reason)),
     };
     // The five-second cooperative work bound starts with donor revalidation,
     // and every read and clone step below checks it.
     let deadline = now() + budget;
-    if proof_breach("verify") {
-        return Err(monitor_stop());
-    }
-    // Debug-only oracle controls (absent from release builds; armed only under
-    // the shared proof supervisor's own layout): `drop-dep` removes the
-    // fingerprint `dep-…` file from the plan, and `admit-run` adds the
-    // build-script run payload and run fingerprint the adapter deliberately
-    // never offers. Both let the native oracle prove it distinguishes a
-    // reused unit from a rerun.
-    proof_adjust_plan(
-        &mut plan,
-        &catalog,
-        &request.units,
-        &donor_slot_path,
-        deadline,
-        monitor,
-    )?;
     test_point(TestPoint::BeforeVerify { pool });
     // Every donor payload read happens here, under the shared hold: each planned file
     // is opened without following a link, checked against the catalog's
@@ -1153,10 +1136,6 @@ pub fn seed_monitored(
             index,
             path: &recipient_path,
         });
-        proof_crash_after_first_clone();
-        if proof_breach("after-clone") {
-            return Err(monitor_stop());
-        }
         // The clone is hashed against the same recorded digest; a clone that
         // does not reproduce it is never published.
         let cloned = match walk::open_regular(&directory, &name) {
@@ -1220,10 +1199,6 @@ pub fn seed_monitored(
     if walked.gap == Some(SeedWalkGap::MonitorStop) || monitor() {
         return Err(monitor_stop());
     }
-    // Debug-only walk-gap control (absent from release builds; armed only under
-    // the shared proof supervisor's own layout): the native proof injects each
-    // failure class it cannot create on disk to prove publication is withheld.
-    let walked = proof_inject_walk_gap(walked);
     let observation = SeedObservation {
         store_id: view.store_id.clone(),
         slot_id: recipient.id.to_string(),
@@ -1292,218 +1267,6 @@ pub fn publish_seed_catalog(pool: &Path, catalog: &SeedCatalog) -> Result<(), Le
 
 fn skip(reason: SeedSkipReason) -> SeedOutcome {
     SeedOutcome::Skipped(SeedSkip { reason })
-}
-
-/// A debug-only proof seam's value, when the shared supervisor armed this
-/// process and the variable is set. Absent from release builds, and never read
-/// in an ordinary run.
-#[cfg(debug_assertions)]
-fn proof_seam(name: &str) -> Option<String> {
-    crate::proof::evidence()?;
-    std::env::var(name).ok()
-}
-
-#[cfg(not(debug_assertions))]
-fn proof_seam(_name: &str) -> Option<String> {
-    None
-}
-
-/// The debug-only plan controls. `drop-dep` drops only the fingerprint
-/// `dep-…` files; `admit-run` appends the run payload and run fingerprint of
-/// each selected build-script package, with sizes and digests computed here.
-/// Both are absent from release builds and armed only under the supervisor.
-fn proof_adjust_plan(
-    plan: &mut Plan,
-    catalog: &SeedCatalog,
-    units: &[SeedUnitRef],
-    donor_slot: &Path,
-    deadline: Instant,
-    monitor: &mut dyn FnMut() -> bool,
-) -> Result<(), LeaseError> {
-    let Some(mode) = proof_seam("OXIDE_TEST_SEED_PLAN") else {
-        return Ok(());
-    };
-    if mode == "drop-dep" {
-        plan.files.retain(|planned| {
-            !planned
-                .file
-                .path
-                .rsplit('/')
-                .next()
-                .is_some_and(|name| name.starts_with("dep-"))
-        });
-        plan.logical_bytes = plan.files.iter().fold(0u64, |total, planned| {
-            total.saturating_add(planned.file.size)
-        });
-        return Ok(());
-    }
-    if mode != "admit-run" {
-        return Ok(());
-    }
-    let selected: Vec<&str> = units
-        .iter()
-        .filter(|unit| unit.role == SeedRole::BuildScriptCompile)
-        .filter_map(|unit| {
-            catalog
-                .packages
-                .iter()
-                .find(|package| {
-                    package
-                        .units
-                        .iter()
-                        .any(|candidate| candidate.fingerprint_dir == unit.fingerprint_dir)
-                })
-                .map(|package| package.name.as_str())
-        })
-        .collect();
-    if selected.is_empty() {
-        return Ok(());
-    }
-    let profile = match catalog.producer.recipe.as_str() {
-        "debug" => "debug",
-        "release" => "release",
-        _ => "debug",
-    };
-    let root = donor_slot.join("build");
-    let mut extras: Vec<(String, PathBuf)> = Vec::new();
-    let entries = match fs::read_dir(root.join(profile).join(".fingerprint")) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(()),
-    };
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Some((literal, hash)) = name.rsplit_once('-') else {
-            continue;
-        };
-        if !selected.contains(&literal) || hash.len() != 16 {
-            continue;
-        }
-        for file in [
-            "run-build-script-build-script-build",
-            "run-build-script-build-script-build.json",
-        ] {
-            let path = format!("{profile}/.fingerprint/{name}/{file}");
-            extras.push((path.clone(), root.join(&path)));
-        }
-        for file in ["output", "root-output", "stderr", "invoked.timestamp"] {
-            let path = format!("{profile}/build/{name}/{file}");
-            extras.push((path.clone(), root.join(&path)));
-        }
-        let out = format!("{profile}/build/{name}/out");
-        let mut pending = vec![(out.clone(), root.join(&out))];
-        while let Some((relative, directory)) = pending.pop() {
-            if extras.len() > SEED_MAX_PLAN_FILES || now() > deadline || monitor() {
-                return Ok(());
-            }
-            let Ok(items) = fs::read_dir(&directory) else {
-                continue;
-            };
-            for item in items.flatten() {
-                let Some(child) = item.file_name().to_str().map(str::to_owned) else {
-                    continue;
-                };
-                let child_relative = format!("{relative}/{child}");
-                let child_path = root.join(&child_relative);
-                let Ok(metadata) = fs::symlink_metadata(&child_path) else {
-                    continue;
-                };
-                if metadata.is_dir() {
-                    pending.push((child_relative, child_path));
-                } else if metadata.is_file() && metadata.uid() == current_uid() {
-                    extras.push((child_relative, child_path));
-                }
-            }
-        }
-    }
-    for (relative, path) in extras {
-        if plan
-            .files
-            .iter()
-            .any(|planned| planned.file.path == relative)
-        {
-            continue;
-        }
-        let Ok(file) = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)
-        else {
-            continue;
-        };
-        let metadata = match fstat(file.as_fd()) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG || metadata.st_uid != current_uid() {
-            continue;
-        }
-        let size = metadata.st_size.max(0) as u64;
-        let digest = match hash_fd(file.as_fd(), deadline, monitor) {
-            Ok(digest) => digest,
-            Err(_) => continue,
-        };
-        plan.files.push(PlannedFile {
-            join: None,
-            file: SeedFile {
-                path: relative,
-                size,
-                mtime_ms: 0,
-                digest,
-                kind: SeedFileKind::Fingerprint,
-            },
-        });
-        plan.logical_bytes = plan.logical_bytes.saturating_add(size);
-    }
-    Ok(())
-}
-
-/// The debug-only injected-stop seam: report the caller's monitor stop at a
-/// named point, so the native proof can exercise a mid-seed fault that retains
-/// the untrusted generation and refuses. Armed only under the supervisor.
-fn proof_breach(point: &str) -> bool {
-    proof_seam("OXIDE_TEST_SEED_BREACH").as_deref() == Some(point)
-}
-
-/// The debug-only crash seam: after the first clone exists and before any
-/// digest check, abort this command. The untrusted origin and the partial
-/// recipient survive for the next command's journaled whole-slot eviction.
-fn proof_crash_after_first_clone() {
-    if proof_seam("OXIDE_TEST_SEED_CRASH").as_deref() == Some("after-first-clone") {
-        std::process::abort();
-    }
-}
-
-/// Replace a completed walk's clean result with an injected gap, so the native
-/// proof can exercise each failure class it cannot create on disk. A real gap
-/// is never overwritten (the injected value applies only to a clean walk).
-#[cfg(debug_assertions)]
-fn proof_inject_walk_gap(walked: walk::WalkOutcome) -> walk::WalkOutcome {
-    if walked.gap.is_some() {
-        return walked;
-    }
-    let Some(gap) = proof_seam("OXIDE_TEST_SEED_WALK") else {
-        return walked;
-    };
-    let gap = match gap.as_str() {
-        "foreign-owner" | "ownership" => SeedWalkGap::ForeignOwner,
-        "unreadable" | "failed" => SeedWalkGap::Unreadable,
-        "device-boundary" => SeedWalkGap::DeviceBoundary,
-        "entry-limit" => SeedWalkGap::EntryLimit,
-        "depth-limit" => SeedWalkGap::DepthLimit,
-        "unexpected-type" => SeedWalkGap::UnexpectedType,
-        _ => return walked,
-    };
-    walk::WalkOutcome {
-        gap: Some(gap),
-        ..walked
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn proof_inject_walk_gap(walked: walk::WalkOutcome) -> walk::WalkOutcome {
-    walked
 }
 
 fn walk_limits() -> SeedWalkLimits {

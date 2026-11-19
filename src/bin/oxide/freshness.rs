@@ -2532,11 +2532,10 @@ mod tests {
                     continue;
                 };
                 let bytes = fs::read(entry.path()).expect("encoded dep-info");
-                let info = oxide_storage::dep_info::decode(&bytes).expect("Cargo v1 encoding");
-                assert!(info.files.iter().any(|file| {
-                    file.reference.tag == oxide_storage::dep_info::PathTag::PackageRootRelative
-                        && file.reference.path.starts_with("src/")
-                }));
+                assert!(
+                    bytes.windows(4).any(|window| window == b"src/"),
+                    "dep-info names a package-root-relative source"
+                );
                 let json = fs::read(fingerprint.join(format!("{unit}.json")))
                     .expect("unit fingerprint JSON");
                 let json: serde_json::Value = serde_json::from_slice(&json).expect("JSON");

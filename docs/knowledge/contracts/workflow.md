@@ -405,12 +405,6 @@ Seeding is on by default. Only the exact value `OXIDE_COLD_SEED=0` opts out.
 - The catalog lives in `oxide-managed/seeds/`. Both internal and removable pools
   seed, and the reserve gate applies to the start.
 
-Offline Cargo homes for fixtures: `scripts/offline_seed.py` builds a private
-offline `CARGO_HOME` from one `Cargo.lock`. It copies only the lock's inputs (the
-crates.io sparse namespace and any pinned Git bare repositories), with no-follow
-anchored reads, byte bounds, no network and no host Git. `effigy offline-seed:test`
-runs its self-test. It is fixture tooling and not a product path.
-
 ## Inherited rustc wrapper
 
 **Rustc wrapper.** Leased builds bypass an inherited `RUSTC_WRAPPER`, such as a
@@ -930,7 +924,7 @@ proof ladders, reviewer-native sessions or qualification selectors exist.
 - Other surviving selectors: `rust:tree-duplicates`, `dogfood:scripts:test` (the
   installer's synthetic install, rollback and canary cases, including the three canary
   modes with a fake staged binary and a check that the format-change run never names
-  or writes the live documents), `offline-seed:test`.
+  or writes the live documents).
 - The independent reviewer judges the exact head, its regressions and the author's
   evidence. The reviewer does not repeat the covering selectors and reports missing
   evidence.

@@ -1,5 +1,5 @@
-//! Budget-only build-slot leases, read-only target inventory and a bounded
-//! Cargo dep-info decoder for the `oxide` front door.
+//! Budget-only build-slot leases, read-only target inventory and cold-slot
+//! source verification for the `oxide` front door.
 
 #[cfg(all(test, unix))]
 mod test_fs;
@@ -19,26 +19,11 @@ pub mod lease;
 #[cfg(unix)]
 mod fs_util;
 
-/// Debug-only guard for product proof hooks (oxide#155).
-#[cfg(debug_assertions)]
-pub mod proof;
-
-/// The shared proof supervisor's arming layout: its deadline, its canonical
-/// owned scratch root and its evidence directory nested in it or its
-/// `scratch`/`evidence` sibling (oxide#192). One definition decides every
-/// proof seam, in every profile.
-#[cfg(unix)]
-pub mod supervisor;
-
 /// Bounded source verification for cold-slot seeding: the registry archive
-/// reader, the canonical tree digest, the verification cache and the git
-/// adapter (oxide#166, slice 1).
+/// reader, the canonical tree digest and the verification cache (oxide#166,
+/// slice 1).
 #[cfg(unix)]
 pub mod seed_source;
-
-/// Bounded decoder for Cargo's encoded dep-info, kept as input for the
-/// cross-checkout freshness gate.
-pub mod dep_info;
 
 /// Barge-backed storage authority: volumes, areas, marked roots, holds, pins,
 /// pruning, trash and scratch. The one place Oxide declares its areas and

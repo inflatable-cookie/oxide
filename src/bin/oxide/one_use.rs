@@ -34,8 +34,8 @@ use std::path::{Component, Path, PathBuf};
 
 /// The one production opt-in (design §3.5): exactly `1`.
 pub(crate) const OPT_IN: &str = "OXIDE_ONE_USE_WORKSPACE";
-/// The qualified shared proof supervisor's scratch root: a candidate source,
-/// never a classifier of its own (design §3.2).
+/// The task scratch root named by the caller's environment: a candidate
+/// source, never a classifier of its own (design §3.2).
 pub(crate) const TASK_SCRATCH: &str = "OXIDE_TASK_SCRATCH_ROOT";
 /// The command-line environment's temporary directory: a candidate source.
 pub(crate) const TMPDIR: &str = "TMPDIR";

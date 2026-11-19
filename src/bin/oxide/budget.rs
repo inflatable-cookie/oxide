@@ -632,62 +632,6 @@ pub fn finished(
     });
 }
 
-/// The debug-only proof control for a group that never closes.
-pub const CLOSURE_HOOK: &str = "OXIDE_TEST_CLOSURE_STUCK";
-
-/// Whether the debug closeout hook asks this run to report an unconfirmed
-/// group. Release builds have no hook and always answer `false`.
-pub fn closure_stuck() -> bool {
-    #[cfg(debug_assertions)]
-    {
-        std::env::var_os(CLOSURE_HOOK).is_some()
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        false
-    }
-}
-
-/// The debug-only proof control for the in-flight spawn window: a delay placed
-/// after the last admission check and before the launch, so the proof can force
-/// an observable late start. Release builds have no hook.
-pub const SPAWN_DELAY_HOOK: &str = "OXIDE_TEST_SPAWN_DELAY_MS";
-
-/// Milliseconds to wait just before the launch attempt (debug builds only).
-pub fn spawn_delay() -> Option<Duration> {
-    #[cfg(debug_assertions)]
-    {
-        let value = std::env::var_os(SPAWN_DELAY_HOOK)?;
-        let millis = value.to_str()?.parse::<u64>().ok()?;
-        Some(Duration::from_millis(millis))
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        None
-    }
-}
-
-/// A build without the debug hook refuses the variable whenever it is present,
-/// rather than silently ignoring a proof control.
-pub fn refuse_absent_test_hook() -> Result<(), String> {
-    #[cfg(debug_assertions)]
-    {
-        let _ = (CLOSURE_HOOK, SPAWN_DELAY_HOOK);
-        Ok(())
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        for hook in [CLOSURE_HOOK, SPAWN_DELAY_HOOK] {
-            if std::env::var_os(hook).is_some() {
-                return Err(format!(
-                    "{hook} is a debug-only proof control; this build has no such hook"
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
 /// KILL one preparation child and reap it inside a finite bound.
 pub fn kill_and_reap(child: &mut std::process::Child) -> bool {
     let _ = child.kill();
@@ -1393,13 +1337,6 @@ mod tests {
         assert!(program["execution_started_ms"].as_u64().unwrap() >= 20);
         assert!(program["admission_elapsed_ms"].as_u64().unwrap() >= 20);
         reset();
-    }
-
-    #[test]
-    fn the_debug_closure_hook_is_absent_unless_set() {
-        reset();
-        assert!(!closure_stuck());
-        assert!(refuse_absent_test_hook().is_ok());
     }
 
     #[test]

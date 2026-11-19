@@ -305,7 +305,6 @@ fn recorded_absent_scratch_status_is_read_only() {
     let hash = Sha256::digest(pool.as_os_str().as_bytes());
     let name = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let record_path = records.join(format!("{name}.json"));
-    let walk_log = scratch.0.join("walk-log");
     let run = || {
         Command::new(env!("CARGO_BIN_EXE_oxide"))
             .arg("status")
@@ -315,7 +314,6 @@ fn recorded_absent_scratch_status_is_read_only() {
             .env("OXIDE_TEST_HOME_FROM_ENV", "1")
             .env("OXIDE_POOL", &pool)
             .env("OXIDE_CONFIG", scratch.0.join("missing-config"))
-            .env("OXIDE_TEST_WALK_LOG", &walk_log)
             .env_remove("OXIDE_SCRATCH_ROOT")
             .output()
             .unwrap()
@@ -339,6 +337,5 @@ fn recorded_absent_scratch_status_is_read_only() {
         .contains("unavailable (scratch volume test-uuid absent)"));
     assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
     assert_eq!(std::fs::read_dir(&records).unwrap().count(), 1);
-    assert!(!walk_log.exists());
     assert!(!mount.exists());
 }

@@ -159,9 +159,9 @@ evidence.
   keyed by archive device, inode, size and mtime, and by archive SHA-256. Any
   identity change forces full re-derivation or a skip.
 
-**Git.** A sanitized, bounded verifier reusing the freshness gate's Git protocol
-exists in `src/seed_source/git.rs`, but it is dormant. Product lock parsing
-rejects Git sources before any verification, so nothing seeds from Git.
+**Git.** Product lock parsing rejects Git sources before any verification, so
+nothing seeds from Git. The dormant Git verifier, its hint discovery and its
+closure checks were removed (red-pen 1, oxide#340); seeding is registry-only.
 
 **Residual.** A same-user writer that changes a source during the producing
 build and restores the old bytes, preserving mtime and size, is not detected.
