@@ -11,6 +11,7 @@ use crate::store::{self, Store};
 use oxide_storage::storage::{AreaConfig, Storage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -777,11 +778,14 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
     }
     note_reservation(&mut registry, receipt, &receipt_path, checkout_volume_uuid)?;
     pin_references(control, receipt)?;
+    // A recorded ID is the generation's identity. Backfill missing IDs from
+    // Barge's markers once per area, even when many rows share that area.
+    let mut roots_by_area = HashMap::new();
     for row in &mut registry.rows {
         if !row.live()
+            || row.barge_id.is_some()
             || !row.root.is_dir()
-            || (row.barge_id.is_none()
-                && !row.root.join(oxide_storage::storage::ROOT_MARKER).exists())
+            || !row.root.join(oxide_storage::storage::ROOT_MARKER).exists()
         {
             continue;
         }
@@ -792,16 +796,20 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
             nonce: row.nonce.clone(),
             generation: row.generation,
         };
-        let area = output_area(control, &selected)?;
-        if let Some(root) = area
-            .list_without_bytes()
-            .map_err(|error| error.to_string())?
-            .roots
-            .into_iter()
-            .find(|root| root.path == row.root)
-        {
-            row.barge_id = Some(root.id);
-        }
+        let (account, config) = output_area_config(control, &selected)?;
+        let roots = match roots_by_area.entry((account, config.uuid.clone())) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let area = Storage::open(&entry.key().0)?.declare(&config)?;
+                entry.insert(
+                    output_roots(&area)?
+                        .into_iter()
+                        .map(|root| (root.path, root.id))
+                        .collect::<HashMap<_, _>>(),
+                )
+            }
+        };
+        row.barge_id = roots.get(&row.root).cloned();
     }
     write_registry(control, &registry)
 }
@@ -1477,6 +1485,48 @@ fn output_area(control: &Path, selected: &Selected) -> Result<barge::Area, Strin
     Storage::open(&account)?.declare(&config)
 }
 
+/// Inventory for identity and protection only. Callers may hold admission.
+fn output_roots(area: &barge::Area) -> Result<Vec<barge::RootInfo>, String> {
+    let listing = area
+        .list_without_bytes()
+        .map_err(|error| error.to_string())?;
+    #[cfg(test)]
+    observe_output_listing(&listing);
+    Ok(listing.roots)
+}
+
+#[cfg(test)]
+thread_local! {
+    static OUTPUT_LISTINGS: std::cell::Cell<Option<(usize, usize)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn observe_output_listing(listing: &barge::Listing) {
+    OUTPUT_LISTINGS.with(|counts| {
+        if let Some((calls, sized)) = counts.get() {
+            // Every root in the regression has nonempty contents. Measuring
+            // one produces bytes (or an approximation on an incomplete walk).
+            let measured = listing
+                .roots
+                .iter()
+                .filter(|root| root.bytes != 0 || root.bytes_approximate)
+                .count();
+            counts.set(Some((calls + 1, sized + measured)));
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn count_output_listings<T>(action: impl FnOnce() -> T) -> (T, (usize, usize)) {
+    OUTPUT_LISTINGS.with(|counts| {
+        assert!(counts.replace(Some((0, 0))).is_none());
+        let result = action();
+        (result, counts.take().unwrap())
+    })
+}
+
 fn existing_output_area(
     control: &Path,
     selected: &Selected,
@@ -1526,10 +1576,7 @@ fn import_output(
     // The Barge marker and account can already own this path even before
     // its first Oxide index row is committed. Re-pinning it is conservative;
     // the caller still validates every Oxide link and marker before use.
-    let existing = area
-        .list_without_bytes()
-        .map_err(|error| error.to_string())?
-        .roots
+    let existing = output_roots(&area)?
         .into_iter()
         .find(|root| root.path == selected.root());
     if let Some(root) = existing {
@@ -1722,11 +1769,7 @@ fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
         let Some(area) = existing_output_area(control, &selected)? else {
             continue;
         };
-        for root in area
-            .list_without_bytes()
-            .map_err(|error| error.to_string())?
-            .roots
-        {
+        for root in output_roots(&area)? {
             let recorded = registry
                 .rows
                 .iter()
@@ -1922,15 +1965,80 @@ pub fn status_lines(control: &Path) -> Vec<String> {
 #[cfg(test)]
 pub(crate) fn test_output_storage(control: &Path, selected: &Selected) -> (barge::Area, String) {
     let area = output_area(control, selected).unwrap();
-    let id = area
-        .list()
+    let id = output_roots(&area)
         .unwrap()
-        .roots
         .into_iter()
         .find(|root| root.path == selected.root())
         .unwrap()
         .id;
     (area, id)
+}
+
+/// Fill the adoption fixture's area with roots and live registry rows, some
+/// written before Barge IDs were recorded. Return the expected identities.
+#[cfg(test)]
+pub(crate) fn seed_output_neighbors(
+    control: &Path,
+    selected: &Selected,
+    count: usize,
+) -> HashMap<PathBuf, String> {
+    let area = output_area(control, selected).unwrap();
+    let mut registry = ready_registry(control).unwrap();
+    let mut expected = HashMap::new();
+    for index in 0..count {
+        let root = area.create_root("neighbor").unwrap();
+        fs::create_dir(root.path.join("debug")).unwrap();
+        fs::write(root.path.join("debug/payload"), [42; 4096]).unwrap();
+        let checkout = control.join(format!("neighbor-{index}"));
+        let checkout_id = sha256_hex(checkout.as_os_str().as_encoded_bytes());
+        registry.rows.push(Row {
+            receipt: outputs::receipt_path_public(control, &checkout_id),
+            checkout_id,
+            checkout,
+            checkout_volume_uuid: None,
+            member: "debug".to_owned(),
+            root: root.path.clone(),
+            barge_id: (index % 2 == 0).then(|| root.id.clone()),
+            root_kind: selected.kind(),
+            volume_uuid: selected.volume_uuid().map(str::to_owned),
+            recipe: outputs::RECIPE_PUBLIC.to_owned(),
+            nonce: None,
+            generation: 1,
+            root_dev: None,
+            root_ino: None,
+            marker_digest: None,
+            selected: true,
+            pending: false,
+            pruning: None,
+            pruned_ms: None,
+            reservation: None,
+            cancelling: None,
+        });
+        expected.insert(root.path, root.id);
+    }
+    write_registry(control, &registry).unwrap();
+    // Positive control: the same inventory observer sees every sized root
+    // when Barge is asked to measure the fixture.
+    let ((), counts) = count_output_listings(|| observe_output_listing(&area.list().unwrap()));
+    assert_eq!(counts, (1, count));
+    expected
+}
+
+#[cfg(test)]
+pub(crate) fn assert_output_neighbors(control: &Path, expected: &HashMap<PathBuf, String>) {
+    let registry = ready_registry(control).unwrap();
+    let mut matched = 0;
+    for row in &registry.rows {
+        if let Some(id) = expected.get(&row.root) {
+            assert_eq!(row.barge_id.as_ref(), Some(id));
+            assert_eq!(
+                fs::read(row.root.join("debug/payload")).unwrap(),
+                [42; 4096]
+            );
+            matched += 1;
+        }
+    }
+    assert_eq!(matched, expected.len());
 }
 
 /// Whether an earlier owned generation occupied this path. A missing or

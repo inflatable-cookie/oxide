@@ -5216,7 +5216,11 @@ migration and consumer adoption remain separate gates.
   absent (no file, directory or link, dangling links included). It runs the
   adopt barrier, downgrade fence, admission lock, roots, marker and receipt,
   with a missing-target-only transition, and releases the barrier before the
-  slot is taken. Every fact is rechecked under the admission lock. A concurrent
+  slot is taken. Output identity, holds and pins use Barge markers and
+  bytes-free listings. Auto-adopt, adopt and detach do not measure neighboring
+  output payloads while holding admission. See the
+  [Barge adoption contract](barge-adoption.md) for registry ID backfill.
+  Every fact is rechecked under the admission lock. A concurrent
   receipt, creator, mode or volume change makes it a no-op, and the existing
   path decides. The conversion creates the PROFILE layout (oxide#160, S4b):
   it runs the same creator an explicit `oxide outputs adopt` runs for a fresh

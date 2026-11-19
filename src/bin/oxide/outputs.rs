@@ -4136,6 +4136,22 @@ pub fn auto_adopt(
     if !auto_adopts(&facts) {
         return Ok(());
     }
+    auto_adopt_fresh(store, &context, &captured, || {
+        Ok(external_choice(&context)?
+            .ok()
+            .map(|registration| external_spec(&registration, checkout)))
+    })
+}
+
+/// Convert a fresh checkout, consulting the current placement again while
+/// admission is held. The placement lookup is separate from publication so
+/// the same transition can run on a private directory fixture.
+fn auto_adopt_fresh(
+    store: &Store,
+    context: &Context,
+    captured: &Selected,
+    current: impl FnOnce() -> Result<Option<RootSpec>, String>,
+) -> Result<(), String> {
     // Expected automatic-adoption ineligibility must leave the build usable
     // (oxide#154). The prerequisite is asked before the barrier, the
     // downgrade fence or the admission lock, so an ineligible checkout gets
@@ -4144,10 +4160,11 @@ pub fn auto_adopt(
     // publish (oxide#160), the same set `adopt_profile_from` checks before it
     // creates the real target directory.
     for member in AUTO_ADOPT_MEMBERS {
-        if first_link_git_answer(&context, Some(member)).verdict != LinkGitVerdict::Eligible {
+        if first_link_git_answer(context, Some(member)).verdict != LinkGitVerdict::Eligible {
             return Ok(());
         }
     }
+    let checkout = &context.workspace;
     let mut waits = WaitAccounting::default();
     let guard = barrier(store, checkout, &mut waits)?;
     let outcome: Result<Option<Selected>, String> = (|| {
@@ -4164,11 +4181,10 @@ pub fn auto_adopt(
         if context.receipt()?.is_some() || context.target()? != TargetState::Missing {
             return Ok(None);
         }
-        let Ok(registration) = external_choice(&context)? else {
+        let Some(spec) = current()? else {
             return Ok(None);
         };
-        let spec = external_spec(&registration, checkout);
-        if !selection_matches(&captured, &spec.selected(0)) {
+        if !selection_matches(captured, &spec.selected(0)) {
             return Ok(None);
         }
         // The first conversion creates the profile layout through the SAME
@@ -4179,7 +4195,7 @@ pub fn auto_adopt(
         // identical in form to a fresh explicit adoption.
         let receipt = Receipt::first_with(checkout, &context.checkout_id, LayoutKind::Profile);
         let (_committed, selected, _converted) =
-            adopt_profile_from(&context, receipt, Start::MissingOnly, Some(&spec))?;
+            adopt_profile_from(context, receipt, Start::MissingOnly, Some(&spec))?;
         Ok(Some(selected))
     })();
     release_barrier(store, guard)?;
@@ -17378,6 +17394,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fresh_auto_adoption_does_not_measure_neighboring_outputs() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let store = Store::for_tests(&fixture.root.join("pool"));
+        let control = store.owner_control();
+        let context = Context::new(Some(control.to_path_buf()), fixture.checkout.clone());
+        crate::prune::ensure_ready(&store, &fixture.checkout).unwrap();
+        let spec = fixture.local();
+        let neighbors = crate::prune::seed_output_neighbors(control, &spec.selected(1), 708);
+        assert!(context.receipt().unwrap().is_none());
+        assert_eq!(context.target().unwrap(), TargetState::Missing);
+
+        let started = Instant::now();
+        let (result, (listings, measured)) = crate::prune::count_output_listings(|| {
+            auto_adopt_fresh(&store, &context, &spec.selected(0), || {
+                Ok(Some(spec.clone()))
+            })
+        });
+        let elapsed = started.elapsed();
+        result.unwrap();
+        assert_eq!(measured, 0, "auto-adoption measured output payloads");
+        assert!(
+            listings <= 8,
+            "auto-adoption listed the area {listings} times"
+        );
+        // A generous upper bound for the whole conversion, which includes
+        // every admission-lock hold as well as work outside the lock.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "auto-adoption took {elapsed:?}"
+        );
+
+        let receipt = context.receipt().unwrap().unwrap();
+        assert_eq!(receipt.state, ReceiptState::Committed);
+        for member in AUTO_ADOPT_MEMBERS {
+            assert_eq!(
+                fs::read_link(context.link().join(member)).unwrap(),
+                spec.root().join(member),
+            );
+        }
+        crate::prune::assert_output_neighbors(control, &neighbors);
+        println!(
+            "auto-adoption beside {} roots: {measured} measured, {listings} metadata listings, {elapsed:?} including admission-lock holds",
+            neighbors.len()
+        );
+    }
+
     /// A command whose slot came from the internal pool, or from a registration
     /// that was ephemeral when it selected, never converts, even when the drive
     /// is permanent by the time it checks. The all-true facts are the control.
@@ -18780,7 +18843,7 @@ mod tests {
             .is_symlink());
         let (area, id) = crate::prune::test_output_storage(&fixture.control, &selected);
         assert!(area
-            .list()
+            .list_without_bytes()
             .unwrap()
             .roots
             .iter()

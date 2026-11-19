@@ -20,6 +20,7 @@ and Queue history; no evidence, credit or fixture from them is migrated.
 `3320dd276856356c5a9e59bafa6f091c0df71ac3` (barge#088: mount-identity checks,
 no-replace renames, eviction and lock-open corrections). The library uses caret
 dependency requirements. Only test builds request Barge's `testing` feature.
+The offline seeder derives its Git revision from `Cargo.lock`.
 `scripts/offline_seed.py` derives the exact Git revision from `Cargo.lock`;
 a missing revision is an offline failure.
 
@@ -159,7 +160,10 @@ eviction. An eviction left in trash surfaces an error and earns no freed
 space. Warm reuse above the reserve walks no other payload. Barge's own
 soft caps use its release size records, with measurements of vanished roots
 reported as approximate. Identity and protection views use bytes-free Barge
-listings. Oxide counts byte walks separately and reports the unavailable
+listings or marker-only resolution. Owned-output receipt publication keeps
+recorded Barge IDs and backfills missing IDs with at most one metadata listing
+per area. It never measures output payloads under the admission lock. Oxide
+counts byte walks separately and reports the unavailable
 count for Barge's internal marker enumeration. The
 [admission observations](local-lease.md#admission-observations-oxide317)
 own the measurement rules.
