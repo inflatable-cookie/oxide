@@ -3,6 +3,9 @@
 //! Collection is read-only. The rendered effective values, rather than file
 //! names, enter the digest; the file list is retained as review evidence.
 
+use oxide_storage::lease::seed::{
+    SEED_MAX_CONFIG_FILES, SEED_MAX_CONTEXT_BYTES, SEED_MAX_CONTEXT_RENDERED_BYTES,
+};
 use serde_json::{Map, Value};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
@@ -11,9 +14,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-const MAX_FILES: usize = 16;
-const MAX_BYTES: usize = 4 * 1024 * 1024;
-const MAX_RENDERED: usize = 128 * 1024;
 const FLAGS: &[&str] = &[
     "RUSTFLAGS",
     "CARGO_ENCODED_RUSTFLAGS",
@@ -195,7 +195,9 @@ fn read_config(path: &Path, total: &mut usize) -> Result<Option<Value>, &'static
     if !metadata.is_file() {
         return Err("unreadable config");
     }
-    let remaining = MAX_BYTES.checked_sub(*total).ok_or("config cap")?;
+    let remaining = (SEED_MAX_CONTEXT_BYTES as usize)
+        .checked_sub(*total)
+        .ok_or("config cap")?;
     let mut bytes = Vec::new();
     file.by_ref()
         .take((remaining + 1) as u64)
@@ -263,7 +265,7 @@ pub(crate) fn collect(
             let path = dir.join(name);
             if let Some(mut value) = read_config(&path, &mut total)? {
                 check_config(&mut value, &base)?;
-                if files.len() == MAX_FILES {
+                if files.len() == SEED_MAX_CONFIG_FILES {
                     return Err("config cap");
                 }
                 let text = path.to_str().ok_or("non-UTF-8 config path")?.to_owned();
@@ -281,7 +283,7 @@ pub(crate) fn collect(
     }
     let mut flags = Vec::new();
     let mut context = serde_json::to_vec(&effective).map_err(|_| "invalid config")?;
-    if context.len() > MAX_RENDERED {
+    if context.len() > SEED_MAX_CONTEXT_RENDERED_BYTES {
         return Err("config cap");
     }
     for name in FLAGS.iter().copied().chain(std::iter::once("RUSTC")) {
@@ -695,7 +697,7 @@ mod tests {
         // A file one byte past the four MiB byte budget is refused unparsed.
         let tree = Tree::new();
         let mut text = String::from("#");
-        text.push_str(&"x".repeat(MAX_BYTES));
+        text.push_str(&"x".repeat(SEED_MAX_CONTEXT_BYTES as usize));
         tree.write("home/work/ws/.cargo/config.toml", &text);
         assert_eq!(tree.digest("home/work/ws/member"), Err("config cap"));
 

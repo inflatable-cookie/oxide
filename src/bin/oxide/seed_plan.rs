@@ -40,6 +40,26 @@ fn same_context(a: &SeedProducer, b: &SeedProducer) -> bool {
         && a.command_family == b.command_family
 }
 
+/// Why effect-free selection found no plan. The front door's user-facing
+/// mapping is a separate change; this layer exposes the fact so a caller never
+/// has to report every miss as "no eligible donor".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SelectMiss {
+    /// Call 1 offered no donor candidate.
+    NoCandidates,
+    /// Every candidate's producer context differs from this command's.
+    ContextMismatch,
+    /// A context-matched candidate's plan exceeded a plan bound. A cap
+    /// rejects the whole candidate rather than truncating it.
+    PlanCap,
+    /// A candidate unit's recorded join input lies outside its verified
+    /// source root, so the unit is never planned.
+    InputRootEscape,
+    /// Context-matched candidates were considered, but no catalog unit
+    /// matched the allowlist and verified sources.
+    NoMatchingUnit,
+}
+
 /// Select the largest overlap, breaking ties by newer rank then slot id. Caps
 /// reject an entire plan rather than silently truncating a unit or donor.
 /// Debug-only plan-cap control (absent from release builds; armed only under
@@ -65,7 +85,7 @@ pub(crate) fn select(
     allowed: &[Package],
     sources: &[VerifiedSource],
     candidates: &[SeedCandidate],
-) -> Option<SeedRequest> {
+) -> Result<SeedRequest, SelectMiss> {
     let limit = proof_limit();
     let max_units = if limit.as_deref() == Some("units") {
         0
@@ -83,10 +103,14 @@ pub(crate) fn select(
         SEED_MAX_PLAN_BYTES
     };
     let mut best: Option<(&SeedCandidate, Vec<SeedUnitRef>)> = None;
+    let mut context_matched = false;
+    let mut input_escape = false;
+    let mut capped_any = false;
     for candidate in candidates {
         if !same_context(producer, &candidate.catalog.producer) {
             continue;
         }
+        context_matched = true;
         let mut units = Vec::new();
         let (mut files, mut bytes, mut inputs) = (0usize, 0u64, 0usize);
         let mut capped = false;
@@ -121,16 +145,18 @@ pub(crate) fn select(
                 // These are recorded prerequisites, not donor payload reads.
                 // Reject lexical escapes and roots other than the reverified
                 // source tree. Source verification forbids links inside it.
-                if unit.join.inputs.is_empty()
-                    || unit.join.inputs.iter().any(|input| {
-                        let path = std::path::Path::new(input);
-                        !path.is_absolute()
-                            || !path.starts_with(&source.root)
-                            || path
-                                .components()
-                                .any(|part| matches!(part, std::path::Component::ParentDir))
-                    })
-                {
+                if unit.join.inputs.is_empty() {
+                    continue;
+                }
+                if unit.join.inputs.iter().any(|input| {
+                    let path = std::path::Path::new(input);
+                    !path.is_absolute()
+                        || !path.starts_with(&source.root)
+                        || path
+                            .components()
+                            .any(|part| matches!(part, std::path::Component::ParentDir))
+                }) {
+                    input_escape = true;
                     continue;
                 }
                 files = match files.checked_add(unit.files.len()) {
@@ -173,7 +199,11 @@ pub(crate) fn select(
                 break;
             }
         }
-        if capped || units.is_empty() {
+        if capped {
+            capped_any = true;
+            continue;
+        }
+        if units.is_empty() {
             continue;
         }
         let better = best.as_ref().is_none_or(|(old, old_units)| {
@@ -186,7 +216,20 @@ pub(crate) fn select(
             best = Some((candidate, units));
         }
     }
-    best.map(|(candidate, units)| SeedRequest {
+    let Some((candidate, units)) = best else {
+        return Err(if candidates.is_empty() {
+            SelectMiss::NoCandidates
+        } else if !context_matched {
+            SelectMiss::ContextMismatch
+        } else if capped_any {
+            SelectMiss::PlanCap
+        } else if input_escape {
+            SelectMiss::InputRootEscape
+        } else {
+            SelectMiss::NoMatchingUnit
+        });
+    };
+    Ok(SeedRequest {
         recipient: recipient.clone(),
         donor: SeedDonor {
             slot_id: candidate.slot_id.clone(),
@@ -247,7 +290,10 @@ mod tests {
             incarnation: "i".into(),
             lease_id: "l".into(),
         };
-        assert!(select(&recipient, &producer(), &[], &[], &[]).is_none());
+        assert_eq!(
+            select(&recipient, &producer(), &[], &[], &[]),
+            Err(SelectMiss::NoCandidates)
+        );
     }
     fn candidate(id: &str, rank: u64, digest: &str) -> SeedCandidate {
         use oxide_storage::lease::managed::{
@@ -325,11 +371,108 @@ mod tests {
             candidate("new", 2, "tree"),
             candidate("wrong", 3, "other"),
         ];
-        assert!(select(&recipient, &producer(), &[], &[source.clone()], &candidates).is_none());
+        assert_eq!(
+            select(&recipient, &producer(), &[], &[source.clone()], &candidates),
+            Err(SelectMiss::NoMatchingUnit)
+        );
         let allowed = [source.package.clone()];
         let selected = select(&recipient, &producer(), &allowed, &[source], &candidates).unwrap();
         assert_eq!(selected.donor.slot_id, "new");
         assert_eq!(selected.units.len(), 1);
+    }
+
+    fn verified_source(package: crate::seed_lock::Package) -> VerifiedSource {
+        VerifiedSource {
+            package,
+            tree_digest: "tree".into(),
+            kind: SeedSourceKind::Registry,
+            root: "/fixture".into(),
+            verification_root: "/fixture".into(),
+            proc_macro: false,
+        }
+    }
+
+    fn recipient() -> SeedRecipient {
+        SeedRecipient {
+            slot_id: "recipient".into(),
+            incarnation: "i".into(),
+            lease_id: "l".into(),
+        }
+    }
+
+    fn cfg_if_lock() -> String {
+        format!(
+            "version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n",
+            "a".repeat(64)
+        )
+    }
+
+    #[test]
+    fn a_different_producer_context_is_named_as_the_miss() {
+        let package = crate::seed_lock::eligible(cfg_if_lock().as_bytes())
+            .unwrap()
+            .remove(0);
+        let source = verified_source(package.clone());
+        let mut other = candidate("id", 1, "tree");
+        other.catalog.producer.rustc = "/other/rustc".into();
+        assert_eq!(
+            select(&recipient(), &producer(), &[package], &[source], &[other],),
+            Err(SelectMiss::ContextMismatch)
+        );
+    }
+
+    #[test]
+    fn a_join_input_outside_the_verified_root_is_named_as_the_miss() {
+        let package = crate::seed_lock::eligible(cfg_if_lock().as_bytes())
+            .unwrap()
+            .remove(0);
+        let source = verified_source(package.clone());
+        for input in ["/elsewhere/src/lib.rs", "/fixture/../outside/lib.rs"] {
+            let mut escaped = candidate("id", 1, "tree");
+            escaped.catalog.packages[0].units[0].join.inputs = vec![input.into()];
+            assert_eq!(
+                select(
+                    &recipient(),
+                    &producer(),
+                    &[package.clone()],
+                    &[source.clone()],
+                    &[escaped],
+                ),
+                Err(SelectMiss::InputRootEscape),
+                "an escaping input {input} became a plan"
+            );
+        }
+    }
+
+    #[test]
+    fn a_capped_candidate_is_discarded_while_a_valid_one_is_chosen() {
+        let package = crate::seed_lock::eligible(cfg_if_lock().as_bytes())
+            .unwrap()
+            .remove(0);
+        let source = verified_source(package.clone());
+        let mut capped = candidate("capped", 3, "tree");
+        capped.catalog.packages[0].units[0].join.inputs = (0..=SEED_MAX_PLAN_INPUTS)
+            .map(|index| format!("/fixture/src/{index}.rs"))
+            .collect();
+        let valid = candidate("valid", 1, "tree");
+        let selected = select(
+            &recipient(),
+            &producer(),
+            &[package.clone()],
+            &[source.clone()],
+            &[capped, valid],
+        )
+        .expect("the valid candidate is still planned");
+        assert_eq!(selected.donor.slot_id, "valid");
+        // A lone over-cap candidate is a cap miss, never a truncated plan.
+        let mut capped = candidate("capped", 3, "tree");
+        capped.catalog.packages[0].units[0].join.inputs = (0..=SEED_MAX_PLAN_INPUTS)
+            .map(|index| format!("/fixture/src/{index}.rs"))
+            .collect();
+        assert_eq!(
+            select(&recipient(), &producer(), &[package], &[source], &[capped],),
+            Err(SelectMiss::PlanCap)
+        );
     }
 
     #[test]
@@ -355,15 +498,15 @@ mod tests {
         for role in [SeedRole::ProcMacro, SeedRole::BuildScriptCompile] {
             let mut candidate = candidate("id", 1, "tree");
             candidate.catalog.packages[0].units[0].role = role;
-            assert!(
+            assert_eq!(
                 select(
                     &recipient,
                     &producer(),
                     &allowed,
                     &[source.clone()],
                     &[candidate],
-                )
-                .is_none(),
+                ),
+                Err(SelectMiss::NoMatchingUnit),
                 "v1 selected a {role:?} unit"
             );
         }

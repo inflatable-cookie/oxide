@@ -38,6 +38,7 @@ thread_local! {
     static TAMPER_LEDGER: Cell<bool> = const { Cell::new(false) };
     static VERIFY_DELAY_MS: Cell<Option<u64>> = const { Cell::new(None) };
     static CLONE_DELAY_MS: Cell<Option<u64>> = const { Cell::new(None) };
+    static CLONE_DELAY_AT: Cell<Option<(usize, u64)>> = const { Cell::new(None) };
     static REMOVE_CREATED_DIRECTORY: Cell<bool> = const { Cell::new(false) };
     static UNREADABLE_CLONE: Cell<Option<usize>> = const { Cell::new(None) };
     static HARDLINK_CLONE: Cell<bool> = const { Cell::new(false) };
@@ -101,6 +102,7 @@ fn reset_hooks() {
     TAMPER_LEDGER.with(|cell| cell.set(false));
     VERIFY_DELAY_MS.with(|cell| cell.set(None));
     CLONE_DELAY_MS.with(|cell| cell.set(None));
+    CLONE_DELAY_AT.with(|cell| cell.set(None));
     REMOVE_CREATED_DIRECTORY.with(|cell| cell.set(false));
     UNREADABLE_CLONE.with(|cell| cell.set(None));
     HARDLINK_CLONE.with(|cell| cell.set(false));
@@ -142,6 +144,11 @@ pub(super) fn inject(point: TestPoint<'_>) {
         TestPoint::DuringClone { index, path } => {
             if index == 0 {
                 sleep_opt(CLONE_DELAY_MS.with(Cell::get));
+            }
+            if let Some((at, ms)) = CLONE_DELAY_AT.with(Cell::get) {
+                if at == index {
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
             }
             if UNREADABLE_CLONE.with(Cell::get) == Some(index) {
                 fs::set_permissions(path, fs::Permissions::from_mode(0o000))
@@ -771,9 +778,11 @@ fn make_donor_in(
 /// the exact state a `publish_seed_catalog` call starts from.
 fn held_catalog(rig: &Rig, label: &str) -> (LeaseGrant, SeedCatalog) {
     let record_id = rig.next_record_id();
+    // One holder holds one lease at a time, so each fixture label is its own
+    // holder identity.
     let grant = rig.lease_at(
         &format!("donor-{label}"),
-        "donor",
+        &format!("donor-{label}"),
         rig.affinity_dir(record_id),
     );
     let files = default_files();
@@ -893,6 +902,34 @@ fn candidates_ignore_a_catalog_whose_generation_moved_on() {
     release_injected(&rig.pool, &again.lease_id).expect("release again");
     let (_, recipient) = lease_recipient(&rig, "a");
     assert!(candidates(&rig, &recipient).candidates.is_empty());
+}
+
+#[test]
+fn candidates_count_catalogs_not_idle_slots() {
+    reset_hooks();
+    let rig = Rig::new("candidates-catalog-cap");
+    let donor = make_donor(&rig, "a");
+    // Nine idle slots ranked above the donor hold no catalog (a seeded
+    // recipient or a slot that never produced one). They must not crowd the
+    // donor out of the bounded catalog read (§6.2 step 3).
+    for index in 0..9 {
+        let grant = rig.lease(
+            &format!("no-catalog-{index}"),
+            &format!("no-catalog-{index}"),
+        );
+        release_injected(&rig.pool, &grant.lease_id).expect("release empty slot");
+    }
+    let (_, recipient) = lease_recipient(&rig, "reader");
+    let found = candidates(&rig, &recipient);
+    assert_eq!(found.candidates.len(), 1, "{found:?}");
+    assert_eq!(found.candidates[0].slot_id, donor.grant.slot_id);
+
+    // The catalog bound still applies: with a ninth real donor the answer is
+    // the eight by rank, never more.
+    for index in 0..8 {
+        make_donor(&rig, &format!("more-{index}"));
+    }
+    assert_eq!(candidates(&rig, &recipient).candidates.len(), 8);
 }
 
 #[test]
@@ -1275,6 +1312,52 @@ fn plan_bounds_the_total_join_inputs_across_units() {
 }
 
 #[test]
+fn plan_units_refuses_units_outside_the_v1_scope() {
+    reset_hooks();
+    let rig = Rig::new("plan-scope");
+    let (grant, _) = lease_recipient(&rig, "a");
+    let record_id = grant.slot_id.parse::<u64>().expect("record id");
+    let files = default_files();
+    write_files(&grant.env.cargo_build_build_dir, &files);
+    let catalog = catalog_for(&grant, record_id, &files);
+    let lib = SeedUnitRef {
+        fingerprint_dir: FINGERPRINT.to_owned(),
+        role: SeedRole::Lib,
+    };
+    assert!(plan_units(&catalog, std::slice::from_ref(&lib)).is_ok());
+
+    // A non-library role is never planned, even when the catalog holds it.
+    let mut proc_macro = catalog.clone();
+    proc_macro.packages[0].units[0].role = SeedRole::ProcMacro;
+    let wanted = SeedUnitRef {
+        role: SeedRole::ProcMacro,
+        ..lib.clone()
+    };
+    assert!(matches!(
+        plan_units(&proc_macro, &[wanted]),
+        Err(SeedSkipReason::UnsupportedUnit)
+    ));
+
+    let outside_scope: [fn(&mut SeedCatalog); 4] = [
+        |catalog| catalog.packages[0].source_root.kind = SeedSourceKind::Git,
+        |catalog| catalog.packages[0].unique = false,
+        |catalog| catalog.packages[0].leaf = false,
+        |catalog| catalog.packages[0].target = "other".to_owned(),
+    ];
+    for mutate in outside_scope {
+        let mut outside = catalog.clone();
+        mutate(&mut outside);
+        assert!(
+            matches!(
+                plan_units(&outside, std::slice::from_ref(&lib)),
+                Err(SeedSkipReason::UnsupportedUnit)
+            ),
+            "a v1-ineligible package was planned"
+        );
+    }
+}
+
+#[test]
 fn seed_refuses_an_unestablishable_donor_path_instead_of_skipping() {
     reset_hooks();
     let rig = Rig::new("donor-path-symlink");
@@ -1626,6 +1709,25 @@ fn seed_refuses_after_the_clone_when_the_work_deadline_expires() {
         .cargo_build_build_dir
         .join(&donor.files[0].0)
         .exists());
+}
+
+#[test]
+fn a_seed_that_verified_every_clone_publishes_despite_a_tiny_overrun() {
+    reset_hooks();
+    let rig = Rig::new("deadline-verified");
+    let donor = make_donor(&rig, "a");
+    let (_grant, recipient) = lease_recipient(&rig, "a");
+    let mut request = donor.request(&recipient);
+    request.work_budget_ms = Some(1_000);
+    // The overrun happens after the final clone has been hashed: every clone
+    // exists and matches its recorded digest when the budget expires, so
+    // nothing remains for the deadline to protect.
+    CLONE_DELAY_AT.with(|cell| cell.set(Some((default_files().len() - 1, 1_200))));
+    let outcome = seed(&rig.pool, &request).expect("seed");
+    assert!(
+        matches!(outcome, SeedOutcome::Seeded(_)),
+        "a fully verified seed was refused on a tiny overrun: {outcome:?}"
+    );
 }
 
 /// The clock seam a correctness fixture may opt into (oxide#224) is scoped to
@@ -2327,6 +2429,51 @@ fn publish_removes_orphan_sidecars_and_respects_the_family_ceiling() {
 }
 
 #[test]
+fn sidecar_writes_ignore_and_reap_their_own_temp_files() {
+    reset_hooks();
+    let rig = Rig::new("sidecar-temp");
+    let (first, first_catalog) = held_catalog(&rig, "a");
+    publish_seed_catalog(&rig.pool, &first_catalog).expect("publish first");
+    let seeds = rig.pool.join(MANAGED_NAME).join("seeds");
+    let first_path = seeds.join(format!("{}.catalog.json", first.slot_id));
+    let first_size = fs::metadata(&first_path).expect("first catalog").len();
+    let (second, second_catalog) = held_catalog(&rig, "b");
+    let second_size = second_catalog.to_bytes().expect("second bytes").len() as u64;
+
+    // A crashed write's temp file is inert: it never counts against the family
+    // ceiling, so a real catalog still fits beside it without dropping one.
+    let fresh = seeds.join("catalog.tmp-0123456789abcdef");
+    fs::write(&fresh, vec![b'x'; 1024]).expect("fresh temp");
+    fs::set_permissions(&fresh, fs::Permissions::from_mode(0o600)).expect("temp mode");
+    FAMILY_CAP.with(|cell| cell.set(Some(first_size + second_size + 8)));
+    publish_seed_catalog(&rig.pool, &second_catalog).expect("publish beside a temp");
+    assert!(
+        first_path.exists(),
+        "a leaked temp file crowded a real catalog out of the family"
+    );
+    assert!(seeds
+        .join(format!("{}.catalog.json", second.slot_id))
+        .exists());
+
+    // An old temp is this module's abandoned write and is reaped by the next
+    // write; a fresh one may belong to a live concurrent writer.
+    FAMILY_CAP.with(|cell| cell.set(None));
+    let old = seeds.join("catalog.tmp-fedcba9876543210");
+    fs::write(&old, b"old").expect("old temp");
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o600)).expect("temp mode");
+    let aged = fs::File::open(&old).expect("open old temp");
+    aged.set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 60 * 60))
+        .expect("age old temp");
+    drop(aged);
+    release_injected(&rig.pool, &second.lease_id).expect("release second");
+    let (third, third_catalog) = held_catalog(&rig, "c");
+    publish_seed_catalog(&rig.pool, &third_catalog).expect("publish third");
+    assert!(!old.exists(), "an abandoned old temp was never reaped");
+    assert!(fresh.exists(), "a fresh temp was mistaken for an orphan");
+    release_injected(&rig.pool, &third.lease_id).expect("release third");
+}
+
+#[test]
 fn publish_refuses_a_catalog_over_its_byte_ceiling_and_writes_nothing() {
     reset_hooks();
     let rig = Rig::new("publish-ceiling");
@@ -2567,6 +2714,83 @@ fn catalog_schema_rejects_unknown_fields_and_unusable_paths() {
     assert!(at_input_cap.validate().is_ok());
     // The catalog's own byte ceiling is enforced before parsing.
     assert!(SeedCatalog::parse(&vec![b' '; SEED_CATALOG_MAX_BYTES + 1]).is_err());
+}
+
+#[test]
+fn catalog_schema_refuses_units_whose_layout_disagrees_with_the_package() {
+    reset_hooks();
+    let rig = Rig::new("schema-layout");
+    let (grant, _) = lease_recipient(&rig, "a");
+    let record_id = grant.slot_id.parse::<u64>().expect("record id");
+    let files = default_files();
+    write_files(&grant.env.cargo_build_build_dir, &files);
+    let catalog = catalog_for(&grant, record_id, &files);
+    assert!(catalog.validate().is_ok());
+
+    let mut target = catalog.clone();
+    target.packages[0].units[0].target = "other".to_owned();
+    assert!(
+        target.validate().is_err(),
+        "unit target disagreed with package"
+    );
+
+    let mut other_literal = catalog.clone();
+    other_literal.packages[0].units[0].fingerprint_dir =
+        "debug/.fingerprint/other-aaaaaaaaaaaaaaaa".to_owned();
+    assert!(
+        other_literal.validate().is_err(),
+        "unit directory was not named by its package"
+    );
+
+    let mut wrong_shape = catalog.clone();
+    wrong_shape.packages[0].units[0].fingerprint_dir =
+        "debug/fingerprint/cfg-if-aaaaaaaaaaaaaaaa".to_owned();
+    assert!(wrong_shape.validate().is_err(), "fingerprint shape");
+
+    let mut uppercase = catalog.clone();
+    uppercase.packages[0].units[0].fingerprint_dir =
+        "debug/.fingerprint/cfg-if-AAAAAAAAAAAAAAAA".to_owned();
+    assert!(uppercase.validate().is_err(), "uppercase unit identifier");
+
+    let mut other_hex = catalog.clone();
+    for file in &mut other_hex.packages[0].units[0].files {
+        if file.path == ARTIFACT {
+            file.path = "debug/deps/libcfg_if-bbbbbbbbbbbbbbbb.rmeta".to_owned();
+        }
+    }
+    assert!(
+        other_hex.validate().is_err(),
+        "artifact identifier disagreed with the fingerprint directory"
+    );
+
+    let mut other_target = catalog.clone();
+    for file in &mut other_target.packages[0].units[0].files {
+        if file.path == ARTIFACT {
+            file.path = "debug/deps/libother-aaaaaaaaaaaaaaaa.rmeta".to_owned();
+        }
+    }
+    assert!(other_target.validate().is_err(), "artifact target");
+
+    let mut foreign_artifact = catalog.clone();
+    for file in &mut foreign_artifact.packages[0].units[0].files {
+        if file.path == ARTIFACT {
+            file.path = "debug/deps/libcfg_if-aaaaaaaaaaaaaaaa.dylib".to_owned();
+        }
+    }
+    assert!(foreign_artifact.validate().is_err(), "artifact kind");
+
+    let mut other_dep_hex = catalog.clone();
+    other_dep_hex.packages[0].units[0].join.path =
+        "debug/deps/cfg_if-bbbbbbbbbbbbbbbb.d".to_owned();
+    for file in &mut other_dep_hex.packages[0].units[0].files {
+        if file.path == DEP {
+            file.path = "debug/deps/cfg_if-bbbbbbbbbbbbbbbb.d".to_owned();
+        }
+    }
+    assert!(
+        other_dep_hex.validate().is_err(),
+        ".d identifier disagreed with the fingerprint directory"
+    );
 }
 
 #[test]

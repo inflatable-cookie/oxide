@@ -5,7 +5,8 @@
 //!
 //! - [`seed_candidates`] is call 1: it takes the pool lock **alone**, validates
 //!   that the recipient is still held by the caller's lease, and returns the
-//!   bounded catalogs of at most eight donor slots by rank. It reads control
+//!   bounded catalogs of at most eight donor generations by rank; an idle
+//!   slot without an eligible catalog is skipped, never counted. It reads control
 //!   state only: no donor payload is opened and nothing is mutated.
 //! - [`seed`] is call 2: it takes the donor's record lock — derived from the
 //!   pool's control directory and the plan's record id, so it is exactly that
@@ -89,13 +90,14 @@ mod walk;
 pub use catalog::{
     digest as catalog_digest, SeedAttemptState, SeedCatalog, SeedFile, SeedFileKind, SeedJoin,
     SeedPackage, SeedProducer, SeedRejectReason, SeedRejection, SeedRole, SeedSourceKind,
-    SeedSourceRoot, SeedUnit, SEED_CATALOG_MAX_BYTES, SEED_CATALOG_SCHEMA, SEED_MAX_FILES,
-    SEED_MAX_PACKAGES, SEED_MAX_PLAN_INPUTS, SEED_MAX_REJECTED_UNITS, SEED_MAX_REJECTIONS,
-    SEED_MAX_UNITS_PER_PACKAGE, SEED_MAX_UNIT_INPUTS,
+    SeedSourceRoot, SeedUnit, SEED_CATALOG_MAX_BYTES, SEED_CATALOG_SCHEMA, SEED_MAX_CONFIG_FILES,
+    SEED_MAX_CONTEXT_BYTES, SEED_MAX_CONTEXT_RENDERED_BYTES, SEED_MAX_FILES, SEED_MAX_PACKAGES,
+    SEED_MAX_PLAN_INPUTS, SEED_MAX_REJECTED_UNITS, SEED_MAX_REJECTIONS, SEED_MAX_UNITS_PER_PACKAGE,
+    SEED_MAX_UNIT_INPUTS,
 };
 pub use join::{
     output_rule_proven as seed_output_rule_proven, parse as parse_seed_join, JoinRefusal,
-    ParsedJoin,
+    ParsedJoin, MAX_JOIN_BYTES,
 };
 pub use walk::{WalkGap as SeedWalkGap, WalkLimits as SeedWalkLimits};
 
@@ -112,12 +114,16 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Donor slots examined per command: chosen by most recent rank, then slot id.
+/// Donor catalogs read per command: chosen by most recent rank, then slot id.
+/// Idle slots without an eligible catalog never consume this budget.
 pub const SEED_MAX_CANDIDATES: usize = 8;
+/// Idle slots examined while looking for those catalogs. It is the pool's own
+/// slot ceiling, so the walk is bounded even when every slot offers nothing.
+pub const SEED_MAX_CANDIDATE_WALK: usize = super::MAX_SLOTS;
 /// Compile units per plan.
 pub const SEED_MAX_PLAN_UNITS: usize = 256;
 /// Files per plan.
@@ -139,10 +145,15 @@ pub const SEED_WALK_MAX_DEPTH: usize = 64;
 pub const SEED_WALK_MAX_ELAPSED_MS: u64 = 60_000;
 /// All seed sidecars together (catalog, attempt, last, sources).
 pub const SEED_SIDECAR_FAMILY_MAX_BYTES: u64 = 24 * 1024 * 1024;
-/// Sidecars one write may remove because their slot left the ledger.
+/// Sidecars one write may remove because their slot left the ledger, or
+/// because they are this module's own interrupted temp file.
 pub const SEED_ORPHAN_CLEANUP_MAX: usize = 8;
 /// Catalogs one write may drop to stay inside the family byte ceiling.
 pub const SEED_FAMILY_DROP_MAX: usize = 8;
+/// An interrupted sidecar write's temp file is reaped after this age; a newer
+/// one may still be a concurrent writer's live temp. It never counts against
+/// the family ceiling either way.
+pub const SEED_SIDECAR_TEMP_MAX_AGE_MS: u64 = 60 * 60 * 1000;
 
 const SEEDS_DIR: &str = "seeds";
 const CATALOG_SUFFIX: &str = ".catalog.json";
@@ -257,6 +268,9 @@ pub enum SeedSkipReason {
     DonorPayloadMissing,
     /// A planned unit is not in the re-read catalog.
     UnitMissing,
+    /// A planned unit is one v1 never offers: a non-library role, a non-registry
+    /// source, or a package that is not a unique leaf.
+    UnsupportedUnit,
     /// A plan cap is exceeded.
     PlanCap,
     /// The seed's own cooperative deadline expired before the first write.
@@ -287,6 +301,7 @@ impl SeedSkipReason {
             Self::CatalogChanged => "catalog changed",
             Self::DonorPayloadMissing => "donor payload missing",
             Self::UnitMissing => "unit missing",
+            Self::UnsupportedUnit => "unsupported unit",
             Self::PlanCap => "cap",
             Self::WorkDeadline => "deadline",
             Self::FileChanged => "file changed",
@@ -423,38 +438,70 @@ fn read_attempt_at(pool: &Path, slot: &str) -> AttemptRead {
         .join(MANAGED_NAME)
         .join(SEEDS_DIR)
         .join(format!("{slot}{ATTEMPT_SUFFIX}"));
+    let bytes = match read_sidecar(&path, ATTEMPT_MAX_BYTES as u64) {
+        SidecarRead::Missing => return AttemptRead::Absent,
+        SidecarRead::Invalid => return AttemptRead::Invalid,
+        SidecarRead::Present(bytes) => bytes,
+    };
+    match serde_json::from_slice::<SeedAttempt>(&bytes) {
+        Ok(record) if record.valid() => AttemptRead::Present(record),
+        _ => AttemptRead::Invalid,
+    }
+}
+
+/// The bounded result of reading one owner-only sidecar.
+enum SidecarRead {
+    Missing,
+    Invalid,
+    Present(Vec<u8>),
+}
+
+/// Read one sidecar without following a link: `Missing` when no entry exists,
+/// `Invalid` when it is symlinked, foreign-owned, not owner-private, not a
+/// regular file or over `max` bytes, and `Present` with at most `max` bytes.
+/// Every sidecar family uses this one reader, so no caller can accidentally
+/// follow a link or read past its ceiling.
+fn read_sidecar(path: &Path, max: u64) -> SidecarRead {
     let mut file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return AttemptRead::Absent,
-        Err(_) => return AttemptRead::Invalid,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return SidecarRead::Missing,
+        Err(_) => return SidecarRead::Invalid,
     };
     let Ok(metadata) = file.metadata() else {
-        return AttemptRead::Invalid;
+        return SidecarRead::Invalid;
     };
     if !metadata.is_file()
         || metadata.uid() != current_uid()
         || metadata.mode() & 0o077 != 0
-        || metadata.len() > ATTEMPT_MAX_BYTES as u64
+        || metadata.len() > max
     {
-        return AttemptRead::Invalid;
+        return SidecarRead::Invalid;
     }
     let mut bytes = Vec::new();
     if Read::by_ref(&mut file)
-        .take((ATTEMPT_MAX_BYTES + 1) as u64)
+        .take(max.saturating_add(1))
         .read_to_end(&mut bytes)
         .is_err()
-        || bytes.len() > ATTEMPT_MAX_BYTES
+        || bytes.len() as u64 > max
     {
-        return AttemptRead::Invalid;
+        return SidecarRead::Invalid;
     }
-    match serde_json::from_slice::<SeedAttempt>(&bytes) {
-        Ok(record) if record.valid() => AttemptRead::Present(record),
-        _ => AttemptRead::Invalid,
-    }
+    SidecarRead::Present(bytes)
+}
+
+/// The metadata-only half of [`read_sidecar`]: a cheap candidate filter that
+/// opens and parses nothing, used before an expensive read.
+fn sidecar_present(path: &Path, max: u64) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_file()
+            && metadata.uid() == current_uid()
+            && metadata.mode() & 0o077 == 0
+            && metadata.len() <= max
+    })
 }
 
 /// The current held generation's durable attempt state, with corrupt or
@@ -586,7 +633,7 @@ pub fn write_seed_sources(
         .map_err(|_| LeaseError::InvalidInput("invalid source cache"))?;
     let dir = view.pool_root.join(MANAGED_NAME).join(SEEDS_DIR);
     ensure_private_dir(&dir)?;
-    let path = dir.join("sources.json");
+    let path = dir.join(SOURCES_NAME);
     match fs::symlink_metadata(&path) {
         Ok(metadata)
             if metadata.is_file()
@@ -658,28 +705,10 @@ impl SeedLast {
 /// Passive bounded read: missing, malformed, symlinked and foreign sidecars
 /// are ignored. The status caller still binds this record to its ledger view.
 pub fn read_seed_last(pool: &Path) -> Option<SeedLast> {
-    let path = pool.join(MANAGED_NAME).join(SEEDS_DIR).join("last.json");
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .ok()?;
-    let metadata = file.metadata().ok()?;
-    if !metadata.is_file()
-        || metadata.uid() != current_uid()
-        || metadata.mode() & 0o077 != 0
-        || metadata.len() > 2048
-    {
+    let path = pool.join(MANAGED_NAME).join(SEEDS_DIR).join(LAST_NAME);
+    let SidecarRead::Present(bytes) = read_sidecar(&path, 2048) else {
         return None;
-    }
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut file)
-        .take(2049)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() > 2048 {
-        return None;
-    }
+    };
     let record: SeedLast = serde_json::from_slice(&bytes).ok()?;
     (record.valid()
         && super::pool::seed_record_matches(
@@ -718,7 +747,7 @@ pub fn write_seed_last(pool: &Path, record: &SeedLast) -> Result<(), LeaseError>
     ensure_private_dir(&dir)?;
     remove_orphan_sidecars(&dir, view)?;
     enforce_family_bytes(&dir, bytes.len() as u64, &record.slot_id)?;
-    write_sidecar(&dir.join("last.json"), &bytes)
+    write_sidecar(&dir.join(LAST_NAME), &bytes)
 }
 
 /// Call 1: read-only candidate selection under the pool lock alone.
@@ -745,9 +774,25 @@ pub fn seed_candidates(
         .filter(|slot| slot.idle && slot.lease_id.is_none())
         .collect();
     donors.sort_by(|left, right| right.rank.cmp(&left.rank).then(left.id.cmp(&right.id)));
-    donors.truncate(max_candidates.clamp(1, SEED_MAX_CANDIDATES));
+    donors.truncate(SEED_MAX_CANDIDATE_WALK);
+    // §6.2 step 3 bounds the catalogs read, not the idle slots seen: a seeded
+    // recipient or a slot that never produced a catalog offers nothing and
+    // must not crowd out a later real donor. The walk is bounded by the pool's
+    // slot ceiling, and each catalog-shaped file is read at most once.
+    let limit = max_candidates.clamp(1, SEED_MAX_CANDIDATES);
     let mut candidates = Vec::new();
     for slot in donors {
+        if candidates.len() == limit {
+            break;
+        }
+        // The cheap half of a read: presence and custody of the sidecar, with
+        // no parse. Only a catalog-shaped file is opened and parsed below.
+        if !sidecar_present(
+            &catalog_path(&view.pool_root, slot.id),
+            SEED_CATALOG_MAX_BYTES as u64,
+        ) {
+            continue;
+        }
         let Some((catalog, bytes, catalog_digest)) = read_catalog(&view.pool_root, slot.id) else {
             continue;
         };
@@ -1151,10 +1196,11 @@ pub fn seed_monitored(
             index,
             path: &recipient_path,
         });
-        if now() > deadline {
-            return Err(work_deadline_after_clone());
-        }
     }
+    // Once every planned clone has verified there is no remaining clone work
+    // for the cooperative deadline to stop: a tiny overrun after the last
+    // clone must not refuse an otherwise fully verified seed. The walk below
+    // carries its own independent bound.
     // Final donor recheck: the ledger still names the planned generation for
     // both the donor and the recipient.
     test_point(TestPoint::BeforeFinalDonorCheck { pool });
@@ -1509,12 +1555,33 @@ fn plan_units(catalog: &SeedCatalog, units: &[SeedUnitRef]) -> Result<Plan, Seed
         if !seen_units.insert((wanted.fingerprint_dir.as_str(), wanted.role)) {
             return Err(SeedSkipReason::PlanCap);
         }
-        let unit = catalog
-            .packages
-            .iter()
-            .flat_map(|package| package.units.iter())
-            .find(|unit| unit.fingerprint_dir == wanted.fingerprint_dir && unit.role == wanted.role)
-            .ok_or(SeedSkipReason::UnitMissing)?;
+        // v1 plans only a plain library compile unit from a registry source
+        // (§3): every other role is refused even if a producer wrote one.
+        if wanted.role != SeedRole::Lib {
+            return Err(SeedSkipReason::UnsupportedUnit);
+        }
+        let Some((package, unit)) = catalog.packages.iter().find_map(|package| {
+            package
+                .units
+                .iter()
+                .find(|unit| {
+                    unit.fingerprint_dir == wanted.fingerprint_dir && unit.role == wanted.role
+                })
+                .map(|unit| (package, unit))
+        }) else {
+            return Err(SeedSkipReason::UnitMissing);
+        };
+        // The package's own v1 eligibility and the unit identity are checked
+        // again here, from the re-read catalog, rather than trusted from the
+        // caller's plan.
+        if unit.role != SeedRole::Lib
+            || unit.target != package.target
+            || package.source_root.kind != SeedSourceKind::Registry
+            || !package.unique
+            || !package.leaf
+        {
+            return Err(SeedSkipReason::UnsupportedUnit);
+        }
         join_inputs = join_inputs.saturating_add(unit.join.inputs.len());
         if join_inputs > SEED_MAX_PLAN_INPUTS {
             return Err(SeedSkipReason::PlanCap);
@@ -1837,22 +1904,10 @@ fn donor_control(pool_root: &Path, record_id: u64) -> DonorControl {
 /// Read one owner-only sidecar under its byte ceiling, or `None` when it is
 /// missing, symlinked, foreign-owned, not private or oversized.
 fn read_private_bounded(path: &Path, max: u64) -> Option<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_file()
-        || metadata.uid() != current_uid()
-        || metadata.permissions().mode() & 0o077 != 0
-        || metadata.len() > max
-    {
-        return None;
+    match read_sidecar(path, max) {
+        SidecarRead::Present(bytes) => Some(bytes),
+        SidecarRead::Missing | SidecarRead::Invalid => None,
     }
-    let mut bytes = Vec::new();
-    File::open(path)
-        .ok()?
-        .take(max + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() as u64 <= max).then_some(bytes)
 }
 
 fn validate_slot_id(text: &str) -> Result<(), LeaseError> {
@@ -1931,36 +1986,25 @@ fn catalog_path(pool_root: &Path, slot_id: u64) -> PathBuf {
 /// the caller treats the donor as offering nothing.
 fn read_catalog(pool_root: &Path, slot_id: u64) -> Option<(SeedCatalog, Vec<u8>, String)> {
     let path = catalog_path(pool_root, slot_id);
-    let metadata = fs::symlink_metadata(&path).ok()?;
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_file()
-        || metadata.uid() != current_uid()
-        || metadata.permissions().mode() & 0o077 != 0
-        || metadata.len() > SEED_CATALOG_MAX_BYTES as u64
-    {
+    let SidecarRead::Present(bytes) = read_sidecar(&path, SEED_CATALOG_MAX_BYTES as u64) else {
         return None;
-    }
-    let mut bytes = Vec::new();
-    File::open(&path)
-        .ok()?
-        .take(SEED_CATALOG_MAX_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() > SEED_CATALOG_MAX_BYTES {
-        return None;
-    }
+    };
     let catalog = SeedCatalog::parse(&bytes).ok()?;
     let digest = catalog_digest(&bytes);
     Some((catalog, bytes, digest))
 }
 
-/// Remove at most eight sidecars whose slot is no longer in the ledger.
+/// Remove at most eight sidecars whose slot is no longer in the ledger, or
+/// that are this module's own interrupted temp files older than
+/// [`SEED_SIDECAR_TEMP_MAX_AGE_MS`]. A newer temp may belong to a concurrent
+/// writer and is left alone.
 fn remove_orphan_sidecars(dir: &Path, view: &SeedPoolView) -> Result<(), LeaseError> {
     let mut removed = 0usize;
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) => return Err(io_error(error)),
     };
+    let now = std::time::SystemTime::now();
     for entry in entries {
         if removed >= SEED_ORPHAN_CLEANUP_MAX {
             break;
@@ -1968,20 +2012,35 @@ fn remove_orphan_sidecars(dir: &Path, view: &SeedPoolView) -> Result<(), LeaseEr
         let Ok(entry) = entry else { continue };
         let name = entry.file_name();
         let Some(text) = name.to_str() else { continue };
-        let Some(id) = sidecar_slot_id(text) else {
-            continue;
-        };
-        if view.slot(&id.to_string()).is_some() {
-            continue;
-        }
         let path = entry.path();
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
-        if metadata.file_type().is_file()
-            && metadata.uid() == current_uid()
-            && fs::remove_file(&path).is_ok()
-        {
+        if !metadata.file_type().is_file() || metadata.uid() != current_uid() {
+            continue;
+        }
+        let keep = if let Some(temp) = text.strip_prefix(SIDECAR_TEMP_PREFIX) {
+            // `catalog.tmp-<hex>`: this module's own temp write. Only an old one
+            // is reaped; a fresh temp is a live writer's.
+            if temp.len() != 16 || !temp.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                true
+            } else {
+                metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_none_or(|age| age < Duration::from_millis(SEED_SIDECAR_TEMP_MAX_AGE_MS))
+            }
+        } else {
+            let Some(id) = sidecar_slot_id(text) else {
+                continue;
+            };
+            view.slot(&id.to_string()).is_some()
+        };
+        if keep {
+            continue;
+        }
+        if fs::remove_file(&path).is_ok() {
             removed += 1;
         }
     }
@@ -1990,6 +2049,16 @@ fn remove_orphan_sidecars(dir: &Path, view: &SeedPoolView) -> Result<(), LeaseEr
 
 const ATTEMPT_SUFFIX: &str = ".attempt.json";
 const OBSERVED_SUFFIX: &str = ".observed.json";
+const LAST_NAME: &str = "last.json";
+const SOURCES_NAME: &str = "sources.json";
+/// The temp-file name prefix [`write_sidecar`] uses for every family.
+const SIDECAR_TEMP_PREFIX: &str = "catalog.tmp-";
+
+/// Whether a directory entry is one of the four sidecar families. Anything
+/// else (a temp file, a stray entry) is neither counted nor adopted.
+fn is_known_sidecar(name: &str) -> bool {
+    name == LAST_NAME || name == SOURCES_NAME || sidecar_slot_id(name).is_some()
+}
 
 fn sidecar_slot_id(name: &str) -> Option<u64> {
     for suffix in [CATALOG_SUFFIX, ATTEMPT_SUFFIX, OBSERVED_SUFFIX] {
@@ -2072,6 +2141,14 @@ fn sidecar_bytes(dir: &Path) -> Result<u64, LeaseError> {
     let mut total = 0u64;
     for entry in fs::read_dir(dir).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
+        let name = entry.file_name();
+        let Some(text) = name.to_str() else { continue };
+        // Only the four known sidecar families count against the family
+        // ceiling. An interrupted write's temp file is not a sidecar: counting
+        // it would let one crash crowd out real writes until it is reaped.
+        if !is_known_sidecar(text) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
         if metadata.file_type().is_file() {
             total = total.saturating_add(metadata.len());
@@ -2088,7 +2165,7 @@ fn write_sidecar(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
     let parent = path
         .parent()
         .ok_or(LeaseError::InvalidInput("sidecar has no parent"))?;
-    let temp = parent.join(format!("catalog.tmp-{}", random_hex(8)?));
+    let temp = parent.join(format!("{SIDECAR_TEMP_PREFIX}{}", random_hex(8)?));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
     let mut file = options.open(&temp).map_err(io_error)?;

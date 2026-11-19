@@ -1653,14 +1653,18 @@ impl Store {
             Err(SourceFailure::Skip(reason)) => return Ok(SeedRun::Skipped(reason)),
             Err(SourceFailure::Refuse(reason)) => return Err(reason),
         };
-        let Some(request) = crate::seed_plan::select(
+        // Selection exposes its own miss reason; the front door's user-facing
+        // mapping is a separate change, so this call still reports the one
+        // existing token.
+        let request = match crate::seed_plan::select(
             &recipient,
             producer,
             &lock.eligible,
             &sources,
             &candidates.candidates,
-        ) else {
-            return Ok(SeedRun::Skipped("no eligible donor"));
+        ) {
+            Ok(request) => request,
+            Err(_miss) => return Ok(SeedRun::Skipped("no eligible donor")),
         };
         // Debug-only proof pause, ordered between call 1 (the candidate read)
         // and call 2 (the donor pin). Absent from release builds and armed only
