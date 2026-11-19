@@ -255,13 +255,10 @@ struct Ledger {
     /// sequence and every record's rank is 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     next_rank: Option<u64>,
-    /// Slot trees moved whole into the payload's private holding area and
-    /// pending deletion outside the pool lock (oxide#190). Absent means the
-    /// pre-#190 representation, so a pool that never evicted keeps the exact
-    /// bytes an older binary wrote.
-    /// Read-tolerant legacy key from the retired holding journal. This
-    /// version never writes or acts on it; an older writer's rows are kept
-    /// as inert values so the ledger still parses.
+    /// Read-tolerant legacy key from the retired holding journal (oxide#190).
+    /// This version never writes or acts on it, and a pool that never evicted
+    /// keeps the exact bytes an older binary wrote; an older writer's rows are
+    /// kept as inert values so the ledger still parses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     holding: Vec<serde_json::Value>,
     slots: Vec<SlotRecord>,
@@ -710,6 +707,19 @@ impl Payload {
     }
 }
 
+/// What one idle-eviction attempt decided.
+enum Evicted {
+    /// No idle candidate was eligible.
+    None,
+    /// One row is retired and its root is gone, or its deletion is handed to a
+    /// settle pass that runs with the pool lock released.
+    Retired,
+    /// One row is retired and Barge's committed rename left the trash copy in
+    /// place. This is progress, not a refusal: free space is re-read and the
+    /// kept tree is reported.
+    KeptTrash(String),
+}
+
 pub(super) struct Pool {
     /// The exclusive pool lock, held for the life of a mutating open. A
     /// passive measurement holds none.
@@ -731,6 +741,13 @@ pub(super) struct Pool {
     /// A bounded note the caller prints when admission had to report a policy
     /// decision (for example a fallback or a warning).
     admission_note: Option<String>,
+    /// Trash a committed eviction could not delete. It is progress, not a
+    /// refusal, so it is reported rather than failing the command.
+    eviction_notes: Vec<String>,
+    /// This open could not resolve a recorded deletion or a legacy adoption,
+    /// so it kept that object out of service instead of refusing every
+    /// command. [`LedgerView::reconciliation_blocked`] reports it.
+    reconciliation_blocked: bool,
 }
 
 /// Entry points for the `oxide` front door. They open a budget-only
@@ -1294,6 +1311,30 @@ fn require_unprotected(
     }
 }
 
+/// Whether one hand-off record names exactly this idle row, incarnation and
+/// root. The record is committed before the row is dropped, so a match means
+/// the record outlived a ledger write that never landed. Only an idle row is
+/// matched: that is the only state a hand-off record is written for, and a held
+/// generation is never retired on a record's word.
+fn pending_names_slot(record: &pending::PendingEviction, slot: &SlotRecord) -> bool {
+    slot.is_idle()
+        && slot.id == record.slot_id
+        && slot.incarnation == record.incarnation
+        && slot.root.as_deref() == Some(record.root_id.as_str())
+}
+
+/// Resolve one legacy root's Barge identity. Barge's own error is returned so
+/// the caller can still tell `NotFound` from an unreadable account.
+fn resolve_legacy_root(area: &barge::Area, id: &str) -> Result<barge::Root, barge::Error> {
+    #[cfg(test)]
+    if FAIL_ADOPTION.with(|flag| flag.replace(false)) {
+        return Err(barge::Error::unknown_state(
+            "injected Barge failure while resolving a legacy root",
+        ));
+    }
+    area.resolve(id)
+}
+
 fn describe_pins(pins: &BTreeMap<String, usize>, limit: usize) -> String {
     if pins.is_empty() {
         return "none".to_owned();
@@ -1391,12 +1432,26 @@ impl Pool {
             budget: ledger.cap_bytes,
             ledger,
             admission_note: None,
+            eviction_notes: Vec::new(),
+            reconciliation_blocked: false,
         };
         if reconcile {
             if let Some(intent) = pending {
-                admission_cost::in_phase(Phase::Eviction, || {
+                // A valid intent this open cannot prove — a substituted parent,
+                // another volume, an unreadable root — is quarantined rather
+                // than allowed to refuse every lease, release and prepare. Its
+                // row keeps exactly the generation it recorded and stays
+                // unavailable; a later pass asks again.
+                if admission_cost::in_phase(Phase::Eviction, || {
                     pool.recover_held_eviction(&intent, false)
-                })?;
+                })
+                .is_err()
+                {
+                    eprintln!(
+                        "oxide: warning: a recorded held eviction could not be resolved; its row is kept unavailable"
+                    );
+                    pool.reconciliation_blocked = true;
+                }
             }
             pool.storage = pool_storage(&pool.root, &pool.config)?;
             admission_cost::in_phase(Phase::Accounting, || {
@@ -1404,9 +1459,7 @@ impl Pool {
             })?;
             admission_cost::in_phase(Phase::Eviction, || {
                 pool.retire_missing_idle_roots()?;
-                // A decided idle eviction whose root is already gone finished
-                // its Barge rename; its record is only bookkeeping now.
-                pending::drop_completed(&pool.root)
+                pool.reconcile_pending_evictions()
             })?;
         }
         Ok(pool)
@@ -1444,6 +1497,8 @@ impl Pool {
             budget: ledger.cap_bytes,
             ledger,
             admission_note: None,
+            eviction_notes: Vec::new(),
+            reconciliation_blocked: false,
         })
     }
 
@@ -1629,50 +1684,70 @@ impl Pool {
                 .ok_or(LeaseError::UnknownAccounting)?;
             let id = legacy_root_id(&folder);
             let label = slot.profile.as_str();
-            let area = storage
-                .area_for(slot.area_folder())
-                .map_err(|_| LeaseError::UnknownAccounting)?;
+            let area = storage.area_for(slot.area_folder()).map_err(|error| {
+                LeaseError::Barge(format!(
+                    "cannot declare the area of legacy slot {}: {error}",
+                    slot.id
+                ))
+            })?;
             admission_cost::opaque_listing();
-            let adopted = match area.resolve(&id) {
+            let adopted = match resolve_legacy_root(&area, &id) {
                 // The pinned Barge API can unpin by ID but cannot compare
                 // pin provenance under its lock. Keep any existing pin.
-                Ok(root) => {
-                    root.path == path
-                        && root.label == label
-                        && slot.root.as_deref().is_none_or(|recorded| recorded == id)
-                        && fs::symlink_metadata(&path).is_ok_and(|metadata| {
-                            metadata.is_dir()
-                                && metadata.uid() == current_uid()
-                                && metadata.mode() & 0o022 == 0
-                        })
-                }
+                Ok(root) => Ok(root.path == path
+                    && root.label == label
+                    && slot.root.as_deref().is_none_or(|recorded| recorded == id)
+                    && fs::symlink_metadata(&path).is_ok_and(|metadata| {
+                        metadata.is_dir()
+                            && metadata.uid() == current_uid()
+                            && metadata.mode() & 0o022 == 0
+                    })),
                 Err(error) if error.kind() == barge::ErrorKind::NotFound => {
                     // A published id is never attached to a replacement path.
                     if slot.root.is_some() {
-                        false
+                        Ok(false)
                     } else {
                         match storage.adopt_in(slot.area_folder(), leaf, label, &id) {
-                            Ok(root) => root.path == path,
+                            Ok(root) => Ok(root.path == path),
                             Err(error)
                                 if matches!(
                                     error.kind(),
                                     barge::ErrorKind::Refused | barge::ErrorKind::NotFound
                                 ) =>
                             {
-                                false
+                                Ok(false)
                             }
-                            Err(_) => return Err(LeaseError::UnknownAccounting),
+                            Err(error) => Err(LeaseError::Barge(format!(
+                                "cannot adopt legacy slot {} at {}: {error}",
+                                slot.id,
+                                path.display()
+                            ))),
                         }
                     }
                 }
-                Err(_) => return Err(LeaseError::UnknownAccounting),
+                Err(error) => Err(LeaseError::Barge(format!(
+                    "cannot resolve legacy slot {} root {id}: {error}",
+                    slot.id
+                ))),
             };
-            if adopted {
-                let slot = &mut self.ledger.slots[index];
-                slot.root = Some(id);
-                slot.owned = true;
-            } else {
-                self.ledger.slots[index].adoption_refused = true;
+            match adopted {
+                Ok(true) => {
+                    let slot = &mut self.ledger.slots[index];
+                    slot.root = Some(id);
+                    slot.owned = true;
+                }
+                Ok(false) => self.ledger.slots[index].adoption_refused = true,
+                // A Barge error must not refuse every lease, release and
+                // prepare. Keep this row out of service — it is never granted,
+                // evicted or adopted again — and report the open as blocked.
+                Err(error) => {
+                    eprintln!(
+                        "oxide: warning: legacy slot {} is kept out of service: {error}",
+                        self.ledger.slots[index].id
+                    );
+                    self.ledger.slots[index].adoption_refused = true;
+                    self.reconciliation_blocked = true;
+                }
             }
             // Publish each transition before visiting another root. If the
             // write failed after adoption, the next preparation resolves the
@@ -1705,14 +1780,62 @@ impl Pool {
         Ok(())
     }
 
+    /// Roll forward a deferred idle eviction whose ledger write failed.
+    ///
+    /// The hand-off record is durable before the row is dropped, so a row that
+    /// is still recorded was never carried past that write: settling would
+    /// otherwise evict a root an admission could still grant, or leave a slot
+    /// recorded idle with no root. Dropping the row under this lock restores
+    /// the invariant that no record names a live row. If the save fails the
+    /// record is removed instead, so the surviving row and its root stay
+    /// consistent.
+    fn reconcile_pending_evictions(&mut self) -> Result<(), LeaseError> {
+        let (records, quarantined) = pending::read_quarantining(&self.root)?;
+        if quarantined {
+            // One unreadable hand-off list used to refuse every command. Its
+            // roots are left exactly as recorded, so no deletion decision is
+            // invented from it.
+            eprintln!(
+                "oxide: warning: an unreadable idle-eviction record was quarantined; its roots are kept as recorded"
+            );
+            self.reconciliation_blocked = true;
+        }
+        let matched: Vec<pending::PendingEviction> = records
+            .into_iter()
+            .filter(|record| {
+                self.ledger
+                    .slots
+                    .iter()
+                    .any(|slot| pending_names_slot(record, slot))
+            })
+            .collect();
+        if matched.is_empty() {
+            // A decided idle eviction whose root is already gone finished its
+            // Barge rename; its record is only bookkeeping now.
+            return pending::drop_completed(&self.root);
+        }
+        self.ledger.slots.retain(|slot| {
+            !matched
+                .iter()
+                .any(|record| pending_names_slot(record, slot))
+        });
+        match self.persist_revised() {
+            Ok(()) => pending::drop_completed(&self.root),
+            Err(error) => {
+                // The row is still durable, so the record must not stay: a
+                // settle would otherwise evict a root the ledger still names.
+                pending::remove_settled(&self.root, &matched)?;
+                Err(error)
+            }
+        }
+    }
+
     /// Commit Barge's completed evictions to workflow membership before the
     /// next compatible-root lookup. Barge still owns all deletion decisions.
     #[cfg(test)]
     fn prune_storage(&mut self) -> Result<(), LeaseError> {
         let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
-        let report = storage
-            .prune(false)
-            .map_err(|_| LeaseError::UnknownAccounting)?;
+        let report = storage.prune(false).map_err(LeaseError::Barge)?;
         let mut retired = Vec::new();
         for slot in &self.ledger.slots {
             if let Some(id) = slot.root.as_deref() {
@@ -1737,6 +1860,13 @@ impl Pool {
         self.pending_hold = None;
         let mut leased = self.lease_inner(request)?;
         leased.hold = self.pending_hold.take();
+        if !self.eviction_notes.is_empty() {
+            let note = self.eviction_notes.join("; ");
+            leased.admission_note = Some(match leased.admission_note.take() {
+                Some(existing) => format!("{existing}; {note}"),
+                None => note,
+            });
+        }
         Ok(leased)
     }
 
@@ -1749,7 +1879,7 @@ impl Pool {
         }
         if let (Some(storage), Some(reserve)) = (self.storage.as_ref(), request.reserve_bytes) {
             admission_cost::in_phase(Phase::Reserve, || storage.set_reserve(reserve))
-                .map_err(|_| LeaseError::UnknownAccounting)?;
+                .map_err(LeaseError::Barge)?;
         }
         let project = canonical_existing_dir(&request.project, false)?;
         let workspace = canonical_existing_dir(&request.workspace, false)?;
@@ -1878,7 +2008,7 @@ impl Pool {
         let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
         let hold = storage
             .try_hold_in(slot.area_folder(), root)
-            .map_err(|_| LeaseError::UnknownAccounting)?
+            .map_err(LeaseError::Barge)?
             .ok_or(LeaseError::Busy)?;
         self.pending_hold = Some(hold);
         let lease_id = self.mint_lease_id(slot_id, incarnation)?;
@@ -1928,10 +2058,12 @@ impl Pool {
             .fold(0, u64::saturating_add)
             >= self.budget
         {
-            if !self.evict_one_idle_with(Phase::Eviction, |id| {
+            match self.evict_one_idle_with(Phase::Eviction, |id| {
                 !unmeasured.iter().any(|slot| slot.slot_id == id.to_string())
             })? {
-                return Err(LeaseError::Full);
+                Evicted::None => return Err(LeaseError::Full),
+                Evicted::Retired => {}
+                Evicted::KeptTrash(kept) => self.note_eviction(Some(kept)),
             }
         }
         let slot_id = self.ledger.next_slot;
@@ -1955,13 +2087,14 @@ impl Pool {
             Some(storage) => {
                 let root = storage
                     .create(&barge_label(request.layout.as_ref()))
-                    .map_err(|_| LeaseError::UnknownAccounting)?;
-                ensure_private_dir(&root.path.join("build"))?;
-                self.pending_hold = Some(
-                    storage
-                        .hold(&root.id)
-                        .map_err(|_| LeaseError::UnknownAccounting)?,
-                );
+                    .map_err(LeaseError::Barge)?;
+                // From here on this is a marked Barge root with no ledger row.
+                // A failure before the row is durable drops the hold and evicts
+                // the fresh id again, so no marked root is ever left behind.
+                if let Err(error) = self.prepare_fresh_root(&storage, &root) {
+                    self.discard_unrecorded_root(&storage, &root.id);
+                    return Err(error);
+                }
                 root_id = Some(root.id.clone());
                 Some(root.folder)
             }
@@ -2025,7 +2158,7 @@ impl Pool {
             lease_id: Some(lease_id.clone()),
             last_lease_id: lease_id,
             dir,
-            root: root_id,
+            root: root_id.clone(),
             owned: true,
             adoption_refused: false,
             rank: 0,
@@ -2033,20 +2166,55 @@ impl Pool {
             capture: None,
             hold_intent: None,
         });
-        self.ledger.next_slot = slot_id.checked_add(1).ok_or(LeaseError::LedgerExhausted)?;
-        self.stamp_rank(slot_id)?;
-        if let Err(error) = self.persist_revised() {
-            #[cfg(test)]
-            eprintln!("DBG persist_revised: {error:?}");
+        let record = (|| -> Result<(), LeaseError> {
+            self.ledger.next_slot = slot_id.checked_add(1).ok_or(LeaseError::LedgerExhausted)?;
+            self.stamp_rank(slot_id)?;
+            self.persist_revised()
+        })();
+        if let Err(error) = record {
+            // The row never became durable, so the fresh root has none: evict it
+            // rather than leave a marked root no ledger names.
+            if let (Some(storage), Some(root)) = (self.storage.clone(), root_id.clone()) {
+                self.discard_unrecorded_root(&storage, &root);
+            }
             return Err(error);
         }
         let slot = self.slot(slot_id).ok_or(LeaseError::UnknownAccounting)?;
-        if let Err(error) = self.grant_from(slot, false) {
-            #[cfg(test)]
-            eprintln!("DBG grant_from: {error:?}");
-            return Err(error);
+        let grant = self.grant_from(slot, false)?;
+        Ok((grant, unmeasured))
+    }
+
+    /// Finish a fresh root: its build directory exists and this admission holds
+    /// it for the life of the command.
+    fn prepare_fresh_root(
+        &mut self,
+        storage: &crate::storage::PoolStorage,
+        root: &barge::Root,
+    ) -> Result<(), LeaseError> {
+        ensure_private_dir(&root.path.join("build"))?;
+        let hold = storage.hold(&root.id).map_err(LeaseError::Barge)?;
+        self.pending_hold = Some(hold);
+        Ok(())
+    }
+
+    /// Drop a root this admission created but could not record. The hold this
+    /// admission took is released first, and the root is evicted only when the
+    /// durable ledger does not name it: a root that may be recorded is kept,
+    /// because deleting it would strand a live row.
+    fn discard_unrecorded_root(&mut self, storage: &crate::storage::PoolStorage, root: &str) {
+        self.pending_hold = None;
+        let recorded = match read_ledger(&self.root) {
+            Ok(ledger) => ledger
+                .slots
+                .iter()
+                .any(|slot| slot.root.as_deref() == Some(root)),
+            Err(_) => true,
+        };
+        if !recorded {
+            // The same pool-area eviction the other paths use, so the admission
+            // cost observation counts this root's deletion walk.
+            let _ = storage.evict_in(None, root);
         }
-        Ok((self.grant_from(slot, false)?, unmeasured))
     }
 
     fn release_or_recover(&mut self, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
@@ -2082,7 +2250,7 @@ impl Pool {
                 observed_size(
                     slot,
                     &path,
-                    Instant::now() + Duration::from_millis(ACCOUNTING_MAX_ELAPSED_MS),
+                    Instant::now() + Duration::from_millis(RELEASE_WALK_MAX_ELAPSED_MS),
                 )
             })
         });
@@ -2178,12 +2346,17 @@ impl Pool {
 
     /// Retire one idle recorded slot: the decision is committed durably and
     /// the ledger row is dropped. Barge evicts the owned root later, with the
-    /// pool lock released, and its own checks still decide (oxide#324).
-    fn retire_idle_slot(&mut self, id: u64) -> Result<(), LeaseError> {
+    /// pool lock released, and its own checks still decide (oxide#324). The
+    /// returned message is trash a committed inline rename left in place.
+    fn retire_idle_slot(&mut self, id: u64) -> Result<Option<String>, LeaseError> {
         self.retire_idle_slot_in_phase(id, Phase::Eviction)
     }
 
-    fn retire_idle_slot_in_phase(&mut self, id: u64, phase: Phase) -> Result<(), LeaseError> {
+    fn retire_idle_slot_in_phase(
+        &mut self,
+        id: u64,
+        phase: Phase,
+    ) -> Result<Option<String>, LeaseError> {
         // Free-space pressure must observe the bytes a deletion returns before
         // it can decide again, so its eviction stays one inline call. Every
         // other route (the slot ceiling, the byte budget, an explicit
@@ -2194,13 +2367,14 @@ impl Pool {
 
     /// Retire one idle row, using a protection listing the caller already paid
     /// for when it has one. The listing is a bytes-free observation; Barge's
-    /// own eviction rechecks the same facts when it runs.
+    /// own eviction rechecks the same facts when it runs. The returned message
+    /// is trash a committed rename left behind: progress, not a refusal.
     fn retire_idle_slot_known(
         &mut self,
         id: u64,
         protection: Option<&BTreeMap<PathBuf, barge::RootInfo>>,
         defer: bool,
-    ) -> Result<(), LeaseError> {
+    ) -> Result<Option<String>, LeaseError> {
         let Some(slot) = self.slot(id) else {
             return Err(LeaseError::Busy);
         };
@@ -2244,7 +2418,7 @@ impl Pool {
                 // grant or reuse it while Barge's eviction waits for a free
                 // pool lock.
                 self.ledger.slots.retain(|slot| slot.id != id);
-                self.persist_revised()
+                self.persist_revised().map(|()| None)
             }
             // A full hand-off list falls back to the inline eviction rather
             // than growing the record file without bound.
@@ -2257,21 +2431,21 @@ impl Pool {
     /// Free-space pressure needs the returned bytes before it can decide again,
     /// and a full hand-off list falls back to it rather than grow without
     /// bound.
+    ///
+    /// A committed rename is progress even when the trash copy could not be
+    /// deleted: the row is gone, so the caller re-reads free space and reports
+    /// the kept tree instead of failing and draining the next idle slot.
     fn retire_inline(
         &mut self,
         id: u64,
         root: &str,
         area_folder: Option<String>,
-    ) -> Result<(), LeaseError> {
+    ) -> Result<Option<String>, LeaseError> {
         let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
         let evicted = storage
             .evict_in(area_folder.as_deref(), root)
             .map_err(|error| {
-                let message = error.message();
-                if error.kind() == barge::ErrorKind::Refused
-                    && (message.ends_with("is held; refusing to evict it")
-                        || message.ends_with("is pinned; refusing to evict it"))
-                {
+                if crate::storage::eviction_protected(&error) {
                     LeaseError::Busy
                 } else {
                     LeaseError::EvictionIncomplete(format!(
@@ -2281,7 +2455,10 @@ impl Pool {
             })?;
         self.ledger.slots.retain(|slot| slot.id != id);
         self.persist_revised()?;
-        require_deleted(evicted)
+        match require_deleted(evicted) {
+            Ok(()) => Ok(None),
+            Err(kept) => Ok(Some(kept.to_string())),
+        }
     }
 
     /// One bytes-free inventory of the pool's roots, keyed by path.
@@ -2302,7 +2479,9 @@ impl Pool {
         require_unprotected(&protection, path, root)
     }
 
-    /// Retire one idle slot named by its numeric id.
+    /// Retire one idle slot named by its numeric id. The returned messages are
+    /// the trash a done eviction could not delete, so `oxide clean` reports
+    /// what it kept instead of claiming the bytes came back.
     fn evict_idle(&mut self, slot_id: &str) -> Result<Vec<String>, LeaseError> {
         let id =
             slot_id
@@ -2312,8 +2491,8 @@ impl Pool {
                 .ok_or(LeaseError::InvalidInput(
                     "slot ID must be a positive integer",
                 ))?;
-        self.retire_idle_slot(id)?;
-        Ok(Vec::new())
+        let kept = self.retire_idle_slot(id)?;
+        Ok(kept.into_iter().collect())
     }
 
     fn volume_space(&self) -> Result<barge::Space, LeaseError> {
@@ -2321,22 +2500,35 @@ impl Pool {
             .as_ref()
             .ok_or(LeaseError::UnknownAccounting)?
             .space()
-            .map_err(|_| LeaseError::UnknownAccounting)
+            .map_err(LeaseError::Barge)
     }
 
     fn evict_for_reserve(&mut self, reuse: Option<u64>) -> Result<(), LeaseError> {
         let mut space = self.volume_space()?;
         // Keep the compatible root the admission is about to claim. Reread
-        // actual free space after every completed eviction.
-        while space.free_bytes < space.reserve_bytes
-            && self.evict_one_idle_with(Phase::Reserve, |id| Some(id) != reuse)?
-        {
+        // actual free space after every completed eviction, including one whose
+        // trash copy stayed: the row is gone and the rename is Barge's, so the
+        // next decision is made on real space instead of the same failure.
+        while space.free_bytes < space.reserve_bytes {
+            match self.evict_one_idle_with(Phase::Reserve, |id| Some(id) != reuse)? {
+                Evicted::None => break,
+                Evicted::Retired => {}
+                Evicted::KeptTrash(kept) => self.note_eviction(Some(kept)),
+            }
             space = self.volume_space()?;
         }
         if space.free_bytes < space.floor_bytes {
             return Err(LeaseError::Full);
         }
         Ok(())
+    }
+
+    /// Keep a report from a committed eviction that left its trash copy. It is
+    /// attached to the grant's admission note, never printed as a refusal.
+    fn note_eviction(&mut self, kept: Option<String>) {
+        if let Some(kept) = kept {
+            self.eviction_notes.push(kept);
+        }
     }
 
     fn make_slot_room(&mut self) -> Result<(), LeaseError> {
@@ -2346,7 +2538,10 @@ impl Pool {
         let protection = self.protection_listing()?;
         for (_, id) in &candidates {
             match self.retire_idle_slot_known(*id, Some(&protection), true) {
-                Ok(()) => return Ok(()),
+                Ok(kept) => {
+                    self.note_eviction(kept);
+                    return Ok(());
+                }
                 Err(LeaseError::Busy) => {}
                 Err(error) => return Err(error),
             }
@@ -2390,15 +2585,17 @@ impl Pool {
     }
 
     /// Retire the oldest eligible slot. Barge checks the actual hold and pin
-    /// of the named root, including a hold inherited by a child.
+    /// of the named root, including a hold inherited by a child. `None` means
+    /// no candidate was evictable; a kept-trash message means one was retired
+    /// and the caller may decide again.
     fn evict_one_idle_with(
         &mut self,
         phase: Phase,
         eligible: impl Fn(u64) -> bool,
-    ) -> Result<bool, LeaseError> {
+    ) -> Result<Evicted, LeaseError> {
         let candidates = self.ranked_idle(eligible);
         if candidates.is_empty() {
-            return Ok(false);
+            return Ok(Evicted::None);
         }
         let defer = phase != Phase::Reserve;
         let protection = if defer {
@@ -2410,12 +2607,13 @@ impl Pool {
             match admission_cost::in_phase(phase, || {
                 self.retire_idle_slot_known(id, protection.as_ref(), defer)
             }) {
-                Ok(()) => return Ok(true),
+                Ok(None) => return Ok(Evicted::Retired),
+                Ok(Some(kept)) => return Ok(Evicted::KeptTrash(kept)),
                 Err(LeaseError::Busy) => continue,
                 Err(error) => return Err(error),
             }
         }
-        Ok(false)
+        Ok(Evicted::None)
     }
 
     fn ranked_idle(&self, eligible: impl Fn(u64) -> bool) -> Vec<(u64, u64)> {
@@ -2430,9 +2628,12 @@ impl Pool {
         candidates
     }
 
-    /// Sample only slots lacking a current observation, once before pressure
-    /// decisions. Partial walks get a positive, unpublished estimate and
-    /// cannot nominate a byte-pressure victim.
+    /// Sample only idle slots lacking a current observation, once before
+    /// pressure decisions. A held row is never sampled: its tree is still being
+    /// written, so a walk under this lock would be long and its figure would
+    /// describe a build in progress. It is charged the largest current
+    /// observation instead, and a partial walk gets the same positive,
+    /// unpublished estimate and cannot nominate a byte-pressure victim.
     fn admission_charges(
         &mut self,
     ) -> Result<(BTreeMap<u64, u64>, Vec<UnmeasuredSlot>), LeaseError> {
@@ -2442,10 +2643,7 @@ impl Pool {
         let mut changed = false;
         for index in 0..self.ledger.slots.len() {
             let slot = &self.ledger.slots[index];
-            if slot.recorded_size().is_none()
-                && slot.state != SlotPersistState::Evicting
-                && Instant::now() < deadline
-            {
+            if slot.is_idle() && slot.recorded_size().is_none() && Instant::now() < deadline {
                 let record = self
                     .slot_path(slot.id)
                     .ok()
@@ -2546,7 +2744,7 @@ impl Pool {
             store_id: self.config.store_id.clone(),
             backend: self.config.backend.clone(),
             cap_bytes: self.config.cap_bytes,
-            reconciliation_blocked: false,
+            reconciliation_blocked: self.reconciliation_blocked,
             slots: self.ledger.slots.iter().map(ledger_slot).collect(),
         })
     }
@@ -2577,8 +2775,12 @@ impl Pool {
 /// pair. Each file is replaced atomically, so one read may straddle a
 /// concurrent replacement: a mismatched pair is re-read once and a second
 /// mismatch refuses as unknown instead of being repaired or waited for.
-/// Passive generation check for a seed status sidecar. No pool lock,
-/// recovery or filesystem walk is performed.
+fn read_consistent_pair(root: &Path) -> Result<(PoolConfig, Ledger), LeaseError> {
+    read_consistent_pair_before(root, None)
+}
+
+/// Passive generation check for a seed status sidecar. No pool lock, recovery
+/// or filesystem walk is performed.
 pub(super) fn seed_record_matches(
     root: &Path,
     store_id: &str,
@@ -2601,10 +2803,6 @@ pub(super) fn seed_record_matches(
                 && (slot.state != SlotPersistState::Held
                     || slot.lease_id.as_deref() == Some(lease_id))
         })
-}
-
-fn read_consistent_pair(root: &Path) -> Result<(PoolConfig, Ledger), LeaseError> {
-    read_consistent_pair_before(root, None)
 }
 
 fn read_consistent_pair_before(
@@ -2740,9 +2938,6 @@ fn same_generations(snapshot: &PassiveSnapshot, config: &PoolConfig, ledger: &Le
             })
 }
 
-/// The budget-only payload is a plain owner-only directory holding `slots`.
-/// The budget is not OS-enforced. Image and receipt files refuse, so a legacy
-/// APFS image pool is never reinterpreted as a directory.
 /// Open one pool's Barge storage authority from its own recorded config.
 ///
 /// The account is the pool's control directory, so the literal `oxide/pool`
@@ -2757,7 +2952,7 @@ fn pool_storage(
 ) -> Result<Option<crate::storage::PoolStorage>, LeaseError> {
     crate::storage::PoolStorage::open(&root.join(MANAGED_NAME), &pool_backing(root, config)?)
         .map(Some)
-        .map_err(|_| LeaseError::BackingMismatch)
+        .map_err(LeaseError::Barge)
 }
 
 fn pool_backing(
@@ -2782,6 +2977,9 @@ fn pool_backing(
     })
 }
 
+/// The budget-only payload is a plain owner-only directory holding `slots`.
+/// The budget is not OS-enforced. Image and receipt files refuse, so a legacy
+/// APFS image pool is never reinterpreted as a directory.
 fn open_budget_payload(
     root: &Path,
     paths: &BackingPaths,
@@ -3201,6 +3399,11 @@ const POOL_LOCK_NOTICE: Duration = Duration::from_secs(5);
 /// lock are short (eviction moves trees out of the lock), so this is only a
 /// backstop against a stale or unreachable holder.
 const POOL_LOCK_BOUND_SECONDS: u64 = 120;
+/// The release's one observation walk happens inside the pool lock, so it is
+/// bounded well below [`POOL_LOCK_BOUND_SECONDS`]: a walk that runs out leaves
+/// the slot unrecorded, which the next admission charges conservatively, and
+/// no other command waits longer than this for the lock.
+const RELEASE_WALK_MAX_ELAPSED_MS: u64 = 10_000;
 const POOL_LOCK_POLL: Duration = Duration::from_millis(10);
 
 /// The latest instant a pool-lock wait started at `now` may last, and what
@@ -3477,6 +3680,15 @@ thread_local! {
     static PASSIVE_OPEN_DELAY: std::cell::Cell<std::time::Duration> = const {
         std::cell::Cell::new(std::time::Duration::ZERO)
     };
+    /// One injected Barge failure on the next legacy adoption attempt, so a
+    /// test can prove a refused adoption quarantines its row instead of
+    /// refusing every command.
+    static FAIL_ADOPTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_adoption() {
+    FAIL_ADOPTION.with(|flag| flag.set(true));
 }
 
 #[cfg(test)]
@@ -3646,6 +3858,90 @@ mod reserve_tests {
         }
         drop(hold);
     }
+
+    /// A committed rename with a trash copy Barge could not delete is progress:
+    /// the row is gone, so the reserve loop re-reads free space and reports the
+    /// kept tree instead of failing the admission after draining the slot.
+    #[test]
+    fn a_committed_rename_with_kept_trash_is_progress_for_the_reserve_loop() {
+        const UUID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+        const RESERVE: u64 = 4 << 20;
+        let fixture = Fixture::new("reserve-kept-trash");
+        let pool = fixture.pool();
+        let workspace = fixture.dir("workspace");
+        let mut opened = Pool::open(&pool).unwrap();
+        let os = Arc::new(ScriptedSpace {
+            volume: barge::FakeOs::with_volume(pool.clone(), UUID, RESERVE),
+            reads: Mutex::new(VecDeque::new()),
+        });
+        let account = Storage::open_with(
+            fixture.dir("account"),
+            os.clone(),
+            Arc::new(barge::ManualClock::new(1_000)),
+        )
+        .unwrap();
+        let storage = PoolStorage::from_storage(
+            account,
+            &PoolBacking::volume(&pool, UUID, "payload", 8 << 20, RESERVE, RESERVE / 2),
+        )
+        .unwrap();
+        opened.storage = Some(storage);
+
+        // The victim's tree is deeper than Barge's deletion walk, so its
+        // committed rename leaves the trash copy in place.
+        let victim_project = fixture.dir("victim");
+        *os.reads.lock().unwrap() = [RESERVE + 1].into();
+        let victim = opened
+            .lease(&request(&pool, &victim_project, &workspace, "victim"))
+            .unwrap();
+        let victim_path = victim
+            .grant
+            .env
+            .cargo_build_build_dir
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let mut deep = victim.grant.env.cargo_build_build_dir.clone();
+        for _ in 0..140 {
+            deep = deep.join("d");
+            fs::create_dir(&deep).unwrap();
+        }
+        opened.release_or_recover(&victim.grant.lease_id).unwrap();
+        drop(victim);
+
+        // Short until the rename moves the tree out of the way: the first read
+        // is the loop's entry, the second its re-read after the eviction.
+        *os.reads.lock().unwrap() = [RESERVE - 1, RESERVE].into();
+        let fresh_project = fixture.dir("fresh");
+        let fresh = opened
+            .lease(&request(&pool, &fresh_project, &workspace, "fresh"))
+            .unwrap();
+        let note = fresh.admission_note.clone().unwrap_or_default();
+        assert!(
+            note.contains("moved to trash and could not be deleted"),
+            "{note}"
+        );
+        assert!(os.reads.lock().unwrap().is_empty());
+        assert!(!victim_path.exists(), "the rename committed");
+        assert!(
+            !opened
+                .ledger
+                .slots
+                .iter()
+                .any(|slot| opened.slot_path(slot.id).unwrap() == victim_path),
+            "the retired row is gone"
+        );
+        // Put the deep trash back in reach so the fixture can remove it.
+        if let Ok(trash) = fs::read_dir(victim_path.parent().unwrap().join(".trash")) {
+            for entry in trash.flatten() {
+                let mut current = entry.path();
+                for _ in 0..140 {
+                    current = current.join("d");
+                }
+                let _ = fs::set_permissions(current, fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3683,6 +3979,14 @@ mod pool_lock_wait_tests {
             bound
         )
         .is_ok());
+    }
+
+    #[test]
+    fn the_release_walk_bound_stays_well_below_a_pool_lock_wait() {
+        assert!(
+            RELEASE_WALK_MAX_ELAPSED_MS * 10 <= POOL_LOCK_BOUND_SECONDS * 1000,
+            "a release's one walk must not be able to approach the lock-wait bound"
+        );
     }
 
     #[test]

@@ -135,6 +135,9 @@ fn open_parent(area: &barge::Area, path: &Path) -> Result<File, LeaseError> {
 impl Pool {
     /// Settle only the recorded lease. A still-present original root cancels
     /// the intent. Recovery never asks Barge to evict or delete anything.
+    ///
+    /// A reconciling open treats every error here as a quarantined intent (see
+    /// [`super::Pool::open_inner`]); an explicit held eviction reports it.
     pub(super) fn recover_held_eviction(
         &mut self,
         intent: &HeldEvictionIntent,
@@ -294,9 +297,23 @@ impl Pool {
             Err(error) if crate::storage::eviction_moved(&error) => {
                 Err(LeaseError::EvictionIncomplete(error.to_string()))
             }
-            Err(_) => {
-                intent.clear(&self.root).map_err(post)?;
-                return Err(pre(LeaseError::UnknownAccounting));
+            Err(error) => {
+                // Nothing was renamed. A root another writer still holds or a
+                // pin still protects is busy, and every other refusal keeps
+                // Barge's own text. Either way the intent is cleared before
+                // this pre-commit refusal, and a clear that fails is itself a
+                // pre-commit error: the next reconciling open clears the
+                // record, so no settlement is owed.
+                let refusal = if crate::storage::eviction_protected(&error) {
+                    LeaseError::Busy
+                } else {
+                    LeaseError::Barge(format!(
+                        "cannot evict slot root {}: {error}",
+                        intent.root_id
+                    ))
+                };
+                intent.clear(&self.root).map_err(pre)?;
+                return Err(pre(refusal));
             }
         };
         if let Err(settlement) = self.settle_held_eviction(&intent, &parent, admission.is_some()) {
@@ -438,15 +455,17 @@ mod tests {
             );
 
             if interruption == Interruption::BeforeFence {
+                // A parent this open cannot prove is quarantined, not a global
+                // refusal: the open continues, the row keeps the generation it
+                // recorded, and nothing is settled from the intent.
                 let parent = root.parent().unwrap();
                 let original = fixture.dir("retained").join("original-parent");
                 fs::rename(parent, &original).unwrap();
                 fs::create_dir(parent).unwrap();
                 fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
-                assert!(matches!(
-                    managed::prepare_pool(&pool),
-                    Err(LeaseError::UnknownAccounting)
-                ));
+                let blocked = managed::prepare_pool(&pool).unwrap();
+                assert!(blocked.reconciliation_blocked);
+                assert_eq!(blocked.slots.len(), 1);
                 assert_eq!(fs::read(&ledger).unwrap(), before);
                 assert!(HeldEvictionIntent::path(&pool).is_file());
                 fs::remove_dir(parent).unwrap();
