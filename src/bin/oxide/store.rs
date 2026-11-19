@@ -1,8 +1,8 @@
 //! Oxide's private control state beside the lease ledger.
 //!
-//! The ledger, its JSON and the standalone CLI stay unchanged. Oxide leases
-//! through the library with one owner-only project directory per affinity
-//! record (checkout + compatibility key), so the library's "same project,
+//! The lease ledger and its JSON live in `oxide_storage`, which this module
+//! does not change. Oxide leases through the library with one owner-only
+//! project directory per affinity record (checkout + compatibility key), so the library's "same project,
 //! same profile" reuse is checkout-affine by construction. The control
 //! directory `<pool>/oxide-managed` holds the records, FIFO wait tickets, the
 //! admission lock and one `flock` per record held for the life of a command.
@@ -61,9 +61,7 @@ pub const HOST_RESERVE_BYTES: u64 = 20 * GIB;
 /// idle compatible slot replaces the least-recently-used eligible idle whole
 /// slot of that project (oxide#118, raised to twelve by oxide#177).
 pub(crate) const PROJECT_SLOT_CAP: usize = 12;
-/// Finite control-state file size including the atomic temp.
-/// Permanent control-state fence for revised Store mutations (oxide#118).
-
+/// Largest origin document read; the origin is a small JSON record.
 const MAX_ORIGIN_BYTES: u64 = 8 * 1024 * 1024;
 const ORIGIN_VERSION: u32 = 1;
 const WAIT_POLL: Duration = Duration::from_millis(200);
@@ -93,8 +91,10 @@ impl<'a> WorkspaceAdmission<'a> {
     }
 }
 
-/// was written; leasing re-stamps it and Cargo's start advances the counter,
-/// so a mismatch means Cargo may have run unrecorded. `origin: None` is an
+/// The compile origin a record's slot was left with. `mark` is the record's
+/// use counter when the origin was written; leasing re-stamps it and Cargo's
+/// start advances the counter, so a mismatch means Cargo may have run
+/// unrecorded. `origin: None` is an
 /// untrusted slot. An untrusted slot is never reused: the next command evicts
 /// it and builds cold.
 #[derive(Serialize, Deserialize)]
@@ -497,10 +497,7 @@ enum BarrierState {
     Dead(String),
 }
 
-/// How many non-blocking barrier attempts a guarded verb makes before its
-/// bounded refusal (design §4.1 step 4). The production budget is
-/// [`BARRIER_ATTEMPTS`] shipped polls; the unit suite uses two so a held
-/// barrier reaches its bounded refusal quickly.
+/// The production number of non-blocking barrier attempts (design §4.1 step 4).
 const BARRIER_ATTEMPTS: usize = 25;
 
 /// How many non-blocking barrier attempts a guarded verb makes before its
@@ -1046,11 +1043,7 @@ pub fn slot_label(dir: Option<&str>, checkout: Option<&Path>) -> Option<String> 
 /// no ledger or volume access, for a pool status does not open. A missing
 /// or unreadable state is `Err`, never "never used".
 pub fn recorded_last_use(control: &Path) -> Result<Option<LastUse>, String> {
-    let path = control.join("state.json");
-    let file = private_file(&path, false)?.ok_or("no Oxide control state")?;
-    let mut bytes = Vec::new();
-    bounded_read(file.take(MAX_STATE_BYTES + 1), &mut bytes).map_err(|error| error.to_string())?;
-    let state: State = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let state = read_state(&control.join("state.json"))?.ok_or("no Oxide control state")?;
     Ok(state
         .records
         .iter()
@@ -1067,13 +1060,9 @@ pub fn recorded_last_use(control: &Path) -> Result<Option<LastUse>, String> {
 /// Slots lost with the removable volume, from its control state read-only
 /// and without the volume: slot ID, checkout and what happens to it.
 pub fn recorded_lost(control: &Path) -> Result<Vec<(String, Option<PathBuf>, String)>, String> {
-    let path = control.join("state.json");
-    let Some(file) = private_file(&path, false)? else {
+    let Some(state) = read_state(&control.join("state.json"))? else {
         return Ok(Vec::new());
     };
-    let mut bytes = Vec::new();
-    bounded_read(file.take(MAX_STATE_BYTES + 1), &mut bytes).map_err(|error| error.to_string())?;
-    let state: State = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     let boot = boot_session();
     Ok(state
         .records
@@ -1098,18 +1087,9 @@ pub fn active_holders(control: &Path, checkout: &Path) -> Result<Vec<String>, St
 }
 
 fn holders(control: &Path, checkout: &Path, cleans: bool) -> Result<Vec<String>, String> {
-    let path = control.join("state.json");
-    let Some(file) = private_file(&path, false)? else {
+    let Some(state) = read_state(&control.join("state.json"))? else {
         return Ok(Vec::new());
     };
-    let mut bytes = Vec::new();
-    bounded_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
-        .map_err(|error| format!("cannot read Oxide state: {error}"))?;
-    if bytes.len() as u64 > MAX_STATE_BYTES {
-        return Err("Oxide state exceeds its byte limit".to_owned());
-    }
-    let state: State = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("Oxide state is invalid: {error}"))?;
     Ok(holder_lines(&state, checkout, cleans))
 }
 
@@ -2674,6 +2654,12 @@ impl Store {
                                                 .to_owned(),
                                         );
                                 }
+                                // The internal control may already carry the
+                                // successor fence (a crash between the two
+                                // saves), so this paired upgrade is the only
+                                // remaining closure check: it must hold here
+                                // too, not only in the first upgrade.
+                                writers_closed(&state, "the paired", own_checkout)?;
                                 state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
                                 sibling.save_for_writer(&state)?;
                             }
@@ -2688,13 +2674,7 @@ impl Store {
                                     "the paired pool records initializer transaction {transaction}, not the recorded {recorded}; refusing"
                                 ));
                             }
-                            writers_closed(&state, "the paired", own_checkout)?;
-                            state.outputs_init = Some(OutputsInit::Ready {
-                                transaction: recorded.clone(),
-                                ready_ms: process::now_ms(),
-                            });
-                            state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
-                            sibling.save_for_writer(&state)?;
+                            fence_paired(sibling, &mut state, &recorded, own_checkout)?;
                         }
                         None => {
                             // Parity with the `Ready` arm above: the released
@@ -2712,13 +2692,7 @@ impl Store {
                             }
                             // A new or reappearing control is fenced only
                             // with its own writers positively closed.
-                            writers_closed(&state, "the paired", own_checkout)?;
-                            state.outputs_init = Some(OutputsInit::Ready {
-                                transaction: recorded.clone(),
-                                ready_ms: process::now_ms(),
-                            });
-                            state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
-                            sibling.save_for_writer(&state)?;
+                            fence_paired(sibling, &mut state, &recorded, own_checkout)?;
                         }
                     }
                     if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
@@ -3015,21 +2989,12 @@ impl Store {
         self
     }
 
-    fn sibling_state(&self) -> Option<State> {
-        let sibling = self.sibling.as_ref()?;
-        let file = private_file(&sibling.control.join("state.json"), false).ok()??;
-        let mut bytes = Vec::new();
-        bounded_read(file.take(MAX_STATE_BYTES + 1), &mut bytes).ok()?;
-        serde_json::from_slice::<State>(&bytes).ok()
-    }
-
     /// The other pool's state with its failures distinguished from absence.
     /// `Ok(None)` means there is no state document at all (so no records);
     /// every other problem — a symlinked or unreadable document, an
-    /// inaccessible ancestor, an invalid document — is an error, which the
-    /// guarded barrier reports as unknown custody instead of treating it as
-    /// clear. `exists()` is never used for this, because it maps every metadata
-    /// error to `false`.
+    /// inaccessible ancestor, an invalid document — is an error. Callers map
+    /// that error to unknown custody (or refuse), never to clear. `exists()` is
+    /// never used for this, because it maps every metadata error to `false`.
     fn checked_sibling_state(&self) -> Result<Option<State>, String> {
         let Some(sibling) = self.sibling.as_ref() else {
             return Ok(None);
@@ -3051,42 +3016,32 @@ impl Store {
             }
             Ok(_) => {}
         }
-        let path = sibling.control.join("state.json");
-        let Some(file) = private_file(&path, false)
-            .map_err(|error| format!("the other pool's record state is unreadable: {error}"))?
-        else {
-            return Ok(None);
-        };
-        let mut bytes = Vec::new();
-        bounded_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
-            .map_err(|error| format!("the other pool's record state is unreadable: {error}"))?;
-        if bytes.len() as u64 > MAX_STATE_BYTES {
-            return Err("the other pool's record state exceeds its byte limit".to_owned());
-        }
-        let state: State = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("the other pool's record state is invalid: {error}"))?;
-        Ok(Some(state))
+        read_state(&sibling.control.join("state.json"))
+            .map_err(|error| format!("the other pool's record state is unreadable: {error}"))
     }
 
-    fn sibling_active(&self) -> usize {
-        self.sibling_state().map_or(0, |state| {
+    /// The number of active command records in the other pool. An unreadable
+    /// state is an error, so the caller refuses rather than admitting over it.
+    fn sibling_active(&self) -> Result<usize, String> {
+        Ok(self.checked_sibling_state()?.map_or(0, |state| {
             state
                 .records
                 .iter()
                 .filter(|record| record.active())
                 .count()
-        })
+        }))
     }
 
     /// Whether the other pool holds an active command for `checkout`
-    /// (internal clean checks the removable pool's commands).
-    fn sibling_busy(&self, checkout: &Path) -> bool {
-        self.sibling_state().is_some_and(|state| {
+    /// (internal clean checks the removable pool's commands). An unreadable
+    /// state is an error, never "not busy".
+    fn sibling_busy(&self, checkout: &Path) -> Result<bool, String> {
+        Ok(self.checked_sibling_state()?.is_some_and(|state| {
             state
                 .records
                 .iter()
                 .any(|record| record.checkout.as_deref() == Some(checkout) && record.active())
-        })
+        }))
     }
 
     /// A per-checkout binding mutex: not state-dependent, so two commands can
@@ -3118,19 +3073,11 @@ impl Store {
         } else {
             None
         };
-        // A sibling with no state file has no records; an unreadable one is
-        // unknown custody, never "clear".
-        let other_state = match &self.sibling {
-            None => None,
-            Some(sibling) => match self.sibling_state() {
-                Some(state) => Some(state),
-                None if !sibling.control.join("state.json").exists() => None,
-                None => {
-                    return Ok(CheckoutCustody::Unknown(
-                        "the other pool's record state is unreadable".to_owned(),
-                    ))
-                }
-            },
+        // A sibling with no state file has no records; any failure to read or
+        // parse one is unknown custody, never "clear".
+        let other_state = match self.checked_sibling_state() {
+            Ok(state) => state,
+            Err(reason) => return Ok(CheckoutCustody::Unknown(reason)),
         };
         let boot = boot_session();
         let pools = [
@@ -3162,7 +3109,7 @@ impl Store {
         let file = private_file(&sibling.control.join("admission.lock"), true)?
             .ok_or("the internal admission lock is missing")?;
         crate::budget::lock(&file, "internal admission")?;
-        let cleaning = match self.sibling_state() {
+        let cleaning = match self.checked_sibling_state()? {
             None => false,
             Some(state) => {
                 let mut live = false;
@@ -3570,7 +3517,7 @@ impl Store {
                     || state.records.iter().any(|record| {
                         record.checkout.as_deref() == Some(checkout) && record.active()
                     })
-                    || self.sibling_busy(checkout);
+                    || self.sibling_busy(checkout)?;
                 if !busy {
                     if state.cleans.len() >= MAX_TICKETS {
                         return Err(format!("too many concurrent oxide cleans ({MAX_TICKETS})"));
@@ -4088,7 +4035,7 @@ impl Store {
             .iter()
             .filter(|record| record.active())
             .count()
-            + self.sibling_active();
+            + self.sibling_active()?;
         if active >= max_active {
             self.save(&state)?;
             return Ok(Err(Wait::HostLimit(active)));
@@ -4099,64 +4046,10 @@ impl Store {
             let project = self.affinity_dir(record.id);
             view.slots.iter().any(|slot| slot.project == project)
         };
-        let matches = |record: &Record| {
-            record.phase != Phase::Retired
-                && record.checkout.as_deref() == Some(key.checkout.as_path())
-                && record.compatibility == key.compatibility
-                // Class is part of record identity (design §5.2): an existing
-                // record of the other class is never reused or relabelled.
-                && record.class == admission.class
-        };
-        // The stale sweep is about **this key**, not this class (design §5.2,
-        // §5.7): an idle slotless record of the other class is still a live
-        // record of this checkout and keeps it, so the one-use command takes a
-        // distinct record instead of deleting the normal or legacy one.
-        let same_key = |record: &Record| {
-            record.phase != Phase::Retired
-                && record.checkout.as_deref() == Some(key.checkout.as_path())
-                && record.compatibility == key.compatibility
-        };
-        let stale: Vec<u64> = state
-            .records
-            .iter()
-            .filter(|record| record.phase == Phase::Idle && !has_slot(record) && !same_key(record))
-            .map(|record| record.id)
-            .collect();
-        for id in stale {
-            self.forget_record(&mut state, id);
-        }
+        self.forget_stale_records(&mut state, key, &view);
 
-        // Second-slot rule: this checkout may hold several records of one
-        // key. Take an idle one whose lock is free, one with a slot first,
-        // then the most recently used. A busy one (a live command, an
-        // interrupted one whose group may still run, or a lock still held)
-        // is never reused, released, evicted or relabelled here; the
-        // command takes another idle compatible slot or a new one through
-        // the normal admission below, and waits only when neither exists.
-        let mut own: Vec<usize> = (0..state.records.len())
-            .filter(|&index| matches(&state.records[index]))
-            .collect();
-        own.sort_by_key(|&index| {
-            let record = &state.records[index];
-            std::cmp::Reverse((has_slot(record), record.last_used))
-        });
-        let mut existing = None;
-        let mut lock = None;
-        let mut busy = false;
-        for index in own {
-            if state.records[index].phase != Phase::Idle {
-                busy = true;
-                continue;
-            }
-            match probe_lock(&self.lock_path(state.records[index].id), true)? {
-                Probe::Free(file) => {
-                    existing = Some(index);
-                    lock = Some(file);
-                    break;
-                }
-                Probe::Held | Probe::Missing => busy = true,
-            }
-        }
+        let (mut existing, mut lock, busy) =
+            self.find_own_slot(&state, key, admission.class, &view)?;
         let mut shared_from = None;
         let mut shared_origin = None;
         // A project-cap replacement the library performs as part of the
@@ -4345,28 +4238,7 @@ impl Store {
         }
         self.save(&state)?;
 
-        // A new slot joins the folder this repository already uses, which
-        // needs no Git call; otherwise its label comes from the checkout.
-        let same_repository: Vec<PathBuf> = state
-            .records
-            .iter()
-            .filter(|other| other.identity == key.identity)
-            .map(|other| self.affinity_dir(other.id))
-            .collect();
-        let known = view
-            .slots
-            .iter()
-            .filter(|slot| same_repository.contains(&slot.project))
-            .find_map(|slot| {
-                slot.dir
-                    .as_deref()?
-                    .split_once('/')
-                    .map(|(folder, _)| folder)
-            });
-        let folders = match known {
-            Some(folder) => vec![folder.to_owned()],
-            None => identity::slot_folders(&identity::project_label(&key.checkout), &key.identity),
-        };
+        let (same_repository, folders) = self.slot_folders(&state, key, &view);
         let replace_slot =
             match &replace {
                 Some((_, slot_id)) => Some(slot_id.parse::<u64>().map_err(|_| {
@@ -4577,6 +4449,117 @@ impl Store {
         }))
     }
 
+    fn find_own_slot(
+        &self,
+        state: &State,
+        key: &SlotKey,
+        class: WorkspaceClass,
+        view: &LedgerView,
+    ) -> Result<(Option<usize>, Option<File>, bool), String> {
+        let has_slot = |record: &Record| {
+            let project = self.affinity_dir(record.id);
+            view.slots.iter().any(|slot| slot.project == project)
+        };
+        let matches = |record: &Record| {
+            record.phase != Phase::Retired
+                && record.checkout.as_deref() == Some(key.checkout.as_path())
+                && record.compatibility == key.compatibility
+                // Class is part of record identity (design §5.2): an existing
+                // record of the other class is never reused or relabelled.
+                && record.class == class
+        };
+        // Second-slot rule: this checkout may hold several records of one
+        // key. Take an idle one whose lock is free, one with a slot first,
+        // then the most recently used. A busy one (a live command, an
+        // interrupted one whose group may still run, or a lock still held)
+        // is never reused, released, evicted or relabelled here; the
+        // command takes another idle compatible slot or a new one through
+        // the normal admission below, and waits only when neither exists.
+        let mut own: Vec<usize> = (0..state.records.len())
+            .filter(|&index| matches(&state.records[index]))
+            .collect();
+        own.sort_by_key(|&index| {
+            let record = &state.records[index];
+            std::cmp::Reverse((has_slot(record), record.last_used))
+        });
+        let mut existing = None;
+        let mut lock = None;
+        let mut busy = false;
+        for index in own {
+            if state.records[index].phase != Phase::Idle {
+                busy = true;
+                continue;
+            }
+            match probe_lock(&self.lock_path(state.records[index].id), true)? {
+                Probe::Free(file) => {
+                    existing = Some(index);
+                    lock = Some(file);
+                    break;
+                }
+                Probe::Held | Probe::Missing => busy = true,
+            }
+        }
+        Ok((existing, lock, busy))
+    }
+
+    /// Forget idle records that no longer own a slot or match this key.
+    fn forget_stale_records(&self, state: &mut State, key: &SlotKey, view: &LedgerView) {
+        let has_slot = |record: &Record| {
+            let project = self.affinity_dir(record.id);
+            view.slots.iter().any(|slot| slot.project == project)
+        };
+        // The stale sweep is about **this key**, not this class (design §5.2,
+        // §5.7): an idle slotless record of the other class is still a live
+        // record of this checkout and keeps it, so the one-use command takes a
+        // distinct record instead of deleting the normal or legacy one.
+        let same_key = |record: &Record| {
+            record.phase != Phase::Retired
+                && record.checkout.as_deref() == Some(key.checkout.as_path())
+                && record.compatibility == key.compatibility
+        };
+        let stale: Vec<u64> = state
+            .records
+            .iter()
+            .filter(|record| record.phase == Phase::Idle && !has_slot(record) && !same_key(record))
+            .map(|record| record.id)
+            .collect();
+        for id in stale {
+            self.forget_record(state, id);
+        }
+    }
+
+    /// Choose a folder already used by this repository, or derive a new one.
+    fn slot_folders(
+        &self,
+        state: &State,
+        key: &SlotKey,
+        view: &LedgerView,
+    ) -> (Vec<PathBuf>, Vec<String>) {
+        // A new slot joins the folder this repository already uses, which
+        // needs no Git call; otherwise its label comes from the checkout.
+        let same_repository: Vec<PathBuf> = state
+            .records
+            .iter()
+            .filter(|other| other.identity == key.identity)
+            .map(|other| self.affinity_dir(other.id))
+            .collect();
+        let known = view
+            .slots
+            .iter()
+            .filter(|slot| same_repository.contains(&slot.project))
+            .find_map(|slot| {
+                slot.dir
+                    .as_deref()?
+                    .split_once('/')
+                    .map(|(folder, _)| folder)
+            });
+        let folders = match known {
+            Some(folder) => vec![folder.to_owned()],
+            None => identity::slot_folders(&identity::project_label(&key.checkout), &key.identity),
+        };
+        (same_repository, folders)
+    }
+
     /// Own-command crash recovery: a non-idle record whose lock is free has
     /// no live Oxide owner. [`settle`] decides whether its held lease can be
     /// recovered; each recovery is logged for `oxide status`.
@@ -4785,12 +4768,7 @@ impl Store {
     /// The record's origin if the last command on it recorded one and no
     /// command ran since.
     fn trusted_origin(&self, record: &Record) -> Option<Built> {
-        let file = private_file(&self.origin_path(record.id), false).ok()??;
-        let mut bytes = Vec::new();
-        bounded_read(file.take(MAX_ORIGIN_BYTES + 1), &mut bytes).ok()?;
-        if bytes.len() as u64 > MAX_ORIGIN_BYTES {
-            return None;
-        }
+        let bytes = bounded_read(&self.origin_path(record.id), MAX_ORIGIN_BYTES).ok()??;
         let stored: OriginFile = serde_json::from_slice(&bytes).ok()?;
         (stored.version == ORIGIN_VERSION && stored.mark == record.last_used)
             .then_some(stored.origin)
@@ -4995,16 +4973,10 @@ impl Store {
     }
 
     fn load(&self) -> Result<State, String> {
-        let Some(file) = private_file(&self.control.join("state.json"), false)? else {
-            return Ok(State::default());
-        };
-        let mut bytes = Vec::new();
-        bounded_read(file.take(MAX_STATE_BYTES + 1), &mut bytes)
-            .map_err(|error| format!("cannot read Oxide state: {error}"))?;
-        // The shared parser is the fence's acceptance test too
-        // (`oxide_storage::lease::control::parse_state`), so the two writers
-        // cannot disagree about what a valid control document is.
-        parse_state(&bytes)
+        // Every reader goes through `read_state`, which uses the shared parser
+        // (`oxide_storage::lease::control::parse_state`) the fence also uses, so
+        // no reader or writer can disagree about a valid control document.
+        Ok(read_state(&self.control.join("state.json"))?.unwrap_or_default())
     }
 
     fn save(&self, state: &State) -> Result<(), String> {
@@ -5209,9 +5181,6 @@ fn verify_private_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Take the internal pool's existing admission lock for metadata updates and
-/// command admission. Only the lock file may be created; the control
-/// directory must already exist.
 /// The internal pool's admission lock, made reentrant for this thread so an
 /// owned-output publication can update its registry and its receipt inside one
 /// critical section without taking the same lock twice (oxide#129). Nested
@@ -5258,6 +5227,25 @@ impl Drop for PublicationGuard {
             }
         });
     }
+}
+
+/// Record `transaction` as the paired control's ready registry and publish the
+/// successor fence, after that control's writers are positively closed. The
+/// caller holds the paired pool's admission lock and has already checked any
+/// predecessor fence it accepted.
+fn fence_paired(
+    sibling: &Store,
+    state: &mut State,
+    transaction: &str,
+    own_checkout: Option<&Path>,
+) -> Result<(), String> {
+    writers_closed(state, "the paired", own_checkout)?;
+    state.outputs_init = Some(OutputsInit::Ready {
+        transaction: transaction.to_owned(),
+        ready_ms: process::now_ms(),
+    });
+    state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
+    sibling.save_for_writer(state)
 }
 
 /// Positive writer closure in one pool's state for owned-outputs
@@ -5397,6 +5385,9 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
     Ok(Some(file))
 }
 
+/// Take the internal pool's existing admission lock for metadata updates and
+/// command admission. Only the lock file may be created; the control
+/// directory must already exist.
 pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
     lock_admission_inner(control, None)
 }
@@ -5609,15 +5600,11 @@ pub fn hold_record_for_tests(store: &Store, checkout: &Path, id: u64) -> File {
 /// so a caller reports "not measured" instead of falling back to a scan.
 fn read_observations(control: &Path) -> Result<Option<Observations>, String> {
     let path = control.join(OBSERVATIONS_NAME);
-    let Some(file) = private_file(&path, false)? else {
+    let Some(bytes) = bounded_read(&path, MAX_OBSERVATIONS_BYTES)
+        .map_err(|error| format!("cannot read recorded observations: {error}"))?
+    else {
         return Ok(None);
     };
-    let mut bytes = Vec::new();
-    bounded_read(file.take(MAX_OBSERVATIONS_BYTES + 1), &mut bytes)
-        .map_err(|error| format!("cannot read recorded observations: {error}"))?;
-    if bytes.len() as u64 > MAX_OBSERVATIONS_BYTES {
-        return Err("recorded observations exceed their byte limit".to_owned());
-    }
     let document: Observations = serde_json::from_slice(&bytes)
         .map_err(|error| format!("recorded observations are invalid: {error}"))?;
     if document.schema != OBSERVATIONS_SCHEMA {
@@ -5851,6 +5838,32 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, St
         return Err(format!("{} must be an owner-only file", path.display()));
     }
     Ok(Some(file))
+}
+
+/// The bytes of one private control file, read at most `max` bytes. `Ok(None)`
+/// means the file is absent. A file longer than `max` is an error, never a
+/// truncated read, so a caller cannot parse a prefix of an oversized document.
+fn bounded_read(path: &Path, max: u64) -> Result<Option<Vec<u8>>, String> {
+    let Some(file) = private_file(path, false)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > max {
+        return Err(format!("{} exceeds its byte limit", path.display()));
+    }
+    Ok(Some(bytes))
+}
+
+/// One control state document through the shared parser (`parse_state`), the
+/// same acceptance test the writer and the owned-outputs fence use. `Ok(None)`
+/// is an absent document; every other failure is an error.
+fn read_state(path: &Path) -> Result<Option<State>, String> {
+    bounded_read(path, MAX_STATE_BYTES)?
+        .map(|bytes| parse_state(&bytes))
+        .transpose()
 }
 
 /// Approximate age from the existing ticket file's metadata only.
@@ -6988,6 +7001,118 @@ pub(crate) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// The crash window of the paired fence upgrade: the internal control
+    /// already carries the successor fence while the paired control is still
+    /// `Ready` for the same transaction under the predecessor fence. The
+    /// upgrade must refuse while a paired command still holds a record.
+    #[test]
+    fn the_paired_ready_upgrade_refuses_an_open_writer() {
+        let transaction = "e".repeat(32);
+        let (root, internal, removable) = paired_controls("paired-ready-upgrade");
+        internal
+            .save(&State {
+                owned_outputs: Some(OWNED_OUTPUTS_FENCE.to_owned()),
+                outputs_init: Some(OutputsInit::Ready {
+                    transaction: transaction.clone(),
+                    ready_ms: 1,
+                }),
+                recorded_accounting: Some(RECORDED_ACCOUNTING_FENCE.to_owned()),
+                ..State::default()
+            })
+            .unwrap();
+        let mut paired = State {
+            owned_outputs: Some(LEGACY_OWNED_OUTPUTS_FENCE.to_owned()),
+            outputs_init: Some(OutputsInit::Ready {
+                transaction: transaction.clone(),
+                ready_ms: 1,
+            }),
+            recorded_accounting: Some(RECORDED_ACCOUNTING_FENCE.to_owned()),
+            ..State::default()
+        };
+        paired
+            .records
+            .push(record(Phase::Running, Some(i32::MAX), Some("v1.a.1.1.1")));
+        removable.save(&paired).unwrap();
+        let paired_before = fs::read(removable.control.join("state.json")).unwrap();
+        let error = internal
+            .initialize_outputs(&transaction, None, &|_, _| -> Result<(), String> {
+                panic!("a refusing control created a registry")
+            })
+            .unwrap_err();
+        assert!(
+            error.contains("the paired pool holds an active command record"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(removable.control.join("state.json")).unwrap(),
+            paired_before,
+            "the refused upgrade left the paired control unchanged"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An unreadable sibling control directory is unknown custody, never
+    /// clear: the document looks absent through it, so the verdict must
+    /// refuse instead of reading that as no records.
+    #[test]
+    fn checkout_custody_refuses_an_unreadable_sibling_state() {
+        // SAFETY: geteuid has no preconditions; root reads through mode 000.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (root, internal, removable) = paired_controls("custody-sibling-unreadable");
+        removable.save(&State::default()).unwrap();
+        fs::set_permissions(&removable.control, fs::Permissions::from_mode(0o000)).unwrap();
+        let custody = internal.checkout_custody(Path::new("/checkout"), 0);
+        fs::set_permissions(&removable.control, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(custody, Ok(CheckoutCustody::Unknown(_))),
+            "{custody:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A sibling document the shared parser refuses is unknown custody even
+    /// when plain serde would accept it: the fence, the writer and every
+    /// reader must agree on what a valid control document is.
+    #[test]
+    fn checkout_custody_refuses_a_sibling_state_the_parser_rejects() {
+        let (root, internal, removable) = paired_controls("custody-sibling-invalid");
+        let invalid = State {
+            owned_outputs: Some("oxide.outputs/9".to_owned()),
+            ..State::default()
+        };
+        write_private(
+            &removable.control.join("state.json"),
+            &serde_json::to_vec(&invalid).unwrap(),
+        );
+        let custody = internal
+            .checkout_custody(Path::new("/checkout"), 0)
+            .unwrap();
+        assert!(
+            matches!(custody, CheckoutCustody::Unknown(_)),
+            "{custody:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The bounded reader refuses a file over its limit rather than returning
+    /// a truncated prefix, and an absent file is `None`, not an error.
+    #[test]
+    fn bounded_read_enforces_its_limit_and_reports_absence() {
+        let (root, internal, _removable) = paired_controls("bounded-read");
+        let path = internal.control.join("bounded.json");
+        assert_eq!(bounded_read(&path, 4).unwrap(), None);
+        write_private(&path, b"0123456789");
+        let error = bounded_read(&path, 4).unwrap_err();
+        assert!(error.contains("byte limit"), "{error}");
+        assert_eq!(
+            bounded_read(&path, 10).unwrap(),
+            Some(b"0123456789".to_vec())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// A holder of a checkout's clean barrier excludes only barriers when it
     /// rechecks writers: command records are still reported. The prune
     /// custody routes take the records-only shape through the fresh witness's
@@ -7588,8 +7713,8 @@ pub(crate) mod tests {
             .records
             .push(record(Phase::Running, Some(i32::MAX), Some("v1.a.1.1.1")));
         removable.save(&state).unwrap();
-        assert!(internal.sibling_busy(checkout));
-        assert!(!internal.sibling_busy(other));
+        assert!(internal.sibling_busy(checkout).unwrap());
+        assert!(!internal.sibling_busy(other).unwrap());
         let Cleaning::Guard(guard) = internal
             .begin_clean(other, &mut WaitAccounting::default())
             .unwrap()
@@ -11311,11 +11436,6 @@ mod scratch_internal_tests {
     }
 }
 
-/// Focused regressions for the fresh per-row custody witnesses (oxide#235):
-/// reuse of one parsed durable state per pool only while fresh witnesses
-/// prove it remains that same atomically replaced document, per-row
-/// non-blocking locks that are never created or fenced on this route, and
-/// refusal of every uncertain identity.
 /// The real child launch keeps the lease's root hold. The test runs in its own
 /// test process: a spawned child inherits every inheritable descriptor of the
 /// process, so running it beside other fixtures would make their lock probes
@@ -11431,8 +11551,4 @@ mod launch_hold_tests {
         pinned_area.unpin(&pinned.id).unwrap();
         area.evict_any(&pinned.id).expect("evicted after unpin");
     }
-}
-
-fn bounded_read(reader: impl Read, bytes: &mut Vec<u8>) -> std::io::Result<usize> {
-    reader.take(u64::MAX).read_to_end(bytes)
 }
