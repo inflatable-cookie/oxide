@@ -978,6 +978,34 @@ fn an_eviction_reports_a_trash_that_cannot_be_created_from_the_settle() {
 }
 
 #[test]
+fn a_failed_trash_sweep_does_not_block_recorded_eviction() {
+    let fixture = Fixture::new("sweep-failure-eviction");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let leased = managed::lease(request(&pool, &project, &project, "first")).unwrap();
+    let slot = leased.grant.slot_id.clone();
+    let path = leased
+        .grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .unwrap()
+        .to_owned();
+    managed::release(&pool, &leased.grant.lease_id).unwrap();
+    drop(leased);
+    managed::evict_idle_slot(&pool, &slot).unwrap();
+    super::pool::fail_next_trash_sweep();
+    let (messages, walks) = count_pool_walks(|| managed::settle_pending_evictions(&pool));
+    assert!(messages
+        .unwrap()
+        .iter()
+        .any(|message| message.contains("injected sweep failure")));
+    assert!(walks.iter().any(|walk| matches!(walk, PoolWalk::Evict(_))));
+    assert!(!path.exists());
+    assert!(!pool.join("oxide-managed/idle-evictions.json").exists());
+}
+
+#[test]
 fn sweeping_owned_trash_does_not_resample_the_roots_bytes() {
     let fixture = Fixture::new("trash-byte-walks");
     let pool = fixture.pool();

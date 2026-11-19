@@ -3126,6 +3126,11 @@ pub(crate) fn last_settle_held_no_pool_lock() -> bool {
     pending::last_settle_held_no_pool_lock()
 }
 
+#[cfg(test)]
+pub(crate) fn fail_next_trash_sweep() {
+    pending::fail_next_sweep();
+}
+
 fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, LeaseError> {
     let (deadline, bound) = pool_lock_deadline(Instant::now());
     lock_pool_until(pool, create, notice, deadline, bound)

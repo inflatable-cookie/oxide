@@ -88,7 +88,8 @@ record list also falls back to the inline call rather than grow the file.
 
 A mutating open drops a record whose recorded root path is absent, because Barge's
 rename already committed and its trash is swept by the unlocked settlement pass,
-even when no pending records remain. A record whose root is
+even when no pending records remain. A sweep failure is reported and does not
+prevent settlement of other recorded roots. A record whose root is
 still present stays for a later pass; recovery never deletes it directly.
 
 A held eviction checks the writer generation and exact lease under the pool lock.

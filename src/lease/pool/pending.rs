@@ -212,15 +212,25 @@ pub fn settle(pool: &Path) -> Result<Vec<String>, LeaseError> {
     // Sweep it here, never while opening the pool under its lock.
     #[cfg(test)]
     POOL_LOCK_FREE.with(|free| free.set(!crate::lease::pool::pool_lock_is_held(pool)));
-    let swept = storage
-        .sweep_all_trash()
-        .map_err(|_| LeaseError::UnknownAccounting)?;
-    for kept in swept.kept {
-        messages.push(format!(
-            "trash at {} was kept: {}",
-            kept.path.display(),
-            kept.reason
-        ));
+    #[cfg(test)]
+    let swept = if FAIL_SWEEP.with(|flag| flag.replace(false)) {
+        Err("injected sweep failure".to_owned())
+    } else {
+        storage.sweep_all_trash()
+    };
+    #[cfg(not(test))]
+    let swept = storage.sweep_all_trash();
+    match swept {
+        Ok(swept) => {
+            for kept in swept.kept {
+                messages.push(format!(
+                    "trash at {} was kept: {}",
+                    kept.path.display(),
+                    kept.reason
+                ));
+            }
+        }
+        Err(error) => messages.push(format!("could not sweep Barge trash: {error}")),
     }
     let mut settled: Vec<PendingEviction> = Vec::new();
     for record in records {
@@ -271,6 +281,7 @@ thread_local! {
     /// Whether every `evict_in` this thread's last settle made ran with the
     /// pool lock free. The regression reads it after a settle; a settle with no
     /// records leaves it `true`.
+    static FAIL_SWEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static POOL_LOCK_FREE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
@@ -279,4 +290,9 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn last_settle_held_no_pool_lock() -> bool {
     POOL_LOCK_FREE.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_sweep() {
+    FAIL_SWEEP.with(|flag| flag.set(true));
 }
