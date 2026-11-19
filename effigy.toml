@@ -26,11 +26,12 @@ minimum_effigy_version = "0.14.0"
 # with a hash receipt under ~/.local/state/oxide/install. `oxide:install`
 # refuses any existing `oxide`; `oxide:reinstall` replaces only the binary
 # matching the newest receipt.
-"oxide:install" = "python3 scripts/oxide-install.py"
-"oxide:reinstall" = "python3 scripts/oxide-install.py --replace"
+"oxide:canary" = "python3 scripts/oxide-install.py --canary {args}"
+"oxide:install" = "python3 scripts/oxide-install.py {args}"
+"oxide:reinstall" = "python3 scripts/oxide-install.py --replace {args}"
 "oxide:rollback" = "python3 scripts/oxide-install.py --rollback"
 # Synthetic fixtures for the installer's link, clobber and identity
-# refusals. Never builds or installs.
+# refusals and the staged canary. Never builds or installs.
 "dogfood:scripts:test" = "python3 -B scripts/test_dogfood_scripts.py"
 # The shared session supervisor's pure cases (oxide#109): fake clock, process
 # table, signals and readings; spawns nothing. Not the qualification.

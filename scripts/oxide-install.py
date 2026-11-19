@@ -5,8 +5,9 @@ Initial mode refuses any `oxide` on PATH and any existing destination entry.
 the newest install receipt. A replacement saves that binary beside its
 receipt. `--rollback` restores the verified prior binary without building.
 `--check` stops after the preflight and builds nothing.
-Effigy does not forward selector arguments, so `OXIDE_INSTALL_PIN` also names
-the pin.
+`--canary` builds the same way and tests the staged binary on the live pool.
+`--require-canary` requires a fresh PASS for the same pin. `OXIDE_INSTALL_PIN`
+also names the pin.
 
 The receipt records the pinned build's own `control_state_version` and
 `registration_version` capabilities, read by an effect-free probe of the
@@ -24,6 +25,7 @@ import datetime
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -32,7 +34,8 @@ import stat
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
+import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 HOME = Path(os.environ["HOME"])
@@ -420,6 +423,258 @@ def write_private(directory, name, mode, write):
         os.fsync(output.fileno())
 
 
+def write_canary_receipt(pin, result):
+    directory = open_owned_directory(RECEIPTS / "canary", create=True)
+    temporary = temporary_name()
+    try:
+        receipt = {"pin": pin, "result": result,
+                   "finished": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+        write_private(directory, temporary, 0o600,
+                      lambda output: output.write((json.dumps(receipt) + "\n").encode()))
+        os.replace(temporary, f"{pin}.json", src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        os.close(directory)
+
+
+def require_canary(pin):
+    try:
+        directory = open_owned_directory(RECEIPTS / "canary")
+        try:
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            with os.fdopen(os.open(f"{pin}.json", flags, dir_fd=directory), "rb") as file:
+                info = os.fstat(file.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                    raise ValueError("receipt must be an owner-only regular file")
+                data = file.read(RECEIPT_MAX_BYTES + 1)
+        finally:
+            os.close(directory)
+        if len(data) > RECEIPT_MAX_BYTES:
+            raise ValueError("receipt exceeds the byte limit")
+        receipt = json.loads(data)
+        finished = datetime.datetime.fromisoformat(receipt["finished"])
+        age = datetime.datetime.now(datetime.timezone.utc) - finished
+        if (receipt["pin"] == pin and receipt["result"] == "PASS"
+                and datetime.timedelta(0) <= age < datetime.timedelta(hours=1)):
+            return
+        raise ValueError("receipt must record a PASS less than an hour old")
+    except (KeyError, TypeError, ValueError, OSError) as error:
+        raise Refusal(f"no fresh canary PASS for {pin}; run effigy oxide:canary -- --pin {pin} ({error})") from error
+
+
+def canary_compatibility(candidate):
+    # Admission can publish writer fences. Keep the installed writer usable
+    # and leave format transitions to the planner's compatibility window.
+    if path_entries() or os.path.lexists(DESTINATION):
+        previous, _ = preflight(True)
+        for name, version in candidate.items():
+            installed = previous[1].get(name)
+            if type(installed) is not int or version != installed:
+                raise Refusal(f"live canary needs matching {name}: installed {installed}, staged {version}")
+
+
+def canary_scratch(description, override):
+    if description["schema"] != "oxide.pool.describe/1":
+        raise Refusal("the staged binary returned an unknown pool description")
+    pool = Path(description["internal"]["pool"]).resolve(strict=True)
+    if not (pool / "config.json").is_file():
+        raise Refusal(f"no existing live pool at {pool}")
+    removable = description["removable"]
+    payload = None
+    if description["selected"] == "removable" and removable["available"] is True:
+        if override is not None:
+            raise Refusal("the removable pool uses its registered volume's scratch directory")
+        mount = Path(removable["mount_point"])
+        payload = Path(removable["payload"])
+        scratch = Path(removable["suggested_scratch_root"])
+        device = mount.stat().st_dev
+        if (not mount.is_absolute() or mount.resolve(strict=True) != mount
+                or device == mount.parent.stat().st_dev
+                or scratch != mount / "scratch" or payload.parent != mount):
+            raise Refusal("removable scratch does not name the registered mounted volume")
+    elif description["selected"] == "internal" and (
+        removable is None or removable.get("unavailable_reason") == "absent"
+    ):
+        scratch = override or pool.parent / "scratch"
+        device = pool.stat().st_dev
+    else:
+        raise Refusal("the staged binary could not identify an eligible live pool")
+    if not scratch.is_absolute() or scratch.resolve(strict=True) != scratch or scratch == scratch.parent:
+        raise Refusal(f"scratch must be an existing canonical directory: {scratch}")
+    info = scratch.stat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_dev != device or info.st_mode & 0o022
+            or scratch == pool or pool in scratch.parents or scratch in pool.parents):
+        raise Refusal(f"scratch must be on the selected volume, outside the pool and privately writable: {scratch}")
+    return pool, payload, scratch, (info.st_dev, info.st_ino)
+
+
+def directory_identity(path):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise Refusal(f"{path} is no longer a real directory")
+    return info.st_dev, info.st_ino
+
+
+def canary_check(built, crate, environment):
+    reader, writer = os.pipe()
+    try:
+        os.set_blocking(writer, False)
+        # A surviving descendant must not tie up the reader via an output pipe.
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as output:
+            started = time.monotonic()
+            result = subprocess.run(
+                [str(built), "check", "--admission-budget", "300s", "--execution-budget", "60s",
+                 "--budget-events", str(writer), "--offline"],
+                cwd=crate, env=environment, pass_fds=(writer,), stderr=output,
+            )
+            wall = time.monotonic() - started
+            output.seek(0)
+            result.stderr = output.read()
+        # One start and one terminal record fit in the pipe. Read after exit
+        # without waiting for EOF or a descriptor held by another process.
+        os.set_blocking(reader, False)
+        try:
+            events = [json.loads(line) for line in os.read(reader, 4096).splitlines()]
+        except (ValueError, BlockingIOError):
+            events = []
+        return result, wall, events
+    finally:
+        os.close(writer)
+        os.close(reader)
+
+
+def assess_canary(label, result, wall, events, expected, payload, limit):
+    print(result.stderr, end="", file=sys.stderr)
+    print(f"{label}: wall {wall:.3f}s")
+    queued = re.findall(r"^oxide: admission queue wait ([0-9]{1,20}) ns$", result.stderr, re.MULTILINE)
+    if len(queued) > 1:
+        raise Refusal(f"{label}: ambiguous queue wait")
+    queue_ns = int(queued[0]) if queued else 0
+    if queued:
+        print(f"{label}: queue wait {queue_ns / 1_000_000_000:.3f}s")
+    else:
+        print(f"{label}: precise queue wait unavailable; no wait deducted")
+    if result.returncode != 0:
+        raise Refusal(f"{label}: staged check exited {result.returncode}")
+    if len(events) != 2 or not all(isinstance(event, dict) for event in events):
+        raise Refusal(f"{label}: incomplete admission telemetry")
+    start, finish = events
+    admission_ms = start.get("admission_elapsed_ms")
+    if (start.get("v") != 1 or finish.get("v") != 1 or start.get("seq") != 1 or finish.get("seq") != 2
+            or not start.get("invocation") or start["invocation"] != finish.get("invocation")
+            or start.get("event") != "admitted_child_started" or start.get("phase") != "primary_cargo"
+            or start.get("spawn_late") is not False or type(admission_ms) is not int or admission_ms < 0
+            or finish.get("event") != "finished" or finish.get("outcome") != "child_exit"
+            or finish.get("exit_code") != 0 or finish.get("drain") != "complete"
+            or finish.get("lease") != "released"):
+        raise Refusal(f"{label}: staged check did not report a complete, released admission")
+    elapsed_ns = admission_ms * 1_000_000
+    if queue_ns >= elapsed_ns + 1_000_000:
+        raise Refusal(f"{label}: queue wait exceeds pre-child time")
+    admission = max(0, elapsed_ns - queue_ns) / 1_000_000_000
+    print(f"{label}: admission {admission:.3f}s excluding queue wait (limit {limit:g}s)")
+    slots = list(re.finditer(
+        r"^oxide: .* profile, build strategy, slot (\S+) (cold|warm), .*?$", result.stderr, re.MULTILINE
+    ))
+    if len(slots) != 1:
+        raise Refusal(f"{label}: staged check did not report exactly one slot")
+    slot = slots[0]
+    marker = ", budget-only, removable "
+    correct_pool = f"{marker}{payload})" in slot[0] if payload is not None else marker not in slot[0]
+    if not correct_pool or slot[2] != expected:
+        raise Refusal(f"{label}: expected a {expected} slot on the selected pool")
+    return slot[1], admission
+
+
+def run_canary(built, arguments):
+    # Prevent the staged binary's normal older-binary hand-off and keep
+    # caller-supplied scratch/test settings from routing the canary elsewhere.
+    excluded = {"OXIDE_POOL_CREATE", "OXIDE_TASK_SCRATCH_ROOT", "OXIDE_SCRATCH_ROOT",
+                "OXIDE_ONE_USE_WORKSPACE", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"}
+    environment = {key: value for key, value in os.environ.items()
+                   if key not in excluded and not key.startswith(("OXIDE_TEST_", "OXIDE_PROOF_"))}
+    environment["OXIDE_INTERNAL_HANDED_OFF"] = "1"
+    print("Staged oxide status:", flush=True)
+    started = time.monotonic()
+    subprocess.run([str(built), "status"], env=environment, check=True, timeout=60)
+    print(f"status: wall {time.monotonic() - started:.3f}s")
+    described = subprocess.run([str(built), "pool", "describe", "--json"], env=environment,
+                               check=True, stdout=subprocess.PIPE, text=True, timeout=60)
+    pool, payload, scratch, scratch_id = canary_scratch(json.loads(described.stdout), arguments.scratch_root)
+    # A disappearing pool cannot authorize creation at the explicit path.
+    environment.update(OXIDE_POOL=str(pool), GIT_CEILING_DIRECTORIES=str(scratch))
+    if directory_identity(scratch) != scratch_id:
+        raise Refusal("the selected scratch directory changed")
+    crate = Path(tempfile.mkdtemp(prefix="oxide-canary.", dir=scratch))
+    created = directory_identity(crate)
+    safe_to_remove = True
+    missed_limits = []
+    try:
+        (crate / "src").mkdir()
+        (crate / "target").mkdir()  # Keep final output local in permanent mode.
+        (crate / "Cargo.toml").write_text(
+            '[package]\nname = "oxide-canary"\nversion = "0.0.0"\nedition = "2021"\n[workspace]\n'
+        )
+        (crate / "src/lib.rs").write_text("pub fn canary() {}\n")
+        cold_slot = None
+        for label, expected, limit in (("new slot", "cold", arguments.new_seconds),
+                                       ("warm reuse", "warm", arguments.warm_seconds)):
+            if (directory_identity(scratch) != scratch_id or directory_identity(crate) != created
+                    or created[0] != scratch_id[0]):
+                raise Refusal("the canary crate or selected volume changed")
+            safe_to_remove = False
+            result, wall, events = canary_check(built, crate, environment)
+            terminal = events[-1] if events and isinstance(events[-1], dict) else {}
+            safe_to_remove = (terminal.get("v") == 1 and terminal.get("event") == "finished"
+                              and terminal.get("lease") == "released"
+                              and terminal.get("drain") in ("complete", "not_reached"))
+            slot, admission = assess_canary(label, result, wall, events, expected, payload, limit)
+            if admission > limit:
+                missed_limits.append(f"{label} admission exceeded {limit:g}s")
+            if expected == "cold":
+                cold_slot = slot
+            elif slot != cold_slot:
+                raise Refusal("warm check used a different slot")
+    finally:
+        if safe_to_remove:
+            if directory_identity(scratch) != scratch_id or directory_identity(crate) != created:
+                raise Refusal(f"the canary crate or its scratch directory changed; skipped cleanup of {crate}")
+            shutil.rmtree(crate)
+        else:
+            print(f"Canary crate cleanup skipped because writer closure is unconfirmed: {crate}",
+                  file=sys.stderr)
+    if missed_limits:
+        raise Refusal(", ".join(missed_limits))
+
+
+def positive_seconds(value):
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("expected a positive number of seconds")
+    return seconds
+
+
+def canary(pin, arguments):
+    # Hold the install lock across the live exercise and its receipt.
+    with ExitStack() as lock:
+        with tempfile.TemporaryDirectory(prefix="oxide-canary-build.") as staging:
+            print(f"staging {staging}", flush=True)
+            instance = new_instance()
+            built, _ = build(pin, instance, Path(staging))
+            capabilities = state_capabilities(built)
+            build_identity(built, pin, instance)
+            lock.enter_context(receipt_lock())
+            write_canary_receipt(pin, "FAIL")
+            canary_compatibility(capabilities)
+            run_canary(built, arguments)
+        write_canary_receipt(pin, "PASS")
+    print(f"oxide:canary PASS for {pin}")
+
+
 def write_receipt(receipt, finished, pin, directory=None):
     """Write one complete owner-only receipt, without replacing an old one."""
     name = f"{finished.strftime('%Y%m%dT%H%M%SZ_%f')}-{pin[:12]}.json"
@@ -649,13 +904,24 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--replace", action="store_true", help="replace the receipt-matching binary")
     mode.add_argument("--rollback", action="store_true", help="restore the verified previous binary")
+    mode.add_argument("--canary", action="store_true", help="run the staged binary on the live pool")
     parser.add_argument("--check", action="store_true", help="preflight only; build nothing")
+    parser.add_argument("--require-canary", action="store_true", help="require a same-pin PASS from the last hour")
+    parser.add_argument("--new-seconds", type=positive_seconds, help="canary new-slot limit (default: 10)")
+    parser.add_argument("--warm-seconds", type=positive_seconds, help="canary warm-reuse limit (default: 5)")
+    parser.add_argument("--scratch-root", type=Path, help="existing scratch directory for an internal-pool canary")
     arguments = parser.parse_args()
+    if arguments.canary and (arguments.check or arguments.require_canary):
+        parser.error("--canary cannot be combined with --check or --require-canary")
+    if not arguments.canary and any(value is not None for value in (
+        arguments.new_seconds, arguments.warm_seconds, arguments.scratch_root,
+    )):
+        parser.error("--new-seconds, --warm-seconds and --scratch-root require --canary")
     started = datetime.datetime.now(datetime.timezone.utc)
     try:
         if arguments.rollback:
-            if arguments.pin is not None:
-                raise Refusal("rollback selects the prior receipt and takes no pin")
+            if arguments.pin is not None or arguments.require_canary:
+                raise Refusal("rollback selects the prior receipt and takes no pin or --require-canary")
             if arguments.check:
                 directory = open_owned_directory(RECEIPTS)
                 try:
@@ -667,7 +933,17 @@ def main():
                     rollback(directory)
             return 0
 
+        if not arguments.canary:
+            print("Run effigy oxide:canary before installing the same pin. Use --require-canary to enforce it.",
+                  flush=True)
         pin, tree, tip = authenticate_pin(arguments.pin or os.environ.get("OXIDE_INSTALL_PIN") or None)
+        if arguments.canary:
+            arguments.new_seconds = arguments.new_seconds or 10
+            arguments.warm_seconds = arguments.warm_seconds or 5
+            canary(pin, arguments)
+            return 0
+        if arguments.require_canary:
+            require_canary(pin)
         previous, expected = preflight(arguments.replace)
         print(f"pin {pin} tree {tree} (origin main {tip})")
         print(f"destination {DESTINATION}: " + ("absent" if previous is None else f"matches {previous[0].name}"))
@@ -693,12 +969,22 @@ def main():
             **capabilities,
         }
         with receipt_lock() as directory:
+            if arguments.require_canary:
+                require_canary(pin)
             if preflight(arguments.replace) != (previous, expected):
                 raise Refusal("the installation changed during the build")
             commit_install(built, receipt["built_sha256"], receipt, previous, expected, directory)
-    except (Refusal, subprocess.CalledProcessError, OSError) as error:
+    except (Refusal, subprocess.SubprocessError, OSError) as error:
+        if arguments.canary:
+            print(f"oxide:canary FAIL: {error}", file=sys.stderr)
+            return 1
         action = "rollback" if arguments.rollback else "install"
         print(f"oxide:{action} refused: {error}", file=sys.stderr)
+        return 1
+    except (KeyError, TypeError, ValueError, KeyboardInterrupt) as error:
+        if not arguments.canary:
+            raise
+        print(f"oxide:canary FAIL: {error or 'interrupted'}", file=sys.stderr)
         return 1
     shutil.rmtree(staging)
     return 0

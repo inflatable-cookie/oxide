@@ -694,6 +694,14 @@ impl WaitAccounting {
         }
     }
 
+    /// Time behind other tickets or the active-build limit, excluding time
+    /// spent retrying admission and taking the pool locks.
+    pub(crate) fn admission_queue_wait(&self) -> Option<Duration> {
+        self.duration_available.then_some(())?;
+        self.totals[WaitCategory::Queue.index()]
+            .checked_add(self.totals[WaitCategory::HostLimit.index()])
+    }
+
     pub(crate) fn summary_suffix(&self) -> Option<String> {
         if !self.observed {
             return None;
@@ -2210,24 +2218,22 @@ impl Store {
         let mut reported_waiting = false;
         let ticket = self.register_ticket()?;
         loop {
+            // End the polling interval before doing any admission work. A
+            // slow attempt that finally grants must count as work, even
+            // when the preceding attempt found the queue or host limit full.
+            waits.stop(Instant::now());
             if crate::budget::admission_expired() {
-                waits.stop(Instant::now());
                 self.remove_ticket(ticket.0)?;
                 return Ok(Acquired::AdmissionExpired);
             }
             if let Some(signal) = process::received_signal() {
-                waits.stop(Instant::now());
                 self.remove_ticket(ticket.0)?;
                 return Ok(Acquired::Interrupted(signal));
             }
             let attempt = self.attempt(ticket.0, key, profile, max_active, admission, share, label);
             match attempt {
-                Err(error) => {
-                    waits.stop(Instant::now());
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
                 Ok(Ok(lease)) => {
-                    waits.stop(Instant::now());
                     self.remove_ticket(ticket.0)?;
                     if crate::budget::admission_expired() {
                         // The window closed while this attempt ran: the lease
@@ -6070,6 +6076,10 @@ pub(crate) mod tests {
         // Freshness work between lease attempts is outside measured waiting.
         waits.observe(&Wait::HostLimit(2), 2, start + Duration::from_secs(10));
         waits.stop(start + Duration::from_millis(11_100));
+        assert_eq!(
+            waits.admission_queue_wait(),
+            Some(Duration::from_millis(1_400))
+        );
 
         assert_eq!(
             waits.completion_line("slot ready").as_deref(),
