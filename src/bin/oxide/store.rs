@@ -4046,64 +4046,10 @@ impl Store {
             let project = self.affinity_dir(record.id);
             view.slots.iter().any(|slot| slot.project == project)
         };
-        let matches = |record: &Record| {
-            record.phase != Phase::Retired
-                && record.checkout.as_deref() == Some(key.checkout.as_path())
-                && record.compatibility == key.compatibility
-                // Class is part of record identity (design §5.2): an existing
-                // record of the other class is never reused or relabelled.
-                && record.class == admission.class
-        };
-        // The stale sweep is about **this key**, not this class (design §5.2,
-        // §5.7): an idle slotless record of the other class is still a live
-        // record of this checkout and keeps it, so the one-use command takes a
-        // distinct record instead of deleting the normal or legacy one.
-        let same_key = |record: &Record| {
-            record.phase != Phase::Retired
-                && record.checkout.as_deref() == Some(key.checkout.as_path())
-                && record.compatibility == key.compatibility
-        };
-        let stale: Vec<u64> = state
-            .records
-            .iter()
-            .filter(|record| record.phase == Phase::Idle && !has_slot(record) && !same_key(record))
-            .map(|record| record.id)
-            .collect();
-        for id in stale {
-            self.forget_record(&mut state, id);
-        }
+        self.forget_stale_records(&mut state, key, &view);
 
-        // Second-slot rule: this checkout may hold several records of one
-        // key. Take an idle one whose lock is free, one with a slot first,
-        // then the most recently used. A busy one (a live command, an
-        // interrupted one whose group may still run, or a lock still held)
-        // is never reused, released, evicted or relabelled here; the
-        // command takes another idle compatible slot or a new one through
-        // the normal admission below, and waits only when neither exists.
-        let mut own: Vec<usize> = (0..state.records.len())
-            .filter(|&index| matches(&state.records[index]))
-            .collect();
-        own.sort_by_key(|&index| {
-            let record = &state.records[index];
-            std::cmp::Reverse((has_slot(record), record.last_used))
-        });
-        let mut existing = None;
-        let mut lock = None;
-        let mut busy = false;
-        for index in own {
-            if state.records[index].phase != Phase::Idle {
-                busy = true;
-                continue;
-            }
-            match probe_lock(&self.lock_path(state.records[index].id), true)? {
-                Probe::Free(file) => {
-                    existing = Some(index);
-                    lock = Some(file);
-                    break;
-                }
-                Probe::Held | Probe::Missing => busy = true,
-            }
-        }
+        let (mut existing, mut lock, busy) =
+            self.find_own_slot(&state, key, admission.class, &view)?;
         let mut shared_from = None;
         let mut shared_origin = None;
         // A project-cap replacement the library performs as part of the
@@ -4292,28 +4238,7 @@ impl Store {
         }
         self.save(&state)?;
 
-        // A new slot joins the folder this repository already uses, which
-        // needs no Git call; otherwise its label comes from the checkout.
-        let same_repository: Vec<PathBuf> = state
-            .records
-            .iter()
-            .filter(|other| other.identity == key.identity)
-            .map(|other| self.affinity_dir(other.id))
-            .collect();
-        let known = view
-            .slots
-            .iter()
-            .filter(|slot| same_repository.contains(&slot.project))
-            .find_map(|slot| {
-                slot.dir
-                    .as_deref()?
-                    .split_once('/')
-                    .map(|(folder, _)| folder)
-            });
-        let folders = match known {
-            Some(folder) => vec![folder.to_owned()],
-            None => identity::slot_folders(&identity::project_label(&key.checkout), &key.identity),
-        };
+        let (same_repository, folders) = self.slot_folders(&state, key, &view);
         let replace_slot =
             match &replace {
                 Some((_, slot_id)) => Some(slot_id.parse::<u64>().map_err(|_| {
@@ -4522,6 +4447,117 @@ impl Store {
             _lock: lock,
             _root_hold: root_hold,
         }))
+    }
+
+    fn find_own_slot(
+        &self,
+        state: &State,
+        key: &SlotKey,
+        class: WorkspaceClass,
+        view: &LedgerView,
+    ) -> Result<(Option<usize>, Option<File>, bool), String> {
+        let has_slot = |record: &Record| {
+            let project = self.affinity_dir(record.id);
+            view.slots.iter().any(|slot| slot.project == project)
+        };
+        let matches = |record: &Record| {
+            record.phase != Phase::Retired
+                && record.checkout.as_deref() == Some(key.checkout.as_path())
+                && record.compatibility == key.compatibility
+                // Class is part of record identity (design §5.2): an existing
+                // record of the other class is never reused or relabelled.
+                && record.class == class
+        };
+        // Second-slot rule: this checkout may hold several records of one
+        // key. Take an idle one whose lock is free, one with a slot first,
+        // then the most recently used. A busy one (a live command, an
+        // interrupted one whose group may still run, or a lock still held)
+        // is never reused, released, evicted or relabelled here; the
+        // command takes another idle compatible slot or a new one through
+        // the normal admission below, and waits only when neither exists.
+        let mut own: Vec<usize> = (0..state.records.len())
+            .filter(|&index| matches(&state.records[index]))
+            .collect();
+        own.sort_by_key(|&index| {
+            let record = &state.records[index];
+            std::cmp::Reverse((has_slot(record), record.last_used))
+        });
+        let mut existing = None;
+        let mut lock = None;
+        let mut busy = false;
+        for index in own {
+            if state.records[index].phase != Phase::Idle {
+                busy = true;
+                continue;
+            }
+            match probe_lock(&self.lock_path(state.records[index].id), true)? {
+                Probe::Free(file) => {
+                    existing = Some(index);
+                    lock = Some(file);
+                    break;
+                }
+                Probe::Held | Probe::Missing => busy = true,
+            }
+        }
+        Ok((existing, lock, busy))
+    }
+
+    /// Forget idle records that no longer own a slot or match this key.
+    fn forget_stale_records(&self, state: &mut State, key: &SlotKey, view: &LedgerView) {
+        let has_slot = |record: &Record| {
+            let project = self.affinity_dir(record.id);
+            view.slots.iter().any(|slot| slot.project == project)
+        };
+        // The stale sweep is about **this key**, not this class (design §5.2,
+        // §5.7): an idle slotless record of the other class is still a live
+        // record of this checkout and keeps it, so the one-use command takes a
+        // distinct record instead of deleting the normal or legacy one.
+        let same_key = |record: &Record| {
+            record.phase != Phase::Retired
+                && record.checkout.as_deref() == Some(key.checkout.as_path())
+                && record.compatibility == key.compatibility
+        };
+        let stale: Vec<u64> = state
+            .records
+            .iter()
+            .filter(|record| record.phase == Phase::Idle && !has_slot(record) && !same_key(record))
+            .map(|record| record.id)
+            .collect();
+        for id in stale {
+            self.forget_record(state, id);
+        }
+    }
+
+    /// Choose a folder already used by this repository, or derive a new one.
+    fn slot_folders(
+        &self,
+        state: &State,
+        key: &SlotKey,
+        view: &LedgerView,
+    ) -> (Vec<PathBuf>, Vec<String>) {
+        // A new slot joins the folder this repository already uses, which
+        // needs no Git call; otherwise its label comes from the checkout.
+        let same_repository: Vec<PathBuf> = state
+            .records
+            .iter()
+            .filter(|other| other.identity == key.identity)
+            .map(|other| self.affinity_dir(other.id))
+            .collect();
+        let known = view
+            .slots
+            .iter()
+            .filter(|slot| same_repository.contains(&slot.project))
+            .find_map(|slot| {
+                slot.dir
+                    .as_deref()?
+                    .split_once('/')
+                    .map(|(folder, _)| folder)
+            });
+        let folders = match known {
+            Some(folder) => vec![folder.to_owned()],
+            None => identity::slot_folders(&identity::project_label(&key.checkout), &key.identity),
+        };
+        (same_repository, folders)
     }
 
     /// Own-command crash recovery: a non-idle record whose lock is free has
