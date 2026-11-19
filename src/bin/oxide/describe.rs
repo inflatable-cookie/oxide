@@ -269,7 +269,7 @@ fn probe_volume(registration: &Registration) -> Result<Binding, Unavailable> {
             ),
         ));
     }
-    removable::check_identity(&identity, None)
+    removable::check_identity(&identity)
         .map_err(|error| unavailable(Reason::VolumeUnusable, error))?;
     Ok(binding)
 }

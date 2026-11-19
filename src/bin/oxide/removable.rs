@@ -72,8 +72,9 @@ pub struct Registration {
     pub mount_point: PathBuf,
     pub volume_uuid: String,
     pub container_uuid: String,
-    /// Selection refuses the volume when its available space is at or below
-    /// this. Chosen by the operator; Oxide never picks it.
+    /// Free space below which Barge prunes idle roots to make room. It is a
+    /// prune trigger, never a selection refusal; the floor refuses admission.
+    /// Chosen by the operator; Oxide never picks it.
     pub reserve_bytes: u64,
     /// Oxide's admission budget on the volume. Not an APFS quota.
     pub cap_bytes: u64,
@@ -148,9 +149,10 @@ usage: oxide pool register-removable <mount-point> --reserve <size> --cap <size>
 
 register-removable registers a dedicated APFS volume mounted directly under
 /Volumes as the preferred build pool. The default mode is ephemeral. <size> is bytes or a whole number of
-KB, MB, GB, TB, KiB, MiB, GiB or TiB. --reserve is the free space a build
-start must find above it; --cap is Oxide's admission budget on the volume.
-Both are required.
+KB, MB, GB, TB, KiB, MiB, GiB or TiB. --reserve is the free space Barge keeps
+on the volume: below it, admission prunes idle roots to make room, and the
+floor refuses admission only when that space cannot be recovered. --cap is
+Oxide's admission budget on the volume. Both are required.
 
 set-mode updates the existing removable registration only. Permanent mode
 warns when a build falls back to the internal pool; ephemeral mode keeps the
@@ -252,7 +254,7 @@ fn register(mount: &Path, reserve: u64, cap: u64, mode: DriveMode) -> Result<u8,
         return Err(format!("{} is not writable", mount.display()));
     }
     let identity = disk_identity(binding.mount_point(), binding.uuid(), &plist)?;
-    check_identity(&identity, None)?;
+    check_identity(&identity)?;
     let internal = Store::open_or_create()?;
     let control = internal.control().to_path_buf();
     let _admission = store::lock_admission(&control)?;
@@ -271,22 +273,40 @@ fn register(mount: &Path, reserve: u64, cap: u64, mode: DriveMode) -> Result<u8,
     // Revalidate the root immediately before the first media write: the
     // registration is refused, not repaired, if it changed.
     let facts = binding.verify()?;
-    init_volume_pool(&control.join(POOL_DIR), &binding, PAYLOAD_DIR, cap)
-        .map_err(|error| format!("cannot create the removable pool: {error}"))?;
-    let registration = Registration {
-        version: REGISTRATION_VERSION,
-        mount_point: binding.mount_point().to_path_buf(),
-        volume_uuid: binding.uuid().to_owned(),
-        container_uuid: identity.container_uuid,
-        reserve_bytes: reserve,
-        cap_bytes: cap,
-        quota_bytes: identity.quota_bytes,
-        capacity_bytes: facts.capacity_bytes,
-        registered_ms: process::now_ms(),
-        mode,
+    let pool = control.join(POOL_DIR);
+    let created = Created::note(binding.mount_point());
+    let established = init_volume_pool(&pool, &binding, PAYLOAD_DIR, cap)
+        .map_err(|error| format!("cannot create the removable pool: {error}"))
+        .and_then(|_| {
+            let registration = Registration {
+                version: REGISTRATION_VERSION,
+                mount_point: binding.mount_point().to_path_buf(),
+                volume_uuid: binding.uuid().to_owned(),
+                container_uuid: identity.container_uuid,
+                reserve_bytes: reserve,
+                cap_bytes: cap,
+                quota_bytes: identity.quota_bytes,
+                capacity_bytes: facts.capacity_bytes,
+                registered_ms: process::now_ms(),
+                mode,
+            };
+            registered_area(&removable_control(&control), &registration)?;
+            write_registration(&control, &registration)?;
+            Ok(registration)
+        });
+    let registration = match established {
+        Ok(registration) => registration,
+        // A leftover pool directory would refuse every later registration as
+        // already registered, so this attempt's own creations are undone.
+        Err(error) => {
+            return Err(roll_back_registration(
+                &pool,
+                binding.mount_point(),
+                &created,
+                error,
+            ))
+        }
     };
-    registered_area(&removable_control(&control), &registration)?;
-    write_registration(&control, &registration)?;
     println!(
         "registered removable pool on {} (volume {}, container {}): reserve {} MiB, admission cap {} MiB; payload {}/{PAYLOAD_DIR}",
         registration.mount_point.display(),
@@ -297,6 +317,59 @@ fn register(mount: &Path, reserve: u64, cap: u64, mode: DriveMode) -> Result<u8,
         registration.mount_point.display()
     );
     Ok(0)
+}
+
+/// The volume folder that the registered area uses for its slots, under
+/// [`PAYLOAD_DIR`].
+const SLOTS_FOLDER: &str = "slots";
+
+/// Which drive-side directories were absent before a registration attempt, so
+/// a failed attempt removes only what it created.
+struct Created {
+    payload: bool,
+    slots: bool,
+}
+
+impl Created {
+    fn note(mount: &Path) -> Self {
+        let payload = mount.join(PAYLOAD_DIR);
+        let absent = |path: &Path| fs::symlink_metadata(path).is_err();
+        Self {
+            payload: absent(&payload),
+            slots: absent(&payload.join(SLOTS_FOLDER)),
+        }
+    }
+}
+
+/// Undo a failed registration: the internal pool directory, then the drive's
+/// slots folder and payload root, each only when this attempt created it.
+/// Returns the original error, plus anything the rollback could not remove.
+fn roll_back_registration(pool: &Path, mount: &Path, created: &Created, error: String) -> String {
+    let payload = mount.join(PAYLOAD_DIR);
+    let slots = payload.join(SLOTS_FOLDER);
+    let mut leftovers = Vec::new();
+    let mut settle = |path: &Path, result: std::io::Result<()>| {
+        if let Err(source) = result {
+            if source.kind() != std::io::ErrorKind::NotFound {
+                leftovers.push(format!("{}: {source}", path.display()));
+            }
+        }
+    };
+    settle(pool, fs::remove_dir_all(pool));
+    if created.slots {
+        settle(&slots, fs::remove_dir_all(&slots));
+    }
+    if created.payload {
+        settle(&payload, fs::remove_dir(&payload));
+    }
+    if leftovers.is_empty() {
+        error
+    } else {
+        format!(
+            "{error}; the rollback could not remove {}",
+            leftovers.join(", ")
+        )
+    }
 }
 
 fn set_mode(mode: DriveMode) -> Result<u8, String> {
@@ -392,23 +465,15 @@ pub fn disk_identity(
     })
 }
 
-/// The boot/data container and every APFS role refuse; at selection the
-/// container must also be the registered one.
-pub fn check_identity(identity: &DiskIdentity, registered: Option<&str>) -> Result<(), String> {
+/// Registration and `describe` check that the volume is outside the boot/data
+/// container and has no refused APFS role. Selection does not rerun this: the
+/// registered volume UUID pins the volume it selects.
+pub fn check_identity(identity: &DiskIdentity) -> Result<(), String> {
     if identity.container_ref == identity.data_container_ref {
         return Err("the volume is in the internal boot/data container".to_owned());
     }
     let roles: Vec<&str> = identity.roles.iter().map(String::as_str).collect();
-    refuse_roles(&roles)?;
-    if let Some(registered) = registered {
-        if identity.container_uuid != registered {
-            return Err(format!(
-                "the volume is in container {}, not the registered {registered}",
-                identity.container_uuid
-            ));
-        }
-    }
-    Ok(())
+    refuse_roles(&roles)
 }
 
 /// Only a plain data volume with no APFS role is accepted: a Time Machine
@@ -862,7 +927,9 @@ fn declare_registered_area(
     storage: &Storage,
     registration: &Registration,
 ) -> Result<Option<barge::Area>, String> {
-    match storage.known_volume("pool") {
+    // Only a missing registration means "not yet imported". Any other read
+    // failure is unknown state, which must refuse rather than re-import.
+    match storage.barge().volume("pool") {
         Ok(volume) => {
             let spec = volume.spec();
             if spec.mount != registration.mount_point
@@ -885,7 +952,7 @@ fn declare_registered_area(
                 )?;
             }
         }
-        Err(_) => {
+        Err(error) if error.kind() == barge::ErrorKind::NotFound => {
             if oxide_storage::storage::OxideOs
                 .volume_identity(&registration.mount_point)
                 .map_err(|error| error.to_string())?
@@ -894,6 +961,7 @@ fn declare_registered_area(
                 return Ok(None);
             }
         }
+        Err(error) => return Err(error.to_string()),
     }
     let config = AreaConfig::new("pool", &registration.mount_point, "pool")
         .uuid(Some(registration.volume_uuid.clone()))
@@ -1234,22 +1302,18 @@ mod tests {
         }
     }
 
-    /// Injected metadata: selection refuses a registered volume that later
-    /// gained the Backup role, moved to another container or sits in the
-    /// boot/data container.
+    /// Injected metadata: registration and `describe` refuse a volume with a
+    /// refused APFS role or one in the boot/data container. Selection does not
+    /// repeat this check; the registered UUID pins the volume.
     #[test]
-    fn selection_rechecks_container_and_roles() {
+    fn identity_refuses_boot_container_and_refused_roles() {
         let registered = "7CADDF63-E2EA-4EF5-8D0B-889B7E829171";
-        assert!(check_identity(&identity(registered, &[]), Some(registered)).is_ok());
-        let backup =
-            check_identity(&identity(registered, &["Backup"]), Some(registered)).unwrap_err();
+        assert!(check_identity(&identity(registered, &[])).is_ok());
+        let backup = check_identity(&identity(registered, &["Backup"])).unwrap_err();
         assert!(backup.contains("Backup"), "{backup}");
-        let moved = check_identity(&identity("OTHER", &[]), Some(registered)).unwrap_err();
-        assert!(moved.contains("not the registered"), "{moved}");
         let mut internal = identity(registered, &[]);
         internal.container_ref = "disk3".to_owned();
-        assert!(check_identity(&internal, Some(registered)).is_err());
-        assert!(check_identity(&internal, None).is_err());
+        assert!(check_identity(&internal).is_err());
     }
 
     #[test]
@@ -1459,5 +1523,87 @@ mod tests {
                 "{refused:?}: {error}"
             );
         }
+    }
+
+    /// A registration whose Barge state cannot be read refuses, even when the
+    /// drive is absent. Treating that state as "not yet registered" would fall
+    /// back to the internal pool without a positive absence.
+    #[test]
+    fn an_unreadable_barge_registration_refuses_even_when_the_drive_is_absent() {
+        let temp = barge::testing::TempDir::new("oxide-removable-unreadable").unwrap();
+        let mount = temp.path().join("drive");
+        fs::create_dir(&mount).unwrap();
+        let mut registration = registration(DriveMode::Ephemeral);
+        registration.mount_point = mount.clone();
+        registration.reserve_bytes = 1 << 20;
+        let os = barge::FakeOs::with_volume(&mount, &registration.volume_uuid, 0);
+        let state = temp.path().join("state");
+        let storage = Storage::open_with(
+            state.clone(),
+            Arc::new(os.clone()),
+            Arc::new(barge::ManualClock::new(1)),
+        )
+        .unwrap();
+        storage
+            .register_volume(
+                "pool",
+                &mount,
+                Some(&registration.volume_uuid),
+                "",
+                registration.reserve_bytes,
+                oxide_storage::storage::reserve_floor(registration.reserve_bytes),
+            )
+            .unwrap();
+        os.set_uuid(&mount, None);
+        fs::write(state.join("volumes.json"), b"{not json").unwrap();
+
+        let error = declare_registered_area(&storage, &registration).unwrap_err();
+
+        assert!(error.contains("volumes.json"), "{error}");
+    }
+
+    /// A failed registration removes the pool directory and the drive folders
+    /// it created, so the next attempt is not blocked by a leftover.
+    #[test]
+    fn a_failed_registration_rolls_back_only_what_it_created() {
+        let temp = barge::testing::TempDir::new("oxide-removable-rollback").unwrap();
+        let pool = temp.path().join("removable");
+        fs::create_dir_all(pool.join("nested")).unwrap();
+        fs::write(pool.join("config.json"), b"{}").unwrap();
+        let mount = temp.path().join("drive");
+        fs::create_dir_all(mount.join("oxide-pool/slots")).unwrap();
+        let created = Created {
+            payload: true,
+            slots: true,
+        };
+
+        let error = roll_back_registration(&pool, &mount, &created, "boom".to_owned());
+
+        assert_eq!(error, "boom");
+        assert!(!pool.exists());
+        assert!(!mount.join("oxide-pool").exists());
+        assert!(mount.is_dir());
+    }
+
+    #[test]
+    fn a_rollback_keeps_drive_folders_that_predate_the_attempt() {
+        let temp = barge::testing::TempDir::new("oxide-removable-preexisting").unwrap();
+        let pool = temp.path().join("removable");
+        fs::create_dir(&pool).unwrap();
+        let mount = temp.path().join("drive");
+        fs::create_dir_all(mount.join("oxide-pool/slots")).unwrap();
+        fs::write(mount.join("oxide-pool/slots/keep"), b"operator data").unwrap();
+        let created = Created {
+            payload: false,
+            slots: false,
+        };
+
+        roll_back_registration(&pool, &mount, &created, "boom".to_owned());
+
+        assert!(!pool.exists());
+        assert_eq!(
+            fs::read(mount.join("oxide-pool/slots/keep")).unwrap(),
+            b"operator data"
+        );
     }
 }
