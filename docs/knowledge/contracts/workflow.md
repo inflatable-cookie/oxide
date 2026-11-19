@@ -503,8 +503,8 @@ paths. The summary says `temp: inherited <path>` or `temp: oxide <path>`.
   lists pools at other known paths as orphaned. Nothing reclaims them.
 - **Explicit release:** `oxide pool recover-interrupted <slot>` releases an
   interrupted slot. `oxide pool release-quarantined <slot> --confirm-writers-stopped`
-  releases a slot quarantined in this boot session, once its writers are stopped.
-  `--dry-run` prints the census and changes nothing.
+  refuses legacy quarantined generations because they lack cooperative Barge
+  hold history; confirmation and `--dry-run` do not change that refusal.
 
 ## Removable build volume
 
@@ -521,18 +521,16 @@ paths. The summary says `temp: inherited <path>` or `temp: oxide <path>`.
   the reserve starts Barge's reserve pruning and never refuses selection; the floor
   refuses admission only when that space cannot be recovered. A running command
   never switches volumes.
-- **Registration failure:** a registration that fails after the drive's pool is
-  created removes that pool directory and the drive folders it created, so the
-  next attempt is not refused as already registered. Folders that existed before
-  the attempt are left alone.
+- **Registration failure:** paths whose creation by the failed attempt cannot be
+  established are retained and reported for inspection before another attempt.
 - **Modes:** both modes use the same checks. `ephemeral` keeps final outputs local.
   `permanent` places them on the drive (see [final outputs](#final-outputs)). A
   permanent drive that cannot be used produces a warning before admission, with the
   reason.
 - **Surprise removal:** the watchdog stops the running command on removal, and the
   command reports the lost volume. A slot whose writer closure is unknown stays
-  held or quarantined until `recover-interrupted` or `release-quarantined` settles
-  it. A removable slot is flushed before it goes idle. A failed flush retires the
+  held or quarantined. `recover-interrupted` can release an interrupted slot;
+  legacy quarantined generations remain retained. A removable slot is flushed before it goes idle. A failed flush retires the
   slot.
 - **Previous registrations:** a registration under another pool's control root is
   never moved, adopted or removed. `register-removable` refuses while one exists

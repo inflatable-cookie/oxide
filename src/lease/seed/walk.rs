@@ -387,7 +387,7 @@ fn list_names(
 ) -> std::io::Result<Vec<CString>> {
     // fdopendir owns its descriptor, so hand it a duplicate.
     // SAFETY: `directory` is live.
-    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -398,19 +398,23 @@ fn list_names(
         unsafe { libc::close(duplicate) };
         return Err(std::io::Error::last_os_error());
     }
+    struct DirectoryStream(*mut libc::DIR);
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            // SAFETY: the guard uniquely owns this live stream.
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+    let stream = DirectoryStream(stream);
     let mut names = Vec::new();
     loop {
         if monitor() {
-            // SAFETY: the live directory stream is closed exactly once.
-            unsafe { libc::closedir(stream) };
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "seed monitor stop",
             ));
         }
-        if deadline.is_some_and(|deadline| Instant::now() > deadline) {
-            // SAFETY: `stream` is live and not used again; it closes `duplicate`.
-            unsafe { libc::closedir(stream) };
+        if deadline.is_some_and(|deadline| super::now() > deadline) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "walk deadline",
@@ -418,13 +422,10 @@ fn list_names(
         }
         clear_errno();
         // SAFETY: `stream` is a live directory stream.
-        let entry = unsafe { libc::readdir(stream) };
+        let entry = unsafe { libc::readdir(stream.0) };
         if entry.is_null() {
             let error = current_errno();
             if error != 0 {
-                // SAFETY: `stream` is live and not used again; it closes
-                // `duplicate`.
-                unsafe { libc::closedir(stream) };
                 return Err(std::io::Error::from_raw_os_error(error));
             }
             break;
@@ -440,8 +441,6 @@ fn list_names(
             break;
         }
     }
-    // SAFETY: `stream` is live and not used again; it closes `duplicate`.
-    unsafe { libc::closedir(stream) };
     Ok(names)
 }
 

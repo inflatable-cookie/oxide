@@ -296,8 +296,8 @@ fn register(mount: &Path, reserve: u64, cap: u64, mode: DriveMode) -> Result<u8,
         });
     let registration = match established {
         Ok(registration) => registration,
-        // A leftover pool directory would refuse every later registration as
-        // already registered, so this attempt's own creations are undone.
+        // The initializer does not report creation identities; preserve any
+        // paths whose ownership by this attempt cannot be established.
         Err(error) => {
             return Err(roll_back_registration(
                 &pool,
@@ -333,7 +333,10 @@ struct Created {
 impl Created {
     fn note(mount: &Path) -> Self {
         let payload = mount.join(PAYLOAD_DIR);
-        let absent = |path: &Path| fs::symlink_metadata(path).is_err();
+        let absent = |path: &Path| {
+            fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        };
         Self {
             payload: absent(&payload),
             slots: absent(&payload.join(SLOTS_FOLDER)),
@@ -341,33 +344,29 @@ impl Created {
     }
 }
 
-/// Undo a failed registration: the internal pool directory, then the drive's
-/// slots folder and payload root, each only when this attempt created it.
-/// Returns the original error, plus anything the rollback could not remove.
+/// Preserve paths whose creation by this attempt cannot be established.
+/// Return the original error with the retained paths for inspection.
 fn roll_back_registration(pool: &Path, mount: &Path, created: &Created, error: String) -> String {
-    let payload = mount.join(PAYLOAD_DIR);
-    let slots = payload.join(SLOTS_FOLDER);
-    let mut leftovers = Vec::new();
-    let mut settle = |path: &Path, result: std::io::Result<()>| {
-        if let Err(source) = result {
-            if source.kind() != std::io::ErrorKind::NotFound {
-                leftovers.push(format!("{}: {source}", path.display()));
-            }
+    // The initializer does not report which mkdir operations it performed or
+    // bind their identities to us. Absence observed before it ran is not proof
+    // that an entry now at that path belongs to this attempt.
+    let mut retained = Vec::new();
+    for path in [
+        pool.to_path_buf(),
+        mount.join(PAYLOAD_DIR),
+        mount.join(PAYLOAD_DIR).join(SLOTS_FOLDER),
+    ] {
+        if fs::symlink_metadata(&path).is_ok() {
+            retained.push(path.display().to_string());
         }
-    };
-    settle(pool, fs::remove_dir_all(pool));
-    if created.slots {
-        settle(&slots, fs::remove_dir_all(&slots));
     }
-    if created.payload {
-        settle(&payload, fs::remove_dir(&payload));
-    }
-    if leftovers.is_empty() {
+    let _ = (created.payload, created.slots);
+    if retained.is_empty() {
         error
     } else {
         format!(
-            "{error}; the rollback could not remove {}",
-            leftovers.join(", ")
+            "{error}; registration left unverified paths untouched: {}",
+            retained.join(", ")
         )
     }
 }
@@ -1579,10 +1578,19 @@ mod tests {
 
         let error = roll_back_registration(&pool, &mount, &created, "boom".to_owned());
 
-        assert_eq!(error, "boom");
-        assert!(!pool.exists());
-        assert!(!mount.join("oxide-pool").exists());
+        assert!(error.contains("left unverified paths untouched"));
+        assert!(pool.exists());
+        assert!(mount.join("oxide-pool").exists());
         assert!(mount.is_dir());
+    }
+
+    #[test]
+    fn creation_probe_does_not_treat_unreadable_paths_as_absent() {
+        let temp = barge::testing::TempDir::new("oxide-removable-unknown").unwrap();
+        let loop_path = temp.path().join("loop");
+        std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+        let created = Created::note(&loop_path);
+        assert!(!created.payload && !created.slots);
     }
 
     #[test]
@@ -1600,7 +1608,7 @@ mod tests {
 
         roll_back_registration(&pool, &mount, &created, "boom".to_owned());
 
-        assert!(!pool.exists());
+        assert!(pool.exists());
         assert_eq!(
             fs::read(mount.join("oxide-pool/slots/keep")).unwrap(),
             b"operator data"

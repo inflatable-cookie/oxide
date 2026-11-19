@@ -210,7 +210,9 @@ pub(crate) fn select(
             units.len() > old_units.len()
                 || (units.len() == old_units.len()
                     && (candidate.rank > old.rank
-                        || (candidate.rank == old.rank && candidate.slot_id < old.slot_id)))
+                        || (candidate.rank == old.rank
+                            && candidate.slot_id.parse::<u64>().unwrap_or(u64::MAX)
+                                < old.slot_id.parse::<u64>().unwrap_or(u64::MAX))))
         });
         if better {
             best = Some((candidate, units));
@@ -379,6 +381,25 @@ mod tests {
         let selected = select(&recipient, &producer(), &allowed, &[source], &candidates).unwrap();
         assert_eq!(selected.donor.slot_id, "new");
         assert_eq!(selected.units.len(), 1);
+    }
+
+    #[test]
+    fn equal_rank_uses_numeric_slot_order() {
+        let lock = format!("version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let package = crate::seed_lock::eligible(lock.as_bytes())
+            .unwrap()
+            .remove(0);
+        let source = verified_source(package.clone());
+        let candidates = [candidate("10", 1, "tree"), candidate("2", 1, "tree")];
+        let selected = select(
+            &recipient(),
+            &producer(),
+            &[package],
+            &[source],
+            &candidates,
+        )
+        .unwrap();
+        assert_eq!(selected.donor.slot_id, "2");
     }
 
     fn verified_source(package: crate::seed_lock::Package) -> VerifiedSource {

@@ -646,9 +646,7 @@ pub fn write_seed_sources(
     }
     remove_orphan_sidecars(&dir, view)?;
     enforce_family_bytes(&dir, bytes.len() as u64, &recipient.slot_id)?;
-    cache
-        .write(&path)
-        .map_err(|_| LeaseError::Io("cannot publish source cache".to_owned()))
+    write_sidecar_bounded(&path, &bytes, crate::seed_source::MAX_CACHE_BYTES as usize)
 }
 
 /// The one bounded, recorded status summary; its facts are descriptive and
@@ -1943,26 +1941,27 @@ fn probe_donor_lock(path: &Path) -> Result<DonorLock, LeaseError> {
             "the donor record lock path is too long",
         ));
     }
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(DonorLock::Missing)
         }
         Err(error) => return Err(io_error(error)),
     };
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_file()
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.file_type().is_file()
         || metadata.uid() != current_uid()
+        || metadata.mode() & 0o077 != 0
     {
         return Err(LeaseError::UnsafePath(
-            "the donor record lock is not an owned regular file",
+            "the donor record lock is not a private owned regular file",
         ));
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(io_error)?;
     // SAFETY: the descriptor is live for the call.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         return Ok(DonorLock::Taken(file));
@@ -2019,18 +2018,13 @@ fn remove_orphan_sidecars(dir: &Path, view: &SeedPoolView) -> Result<(), LeaseEr
         if !metadata.file_type().is_file() || metadata.uid() != current_uid() {
             continue;
         }
-        let keep = if let Some(temp) = text.strip_prefix(SIDECAR_TEMP_PREFIX) {
-            // `catalog.tmp-<hex>`: this module's own temp write. Only an old one
-            // is reaped; a fresh temp is a live writer's.
-            if temp.len() != 16 || !temp.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                true
-            } else {
-                metadata
-                    .modified()
-                    .ok()
-                    .and_then(|modified| now.duration_since(modified).ok())
-                    .is_none_or(|age| age < Duration::from_millis(SEED_SIDECAR_TEMP_MAX_AGE_MS))
-            }
+        let keep = if is_sidecar_temp(text) {
+            // Old temps are inert; a fresh temp may still belong to a writer.
+            metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_none_or(|age| age < Duration::from_millis(SEED_SIDECAR_TEMP_MAX_AGE_MS))
         } else {
             let Some(id) = sidecar_slot_id(text) else {
                 continue;
@@ -2053,6 +2047,22 @@ const LAST_NAME: &str = "last.json";
 const SOURCES_NAME: &str = "sources.json";
 /// The temp-file name prefix [`write_sidecar`] uses for every family.
 const SIDECAR_TEMP_PREFIX: &str = "catalog.tmp-";
+
+fn is_sidecar_temp(name: &str) -> bool {
+    if let Some(suffix) = name.strip_prefix(SIDECAR_TEMP_PREFIX) {
+        return suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    let Some(suffix) = name.strip_prefix(".sources.json.tmp-") else {
+        return false;
+    };
+    let Some((pid, sequence)) = suffix.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && !sequence.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && sequence.bytes().all(|b| b.is_ascii_digit())
+}
 
 /// Whether a directory entry is one of the four sidecar families. Anything
 /// else (a temp file, a stray entry) is neither counted nor adopted.
@@ -2159,7 +2169,11 @@ fn sidecar_bytes(dir: &Path) -> Result<u64, LeaseError> {
 
 /// Atomic owner-only sidecar write: temp, fsync, rename, fsync the directory.
 fn write_sidecar(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
-    if bytes.len() > SEED_CATALOG_MAX_BYTES {
+    write_sidecar_bounded(path, bytes, SEED_CATALOG_MAX_BYTES)
+}
+
+fn write_sidecar_bounded(path: &Path, bytes: &[u8], limit: usize) -> Result<(), LeaseError> {
+    if bytes.len() > limit {
         return Err(LeaseError::LedgerExhausted);
     }
     let parent = path
@@ -2642,4 +2656,72 @@ enum TestPoint<'a> {
     BeforeWalk { slot: &'a Path },
     /// After the walk, before the final ledger recheck.
     BeforeFinalDonorCheck { pool: &'a Path },
+}
+
+#[cfg(test)]
+mod sidecar_regressions {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn donor_lock_rejects_symlink_and_nonprivate_file() {
+        let temp = barge::testing::TempDir::new("oxide-donor-lock").unwrap();
+        let lock = temp.path().join("lock");
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = temp.path().join("alias");
+        symlink(&lock, &alias).unwrap();
+        assert!(probe_donor_lock(&alias).is_err());
+        assert!(matches!(probe_donor_lock(&lock), Ok(DonorLock::Taken(_))));
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(probe_donor_lock(&lock).is_err());
+    }
+
+    #[test]
+    fn recognises_only_own_sidecar_temp_names() {
+        assert!(is_sidecar_temp(".sources.json.tmp-123-45"));
+        assert!(is_sidecar_temp("catalog.tmp-0123456789abcdef"));
+        assert!(!is_sidecar_temp(".sources.json.tmp-123-45-extra"));
+        assert!(!is_sidecar_temp(".sources.json.tmp-other-45"));
+    }
+
+    #[test]
+    fn old_source_cache_temps_are_reaped_but_live_and_foreign_names_stay() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = barge::testing::TempDir::new("oxide-source-orphans").unwrap();
+        let old = temp.path().join(".sources.json.tmp-123-4");
+        let fresh = temp.path().join(".sources.json.tmp-123-5");
+        let foreign = temp.path().join(".sources.json.tmp-not-ours");
+        for path in [&old, &fresh, &foreign] {
+            fs::write(path, b"keep").unwrap();
+        }
+        let name = std::ffi::CString::new(old.as_os_str().as_bytes()).unwrap();
+        let times = [libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        }; 2];
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, name.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+        let view = SeedPoolView {
+            store_id: "x".into(),
+            pool_root: temp.path().into(),
+            payload_root: None,
+            slots: vec![],
+        };
+        remove_orphan_sidecars(temp.path(), &view).unwrap();
+        assert!(!old.exists());
+        assert!(fresh.exists() && foreign.exists());
+    }
+
+    #[test]
+    fn source_sidecar_uses_bounded_atomic_writer() {
+        let temp = barge::testing::TempDir::new("oxide-sources-sidecar").unwrap();
+        let path = temp.path().join(SOURCES_NAME);
+        let bytes = br#"{"schema":"example"}"#;
+        write_sidecar_bounded(&path, bytes, crate::seed_source::MAX_CACHE_BYTES as usize).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
 }

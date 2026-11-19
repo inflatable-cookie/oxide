@@ -14,7 +14,7 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MANIFEST_BYTES: usize = 1024 * 1024;
 
@@ -127,7 +127,7 @@ fn manifest_matches(root: &Path, package: &Package) -> Option<bool> {
             return None;
         }
     }
-    std::fs::metadata(path)
+    std::fs::symlink_metadata(path)
         .ok()
         .filter(|metadata| metadata.is_file())
         .map(|_| proc_macro)
@@ -340,8 +340,14 @@ fn verify_pass(
         packages,
         &hints,
         cache,
-        crate::process::now_ms(),
+        unix_seconds(SystemTime::now())?,
     )
+}
+
+fn unix_seconds(time: SystemTime) -> Result<u64, &'static str> {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| "clock before Unix epoch")
 }
 
 fn git_hint<'a>(cargo_home: &Path, package: &Package, hints: &'a [GitHint]) -> Option<&'a GitHint> {
@@ -539,8 +545,16 @@ impl Pass {
         kind: SeedSourceKind,
         started: SystemTime,
     ) -> bool {
-        let mut pending = vec![root.to_path_buf()];
-        while let Some(directory) = pending.pop() {
+        let Ok(root_metadata) = std::fs::symlink_metadata(root) else {
+            return false;
+        };
+        let uid = unsafe { libc::geteuid() };
+        if !root_metadata.is_dir() || root_metadata.uid() != uid {
+            return false;
+        }
+        let device = root_metadata.dev();
+        let mut pending = vec![(root.to_path_buf(), 0usize)];
+        while let Some((directory, depth)) = pending.pop() {
             if self.started.elapsed() >= self.duration {
                 return false;
             }
@@ -567,8 +581,14 @@ impl Pass {
                 let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
                     return false;
                 };
+                if metadata.uid() != uid || metadata.dev() != device {
+                    return false;
+                }
                 if metadata.is_dir() {
-                    pending.push(entry.path());
+                    if depth >= SourceLimits::default().max_depth {
+                        return false;
+                    }
+                    pending.push((entry.path(), depth + 1));
                 } else if metadata.is_file() {
                     if !metadata.modified().is_ok_and(|mtime| mtime <= started) {
                         return false;
@@ -767,6 +787,11 @@ mod tests {
         };
         // A plain library is `lib` (rustc's rlib) or `rlib`.
         assert_eq!(with(""), Some(false));
+        std::fs::remove_file(root.join("src/lib.rs")).unwrap();
+        std::os::unix::fs::symlink(root.join("Cargo.toml"), root.join("src/lib.rs")).unwrap();
+        assert_eq!(with(""), None);
+        std::fs::remove_file(root.join("src/lib.rs")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "").unwrap();
         assert_eq!(with("[lib]\ncrate-type=['rlib']\n"), Some(false));
         // Any other crate type emits outputs outside the pinned layout.
         assert_eq!(with("[lib]\ncrate-type=['cdylib']\n"), None);
@@ -784,6 +809,31 @@ mod tests {
             with("[lib]\nproc-macro=true\ncrate-type=['cdylib']\n"),
             None
         );
+    }
+
+    #[test]
+    fn verification_timestamp_uses_unix_seconds() {
+        assert_eq!(
+            unix_seconds(UNIX_EPOCH + Duration::from_millis(1_234_567)).unwrap(),
+            1234
+        );
+        assert!(unix_seconds(UNIX_EPOCH - Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn unchanged_source_refuses_excessive_depth_and_symlinks() {
+        let fixture = Fixture::new();
+        let mut path = fixture.0.clone();
+        for _ in 0..=SourceLimits::default().max_depth {
+            path.push("d");
+            std::fs::create_dir(&path).unwrap();
+        }
+        let mut pass = Pass::new(Duration::from_secs(4));
+        assert!(!pass.unchanged_since(&fixture.0, SeedSourceKind::Registry, SystemTime::now()));
+        std::fs::remove_dir_all(fixture.0.join("d")).unwrap();
+        std::os::unix::fs::symlink(&fixture.0, fixture.0.join("link")).unwrap();
+        let mut pass = Pass::new(Duration::from_secs(4));
+        assert!(!pass.unchanged_since(&fixture.0, SeedSourceKind::Registry, SystemTime::now()));
     }
 
     #[test]
