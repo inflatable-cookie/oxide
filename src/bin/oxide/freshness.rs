@@ -2519,6 +2519,33 @@ mod tests {
         };
         assert_eq!(run(&first), "1");
         assert!(crate::cargo_layout::holds_v2_build(&slot.join("debug")));
+        // Inspect Cargo's actual v2 fingerprint, not rustc's text .d file in
+        // out/. The gate's layout adapter must consume these same bytes.
+        let package = slot.join("debug/build/probe");
+        let mut decoded_units = 0;
+        for entry in fs::read_dir(package).expect("unit directories") {
+            let fingerprint = entry.expect("unit").path().join("fingerprint");
+            for entry in fs::read_dir(&fingerprint).expect("fingerprint directory") {
+                let entry = entry.expect("fingerprint entry");
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(unit) = name.strip_prefix("dep-") else {
+                    continue;
+                };
+                let bytes = fs::read(entry.path()).expect("encoded dep-info");
+                let info = oxide_storage::dep_info::decode(&bytes).expect("Cargo v1 encoding");
+                assert!(info.files.iter().any(|file| {
+                    file.reference.tag == oxide_storage::dep_info::PathTag::PackageRootRelative
+                        && file.reference.path.starts_with("src/")
+                }));
+                let json = fs::read(fingerprint.join(format!("{unit}.json")))
+                    .expect("unit fingerprint JSON");
+                let json: serde_json::Value = serde_json::from_slice(&json).expect("JSON");
+                assert_eq!(json["local"][0]["CheckDepInfo"]["fingerprint"], "mtime");
+                assert!(fingerprint.join(unit).is_file(), "unit fingerprint hash");
+                decoded_units += 1;
+            }
+        }
+        assert!(decoded_units >= 2, "library and binary dep-info");
         let anchor_ns = now_ns();
 
         // Control: without the gate's refresh, Cargo 1.100.0 keeps the stale unit.
