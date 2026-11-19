@@ -1,167 +1,142 @@
-# Local lease library (standalone CLI retired)
+# Local lease library
 
-Oxide keeps Rust workflow state in `oxide_storage::lease::managed`: slots,
-compatibility keys, generations, affinity, ranks, lease tokens and the front-door
-control records. Barge owns their storage beneath it: locations, marked roots,
-shared/exclusive holds, pins, pressure pruning and marker-checked trash. The
-[adoption contract](barge-adoption.md) owns that boundary and transition rules.
+This contract owns the semantics of the retained local lease library. Oxide
+keeps Rust workflow state in `oxide_storage::lease::managed`: slots, compatibility
+keys, generations, affinity, ranks, lease tokens and front-door control records.
+Barge stores the physical layer beneath it: locations, marked roots, holds, pins,
+pressure pruning and marker-checked trash. The [barge adoption contract](barge-adoption.md)
+owns that boundary and the transition rules.
 
-The standalone `oxide-storage-lease` CLI and APFS image backend were retired in
-oxide#102. Nucleus's installed copy and historical evidence remain untouched;
-this source change neither installs a binary nor migrates live data.
+The standalone `oxide-storage-lease` CLI and its APFS image backend were retired
+in oxide#102. Its installed copy and history are outside this repository.
 
-## Callable
+## Pools and callers
 
-The library supports `directory-budget-v1` and `apfs-volume-v1` pools. The
-unpublished `oxide` front door supplies Cargo identity, profile, checkout,
-budget and registered-volume policy. Older image formats refuse before writes.
-The library returns the Barge root hold with each successful lease; callers
-must retain it for the entire use. Independent replay of the same holder is
-refused rather than returning a grant without a hold.
+The library supports `directory-budget-v1` and `apfs-volume-v1` pools. Older image
+formats refuse before any write. The `oxide` front door supplies Cargo identity,
+profile, checkout, budget and registered-volume policy.
 
-## Pool
+Each successful lease returns the Barge root hold. The caller must keep it for the
+whole use. An independent replay by the same holder is refused rather than
+granted without a hold.
 
 A pool has owner-only control state, its Rust lease ledger and a private Barge
-account. The `oxide/pool` area preserves the existing payload/slots placement.
-Compatible idle reuse retains both root path and bytes. A new generation after
-retirement or eviction uses `create_root`, with a fresh ID and path. An
-unrecorded stray at an old path never becomes a successor.
+account. Compatible idle reuse keeps both root path and bytes. A new generation,
+after retirement or eviction, gets a fresh ID and path. An unrecorded stray at an
+old path never becomes its successor.
 
-Pool preparation adopts idle legacy rows when the kernel confirms that the
-recorded Oxide holder PID is absent. A live or unverifiable holder keeps the
-row unavailable. An admission whose compatible idle row awaits the next
-batch returns a retry message. A matching held legacy row still needs an
-explicit writer-closure check. Adoption creates no pin, so an unpinned root can be
-evicted without a warm grant. Existing pins remain protected by Barge.
+Pool preparation adopts an idle legacy row only when the kernel confirms its
+recorded Oxide holder PID is absent. A live or unverifiable holder keeps the row
+unavailable. Adoption creates no pin.
 
-## Oxide front door control directory
+## Front-door control directory
 
-`oxide-managed` holds the front door's state, record locks, clean barriers,
+`oxide-managed` holds the front door's state: record locks, clean barriers,
 affinity and seed sidecars. These describe Rust command workflow, not generic
-storage ownership. Output receipts describe selected member links; Barge pins
-protect their selected roots independently of command lifetime. Newer control
-formats retain the existing forward refusal and installed-binary handoff.
+storage ownership. Output receipts describe selected member links. Barge pins
+protect the selected roots independently of command lifetime. Newer control
+formats keep the existing forward refusal and installed-binary handoff.
 
 ## Commands
 
-Admission takes an exclusive Barge hold before returning a slot. Release
-records a bounded measurement of the closing slot and updates Rust lease
-state before the caller drops its hold. Recovery uses cooperative
-hold availability; normal process-group stop/exit handling remains product
-handling and is not an arbitrary-writer custody certificate. Children inherit
-the actual root hold on Oxide's launch route. A child closing inherited
-descriptors or an unrelated unheld writer is outside this guarantee.
-
-Seeding retains a shared donor hold beside the recipient's exclusive hold.
-The generation-bound catalog, compatibility, source verification and clone
-failure policy remain Oxide's responsibility. A pre-write failure can skip;
-after recipient writes, failure cannot publish a trusted origin.
+- **Admission** takes an exclusive Barge hold before returning a slot.
+- **Release** records a bounded measurement of the closing slot and updates the
+  Rust lease state before the caller drops its hold.
+- **Recovery** uses cooperative hold availability. Normal process-group exit
+  handling is product handling, not a certificate that no arbitrary writer
+  remains.
+- **Children** inherit the actual root hold on Oxide's launch route. A child that
+  closes inherited descriptors, or an unrelated unheld writer, is outside the
+  guarantee.
+- **Seeding** keeps a shared donor hold beside the recipient's exclusive hold.
+  Catalog, compatibility, source verification and clone-failure policy stay
+  Oxide's. A failure before recipient writes can skip; a failure after them cannot
+  publish a trusted origin.
 
 ## Capacity and eviction
 
-Budgets remain soft admission figures. New-slot admission uses recorded
-logical bytes against the pool budget. Both new-slot and warm admission read
-removable free space against Barge's reserve and floor. Below reserve, they can
-evict idle ledger candidates by ID and reread free space after each eviction.
-The intended warm root stays out of that candidate set. Low space never
-silently selects another volume.
+Budgets are soft admission figures. New-slot admission uses recorded logical bytes
+against the pool budget. Both new-slot and warm admission read removable free space
+against Barge's reserve and floor. Below the reserve they evict idle ledger
+candidates by ID and reread free space after each eviction. The warm root being
+granted is excluded from that candidate set. Low space never silently selects
+another volume.
 
-Eviction takes an exclusive nonblocking hold and rechecks the durable pin
-under the area lock before renaming into Barge trash. Deletion requires the
-matching marker, follows no symlink and crosses no mount. Oxide has no
-per-entry deletion journal, holding-area deleter or descriptor census.
+Eviction takes an exclusive non-blocking hold, rechecks the durable pin under the
+area lock, and renames into Barge trash. Deletion needs the matching marker,
+follows no symlink and crosses no mount. Oxide has no per-entry deletion journal
+and no descriptor census.
 
-An explicit held eviction checks the writer generation and exact lease under
-the existing pool lock. It writes one private, versioned intent bound to the
-pool, lease, Barge root and parent identity before asking Barge to evict.
-A normal refusal clears the intent and leaves the control and ledger
-unchanged. When the fence must advance, Oxide reserves the existing admission
-lock and publishes the fence after the rename, before saving the revised
-ledger. A settlement failure retains the intent for recovery.
-If Barge moves the root and cannot delete the trash entry, Oxide settles the
-intent and reports the deletion failure as post-commit.
+A held eviction checks the writer generation and exact lease under the pool lock.
+It first writes a private, versioned intent bound to the pool, lease, Barge root
+and parent identity. A normal refusal clears the intent and leaves the control
+files and ledger unchanged. When the fence must advance, the fence is published
+after the rename and before the revised ledger is saved. A settlement failure
+keeps the intent for recovery. If Barge moves the root but cannot delete the trash
+entry, Oxide settles the intent and reports the deletion failure as post-commit.
 
-On the next ordinary locked open or exact retry, Oxide clears an intent
-whose original root is still present. It retires the matching ledger row
-when the original parent is verified and both the recorded root ID and
-its path are absent. Recovery leaves unrelated missing roots, substituted
-paths and uncertain custody alone. It never repeats the Barge eviction.
+On the next locked open or exact retry, Oxide clears an intent whose original root
+is still present. It retires the matching ledger row only when the original parent
+is verified and both the recorded root ID and its path are absent. It leaves
+unrelated missing roots, substituted paths and uncertain custody alone, and never
+repeats the Barge eviction.
 
 ### Admission observations (oxide#317)
 
-Oxide times each admission lock hold from acquisition through release,
-including front-door preparation and refused attempts. A private sidecar keeps
-the last 32 observations. The writer publishes after dropping the pool lock.
-The build summary names the phase for holds over two seconds, holds with
-more than one byte walk, and holds with an unavailable Barge listing count.
-Default status reads recent per-pool maxima without taking the pool lock.
+Oxide times each admission lock hold, including front-door preparation and refused
+attempts. A private sidecar keeps the last 32 observations. The writer publishes
+after the pool lock is dropped. The build summary names the phase for holds over
+two seconds, holds with more than one byte walk, and holds with an unavailable
+Barge listing count. Default status reads recent per-pool maxima without taking
+the pool lock.
 
-Count one byte walk for each root submitted to a sizing traversal, including
-a walk whose result is incomplete or whose eviction later fails. Barge's
-eviction sizes the root once before rename. A trash sweep removes entries and
-reports reclaimed bytes during deletion, without a separate sizing traversal.
-Report explicit inventory entries separately. Barge's internal marker
-enumeration during resolve, hold, eviction and adoption is timed and displayed
-as a listing with an unavailable count. The 256-slot regression checks both
-facts. Above reserve, the reserve check enumerates no roots.
+Count one byte walk per root submitted to a sizing traversal, including incomplete
+or later-failed walks. Barge's eviction sizes the root once before rename. A trash
+sweep reports reclaimed bytes during deletion, with no separate sizing traversal.
+Above the reserve, the reserve check enumerates no roots.
 
-At the slot ceiling, Oxide first tries the oldest candidate through Barge. If
-it is protected, one bytes-free inventory identifies other held or pinned
-candidates before Oxide tries the remaining roots. A refusal reports held and
-pinned counts (which can overlap), other unavailable rows, pending legacy
-adoption and pin reasons. If this checkout can wait for a compatible
-holder, the first ceiling diagnosis is printed with its wait message.
-Default status reads bound pin records at the
-ledger's known paths without enumerating directories or reading payloads.
-Pin reasons are diagnostic. Unreadable records are reported as unknown.
+At the slot ceiling, Oxide tries the oldest candidate through Barge first. If that
+is protected, one bytes-free inventory identifies other held or pinned candidates
+before the rest are tried. A refusal reports held and pinned counts, other
+unavailable rows, pending legacy adoption and pin reasons. Default status reads
+bounded pin records at the ledger's known paths without enumerating directories.
 
-### Normal warm reuse (oxide#280)
+## Warm reuse
 
-The normal compatible idle path keeps its generation and does not recursively
-scan before every grant. Barge validates and holds the root; Cargo and Oxide's
-freshness checks still decide reuse correctness. A cache hit is never test
-success.
+A compatible idle slot keeps its generation and is not scanned before each grant.
+Barge validates and holds the root. Cargo's and Oxide's freshness checks decide
+reuse correctness, and a cache hit is never test success. The admission rule is
+owned by [warm-reuse admission](warm-reuse-admission.md).
 
-### Ledger-only view for front-door membership (oxide#110, lead `e4c74399`)
+## Ledger-only views and passive reads
 
 Membership and workflow rank views read the bounded ledger without walking
-payloads. They grant no independent deletion authority.
+payloads. They grant no deletion authority.
 
-### Passive snapshot and measurement (oxide#128)
+Status is read-only. Explicit measurement starts its caller deadline before the
+passive open and uses it through setup, accounting and the stability reread. A
+partial or unreadable measurement reports unknown capacity. Logical and allocated
+bytes stay distinct, and a sample is not a physical peak.
 
-Status is read-only. Explicit measurement starts its caller deadline before
-passive opening, checks it through setup and uses it for accounting and the
-stability reread; zero supplies no grace period.
-partial or unreadable measurements report unknown capacity. Logical and
-allocated bytes remain distinct, and a sample is not a physical peak.
+## Slot headroom and ranked replacement
 
-### Slot headroom and ranked idle replacement (oxide#118)
+Oxide keeps Rust slot and project headroom, and ranks idle ledger rows by least
+recent use. It sends one chosen root ID to Barge at a time. A hold or pin refusal
+moves on to the next candidate. If no eligible root can make room, admission
+reports a capacity refusal.
 
-Oxide keeps Rust slot/project headroom and ranks idle ledger rows by least
-recent use. It sends one chosen root ID to Barge at a time. A hold or pin
-refusal lets it consider the next candidate. If no eligible root can make
-room, admission reports a capacity refusal.
+### Recorded per-slot accounting
 
-### Recorded per-slot accounting (oxide#146: implemented, native held)
-
-Oxide#315 restores this admission strategy over Barge. A size belongs to the lease generation that was observed. A new grant clears
-the old observation. Release samples only the closing root, and new-slot
-admission samples only rows without a current record. A complete observation
-is persisted once per generation and refreshed at release. An incomplete
-sample carries a positive estimate for that admission and stays out of
-byte-pressure eviction. Status reads ledger observations without walking or
-reconciling. Explicit measurement makes a fresh bounded observation.
-
-## Reviewed local handover artifact
-
-The historical oxide#064 handover and installed Nucleus lease CLI are retained
-outside this repository. Their original scope is recorded in
-[project adoption](project-adoption.md). This adoption changes neither those
-copies nor their evidence. Consumer switching remains an owner action.
+A size belongs to the lease generation that observed it. A new grant clears the
+old observation. Release samples only the closing root, and new-slot admission
+samples only rows without a current record. A complete observation is persisted
+once per generation and refreshed at release. An incomplete sample carries a
+positive estimate for that admission and stays out of byte-pressure eviction.
+Status reads ledger observations without walking. Explicit measurement makes a
+fresh bounded observation.
 
 ## Limits
 
-This is a cooperative same-user storage library, with no daemon or process
-scan. Ordinary tests on private temporary fixtures and independent exact-head
-review establish the source change. Installation, real-data migration and
-live-drive qualification remain separate actions.
+This is a cooperative same-user storage library with no daemon and no process
+scan. Installation, real-data migration and live-drive qualification are separate
+owner actions.

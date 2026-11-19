@@ -25,7 +25,7 @@ Tom's 2026-11-17 lean reset ([vision](docs/knowledge/vision.md#validation-policy
 - Every product brief names its covering Effigy selectors, wall-clock limit and scratch-disk budget.
 - The author runs `rust:compile`, `rust:compile-release`, `rust:format`, `docs:check` when docs change, and the ordinary unit/integration suite (`rust:barge-adoption`) on fresh fixtures below the task's TMPDIR. Crash recovery, deletion and removable-media behaviour are covered by ordinary regression tests there.
 - One independent reviewer judges the exact published head, its regressions and the author's evidence. It does not repeat the covering selectors and reports missing or inadequate evidence honestly.
-- No native proof, reviewer-native session, uncounted diagnostic or qualification ladder is required. The older tier rules, native selectors and the unqualified oxide#233 supervisor candidate remain in the repository and the [workflow contract](docs/knowledge/contracts/workflow.md) as history. They run only on an explicit owner request, and their evidence keeps no transferred credit.
+- No native proof, reviewer-native session, uncounted diagnostic or qualification ladder is required. Those selectors and the shared supervisor were removed in oxide#322; their history stays in git and in the historical evidence under `docs/knowledge/evidence/`, which carries no transferred credit.
 - Gate experiments on wall-clock time and scratch disk. Report resource figures as observations. Preserve product correctness, isolation, ownership and conservative handling of unknown writers.
 - Run targeted checks through Effigy. Don't run full `effigy qa` or repeat completed validation without a changed input or an unresolved finding. Milestone QA stays separate.
 - Tom may accept a task as-is. Record that as operator acceptance, keep the independent findings, and close out without another publication-only review loop. A direct GitHub merge needs explicit scoped authorization and is reconciled through Nucleus's external-merge closeout.
@@ -33,50 +33,21 @@ Tom's 2026-11-17 lean reset ([vision](docs/knowledge/vision.md#validation-policy
 
 ## Effigy command map
 
-Ordinary Rust selectors run through the installed `oxide`. If it is broken,
-use Effigy's existing machine-wide per-program `oxide` fallback and report the
-dogfood finding. Preserve the ordinary routing and existing compiler profiles.
+Ordinary selectors run through the installed `oxide`. If it is broken, use
+Effigy's per-program `oxide` fallback and report the dogfood finding. `effigy
+tasks` lists the live set.
 
 - `rust:compile`: `oxide check --workspace --all-targets --locked`.
-- `rust:compile-release`: release binary check with `RUSTFLAGS='-D warnings'`.
-  Run both compile selectors for unconditional Rust changes.
-- `rust:format`: check formatting; `rust:format-write`: apply it during authoring.
-- `rust:compile-linux`: offline compile for the already-installed target only.
-- `rust:barge-adoption-linux`: compile all targets, including the Linux pool
-  regression, for that installed target; no linking or runtime claim.
-- `docs:check`: links, changelog and whitespace.
-- `rust:barge-adoption`: ordinary heavy covering workspace unit/integration
-  suite for oxide#314, with no named skips and fresh fixtures below task TMPDIR.
-- `rust:test-600`: the separate historical dual-root wrapper; not authorized
-  for this task's scratch boundary.
-- `proof:rust-test-600:test` / `:plan`: wrapper self-check / effect-free plan.
-- `proof:supervisor:test` / `:preflight`: pure cases / effect-free host readiness.
-  Native `proof:supervisor:qualify` and its diagnostic still require their own
-  owner activation; adoption does not promote its candidate.
-- `oxide:canary`: planner-only staged live-pool check after reviewed merge.
-  `--new-seconds` and `--warm-seconds` override the 10 s and 5 s limits.
-- `oxide:install` / `oxide:reinstall`: planner-only installation after reviewed
-  merge. `--require-canary` requires a same-pin PASS less than an hour old.
-- `dogfood:scripts:test`: synthetic installer, rollback and canary cases.
+- `rust:compile-release`: release compile of the binaries with `RUSTFLAGS='-D warnings'`.
+- `rust:format` / `rust:format-write`: check / apply formatting.
+- `rust:compile-linux`: offline compile for the already-installed Linux target; no link or run.
+- `rust:barge-adoption-linux`: compile all targets for that target; no link or run.
+- `rust:tree-duplicates`: duplicate packages in the normal dependency closure.
+- `rust:barge-adoption`: the covering ordinary workspace unit and integration suite.
+- `docs:check`: links, changelog fragments and whitespace.
+- `changelog:check` / `changelog:fold` / `changelog:test`: changelog fragments; `fold` is release-only.
+- `dogfood:scripts:test`: synthetic installer, pin, canary and wire-format cases.
+- `offline-seed:test`: synthetic offline-seeder cases.
+- `oxide:canary` / `oxide:install` / `oxide:reinstall` / `oxide:rollback`: planner-only, after reviewed merge.
 
-`rust:barge-adoption` creates one private per-run directory below the invoking
-`TMPDIR`, passes it as TMPDIR/TMP/TEMP and the test fixture roots, and removes
-only that directory after a successful test command. A failed command retains
-it. Effigy owns heavy admission and the 600-second run deadline. Tests run serially
-because child launches inherit process-wide Barge holds. Unit tests
-inject only the platform/classifier inputs that formerly required boot-volume
-temporary paths; their file operations remain in the private fixture. The
-shared supervisor and the separate dual-root recipe are unchanged and provide
-no authority for this task to create internal-drive fixtures.
-
-The lean Barge adoption uses ordinary tests and independent exact-head review,
-with no adoption/capture/supplier native ladder. Barge owns volumes, locations,
-areas, roots, holds, pins, pressure pruning and marker-checked trash. Oxide keeps
-Cargo and lease/recipe/freshness/seeding/output-link workflow. Children closing
-inherited holds and unrelated unheld writers are outside this cooperative
-model. Unknown legacy roots are retained. See the
-[adoption contract](docs/knowledge/contracts/barge-adoption.md).
-
-Use `effigy tasks` for the remaining selectors and their descriptions, and
-[workflow](docs/knowledge/contracts/workflow.md) for their owning contracts.
-Do not run a native selector solely because it exists.
+Workflow and install contracts: [workflow](docs/knowledge/contracts/workflow.md).

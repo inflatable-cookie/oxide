@@ -1,35 +1,30 @@
 # Knowledge map
 
-[Vision](vision.md) owns scope, Tom's ruling and authorization. [Architecture](architecture.md) owns storage invariants and integration boundaries. [Rust DX landscape](rust-dx-landscape.md) owns sourced research findings, candidate remedies and evidence limits. [Questions](questions.md) owns unresolved design decisions. [Release](contracts/release.md) owns publication restrictions.
+Each fact has one owning file.
 
-[Workflow](contracts/workflow.md) owns the `oxide` command classes, profiles and run strategies, inferred project identity, cross-checkout freshness gate, crash recovery, local executor, execution-location seam, agent integration, the keep/retire assessment, the foundation slice's open decisions, the partial (not passed) foundation qualification record on Oxide's own repository and what the unpublished `oxide` binary implements today, including `init` / `new` adoption, the fixture-proven freshness gate (slot origins live in `oxide-managed/origins/`) the budget-only `directory-budget-v1` pool backend with its host-reserve watchdog, `OXIDE_POOL_CAP`, slot file counts, Cargo home reporting with `oxide clean --cargo-cache`, and the removable build volume (`apfs-volume-v1`: registration, selection when a build starts, ephemeral or permanent mode, flush before a slot goes idle, and surprise-removal handling). The bound successor to the whole-target placement keeps `target` a real directory and owns only positively identified profile members (`debug`, `release`, `<triple>/debug`, `<triple>/release`), with explicit adoption, a journalled whole-target migration and a root/1 marker upgrade (oxide#133). It also points to the repository-owned agent skill source at `skills/oxide/SKILL.md`, which is not installed anywhere.
+- [Vision](vision.md) owns scope, Tom's rulings, authority and the validation policy.
+- [Architecture](architecture.md) owns storage invariants and integration boundaries.
+- [Questions](questions.md) owns unresolved design decisions.
+- [Workflow](contracts/workflow.md) owns the `oxide` command classes, profiles, run strategies, lease and freshness behaviour, crash recovery and agent integration as implemented.
+- [Release](contracts/release.md) owns publication restrictions.
+- [Rust toolchain and quality](rust-toolchain-and-quality.md) owns the development compiler, minimum Rust version and quality routing.
+- [Rust DX landscape](rust-dx-landscape.md) owns sourced research findings, candidate remedies and their evidence limits.
+- [Storage-efficiency findings](storage-efficiency.md) owns measured preparation, profile and disposable-output observations.
+- [Qualification readiness](qualification-readiness.md) owns the condensed containment, freshness, compiler-path and capacity findings. They grant no execution authority.
 
-[Storage-efficiency findings](storage-efficiency.md) records current component preparation, profile and disposable-output behavior across the inspected projects, with limits on what the source evidence establishes.
+## Contracts
 
-[Build-context policy](contracts/build-context-policy.md) owns the proposed lifecycle-aware incremental/debug context semantics, the frozen one-shot comparison recipe, and the private opt-in launcher that enforces deadline and owned-footprint limits. Production policy stays inert. The [direct incremental comparison](storage-efficiency.md#direct-incremental-comparison-2026-10-15) supplies real timing, storage and selected backtrace evidence with raw output attached; production adoption and shared-slot reuse remain unqualified.
-
-[Optimization adoption](contracts/optimization-adoption.md) owns the project adoption policy for component-lazy preparation and the distinction between lightweight improvements and reusable-slot integration.
-
-[Storage inventory](contracts/storage-inventory.md) owns the shipped bounded read-only inventory of one explicitly selected target directory: categories, logical-versus-allocated and hardlink-union accounting, coverage gaps, exit semantics, explicit unknowns and its fixture limits. It is a diagnostic, not storage ownership or cleanup authority.
-
-[Local lease](contracts/local-lease.md) owns the retained library lease semantics `oxide` uses (pool, ledger, finite limits, idle-only eviction, the control directory) and the history of the retired standalone CLI and its Nucleus handover. [Workflow](contracts/workflow.md#budget-only-default-pool-and-user-configuration) owns the budget-only default pool, soft budget and user configuration.
-
-[Nested lease](contracts/nested-lease.md) owns the **proposed, independently design-reviewed (comment `6412288358`) and unimplemented** design for a nested `oxide` joining its outer lease (no new slot or host permit) and for a different-workspace nested command borrowing the outer host permit: the lease token and its validation, writer tickets and closure, permit accounting, nested deadlock rules, alternatives and the proof plan. It changes no shipped behaviour; the current truth that a nested call takes an independent lease stays in [workflow](contracts/workflow.md#what-one-command-does-local-executor).
-
-[Project adoption](contracts/project-adoption.md) owns the consumer integration boundary, the reviewed cross-worktree result and the owner-reported Nucleus lease use. [Rust toolchain and quality](rust-toolchain-and-quality.md) owns the development compiler, initial minimum Rust version and quality-policy routing. [Opt-in stable Cargo profiles](contracts/stable-cargo-profiles.md) owns Oxide's own `oxide-light`/`oxide-full-debug` recipes, their debugging tradeoff, the focused profile-proof selectors and the no-go disposition of the comparison observations.
-
-[Proof supervisor correction](contracts/proof-supervisor-correction.md) holds the reviewed correction design (revision 4) for oxide#109's shared proof supervisor under Tom's pinned-leader cooperative closure ruling; [workflow](contracts/workflow.md#shared-proof-supervisor) records the implementation.
-
-[`oxide exec` output-member inference](contracts/exec-output-inference.md) owns the proposed design that makes `oxide exec` need no `--output` declaration: Cargo's supported stable interface reports no pre-build output directories, so `exec` derives its complete member set from the checkout's committed placement, classifies every existing member-shaped entry before Cargo, and reports rather than guesses a member that placement does not cover. It is design only: no code, native, consumer or host effect.
-
-[Cold-slot seeding](contracts/cold-slot-seeding.md) owns the proposed, unimplemented and unfrozen design for warming a new leased slot from one positively idle same-volume donor's dependency compile units: the restricted on-disk partial association and its source verification, the empty producing epoch and generation-bound donor catalog, the unconditional run-unit exclusion, the donor pin and lock order, the untrusted-recipient transaction and its reset-or-refuse rule, finite bounds and honest accounting, sidecar visibility and its format-fence disposition, the pinned Cargo adapter seam, and the interface with oxide#136 child scratch and the idle-exec D-4 ruling. It mints no implementation, native, installation or consumer authority.
-
-[One-use workspaces](contracts/one-use-workspaces.md) owns the proposed, unimplemented and unfrozen design for disposable temporary checkouts: canonical workspace classification with its bounded candidate roots and unsafe-broad refusals, the independent local-output guard and its receipt/path table including the exact `Prepared` refusal at every replay site, the persisted per-record class and its N+1 control-state fence with a normal-only project cap, the library's bounded membership and `Prefer`/`Only` victim policies with the 16-slot and min(budget/10, 32 GiB) slice, the restore-before-admission rule and the normal-overage continuation, crash/closure behaviour, the requirements it places on the frozen-but-unimplemented cold-slot seeding interface, `#136` child scratch and the idle-exec D-4 ruling, the proof-only controls and per-role staging inventory, and the fixed-script bound and allocation. It mints no implementation, native, installation or consumer authority.
-
-[Scratch pools](contracts/scratch-pools.md) owns the implemented S1–S3 contract and proposed migration slices for an explicit, UUID-bound `directory-budget-v1` pool on a verified external validation volume: the environment-only `OXIDE_SCRATCH_ROOT` opt-in and its scope, the declared scratch root and placement rules, the pool-local binding document and its absent-volume refusal, the refusal matrix, why the built-in default pool and every ordinary refusal are unchanged, the migration list that lets ten proofs drop the owner-accepted internal-root exception (`bd357a4c`) while `rust:outputs-prune`, `rust:prune-absence` and the unit-suite recipe keep it for their boot Data volume premises, and the finite implementation slices with their validation tiers. It grants no implementation, native, host or pool authority.
-
-[Barge adoption](contracts/barge-adoption.md) is Oxide's storage authority contract after Tom's 2026-11-17 lean reset: the pinned merged lean core, what Barge owns (volumes and identity, declared areas, marked roots, cooperative holds, durable pins, reserve/floor pruning, marker-checked trash, scratch), what Oxide keeps (Cargo front door, slots and leases, recipes, seeding, output links, `exec`), the per-pool area declarations, the cooperative hold limits, and the explicit transition for existing Oxide roots while the generic adopt-existing-root seam is settled with the Barge owner.
-
-[Qualification findings](qualification-readiness.md) preserves the Cargo freshness, compiler path, cross-path, containment and capacity findings the workflow builds on. They grant no execution authority.
-
-The [idle exec sessions and run-slot custody design](contracts/idle-exec-sessions.md) is a proposal, not current truth: it owns the before-work interception analysis, the slot-versus-permit split, the `run` custody alternatives and the open operator dispositions. It grants no implementation or native authority and changes no behaviour.
+- [Barge adoption](contracts/barge-adoption.md) owns Oxide's storage authority after the lean reset: what Barge owns, what Oxide keeps, area declarations and the transition for existing roots.
+- [Scratch pools](contracts/scratch-pools.md) owns the explicit `directory-budget-v1` pool on an external validation volume.
+- [Project adoption](contracts/project-adoption.md) owns the consumer integration boundary.
+- [Optimization adoption](contracts/optimization-adoption.md) owns the policy for component-lazy preparation.
+- [Local lease](contracts/local-lease.md) owns the retained lease library semantics.
+- [Warm-reuse admission](contracts/warm-reuse-admission.md) owns admission of a normal warm reuse without a recursive size scan.
+- [Storage inventory](contracts/storage-inventory.md) owns the read-only inventory diagnostic. It is not storage ownership or cleanup authority.
+- [Stable Cargo profiles](contracts/stable-cargo-profiles.md) owns Oxide's own profile recipes and their trade-offs.
+- [Build-context policy](contracts/build-context-policy.md) owns the proposed build-context semantics. Production policy stays inert.
+- [Nested lease](contracts/nested-lease.md) owns the proposed nested-lease design. It is not implemented; a nested call takes an independent lease today.
+- [Idle exec sessions](contracts/idle-exec-sessions.md) owns the proposed idle-session and run-slot custody design. It is not implemented.
+- [Exec output inference](contracts/exec-output-inference.md) owns the proposed design for `oxide exec` without a declared output. It is not implemented.
+- [Cold-slot seeding](contracts/cold-slot-seeding.md) owns the seeding of a new leased slot from an idle same-volume donor.
+- [One-use workspaces](contracts/one-use-workspaces.md) owns disposable temporary checkouts beside normal slots.

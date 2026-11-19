@@ -1,9 +1,0 @@
-# Relax quick-run trial, workload 1 (oxide#307): a small ordinary CLI with a
-# dependency and proc-macro path. Two members so the predeclared interface edit
-# in `greet-core` invalidates the `greet` dependant. The registry versions are
-# the exact pins this repository's own `Cargo.lock` already resolves, so the
-# guarded occurrence can establish the workspace lock offline from the seeded
-# private Cargo home and never downloads during a measured case.
-[workspace]
-resolver = "2"
-members = ["greet-core", "greet"]

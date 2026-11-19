@@ -281,7 +281,7 @@ mod debug {
             std::fs::set_permissions(&marker_path, std::fs::Permissions::from_mode(0o600)).unwrap();
             let receipt = serde_json::json!({
                 "run_id": SESSION,
-                "command": ["python3", "scripts/test-installed-handoff.py", "--diagnostic"],
+                "command": ["python3", "scripts/example-handoff.py", "--diagnostic"],
                 "limit_s": 600.0, "root": text(&base), "scratch": text(&scratch),
                 "evidence": text(&evidence), "scratch_owned": true, "start_ns": 1,
                 "abort_threshold": 1, "terminal_mode": {"mode": "strict", "reason": "r", "evidence": "e"},

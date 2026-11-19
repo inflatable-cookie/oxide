@@ -1044,7 +1044,7 @@ Managed by `oxide init`; edits between these markers are replaced.
 "nextest" = "cargo-nextest run"
 "env" = "$CARGO build"
 [test.suites.rust]
-run = "python3 scripts/bounded-test.py cargo test --workspace"
+run = "python3 scripts/wrapper.py cargo test --workspace"
 "#;
         let lines = plain_cargo_lines(text);
         assert_eq!(
@@ -1053,7 +1053,7 @@ run = "python3 scripts/bounded-test.py cargo test --workspace"
                 (2, r#""rust:compile" = "cargo check --workspace""#),
                 (
                     8,
-                    r#"run = "python3 scripts/bounded-test.py cargo test --workspace""#
+                    r#"run = "python3 scripts/wrapper.py cargo test --workspace""#
                 ),
             ]
         );
@@ -1078,7 +1078,7 @@ run = "cargo test --workspace"
 [test.suites."rust:cargo"]
 run = "cargo metadata"
 [test.suites.rust]
-run = "python3 scripts/bounded-test.py cargo test --workspace"
+run = "python3 scripts/wrapper.py cargo test --workspace"
 "#;
         let scan = classify_effigy(text).unwrap();
         assert_eq!(
@@ -1102,7 +1102,7 @@ run = "python3 scripts/bounded-test.py cargo test --workspace"
                 ("tasks.legacy".to_owned(), "cargo build".to_owned()),
                 (
                     "test.suites.rust".to_owned(),
-                    "python3 scripts/bounded-test.py cargo test --workspace".to_owned()
+                    "python3 scripts/wrapper.py cargo test --workspace".to_owned()
                 ),
             ]
         );
