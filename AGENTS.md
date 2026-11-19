@@ -24,6 +24,7 @@ Tom's 2026-11-17 lean reset ([vision](docs/knowledge/vision.md#validation-policy
 
 - Every product brief names its covering Effigy selectors, wall-clock limit and scratch-disk budget.
 - The author runs `rust:compile`, `rust:compile-release`, `rust:format`, `docs:check` when docs change, and the ordinary unit/integration suite (`rust:barge-adoption`) on fresh fixtures below the task's TMPDIR. Crash recovery, deletion and removable-media behaviour are covered by ordinary regression tests there.
+- Oxide has no `test:affected` selector, and its Nucleus repository record sets no affected-test command. The whole-suite `rust:barge-adoption` run at the head covers every affected test and satisfies a generic "run the affected tests" instruction. Don't block on the missing selector.
 - One independent reviewer judges the exact published head, its regressions and the author's evidence. It does not repeat the covering selectors and reports missing or inadequate evidence honestly.
 - No native proof, reviewer-native session, uncounted diagnostic or qualification ladder is required. Those selectors and the shared supervisor were removed in oxide#322; their history stays in git and in the historical evidence under `docs/knowledge/evidence/`, which carries no transferred credit.
 - Gate experiments on wall-clock time and scratch disk. Report resource figures as observations. Preserve product correctness, isolation, ownership and conservative handling of unknown writers.
