@@ -644,33 +644,20 @@ impl PoolBacking {
             })
     }
 
-    /// Evict from an area already bound to this pool. Never declare or repair
-    /// storage while attempting to retire a held ledger row.
-    pub(crate) fn evict_existing(
+    /// Open an area already bound to this pool without declaring or repairing it.
+    pub(crate) fn existing_pool_area(
         &self,
-        control: &Path,
+        storage: &Storage,
         project_folder: Option<&str>,
-        id: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Area, String> {
         let mut config = self.area_config();
         if let Some(folder) = project_folder {
             config.area = format!("{}-{}", config.area, slug(folder));
             config.folder = format!("{}/{folder}", config.folder);
         }
-        let existing = |storage: Storage| {
-            storage
-                .existing_area(&config)?
-                .ok_or_else(|| format!("pool area {} is missing", config.key()))
-        };
-        // A known area proves the account exists. The writable open then
-        // uses the same declaration without creating a volume or area.
-        existing(Storage::open_read_only(control)?)?
-            .resolve(id)
-            .map_err(|error| format!("cannot resolve held slot root {id}: {error}"))?;
-        existing(Storage::open(control)?)?
-            .evict(id)
-            .map_err(|error| format!("cannot evict slot root {id}: {error}"))?;
-        Ok(())
+        storage
+            .existing_area(&config)?
+            .ok_or_else(|| format!("pool area {} is missing", config.key()))
     }
 }
 

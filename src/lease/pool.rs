@@ -1,16 +1,18 @@
 //! Exclusive pool: short-lived flock, durable JSON ledger, idle-only eviction.
 
+mod held_eviction;
+
 use super::backing::BackingPaths;
 use super::slice::{AdmissionClass, OneUseSlice, RestoreOutcome, SliceReport, VictimPolicy};
 use super::{
     canonical_existing_dir, current_uid, ensure_private_dir, io_error, is_finder_metadata,
     is_tolerated_metadata_file, persist_private_file, random_hex, read_private_file,
-    unexpected_entry, AccountingCoverage, AccountingScan, HeldEvictionFailure, LeaseEnvironment,
-    LeaseError, LeaseGrant, Leased, LedgerSlot, LedgerView, MeasuredPool, PassiveSnapshot,
-    PoolStatus, Profile, RecordedFact, RecordedVolume, ReleaseReceipt, SlotOccupancy, SlotStatus,
-    UnmeasuredSlot, ACCOUNTING_MAX_ELAPSED_MS, CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION,
-    LEDGER_NAME, LEDGER_VERSION, LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME,
-    MANAGED_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS,
+    unexpected_entry, AccountingCoverage, AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant,
+    Leased, LedgerSlot, LedgerView, MeasuredPool, PassiveSnapshot, PoolStatus, Profile,
+    RecordedFact, RecordedVolume, ReleaseReceipt, SlotOccupancy, SlotStatus, UnmeasuredSlot,
+    ACCOUNTING_MAX_ELAPSED_MS, CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
+    LEDGER_VERSION, LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME, MANAGED_NAME,
+    MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS,
     PREVIOUS_CAPACITY_POLICY_VERSION, RAISED_CAPACITY_POLICY_VERSION, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
@@ -616,6 +618,9 @@ fn open_seed_inner(
         // The front-door admission holder publishes the generation. Recheck
         // it here without upgrading the donor's legacy custody document.
         super::check_control_writer(&root.join(MANAGED_NAME))?;
+        if held_eviction::HeldEvictionIntent::read(&root)?.is_some() {
+            return Err(LeaseError::UnknownAccounting);
+        }
     }
     let config = read_config(&root)?;
     let ledger = read_ledger(&root)?;
@@ -1269,6 +1274,11 @@ impl Pool {
         } else {
             lock_pool_inner(&root, false, false)?
         };
+        let pending = if reconcile {
+            held_eviction::HeldEvictionIntent::read(&root)?
+        } else {
+            None
+        };
         // Fence first (oxide#177, ruling 4c9984a1): a managed pool's control
         // state reaches the current fence version before this open can start a
         // recovery journal or finish a recorded deletion. A library fixture
@@ -1297,17 +1307,12 @@ impl Pool {
                 split_slot_dir(dir, slot.id).ok_or(LeaseError::UnknownAccounting)?;
             }
         }
-        let storage = if reconcile {
-            pool_storage(&root, &config)?
-        } else {
-            None
-        };
         let mut pool = Self {
             _lock: Some(lock),
             root,
             config,
             backing,
-            storage,
+            storage: None,
             pending_hold: None,
             deadline: None,
             budget: ledger.cap_bytes,
@@ -1315,6 +1320,10 @@ impl Pool {
             admission_note: None,
         };
         if reconcile {
+            if let Some(intent) = pending {
+                pool.recover_held_eviction(&intent, false)?;
+            }
+            pool.storage = pool_storage(&pool.root, &pool.config)?;
             pool.recover_abandoned_holds(releasing)?;
             pool.retire_missing_idle_roots()?;
             pool.sweep_trash()?;
@@ -2102,58 +2111,6 @@ impl Pool {
                     "slot ID must be a positive integer",
                 ))?;
         self.retire_idle_slot(id)?;
-        Ok(Vec::new())
-    }
-
-    /// Retire one held slot by its exact lease.
-    fn evict_held(
-        &mut self,
-        slot_id: &str,
-        lease_id: &str,
-    ) -> Result<Vec<String>, HeldEvictionFailure> {
-        let pre = HeldEvictionFailure::PreCommit;
-        let id = slot_id
-            .parse::<u64>()
-            .ok()
-            .filter(|id| *id != 0)
-            .ok_or(LeaseError::InvalidInput(
-                "slot ID must be a positive integer",
-            ))
-            .map_err(pre)?;
-        let Some(slot) = self.slot(id) else {
-            return Err(pre(LeaseError::Busy));
-        };
-        if slot.state != SlotPersistState::Held || slot.lease_id.as_deref() != Some(lease_id) {
-            return Err(pre(LeaseError::Busy));
-        }
-        let root = slot
-            .root
-            .clone()
-            .ok_or(pre(LeaseError::UnknownAccounting))?;
-        let project = slot
-            .dir
-            .as_deref()
-            .and_then(|dir| dir.split_once('/'))
-            .map(|(f, _)| f.to_owned());
-        let control = self.root.join(MANAGED_NAME);
-        let admission = super::reserve_eviction_fence(&control).map_err(pre)?;
-        self.ledger.slots.retain(|slot| slot.id != id);
-        self.validate_revised_ledger().map_err(pre)?;
-        pool_backing(&self.root, &self.config)
-            .map_err(pre)?
-            .evict_existing(&control, project.as_deref(), &root)
-            .map_err(|_| pre(LeaseError::UnknownAccounting))?;
-        // Barge has renamed the root. From here an error cannot be reported
-        // as a refusal that left the original pool intact.
-        let post = |error| {
-            HeldEvictionFailure::PostCommit(format!(
-                "slot {id} was evicted but settlement failed: {error}"
-            ))
-        };
-        if admission.is_some() {
-            super::fence_admission_writer(&control).map_err(post)?;
-        }
-        self.persist().map_err(post)?;
         Ok(Vec::new())
     }
 

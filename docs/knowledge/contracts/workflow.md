@@ -1733,6 +1733,11 @@ configured pool touched by the upgraded binary. Keep owner-only copies of
 the original control and ledger documents before editing. Preserve every
 lease, slot, output link, Barge root and pin.
 
+Before restoring a binary that predates held-eviction recovery, settle any
+`<pool>/oxide-managed/held-eviction.json` using the current writer's ordinary
+locked open. If recovery refuses, keep the intent and resolve the recorded
+pool identity before downgrading.
+
 For the first generation's rollback to a predecessor containing oxide#315
 (merge `6f8d8f2c`) and declaring control version 9, the format conversion is:
 

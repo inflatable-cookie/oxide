@@ -80,6 +80,7 @@ fn held_eviction_publishes_the_writer_fence_only_after_commit() {
         "Barge must refuse the exact lease's still-live hold"
     );
     assert_eq!(snapshot(), before);
+    assert!(!control.join("held-eviction.json").exists());
 
     let newer = fenced_state(old_state.clone(), WRITER_GENERATION + 1).unwrap();
     write_state(&newer);

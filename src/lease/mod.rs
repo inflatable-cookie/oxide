@@ -257,7 +257,8 @@ pub enum LeaseError {
 
 /// A held eviction's failure class. Before Barge commits the root rename,
 /// Oxide leaves the control and ledger unchanged and runs no reconciliation.
-/// A failure settling control or the ledger after the rename is post-commit.
+/// A failure after the rename or an uncertain intent cleanup requires
+/// recovery and is reported as post-commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeldEvictionFailure {
     PreCommit(LeaseError),
