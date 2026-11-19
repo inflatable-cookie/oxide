@@ -447,9 +447,12 @@ paths. The summary says `temp: inherited <path>` or `temp: oxide <path>`.
   A test harness that overrides `HOME` still reaches the machine's pool. When the
   two differ and the default pool is used, a notice says so. `status` prints a
   `home:` line.
-- **Time Machine:** the owned pool root is excluded with `tmutil addexclusion`, and
-  `tmutil isexcluded` must confirm it before a build writes. Failure or an unknown
-  result refuses before Cargo runs. Spotlight is not changed, and `status` says so.
+- **Time Machine:** the cheap `tmutil isexcluded` check runs first. A pool inside
+  an already excluded parent (a scratch volume, for example) is excluded through
+  inheritance, so `tmutil addexclusion` — about eleven seconds on this host — is
+  skipped. Only a genuinely included root pays for it. `tmutil isexcluded` must
+  then confirm the result before a build writes; failure or an unknown result
+  refuses before Cargo runs. Spotlight is not changed, and `status` says so.
 - **Recorded pools:** the state directory records the newest 16 pools. `status`
   lists pools at other known paths as orphaned. Nothing reclaims them.
 - **Explicit release:** `oxide pool recover-interrupted <slot>` releases an
@@ -764,8 +767,11 @@ Oxide's own repository is the only adopter that installs the binary.
   `pool describe --json`, then in a fresh dependency-free crate on the selected
   pool's scratch directory runs two offline `oxide check`s. The first must take a
   new slot within 10 seconds. The second must reuse that slot within 5 seconds.
-  Override the limits with `--new-seconds` and `--warm-seconds`. Each check has a
-  300-second admission budget and a 60-second execution budget. The receipt records
+  Override the limits with `--new-seconds` and `--warm-seconds`. The reported
+  admission ends when the child starts: a ceiling eviction's Barge trash
+  deletion runs beside the writer, with the pool and admission locks released,
+  so it is not counted in this figure (oxide#324). Each check has a 300-second
+  admission budget and a 60-second execution budget. The receipt records
   FAIL before the attempt, and PASS only after both checks and cleanup. The crate is
   removed only after writer closure is confirmed.
 - **Canary modes** (oxide#323). All modes share one receipt per pin:

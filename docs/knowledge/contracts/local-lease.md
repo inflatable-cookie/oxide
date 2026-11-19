@@ -67,6 +67,29 @@ area lock, and renames into Barge trash. Deletion needs the matching marker,
 follows no symlink and crosses no mount. Oxide has no per-entry deletion journal
 and no descriptor census.
 
+### Deferred eviction (oxide#324)
+
+Barge's public eviction is one call: it checks the marker, the hold and the pin,
+renames into `.trash/` and deletes the tree there. Deleting a large slot tree took
+seconds while the pool lock was held, so every other admission waited behind it.
+The decision is committed under the lock instead: a bytes-free inventory skips a
+held or pinned candidate, one bounded `oxide-managed/idle-evictions.json` record
+names the pool, slot generation, Barge root, area folder, root path and the
+recorded size (marked approximate when no observation was current), and the ledger
+row is dropped and saved. The record is the commit point: the root is out of the
+ledger, so no admission can grant or reuse it.
+
+Barge's eviction then runs with the pool and front-door admission locks released,
+from the command that decided it or from a later one. It reports a trash copy that
+stayed, and the record is kept until Barge's rename commits, so a later pass asks
+again. Free-space pressure is the exception: it must observe the bytes a deletion
+returns before deciding again, so a reserve eviction stays one inline call. A full
+record list also falls back to the inline call rather than grow the file.
+
+A mutating open drops a record whose recorded root path is absent, because Barge's
+rename already committed and its trash is the sweep's work. A record whose root is
+still present stays for a later pass; recovery never deletes it directly.
+
 A held eviction checks the writer generation and exact lease under the pool lock.
 It first writes a private, versioned intent bound to the pool, lease, Barge root
 and parent identity. A normal refusal clears the intent and leaves the control
@@ -95,11 +118,12 @@ or later-failed walks. Barge's eviction sizes the root once before rename. A tra
 sweep reports reclaimed bytes during deletion, with no separate sizing traversal.
 Above the reserve, the reserve check enumerates no roots.
 
-At the slot ceiling, Oxide tries the oldest candidate through Barge first. If that
-is protected, one bytes-free inventory identifies other held or pinned candidates
-before the rest are tried. A refusal reports held and pinned counts, other
-unavailable rows, pending legacy adoption and pin reasons. Default status reads
-bounded pin records at the ledger's known paths without enumerating directories.
+At the slot ceiling, one bytes-free inventory identifies held or pinned candidates
+before any candidate is committed, and the oldest eligible row is retired; the
+other candidates are tried in rank order without a second inventory. A refusal
+reports held and pinned counts, other unavailable rows, pending legacy adoption and
+pin reasons. Default status reads bounded pin records at the ledger's known paths
+without enumerating directories.
 
 ## Warm reuse
 

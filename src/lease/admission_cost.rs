@@ -23,7 +23,7 @@ const PHASES: [Phase; 4] = [
     Phase::Reserve,
 ];
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Phase {
     Accounting,
     Adoption,

@@ -1285,28 +1285,95 @@ pub enum Backup {
     NotApplicable,
 }
 
-/// Exclude an owned pool root from Time Machine with the sticky,
-/// unprivileged `tmutil addexclusion` and verify with `tmutil isexcluded`.
-/// macOS only; elsewhere not applicable.
+/// The `tmutil` a host runs. The program is a field so a test can replace it
+/// with a script that records its own invocations; production always names
+/// the platform binary.
+#[derive(Clone, Debug)]
+struct Tmutil {
+    program: std::path::PathBuf,
+}
+
+impl Tmutil {
+    fn host() -> Self {
+        Self {
+            program: std::path::PathBuf::from("/usr/bin/tmutil"),
+        }
+    }
+
+    /// `tmutil isexcluded` for the pool root: the effective exclusion state,
+    /// including one inherited from an excluded parent.
+    fn state(&self, pool: &Path) -> Backup {
+        let mut command = std::process::Command::new(&self.program);
+        command
+            .arg("isexcluded")
+            .arg(pool)
+            .stdin(std::process::Stdio::null());
+        let checked = crate::handoff_trace::phase("backup-isexcluded", || {
+            crate::budget::output(&mut command)
+        });
+        match checked {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                if text.trim_start().starts_with("[Excluded]") {
+                    Backup::Excluded
+                } else {
+                    Backup::NotExcluded(format!("tmutil isexcluded: {}", text.trim()))
+                }
+            }
+            Ok(output) => Backup::NotExcluded(format!(
+                "tmutil isexcluded failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(error) => Backup::NotExcluded(format!("cannot run tmutil: {error}")),
+        }
+    }
+
+    /// The sticky, unprivileged exclusion itself.
+    fn add(&self, pool: &Path) -> Backup {
+        let mut command = std::process::Command::new(&self.program);
+        command
+            .arg("addexclusion")
+            .arg(pool)
+            .stdin(std::process::Stdio::null());
+        let added = crate::handoff_trace::phase("backup-addexclusion", || {
+            crate::budget::output(&mut command)
+        });
+        match added {
+            Ok(output) if output.status.success() => Backup::Excluded,
+            Ok(output) => Backup::NotExcluded(format!(
+                "tmutil addexclusion failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(error) => Backup::NotExcluded(format!("cannot run tmutil: {error}")),
+        }
+    }
+}
+
+/// Exclude an owned pool root from Time Machine and verify the result.
+///
+/// The cheap `tmutil isexcluded` runs first: on this host `tmutil
+/// addexclusion` takes about eleven seconds, and a pool inside an already
+/// excluded parent (a scratch volume, for example) is effectively excluded
+/// without it. Only a genuinely included root pays for `addexclusion`, and
+/// the result is verified either way. macOS only; elsewhere not applicable.
 pub fn exclude_from_backup(pool: &Path) -> Backup {
+    exclude_with(&Tmutil::host(), pool)
+}
+
+fn exclude_with(tmutil: &Tmutil, pool: &Path) -> Backup {
     if !cfg!(target_os = "macos") {
         return Backup::NotApplicable;
     }
-    let mut command = std::process::Command::new("/usr/bin/tmutil");
-    command
-        .arg("addexclusion")
-        .arg(pool)
-        .stdin(std::process::Stdio::null());
-    let added = crate::handoff_trace::phase("backup-addexclusion", || {
-        crate::budget::output(&mut command)
-    });
-    match added {
-        Ok(output) if output.status.success() => backup_state(pool),
-        Ok(output) => Backup::NotExcluded(format!(
-            "tmutil addexclusion failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
-        Err(error) => Backup::NotExcluded(format!("cannot run tmutil: {error}")),
+    match tmutil.state(pool) {
+        Backup::Excluded => return Backup::Excluded,
+        Backup::NotApplicable => return Backup::NotApplicable,
+        // Not excluded yet: add the sticky attribute and verify it.
+        Backup::NotExcluded(_) => {}
+    }
+    match tmutil.add(pool) {
+        Backup::NotApplicable => Backup::NotApplicable,
+        Backup::NotExcluded(reason) => Backup::NotExcluded(reason),
+        Backup::Excluded => tmutil.state(pool),
     }
 }
 
@@ -1315,28 +1382,7 @@ pub fn backup_state(pool: &Path) -> Backup {
     if !cfg!(target_os = "macos") {
         return Backup::NotApplicable;
     }
-    let mut command = std::process::Command::new("/usr/bin/tmutil");
-    command
-        .arg("isexcluded")
-        .arg(pool)
-        .stdin(std::process::Stdio::null());
-    let checked =
-        crate::handoff_trace::phase("backup-isexcluded", || crate::budget::output(&mut command));
-    match checked {
-        Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout);
-            if text.trim_start().starts_with("[Excluded]") {
-                Backup::Excluded
-            } else {
-                Backup::NotExcluded(format!("tmutil isexcluded: {}", text.trim()))
-            }
-        }
-        Ok(output) => Backup::NotExcluded(format!(
-            "tmutil isexcluded failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
-        Err(error) => Backup::NotExcluded(format!("cannot run tmutil: {error}")),
-    }
+    Tmutil::host().state(pool)
 }
 
 /// Cheap check before a build: the sticky exclusion is the
@@ -2343,6 +2389,56 @@ mod tests {
         .expect("config");
         assert_eq!(inspect(&budget), Found::Directory);
         assert_eq!(inspect(&scratch.0), Found::Unknown);
+    }
+
+    #[test]
+    fn an_already_excluded_pool_never_pays_for_addexclusion() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("backup-skip");
+        let invocations = scratch.0.join("invocations");
+        let excluded_marker = scratch.0.join("excluded");
+        let program = scratch.0.join("tmutil");
+        // A fake tmutil: `addexclusion` creates the marker, and `isexcluded`
+        // reports the marker's presence. Every invocation is recorded, so the
+        // test can assert `addexclusion` was never run.
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\necho \"$1\" >> '{log}'\n\
+                 case \"$1\" in\n\
+                 addexclusion) : > '{marker}'; exit 0;;\n\
+                 isexcluded) if [ -e '{marker}' ]; then echo \"[Excluded]  $2\"; else echo \"[Included]  $2\"; fi; exit 0;;\n\
+                 *) exit 2;;\n\
+                 esac\n",
+                log = invocations.display(),
+                marker = excluded_marker.display()
+            ),
+        )
+        .expect("fake tmutil");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).expect("mode");
+        let tmutil = Tmutil { program };
+        let pool = scratch.0.join("pool");
+        fs::create_dir(&pool).expect("pool");
+
+        // Inherited exclusion already holds: one cheap check, no add.
+        fs::write(&excluded_marker, []).expect("marker");
+        assert_eq!(exclude_with(&tmutil, &pool), Backup::Excluded);
+        assert_eq!(
+            fs::read_to_string(&invocations).expect("log"),
+            "isexcluded\n"
+        );
+
+        // A genuinely included root pays for the add, then verifies it.
+        fs::remove_file(&excluded_marker).expect("marker");
+        fs::write(&invocations, []).expect("log");
+        assert_eq!(exclude_with(&tmutil, &pool), Backup::Excluded);
+        assert_eq!(
+            fs::read_to_string(&invocations).expect("log"),
+            "isexcluded\naddexclusion\nisexcluded\n"
+        );
     }
 
     #[test]

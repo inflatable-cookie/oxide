@@ -560,43 +560,6 @@ pub struct PoolStatus {
     pub payload_accounting: AccountingScan,
     pub full: Option<bool>,
     pub slots: Vec<SlotStatus>,
-    /// Slot trees already moved into the payload's private holding area and
-    /// pending deletion outside the pool lock (oxide#190). They are charged
-    /// their recorded bytes and are neither idle nor held slots; a measured
-    /// status still catches an unrecorded holding entry in its payload walk.
-    #[serde(default)]
-    pub holding: Vec<HoldingEntry>,
-}
-
-/// One slot tree already renamed into the payload's private holding area and
-/// One pass's result over a pool's holding area. This engine has no holding
-/// area: Barge evicts and deletes its own roots, so a pass claims nothing.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct HoldingDrain {
-    pub claimed: Option<String>,
-    pub gone: bool,
-    pub entries: u64,
-    pub bytes: u64,
-    pub refused: Vec<String>,
-}
-
-/// One slot tree already renamed into the payload's private holding area and
-/// pending deletion outside the pool lock (oxide#190). It is a recorded fact,
-/// not a claim that the tree is still there or that a deleter is running.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HoldingEntry {
-    pub slot_id: String,
-    pub incarnation: String,
-    /// The entry name below the payload's holding area.
-    pub name: String,
-    /// The closed observation's unique bytes, charged until the tree is gone.
-    pub recorded_bytes: u64,
-    /// When the entry was recorded (unix ms).
-    pub at_ms: u64,
-    /// Whether the holding directory was present when this view read the
-    /// area. `None` is "not probed" (a lock-free snapshot never probes).
-    pub present: Option<bool>,
 }
 
 /// Ledger membership of an opened pool, for callers that need no sizes.
@@ -611,8 +574,6 @@ pub struct LedgerView {
     /// A recorded deletion could not complete at this open.
     pub reconciliation_blocked: bool,
     pub slots: Vec<LedgerSlot>,
-    /// Held trees pending deletion outside the pool lock (oxide#190).
-    pub holding: Vec<HoldingEntry>,
 }
 
 /// A pool's recorded identity, ledger membership and recorded payload root,
@@ -646,9 +607,6 @@ pub struct PassiveSnapshot {
     /// Slots with no current record: they make `recorded_total` a stated
     /// lower bound and are walked by the next admission that needs them.
     pub unrecorded_slots: usize,
-    /// Held trees pending deletion outside the pool lock (oxide#190). They are
-    /// charged their recorded bytes and are never slots.
-    pub holding: Vec<HoldingEntry>,
 }
 
 /// The volume a removable pool's config records. Recorded facts only.
@@ -767,12 +725,6 @@ pub struct Leased {
     /// Their charge is not reported: only the incomplete outcome is, so a
     /// caller can record it as the oxide#128 diagnostic fact.
     pub unmeasured: Vec<UnmeasuredSlot>,
-    /// The holding entries **this** admission created, in the order it created
-    /// them (oxide#190). A capacity or project-cap admission may evict more than
-    /// one idle slot, so the list is bounded and may hold several names. The
-    /// command that made them publishes exactly these, outside the pool lock, so
-    /// its own deletion is identified rather than guessed from a rotation.
-    pub holding: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

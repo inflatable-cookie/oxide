@@ -1093,7 +1093,13 @@ def main():
     mode.add_argument("--canary", action="store_true", help="run the staged binary on the live pool")
     parser.add_argument("--check", action="store_true", help="preflight only; build nothing")
     parser.add_argument("--require-canary", action="store_true", help="require a same-pin PASS from the last hour")
-    parser.add_argument("--new-seconds", type=positive_seconds, help="canary new-slot limit (default: 10)")
+    # The reported admission ends when the child starts, and an idle slot's Barge
+    # trash deletion runs beside the writer with the pool and admission locks
+    # released (oxide#324). A live pool at the 256-slot ceiling therefore no longer
+    # charges its post-rename deletion to this figure, so the default stays tight.
+    parser.add_argument("--new-seconds", type=positive_seconds,
+                        help="canary new-slot limit (default: 10); a ceiling eviction's "
+                             "post-rename trash deletion is not counted")
     parser.add_argument("--warm-seconds", type=positive_seconds, help="canary warm-reuse limit (default: 5)")
     parser.add_argument("--scratch-root", type=Path,
                         help="existing scratch directory: a fresh scratch pool with no live-version check; "
