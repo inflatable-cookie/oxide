@@ -58,29 +58,6 @@ after recipient writes, failure cannot publish a trusted origin.
 
 ## Capacity and eviction
 
-### Proposed admission observations (oxide#317)
-
-Time each admission lock hold from successful acquisition through release,
-including refusals and front-door preparation. Keep a fixed recent history in
-private pool control state. Publish it after releasing the pool lock and let
-status read it passively. The build summary reports a hold over two seconds
-or more than one root visited, with the cost attributed to adoption, eviction,
-accounting or reserve. A refusal can report its own cost without a build.
-
-A root visit is a payload traversal or a root returned by an explicit Barge
-inventory. Count one eviction's measurement and deletion as one root visit.
-Barge's internal marker scans during lookup and adoption have no public root
-counter. Their elapsed time is included in the phase. Keep that distinction
-visible in the diagnostic and in the counting regression.
-
-At the slot ceiling, try the ranked candidate through Barge. After a hold or
-pin refusal, a bytes-free listing can identify other protected candidates
-without repeatedly resolving them for eviction. Barge still checks the hold,
-pin and marker before each eviction. Report held and pinned counts (which can
-overlap), other unavailable rows, and pin reasons when no slot can be freed.
-Status reads this pool's recorded pin paths for a current reason tally without
-listing roots. Pin reads are diagnostic and an unreadable reason is unknown.
-
 Budgets remain soft admission figures. New-slot admission uses recorded
 logical bytes against the pool budget. Both new-slot and warm admission read
 removable free space against Barge's reserve and floor. Below reserve, they can
@@ -92,6 +69,32 @@ Eviction takes an exclusive nonblocking hold and rechecks the durable pin
 under the area lock before renaming into Barge trash. Deletion requires the
 matching marker, follows no symlink and crosses no mount. Oxide has no
 per-entry deletion journal, holding-area deleter or descriptor census.
+
+### Admission observations (oxide#317)
+
+Oxide times each admission lock hold from acquisition through release,
+including front-door preparation and refused attempts. A private sidecar keeps
+the last 32 observations. The writer publishes after dropping the pool lock.
+The build summary reports a hold over two seconds or more than one observed
+root walk or listing. It names the phases that did the work. Default status
+reads recent per-pool maxima from the sidecar without taking the pool lock.
+
+A payload walk visits one root. A Barge eviction's size measurement and
+deletion together count as one walk. Explicit inventories report their root
+entries separately. Barge also enumerates markers internally to resolve,
+hold, evict and adopt. The pinned API does not return that count. An
+observation with these calls marks the root total unavailable and still
+records their phase time. The 256-slot regression checks both the observable
+payload counts and the unavailable totals. Above reserve, the reserve check
+enumerates no roots.
+
+At the slot ceiling, Oxide first tries the oldest candidate through Barge. If
+it is protected, one bytes-free inventory identifies other held or pinned
+candidates before Oxide tries the remaining roots. A refusal reports held and
+pinned counts (which can overlap), other unavailable rows, pending legacy
+adoption and pin reasons. Default status reads bound pin records at the
+ledger's known paths without enumerating directories or reading payloads.
+Pin reasons are diagnostic. Unreadable records are reported as unknown.
 
 ### Normal warm reuse (oxide#280)
 

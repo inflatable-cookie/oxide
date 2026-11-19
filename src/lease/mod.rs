@@ -10,6 +10,7 @@
 //! pool recording that backend refuses to open. Owning contract:
 //! `docs/knowledge/contracts/workflow.md`.
 
+pub mod admission_cost;
 mod backing;
 #[cfg(test)]
 mod tests;
@@ -248,6 +249,8 @@ pub enum LeaseError {
     NotFound,
     BackingMismatch,
     LedgerExhausted,
+    SlotCeiling(String),
+    EvictionIncomplete(String),
     Unsupported(&'static str),
     Io(String),
 }
@@ -285,7 +288,9 @@ impl LeaseError {
             | Self::AccountingIncomplete(..)
             | Self::CapacityCharged { .. }
             | Self::OneUseBudget { .. }
-            | Self::LedgerExhausted => 3,
+            | Self::LedgerExhausted
+            | Self::SlotCeiling(_)
+            | Self::EvictionIncomplete(_) => 3,
             Self::UnsafePath(_) | Self::BackingMismatch => 4,
             Self::NotFound => 5,
         }
@@ -299,14 +304,15 @@ impl LeaseError {
             Self::Full => "full",
             Self::UnknownAccounting
             | Self::UnexpectedEntry { .. }
-            | Self::AccountingIncomplete(..) => "unknown_accounting",
+            | Self::AccountingIncomplete(..)
+            | Self::EvictionIncomplete(_) => "unknown_accounting",
             Self::CapacityCharged { .. } => "full",
             Self::OneUseBudget { .. } => "one_use_budget",
             Self::UnsafePath(_) => "unsafe_path",
             Self::HolderConflict => "holder_conflict",
             Self::NotFound => "not_found",
             Self::BackingMismatch => "backing_mismatch",
-            Self::LedgerExhausted => "ledger_exhausted",
+            Self::LedgerExhausted | Self::SlotCeiling(_) => "ledger_exhausted",
             Self::Unsupported(_) => "unsupported",
             Self::Io(_) => "io",
         }
@@ -385,7 +391,7 @@ impl std::fmt::Display for LeaseError {
                 formatter.write_str("finite ledger or slot count is exhausted")
             }
             Self::Unsupported(message) => formatter.write_str(message),
-            Self::Io(message) => write!(formatter, "{message}"),
+            Self::Io(message) | Self::SlotCeiling(message) | Self::EvictionIncomplete(message) => formatter.write_str(message),
         }
     }
 }

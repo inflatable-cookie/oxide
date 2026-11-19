@@ -647,7 +647,9 @@ fn an_unfinished_legacy_transition_preserves_existing_barge_pins() {
 }
 
 #[test]
-fn a_pool_at_its_slot_ceiling_evicts_the_oldest_adopted_idle_row() {
+fn admission_cost_and_protection_at_the_256_slot_ceiling() {
+    use super::admission_cost;
+    use std::io::Write;
     let fixture = Fixture::new("legacy-ceiling");
     let pool = fixture.pool();
     let project = fixture.dir("project");
@@ -671,7 +673,9 @@ fn a_pool_at_its_slot_ceiling_evicts_the_oldest_adopted_idle_row() {
                     "entries": 1,
                     "at_ms": 1,
                 });
-                slot_dir(&pool, &id.to_string());
+                let root = slot_dir(&pool, &id.to_string());
+                fs::create_dir(root.join("build")).unwrap();
+                fs::write(root.join("build/artifact"), b"tiny").unwrap();
                 row
             })
             .collect();
@@ -680,18 +684,109 @@ fn a_pool_at_its_slot_ceiling_evicts_the_oldest_adopted_idle_row() {
         ledger["next_slot"] = (count + 1).into();
         ledger["next_rank"] = (count + 1).into();
     });
-    let (prepared, walks) = count_pool_walks(|| managed::prepare_pool(&pool));
-    assert_eq!(prepared.unwrap().slots.len(), super::MAX_SLOTS);
-    assert_eq!(walks.len(), super::MAX_SLOTS);
-    assert!(walks.iter().all(|walk| matches!(walk, PoolWalk::Adopt(_))));
+    let mut max_prepare_us = 0;
+    let mut migrated = 0;
+    while migrated < super::MAX_SLOTS {
+        let (prepared, walks) = count_pool_walks(|| managed::prepare_pool(&pool));
+        assert_eq!(prepared.unwrap().slots.len(), super::MAX_SLOTS);
+        assert_eq!(walks.len(), 8);
+        assert!(walks.iter().all(|walk| matches!(walk, PoolWalk::Adopt(_))));
+        let (micros, walked, listed, opaque) = admission_cost::latest(&pool);
+        assert_eq!((walked, listed, opaque), (0, 0, true));
+        max_prepare_us = max_prepare_us.max(micros);
+        migrated += walks.len();
+    }
+    assert_eq!(count_pool_walks(|| managed::prepare_pool(&pool)).1, []);
+    assert_eq!(
+        managed::pinned_roots(&pool).unwrap(),
+        "pinned roots by reason: none"
+    );
+
+    let (warm, walks) =
+        count_pool_walks(|| managed::lease(request(&pool, &project, &workspace, "warm")));
+    let warm = warm.unwrap();
+    assert!(warm.grant.reused_slot);
+    assert!(walks.is_empty(), "warm admission does not walk the payload");
+    let (warm_us, walked, listed, opaque) = admission_cost::latest(&pool);
+    assert_eq!(
+        (walked, listed, opaque),
+        (0, 0, true),
+        "Barge hold resolves by enumerating markers"
+    );
+    managed::release(&pool, &warm.grant.lease_id).unwrap();
+    drop(warm);
+
+    let (reserve, walks) = count_pool_walks(|| {
+        super::pool::check_ample_reserve(&pool, &fixture.dir("reserve-account"))
+    });
+    reserve.unwrap();
+    assert!(walks.is_empty());
+    let (reserve_us, walked, listed, opaque) = admission_cost::latest(&pool);
+    assert_eq!((walked, listed, opaque), (0, 0, false));
 
     let other = fixture.dir("other");
     let (admitted, walks) =
         count_pool_walks(|| managed::lease(request(&pool, &other, &workspace, "new")));
-    assert_eq!(admitted.unwrap().grant.slot_id, (count + 1).to_string());
+    let admitted = admitted.unwrap();
+    assert_eq!(admitted.grant.slot_id, (count + 1).to_string());
     assert!(matches!(walks.as_slice(), [PoolWalk::Evict(_)]));
+    let (eviction_us, walked, listed, opaque) = admission_cost::latest(&pool);
+    assert_eq!(
+        (walked, listed, opaque),
+        (1, 0, true),
+        "Barge eviction also enumerates markers"
+    );
     assert!(!pool.join("payload/slots").join(count.to_string()).exists());
     assert!(pool.join("payload/slots/1").is_dir());
+
+    let storage = fixture_storage(&pool);
+    let roots = storage.area().list_without_bytes().unwrap().roots;
+    for (index, root) in roots.iter().filter(|root| !root.held).enumerate() {
+        let reason = if index < 100 {
+            "keep build"
+        } else {
+            "keep evidence"
+        };
+        storage.pin_in(None, &root.id, reason).unwrap();
+    }
+
+    let (refused, walks) = count_pool_walks(|| {
+        managed::lease(request(&pool, &fixture.dir("third"), &workspace, "refused"))
+    });
+    let error = refused.err().expect("ceiling refusal");
+    assert_eq!(error.reason(), "ledger_exhausted");
+    let diagnosis = error.to_string();
+    assert!(
+        diagnosis.contains("1 held, 255 pinned, 0 other unavailable"),
+        "{diagnosis}"
+    );
+    assert!(
+        diagnosis.contains(r#"100 "keep build", 155 "keep evidence""#),
+        "{diagnosis}"
+    );
+    assert_eq!(walks, [PoolWalk::Inventory]);
+    let (refused_us, walked, listed, opaque) = admission_cost::latest(&pool);
+    assert_eq!((walked, listed, opaque), (0, 256, true));
+
+    let ((), walks) = count_pool_walks(|| {
+        assert_eq!(managed::status(&pool).unwrap().slots.len(), 256);
+        assert_eq!(
+            managed::pinned_roots(&pool).unwrap(),
+            r#"pinned roots by reason: 100 "keep build", 155 "keep evidence""#
+        );
+        let history = admission_cost::recorded(&pool).unwrap().unwrap();
+        assert!(history.contains("256 explicitly listed"), "{history}");
+        assert!(history.contains("total unavailable"), "{history}");
+    });
+    assert!(walks.is_empty(), "default status walks and lists no roots");
+    let durations = [max_prepare_us, warm_us, reserve_us, eviction_us, refused_us];
+    assert!(
+        durations.into_iter().all(|micros| micros < 10_000_000),
+        "{durations:?}"
+    );
+    writeln!(std::io::stderr().lock(),
+        "256 slots, lock µs and root counts: adoption max {max_prepare_us} (8 rows per batch, 0 walks, marker total unavailable), warm {warm_us} (0 walks, marker total unavailable), reserve {reserve_us} (0 roots), eviction {eviction_us} (1 walk, marker total unavailable), refusal {refused_us} (0 walks, 256 explicitly listed, marker total unavailable), status 0 roots"
+    ).unwrap();
 }
 
 #[test]

@@ -4498,7 +4498,7 @@ impl Store {
                     // Wait only for a specific held compatible slot of this
                     // checkout. Nothing promises that an unrelated build's
                     // completion frees a count or byte ceiling.
-                    LeaseError::Full | LeaseError::LedgerExhausted if busy => {
+                    LeaseError::Full | LeaseError::LedgerExhausted | LeaseError::SlotCeiling(_) if busy => {
                         Ok(Err(Wait::Capacity))
                     }
                     // A full one-use slice waits only for a holder that can

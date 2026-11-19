@@ -1,5 +1,6 @@
 //! Exclusive pool: short-lived flock, durable JSON ledger, idle-only eviction.
 
+use super::admission_cost::{self, Phase, PoolLock};
 use super::backing::BackingPaths;
 use super::slice::{AdmissionClass, OneUseSlice, RestoreOutcome, SliceReport, VictimPolicy};
 use super::{
@@ -29,6 +30,7 @@ use std::time::{Duration, Instant};
 /// Where a refused entry sits, for [`LeaseError::UnexpectedEntry`].
 const POOL_PLACE: &str = "pool directory";
 const PAYLOAD_PLACE: &str = "payload directory";
+const LEGACY_ADOPTION_BATCH: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct LeaseRequest {
@@ -381,6 +383,7 @@ fn slot_tree_bytes(path: &Path, deadline: Instant) -> Option<(u64, u64)> {
     if !root.is_dir() || !parent.is_dir() || parent.dev() != root.dev() {
         return None;
     }
+    admission_cost::walked(1);
     let device = root.dev();
     let mut directories = vec![path.to_path_buf()];
     let mut total = 0_u64;
@@ -693,7 +696,7 @@ impl Payload {
 pub(super) struct Pool {
     /// The exclusive pool lock, held for the life of a mutating open. A
     /// passive measurement holds none.
-    _lock: Option<File>,
+    _lock: Option<PoolLock>,
     root: PathBuf,
     config: PoolConfig,
     backing: Payload,
@@ -725,6 +728,7 @@ pub mod managed {
         LEDGER_NAME, MAX_SLOTS, PAYLOAD_NAME, SLOTS_NAME, VOLUME_BACKEND_APFS_V1,
     };
     use super::LeaseRequest;
+    use super::{describe_pins, Phase};
     use super::{
         lock_pool, measure_within as measure_walks, open_budget_payload, prepare_new_pool,
         random_hex, read_config, read_consistent_pair, read_ledger, recorded_volume,
@@ -1001,7 +1005,7 @@ pub mod managed {
 
     /// [`lease`], with this admission's accounting notes.
     pub fn lease_measured(request: LeaseRequest) -> Result<Leased, LeaseError> {
-        Pool::open(&request.pool)?.lease(&request)
+        Pool::open_observed(&request.pool, Phase::Accounting)?.lease(&request)
     }
 
     pub fn release(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
@@ -1021,10 +1025,42 @@ pub mod managed {
         .accounted(false)
     }
 
+    /// Pin reasons for known slot paths, without a lock or root inventory.
+    pub fn pinned_roots(pool: &Path) -> Result<String, LeaseError> {
+        let opened = Pool::open_passive(
+            pool,
+            std::time::Instant::now() + Duration::from_millis(ACCOUNTING_MAX_ELAPSED_MS),
+        )?;
+        let mut reasons = std::collections::BTreeMap::new();
+        let mut unreadable = 0;
+        for slot in &opened.ledger.slots {
+            let Some(id) = slot.root.as_deref().filter(|_| slot.owned) else {
+                continue;
+            };
+            match crate::storage::slot_pin_reason(
+                &opened.slot_path(slot.id)?,
+                slot.area_folder(),
+                id,
+            ) {
+                Ok(Some(reason)) => *reasons.entry(reason).or_insert(0) += 1,
+                Ok(None) => {}
+                Err(()) => unreadable += 1,
+            }
+        }
+        let mut line = format!(
+            "pinned roots by reason: {}",
+            describe_pins(&reasons, usize::MAX)
+        );
+        if unreadable != 0 {
+            line.push_str(&format!(" ({unreadable} unreadable)"));
+        }
+        Ok(line)
+    }
+
     /// Prepare a pool at the front door before leasing. Only pending legacy
     /// rows enter the one-time adoption transition.
     pub fn prepare_pool(pool: &Path) -> Result<LedgerView, LeaseError> {
-        let mut pool = Pool::open(pool)?;
+        let mut pool = Pool::open_observed(pool, Phase::Adoption)?;
         pool.adopt_legacy_roots()?;
         pool.ledger_view()
     }
@@ -1032,7 +1068,7 @@ pub mod managed {
     /// Ledger membership without accounting walks; it takes the pool lock
     /// and reconciles recorded evictions before returning.
     pub fn ledger_view(pool: &Path) -> Result<LedgerView, LeaseError> {
-        Pool::open(pool)?.ledger_view()
+        Pool::open_observed(pool, Phase::Accounting)?.ledger_view()
     }
 
     /// Recorded identity and ledger membership of a pool, read with no lock,
@@ -1227,16 +1263,47 @@ pub(super) fn tamper_idle_generations_injected(pool: &Path) -> Result<(), LeaseE
     write_ledger(pool, &ledger)
 }
 
+fn require_deleted(evicted: barge::area::Eviction) -> Result<(), LeaseError> {
+    if evicted.deleted {
+        Ok(())
+    } else {
+        Err(LeaseError::EvictionIncomplete(format!(
+            "slot root {} moved to trash and could not be deleted: {}",
+            evicted.id,
+            evicted.kept_reason.as_deref().unwrap_or("reason unknown")
+        )))
+    }
+}
+
+fn describe_pins(pins: &BTreeMap<String, usize>, limit: usize) -> String {
+    if pins.is_empty() {
+        return "none".to_owned();
+    }
+    let mut reasons: Vec<_> = pins
+        .iter()
+        .take(limit)
+        .map(|(reason, count)| format!("{count} \"{reason}\""))
+        .collect();
+    if pins.len() > limit {
+        reasons.push(format!("{} more reasons", pins.len() - limit));
+    }
+    reasons.join(", ")
+}
+
 impl Pool {
     /// Open a budget-only directory or removable-volume pool. Any other
     /// recorded backend, including the retired `apfs-sparse-image-v1`,
     /// refuses before anything under the pool is touched.
     pub(super) fn open(root: &Path) -> Result<Self, LeaseError> {
-        Self::open_inner(root, false, None, true)
+        Self::open_inner(root, false, None, true, None)
+    }
+
+    fn open_observed(root: &Path, phase: Phase) -> Result<Self, LeaseError> {
+        Self::open_inner(root, false, None, true, Some(phase))
     }
 
     fn open_for_release(root: &Path, lease_id: Option<&str>) -> Result<Self, LeaseError> {
-        Self::open_inner(root, true, lease_id, true)
+        Self::open_inner(root, true, lease_id, true, None)
     }
 
     /// The held eviction's locked open (oxide#196): the pool lock is taken, but
@@ -1245,7 +1312,7 @@ impl Pool {
     /// failure therefore leaves the pool bytes and identity unchanged. A pool
     /// with pending recorded reconciliation refuses in the caller.
     fn open_held_eviction(root: &Path) -> Result<Self, LeaseError> {
-        Self::open_inner(root, false, None, false)
+        Self::open_inner(root, false, None, false, None)
     }
 
     fn open_inner(
@@ -1253,6 +1320,7 @@ impl Pool {
         trace_release: bool,
         releasing: Option<&str>,
         fence_control: bool,
+        observed_phase: Option<Phase>,
     ) -> Result<Self, LeaseError> {
         let root = canonical_existing_dir(root, true)?;
         refuse_foreign_pool_entries(&root)?;
@@ -1262,6 +1330,7 @@ impl Pool {
         } else {
             lock_pool(&root)?
         };
+        let lock = PoolLock::new(lock, &root, observed_phase);
         // Fence first (oxide#177, ruling 4c9984a1): a managed pool's control
         // state reaches the current fence version before this open can start a
         // recovery journal or finish a recorded deletion. A library fixture
@@ -1304,9 +1373,13 @@ impl Pool {
             ledger,
             admission_note: None,
         };
-        pool.recover_abandoned_holds(releasing)?;
-        pool.retire_missing_idle_roots()?;
-        pool.sweep_trash()?;
+        admission_cost::in_phase(Phase::Accounting, || {
+            pool.recover_abandoned_holds(releasing)
+        })?;
+        admission_cost::in_phase(Phase::Eviction, || {
+            pool.retire_missing_idle_roots()?;
+            pool.sweep_trash()
+        })?;
         Ok(pool)
     }
 
@@ -1478,6 +1551,7 @@ impl Pool {
                 .and_then(|dir| dir.split_once('/'))
                 .map(|(folder, _)| folder.to_owned());
             if let Ok(Some(hold)) = storage.try_hold_in(project.as_deref(), &root) {
+                admission_cost::walked(1);
                 drop(hold);
                 slot.state = SlotPersistState::Idle;
                 slot.lease_id = None;
@@ -1493,12 +1567,13 @@ impl Pool {
         Ok(())
     }
 
-    /// Finish adoption on the front door's preparation path. A recorded
-    /// root is never sent back through Barge's recursive adoption check.
+    /// Advance a fixed batch on the front door's preparation path. Each
+    /// finished row is durable before the next row is attempted.
     fn adopt_legacy_roots(&mut self) -> Result<(), LeaseError> {
         let Some(storage) = self.storage.clone() else {
             return Ok(());
         };
+        let mut remaining = LEGACY_ADOPTION_BATCH;
         for index in 0..self.ledger.slots.len() {
             let slot = &self.ledger.slots[index];
             if slot.owned
@@ -1508,6 +1583,10 @@ impl Pool {
             {
                 continue;
             }
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
             let path = self.slot_path(slot.id)?;
             let folder = slot.dir.clone().unwrap_or_else(|| slot.id.to_string());
             let leaf = folder
@@ -1519,6 +1598,7 @@ impl Pool {
             let area = storage
                 .area_for(slot.area_folder())
                 .map_err(|_| LeaseError::UnknownAccounting)?;
+            admission_cost::opaque_listing();
             let adopted = match area.resolve(&id) {
                 // The pinned Barge API can unpin by ID but cannot compare
                 // pin provenance under its lock. Keep any existing pin.
@@ -1562,7 +1642,7 @@ impl Pool {
             }
             // Publish each transition before visiting another root. If the
             // write failed after adoption, the next preparation resolves the
-            // deterministic id above without another recursive adoption.
+            // deterministic id above without another adoption.
             self.persist()?;
         }
         Ok(())
@@ -1634,8 +1714,7 @@ impl Pool {
             self.budget = budget;
         }
         if let (Some(storage), Some(reserve)) = (self.storage.as_ref(), request.reserve_bytes) {
-            storage
-                .set_reserve(reserve)
+            admission_cost::in_phase(Phase::Reserve, || storage.set_reserve(reserve))
                 .map_err(|_| LeaseError::UnknownAccounting)?;
         }
         let project = canonical_existing_dir(&request.project, false)?;
@@ -1671,7 +1750,9 @@ impl Pool {
             .as_ref()
             .is_some_and(crate::storage::PoolStorage::is_removable)
         {
-            self.evict_for_reserve(candidate.map(|(id, _)| id))?;
+            admission_cost::in_phase(Phase::Reserve, || {
+                self.evict_for_reserve(candidate.map(|(id, _)| id))
+            })?;
         }
         // One-use workspaces are dormant; their bounded slice report is still
         // returned so a caller sees the outcome it supplied.
@@ -1779,8 +1860,8 @@ impl Pool {
             self.retire_idle_slot(victim)?;
         }
         // Retire count victims before measuring any unrecorded survivors.
-        if self.ledger.slots.len() >= MAX_SLOTS && !self.evict_one_idle_with(|_| true)? {
-            return Err(LeaseError::LedgerExhausted);
+        if self.ledger.slots.len() >= MAX_SLOTS {
+            admission_cost::in_phase(Phase::Eviction, || self.make_slot_room())?;
         }
         let (charges, unmeasured) = self.admission_charges()?;
         while self
@@ -1791,7 +1872,7 @@ impl Pool {
             .fold(0, u64::saturating_add)
             >= self.budget
         {
-            if !self.evict_one_idle_with(|id| {
+            if !self.evict_one_idle_with(Phase::Eviction, |id| {
                 !unmeasured.iter().any(|slot| slot.slot_id == id.to_string())
             })? {
                 return Err(LeaseError::Full);
@@ -1826,7 +1907,7 @@ impl Pool {
                         .map_err(|_| LeaseError::UnknownAccounting)?,
                 );
                 root_id = Some(root.id.clone());
-                Some(root.folder_name())
+                Some(root.folder)
             }
             None => {
                 let dir = match &request.layout {
@@ -2053,6 +2134,14 @@ impl Pool {
     /// held or pinned one) and the ledger row is dropped. Nothing is moved
     /// outside Barge and no journal is written.
     fn retire_idle_slot(&mut self, id: u64) -> Result<(), LeaseError> {
+        self.retire_idle_slot_in_phase(id, Phase::Eviction)
+    }
+
+    fn retire_idle_slot_in_phase(&mut self, id: u64, phase: Phase) -> Result<(), LeaseError> {
+        admission_cost::in_phase(phase, || self.retire_idle_slot_inner(id))
+    }
+
+    fn retire_idle_slot_inner(&mut self, id: u64) -> Result<(), LeaseError> {
         let Some(slot) = self.slot(id) else {
             return Err(LeaseError::Busy);
         };
@@ -2061,17 +2150,24 @@ impl Pool {
         }
         let root = slot.root.as_deref().ok_or(LeaseError::UnknownAccounting)?;
         let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
-        storage
+        let evicted = storage
             .evict_in(slot.area_folder(), root)
             .map_err(|error| {
-                if error.contains("held") || error.contains("pinned") {
+                let message = error.message();
+                if error.kind() == barge::ErrorKind::Refused
+                    && (message.ends_with("is held; refusing to evict it")
+                        || message.ends_with("is pinned; refusing to evict it"))
+                {
                     LeaseError::Busy
                 } else {
-                    LeaseError::UnknownAccounting
+                    LeaseError::EvictionIncomplete(format!(
+                        "cannot evict slot root {root}: {error}"
+                    ))
                 }
             })?;
         self.ledger.slots.retain(|slot| slot.id != id);
-        self.persist_revised()
+        self.persist_revised()?;
+        require_deleted(evicted)
     }
 
     /// Retire one idle slot named by its numeric id.
@@ -2122,11 +2218,13 @@ impl Pool {
             .storage
             .as_ref()
             .ok_or(pre(LeaseError::UnknownAccounting))?;
-        storage
+        let evicted = storage
             .evict_in(project.as_deref(), &root)
-            .map_err(|_| pre(LeaseError::UnknownAccounting))?;
+            .map_err(|error| pre(LeaseError::EvictionIncomplete(error.to_string())))?;
         self.ledger.slots.retain(|slot| slot.id != id);
         self.persist_revised().map_err(pre)?;
+        require_deleted(evicted)
+            .map_err(|error| HeldEvictionFailure::PostCommit(error.to_string()))?;
         Ok(Vec::new())
     }
 
@@ -2143,7 +2241,7 @@ impl Pool {
         // Keep the compatible root the admission is about to claim. Reread
         // actual free space after every completed eviction.
         while space.free_bytes < space.reserve_bytes
-            && self.evict_one_idle_with(|id| Some(id) != reuse)?
+            && self.evict_one_idle_with(Phase::Reserve, |id| Some(id) != reuse)?
         {
             space = self.volume_space()?;
         }
@@ -2153,9 +2251,95 @@ impl Pool {
         Ok(())
     }
 
+    fn make_slot_room(&mut self) -> Result<(), LeaseError> {
+        let mut candidates = self.ranked_idle(|_| true).into_iter();
+        let first = candidates.next();
+        if let Some((_, id)) = first {
+            match self.retire_idle_slot_inner(id) {
+                Ok(()) => return Ok(()),
+                Err(LeaseError::Busy) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
+        let protection: BTreeMap<_, _> = storage
+            .list_protection()
+            .map_err(LeaseError::EvictionIncomplete)?
+            .into_iter()
+            .map(|info| (info.path.clone(), info))
+            .collect();
+        let mut held = 0;
+        let mut pinned = 0;
+        let mut unavailable = 0;
+        let mut pending = 0;
+        let mut pins = BTreeMap::new();
+        for slot in &self.ledger.slots {
+            let path = self.slot_path(slot.id)?;
+            let info = protection
+                .get(&path)
+                .filter(|info| slot.root.as_deref() == Some(&info.id));
+            let is_held =
+                slot.state == SlotPersistState::Held || info.is_some_and(|info| info.held);
+            let is_pinned = info.is_some_and(|info| info.pinned);
+            held += usize::from(is_held);
+            pinned += usize::from(is_pinned);
+            unavailable += usize::from(!is_held && !is_pinned);
+            pending += usize::from(
+                !slot.owned
+                    && !slot.adoption_refused
+                    && slot.is_idle()
+                    && legacy_writer_absent(&slot.holder),
+            );
+            if let Some(info) = info.filter(|info| info.pinned) {
+                let reason = crate::storage::slot_pin_reason(&path, slot.area_folder(), &info.id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "unknown".to_owned());
+                *pins.entry(reason).or_insert(0) += 1;
+            }
+        }
+
+        // A bytes-free listing is an observation. Actual eviction still
+        // revalidates the root identity, hold and pin through Barge.
+        for (_, id) in candidates {
+            let slot = self.slot(id).ok_or(LeaseError::UnknownAccounting)?;
+            if protection.get(&self.slot_path(id)?).is_some_and(|info| {
+                slot.root.as_deref() == Some(&info.id) && (info.held || info.pinned)
+            }) {
+                continue;
+            }
+            match self.retire_idle_slot_inner(id) {
+                Ok(()) => return Ok(()),
+                Err(LeaseError::Busy) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let reasons = describe_pins(&pins, 8);
+        Err(LeaseError::SlotCeiling(format!(
+            "{MAX_SLOTS}-slot ceiling: {held} held, {pinned} pinned, {unavailable} other unavailable ({pending} pending legacy adoption); pin reasons {reasons}"
+        )))
+    }
+
     /// Retire the oldest eligible slot. Barge checks the actual hold and pin
     /// of the named root, including a hold inherited by a child.
-    fn evict_one_idle_with(&mut self, eligible: impl Fn(u64) -> bool) -> Result<bool, LeaseError> {
+    fn evict_one_idle_with(
+        &mut self,
+        phase: Phase,
+        eligible: impl Fn(u64) -> bool,
+    ) -> Result<bool, LeaseError> {
+        let candidates = self.ranked_idle(eligible);
+        for (_, id) in candidates {
+            match self.retire_idle_slot_in_phase(id, phase) {
+                Ok(()) => return Ok(true),
+                Err(LeaseError::Busy) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    }
+
+    fn ranked_idle(&self, eligible: impl Fn(u64) -> bool) -> Vec<(u64, u64)> {
         let mut candidates: Vec<(u64, u64)> = self
             .ledger
             .slots
@@ -2164,14 +2348,7 @@ impl Pool {
             .map(|slot| (slot.rank, slot.id))
             .collect();
         candidates.sort_unstable();
-        for (_, id) in candidates {
-            match self.retire_idle_slot(id) {
-                Ok(()) => return Ok(true),
-                Err(LeaseError::Busy) => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(false)
+        candidates
     }
 
     /// Sample only slots lacking a current observation, once before pressure
@@ -3156,6 +3333,33 @@ pub(super) fn with_passive_open_delay<T>(
     }
     let _restore = Restore(PASSIVE_OPEN_DELAY.with(|slot| slot.replace(delay)));
     body()
+}
+
+#[cfg(test)]
+pub(super) fn check_ample_reserve(pool: &Path, account: &Path) -> Result<(), LeaseError> {
+    use crate::storage::{PoolBacking, PoolStorage, Storage};
+    use std::sync::Arc;
+    const UUID: &str = "01234567-89ab-cdef-0123-456789abcdef";
+    const RESERVE: u64 = 4 << 20;
+    let storage = Storage::open_with(
+        account.to_path_buf(),
+        Arc::new(barge::FakeOs::with_volume(
+            pool.to_path_buf(),
+            UUID,
+            RESERVE + 1,
+        )),
+        Arc::new(barge::ManualClock::new(1_000)),
+    )
+    .unwrap();
+    let mut opened = Pool::open_observed(pool, Phase::Reserve)?;
+    opened.storage = Some(
+        PoolStorage::from_storage(
+            storage,
+            &PoolBacking::volume(pool, UUID, "payload", 8 << 20, RESERVE, RESERVE / 2),
+        )
+        .unwrap(),
+    );
+    opened.evict_for_reserve(None)
 }
 
 #[cfg(test)]
