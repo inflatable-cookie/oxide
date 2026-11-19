@@ -60,13 +60,8 @@ A future requirement for descendant device uniformity before any Cargo write
 would need a different contract and an enforcement boundary that a finite root
 check cannot provide.
 
-## Class separation and reporting
+## Reporting
 
-- OneUse keeps its restore, membership, budget and complete target measurement.
-  Only the Normal candidate skips the walk. The common idle-to-held transition is
-  unchanged.
-- Normal new-slot restore, pressure, reserve floor, victim selection and deletion
-  are unchanged.
 - A Normal grant records no new observation. It performs no reporting walk and
   substitutes no stale ledger figure for its own measurement.
 - Recorded status observations keep their source, age and generation. They are
@@ -81,8 +76,6 @@ check cannot provide.
   row or incarnation refuses.
 - A held or incompatible generation, and any recovery uncertainty, refuses as it
   does today.
-- OneUse still restores and measures, and refuses the same incomplete or
-  over-budget cases.
 - Reserve refusal, watchdog stop and removal, group closure and release ordering
   remain effective.
 
