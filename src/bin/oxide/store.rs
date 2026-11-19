@@ -2152,6 +2152,24 @@ impl Store {
         self.budget(self.recorded_budget)
     }
 
+    /// The registered removable volume's free-space reserve, when this store is
+    /// the removable pool that registration describes.
+    ///
+    /// The registration lives in the **internal** control directory, which is
+    /// this removable store's owner control. Reading `control()` here found
+    /// nothing on a removable pool (its own control holds no registration) and
+    /// made an internal pool's fallback admission carry the removable volume's
+    /// reserve (oxide#337).
+    fn admission_reserve(&self) -> Option<u64> {
+        if self.backend != Backend::ApfsVolume {
+            return None;
+        }
+        crate::removable::read_registration(self.owner_control())
+            .ok()
+            .flatten()
+            .map(|registration| registration.reserve_bytes)
+    }
+
     /// The host-wide limit resolved for this command.
     pub fn max_active(&self) -> usize {
         self.max_active
@@ -2204,7 +2222,13 @@ impl Store {
             }
             let attempt = self.attempt(ticket.0, key, profile, max_active, admission, share, label);
             match attempt {
-                Err(error) => return Err(error),
+                // A failed attempt still ends this command's wait: the ticket
+                // must not outlive it, or every later command queues behind a
+                // dead ticket (oxide#337).
+                Err(error) => {
+                    self.remove_ticket(ticket.0)?;
+                    return Err(error);
+                }
                 Ok(Ok(lease)) => {
                     self.remove_ticket(ticket.0)?;
                     if crate::budget::admission_expired() {
@@ -4302,10 +4326,7 @@ impl Store {
             // The registered removable volume's free-space reserve, when this
             // pool is the removable one. It is a reserve/prune signal for an
             // unknown-size admission, never a pool-budget input.
-            reserve_bytes: crate::removable::registration(self)
-                .ok()
-                .flatten()
-                .map(|registration| registration.reserve_bytes),
+            reserve_bytes: self.admission_reserve(),
             layout: Some(SlotLayout {
                 folders,
                 same_repository,
@@ -4625,6 +4646,15 @@ impl Store {
                     if !flushed {
                         continue;
                     }
+                    // The reload is authoritative: it may have moved or dropped
+                    // records (a failed flush retires one), so the index taken
+                    // before it is not an identity. Re-locate this record by
+                    // ID instead of indexing with the stale position
+                    // (oxide#337).
+                    let Some(index) = state.records.iter().position(|entry| entry.id == record_id)
+                    else {
+                        continue;
+                    };
                     recover(&self.pool, &recovery.lease_id)
                         .map_err(|error| lease_error("cannot recover a settled slot", &error))?;
                     eprintln!(
@@ -4708,6 +4738,14 @@ impl Store {
             ));
         }
         let mut state = self.load()?;
+        // The pre-flush index is not an identity across the reload (the flush
+        // and its receipt write may have moved or dropped records), so
+        // re-locate this record by ID (oxide#337).
+        let index = state
+            .records
+            .iter()
+            .position(|record| record.id == record_id)
+            .ok_or_else(|| format!("slot {slot_id}'s record vanished while it was recovered"))?;
         recover(&self.pool, &recovery.lease_id)
             .map_err(|error| lease_error("cannot recover the slot", &error))?;
         state.records[index].pending_recovery = None;
@@ -5107,8 +5145,16 @@ fn create_pool(path: &Path, budget: u64) -> Result<(), String> {
     );
     match init_budget_pool(&pool, budget) {
         Ok(_) => Ok(()),
-        // Another command created it first.
-        Err(_) if pool.join("config.json").is_file() => Ok(()),
+        // Only the expected race is tolerated: another command created this
+        // pool first, which the library reports as its one fixed refusal. Any
+        // other error (a permissions failure, a payload in the way, a full
+        // disk) is the caller's to see, not a silent success merely because a
+        // `config.json` exists (oxide#337).
+        Err(LeaseError::InvalidInput("pool already initialized"))
+            if pool.join("config.json").is_file() =>
+        {
+            Ok(())
+        }
         Err(error) => Err(lease_error("could not create the pool", &error)),
     }
 }
@@ -6006,13 +6052,181 @@ thread_local! {
     static WRITER_UPDATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether this command saw a writer-update refusal, consumed by the read.
+///
+/// `main` asks exactly once, after the command ran, so a refusal is still
+/// reported with its own exit code. Taking the flag keeps it from poisoning
+/// every later command on this thread, which a plain read did after one
+/// `WriterUpdated` (oxide#337).
 pub(crate) fn writer_updated() -> bool {
-    WRITER_UPDATED.get()
+    WRITER_UPDATED.take()
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The registered removable volume's reserve belongs to that volume's pool
+    /// only. The registration lives in the internal control directory, which is
+    /// the removable store's owner control: reading the removable pool's own
+    /// control found nothing, and an internal fallback admission carried the
+    /// removable reserve (oxide#337).
+    #[test]
+    fn the_removable_reserve_applies_only_to_the_removable_store() {
+        const RESERVE: u64 = 40 * GIB;
+
+        let (root, internal, _key) = class_fixture("admission-reserve");
+        let control = internal.control().to_path_buf();
+        let registration = serde_json::json!({
+            "version": 2,
+            "mount_point": root.join("volume"),
+            "volume_uuid": "volume",
+            "container_uuid": "container",
+            "reserve_bytes": RESERVE,
+            "cap_bytes": 64 * GIB,
+            "quota_bytes": null,
+            "capacity_bytes": null,
+            "registered_ms": 1,
+            "mode": "permanent",
+        });
+        let path = control.join(crate::removable::REGISTRATION);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(&serde_json::to_vec(&registration).unwrap())
+            .unwrap();
+        drop(file);
+
+        assert!(
+            crate::removable::registration(&internal).unwrap().is_some(),
+            "the registration is recorded beside the internal pool"
+        );
+        assert_eq!(
+            internal.admission_reserve(),
+            None,
+            "an internal pool never carries the volume's reserve"
+        );
+
+        let removable_pool = root.join("removable-pool");
+        let removable_control = removable_pool.join(MANAGED_NAME);
+        fs::create_dir_all(&removable_control).unwrap();
+        fs::set_permissions(&removable_control, fs::Permissions::from_mode(0o700)).unwrap();
+        let removable = Store {
+            control: removable_pool.join(MANAGED_NAME),
+            pool: removable_pool.clone(),
+            backend: Backend::ApfsVolume,
+            payload: root.join("volume").join("oxide-pool"),
+            budget: None,
+            recorded_budget: 64 * GIB,
+            max_active: 8,
+            sibling: Some(Sibling {
+                control: control.clone(),
+                barrier: true,
+            }),
+        };
+        assert!(
+            crate::removable::registration(&removable)
+                .unwrap()
+                .is_none(),
+            "the removable pool's own control holds no registration"
+        );
+        assert_eq!(
+            removable.admission_reserve(),
+            Some(RESERVE),
+            "the removable pool reads the paired registration"
+        );
+    }
+
+    /// A failed attempt ends the wait: its ticket is removed instead of being
+    /// left for every later command to queue behind (oxide#337).
+    #[test]
+    fn a_failed_attempt_leaves_no_dead_wait_ticket() {
+        let (root, store, key) = class_fixture("dead-ticket");
+        // A removable store's barrier takes the paired internal admission
+        // first; a paired control with no admission lock refuses the attempt
+        // before any admission work runs.
+        let store = store.with_sibling(&root.join("paired-control"), true);
+        let mut waits = WaitAccounting::default();
+        let refused = store.acquire(
+            &key,
+            Profile::Quick,
+            WorkspaceAdmission::NORMAL,
+            false,
+            None,
+            &mut waits,
+        );
+        let error = match refused {
+            Err(error) => error,
+            Ok(_) => panic!("the paired control has no admission lock to take"),
+        };
+        assert!(
+            error.contains("paired-control"),
+            "the failure is the paired barrier, after the ticket existed: {error}"
+        );
+
+        let state = store.load().unwrap();
+        assert!(
+            state.tickets.is_empty(),
+            "the failed command's ticket outlived it: {:?}",
+            state.tickets
+        );
+        let waiters = store.control.join("waiters");
+        assert_eq!(
+            fs::read_dir(&waiters).unwrap().count(),
+            0,
+            "a dead ticket lock file stayed in {}",
+            waiters.display()
+        );
+    }
+
+    /// Pool creation tolerates exactly one failure: another command created the
+    /// pool first. Any other failure is reported, even when a `config.json`
+    /// exists (oxide#337).
+    #[test]
+    fn pool_creation_does_not_swallow_an_unexpected_failure() {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!("oxide-create-pool-{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        let pool = root.join("pool");
+        fs::create_dir_all(&pool).unwrap();
+        let config = pool.join("config.json");
+        fs::write(&config, b"not an oxide config").unwrap();
+
+        let refused = create_pool(&pool, 8 * GIB);
+        assert!(
+            refused.is_err(),
+            "an occupied pool directory is not a successful creation: {refused:?}"
+        );
+        assert!(
+            refused.unwrap_err().contains("could not create the pool"),
+            "the failure names the creation"
+        );
+        assert_eq!(fs::read(&config).unwrap(), b"not an oxide config");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `main` asks once, after the command ran. Consuming the flag keeps one
+    /// writer-update refusal from poisoning every later command on this thread
+    /// (oxide#337).
+    #[test]
+    fn a_writer_update_refusal_is_reported_once() {
+        assert!(!writer_updated(), "no refusal has been recorded yet");
+        let message = lease_error("could not lease", &LeaseError::WriterUpdated);
+        assert!(message.contains("could not lease"), "{message}");
+        assert!(writer_updated(), "the refusal is reported to main");
+        assert!(
+            !writer_updated(),
+            "the refusal must not persist into the next command"
+        );
+    }
 
     #[test]
     fn release_admission_notice_and_budget_are_bounded_and_truthful() {

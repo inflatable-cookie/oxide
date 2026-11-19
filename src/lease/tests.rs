@@ -749,6 +749,38 @@ fn update_ledger(pool: &Path, change: impl FnOnce(&mut serde_json::Value)) {
     fs::write(path, serde_json::to_vec(&ledger).unwrap()).unwrap();
 }
 
+/// Plant the durable hand-off record a crash leaves behind between the
+/// decision and its ledger save: it names a row the ledger still records.
+fn plant_handoff_record(pool: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let view = managed::ledger_view(pool).unwrap();
+    let slot = view.slots.first().expect("one recorded row");
+    let (area_folder, root) = fixture_storage(pool)
+        .all_roots()
+        .unwrap()
+        .pop()
+        .expect("the row's Barge root");
+    let document = serde_json::json!({
+        "version": 1,
+        "store_id": view.store_id,
+        "records": [{
+            "store_id": view.store_id,
+            "slot_id": slot.slot_id.parse::<u64>().unwrap(),
+            "incarnation": slot.incarnation.parse::<u64>().unwrap(),
+            "root_id": root.id,
+            "area_folder": area_folder,
+            "path": root.path,
+            "bytes": 0,
+            "bytes_approximate": true,
+        }],
+    });
+    let path = pool.join("oxide-managed/idle-evictions.json");
+    fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    path
+}
+
 #[test]
 fn an_idle_legacy_root_stays_out_of_eviction_while_its_old_holder_lives() {
     let fixture = Fixture::new("legacy-live");
@@ -974,6 +1006,119 @@ fn an_eviction_reports_a_trash_that_cannot_be_created_from_the_settle() {
     assert!(messages.is_empty(), "{messages:?}");
     assert!(!path.exists());
     assert!(!pool.join("oxide-managed/idle-evictions.json").exists());
+}
+
+/// A settle pass judges the pool path and its recorded shape read-only before
+/// it reads the config or takes the lock: a symlinked, foreign or retired pool
+/// refuses untouched, and no lock file is created in one (oxide#337).
+#[test]
+fn a_settle_pass_refuses_a_retired_or_foreign_pool_untouched() {
+    let fixture = Fixture::new("settle-validation");
+    let pool = fixture.pool();
+    let lock = pool.join("lock");
+    let entries = || {
+        let mut names: Vec<String> = fs::read_dir(&pool)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    // The pool lock exists from creation; removing it lets the refusal prove
+    // it created nothing.
+    fs::remove_file(&lock).unwrap();
+    let before = entries();
+
+    fs::write(pool.join("image.sparseimage"), b"retired").unwrap();
+    assert_eq!(
+        managed::settle_pending_evictions(&pool).unwrap_err(),
+        LeaseError::BackingMismatch
+    );
+    assert!(!lock.exists(), "a retired pool was locked");
+    fs::remove_file(pool.join("image.sparseimage")).unwrap();
+
+    fs::write(pool.join("stray"), b"foreign").unwrap();
+    let error = managed::settle_pending_evictions(&pool).unwrap_err();
+    assert!(
+        matches!(error, LeaseError::UnexpectedEntry { .. }),
+        "{error}"
+    );
+    assert!(!lock.exists(), "a foreign pool was locked");
+    fs::remove_file(pool.join("stray")).unwrap();
+    assert_eq!(entries(), before);
+}
+
+/// Custody that cannot be opened is Barge's own failure, reported as such: a
+/// settle pass must not call it a pool recording another backing (oxide#337).
+#[test]
+fn a_settle_that_cannot_open_barge_state_reports_barge() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("settle-barge-open");
+    let pool = fixture.pool();
+    // A private control directory holding a regular file where Barge's account
+    // directory belongs.
+    let control = pool.join("oxide-managed");
+    fs::create_dir(&control).unwrap();
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(control.join("barge"), b"not a directory").unwrap();
+    match managed::settle_pending_evictions(&pool) {
+        Err(LeaseError::Barge(message)) => {
+            assert!(message.contains("storage state"), "{message}")
+        }
+        other => panic!("a Barge open failure is not a backing mismatch: {other:?}"),
+    }
+}
+
+/// The abandoned-hold probe is one non-blocking `flock`: it must not be
+/// reported as a byte walk (oxide#337).
+#[test]
+fn probing_an_abandoned_hold_is_not_reported_as_a_byte_walk() {
+    let fixture = Fixture::new("abandoned-hold-walk");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let workspace = fixture.dir("workspace");
+    let held = managed::lease(request(&pool, &project, &workspace, "gone")).unwrap();
+    // The command died: its root hold went with it and the row still says Held.
+    drop(held);
+    let view = managed::prepare_pool(&pool).unwrap();
+    assert_eq!(view.slots.len(), 1);
+    assert_eq!(view.slots[0].state, SlotOccupancy::Idle);
+    let (micros, walked, _, opaque) = super::admission_cost::latest(&pool);
+    assert!(opaque, "the probe is an opaque listing");
+    assert_eq!(
+        walked, 0,
+        "a lock probe is not a byte walk ({micros} µs under the lock)"
+    );
+}
+
+/// Each idle victim the byte-budget loop retires used to re-list the pool's
+/// protection inventory. One bytes-free listing now decides every victim in
+/// the loop (oxide#337).
+#[test]
+fn byte_pressure_lists_protection_once_for_every_victim_it_retires() {
+    let fixture = Fixture::new("pressure-listing");
+    let pool = fixture.pool();
+    // Three idle slots with 5 MiB each against the 8 MiB fixture budget: the
+    // loop retires two of them before the charges fall below the budget.
+    for label in ["a", "b", "c"] {
+        let project = fixture.dir(&format!("project-{label}"));
+        let workspace = fixture.dir(&format!("workspace-{label}"));
+        let leased = managed::lease_measured(request(&pool, &project, &workspace, label)).unwrap();
+        fill(&leased, 5 << 20);
+        let lease_id = leased.grant.lease_id.clone();
+        drop(leased);
+        managed::release(&pool, &lease_id).unwrap();
+    }
+    let project = fixture.dir("project-next");
+    let workspace = fixture.dir("workspace-next");
+    let (admitted, walks) =
+        count_pool_walks(|| managed::lease_measured(request(&pool, &project, &workspace, "next")));
+    admitted.expect("admit under byte pressure");
+    let listed = walks
+        .iter()
+        .filter(|walk| matches!(walk, PoolWalk::Inventory))
+        .count();
+    assert_eq!(listed, 1, "{walks:?}");
 }
 
 #[test]
@@ -1426,19 +1571,19 @@ fn linux_directory_pool_opens_through_the_production_storage_seam() {
     assert_eq!(first.backend, "directory-budget-v1");
 }
 
-/// The hand-off record is durable before the row is dropped, so a ledger save
-/// that failed leaves a record naming a still-recorded row. A reconciling open
-/// rolls that forward: the row is dropped and the record stays for the settle
-/// that will evict the root, so a settle can never delete a root an admission
-/// could still grant.
+/// A decision whose ledger save failed is rolled back: the row stays a live
+/// idle row and its durable hand-off record is removed, so a settle pass that
+/// runs beside this command can never evict a root the ledger still grants.
+/// The row and its root stay a consistent idle pair for the next command.
 #[test]
-fn a_failed_ledger_save_rolls_its_deferred_eviction_forward_on_the_next_open() {
+fn a_failed_ledger_save_rolls_its_deferred_eviction_back() {
     use std::os::unix::fs::PermissionsExt;
 
     let fixture = Fixture::new("deferred-save-failure");
     let pool = fixture.pool();
     let project = fixture.dir("project");
-    let leased = managed::lease(request(&pool, &project, &project, "first")).unwrap();
+    let workspace = fixture.dir("workspace");
+    let leased = managed::lease(request(&pool, &project, &workspace, "first")).unwrap();
     let slot = leased.grant.slot_id.clone();
     let root = leased
         .grant
@@ -1459,18 +1604,18 @@ fn a_failed_ledger_save_rolls_its_deferred_eviction_forward_on_the_next_open() {
     fs::set_permissions(&pool, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(refused.is_err(), "{refused:?}");
     assert_eq!(fs::read(&ledger).unwrap(), before);
-    assert!(records.is_file());
-
-    let view = managed::prepare_pool(&pool).unwrap();
     assert!(
-        view.slots.is_empty(),
-        "the recorded idle row was rolled forward"
+        !records.exists(),
+        "the hand-off record was rolled back with the row"
     );
-    assert!(records.is_file(), "the root still needs its Barge eviction");
-    assert!(root.is_dir());
+
+    // The pair is untouched: the same settle the front door runs beside a
+    // command must not delete a root the ledger still records.
     assert!(managed::settle_pending_evictions(&pool).unwrap().is_empty());
-    assert!(!root.exists());
-    assert!(!records.exists());
+    assert!(root.is_dir());
+    assert_eq!(managed::ledger_view(&pool).unwrap().slots.len(), 1);
+    let reused = managed::lease(request(&pool, &project, &workspace, "second")).unwrap();
+    assert!(reused.grant.reused_slot);
 }
 
 /// When the roll-forward itself cannot be saved, the record must go: the row
@@ -1485,7 +1630,6 @@ fn a_roll_forward_that_cannot_be_saved_removes_the_handoff_record() {
     let project = fixture.dir("project");
     let workspace = fixture.dir("workspace");
     let leased = managed::lease(request(&pool, &project, &workspace, "first")).unwrap();
-    let slot = leased.grant.slot_id.clone();
     let root = leased
         .grant
         .env
@@ -1495,11 +1639,12 @@ fn a_roll_forward_that_cannot_be_saved_removes_the_handoff_record() {
         .to_path_buf();
     managed::release(&pool, &leased.grant.lease_id).unwrap();
     drop(leased);
-    let records = pool.join("oxide-managed/idle-evictions.json");
-    fs::set_permissions(&pool, fs::Permissions::from_mode(0o500)).unwrap();
-    assert!(managed::evict_idle_slot(&pool, &slot).is_err());
+    // A crash between the decision and its ledger save, reproduced exactly:
+    // the hand-off record is durable and the ledger still records the row.
+    let records = plant_handoff_record(&pool);
     assert!(records.is_file());
 
+    fs::set_permissions(&pool, fs::Permissions::from_mode(0o500)).unwrap();
     let error = managed::prepare_pool(&pool).unwrap_err();
     assert!(!records.exists(), "{error}");
     fs::set_permissions(&pool, fs::Permissions::from_mode(0o700)).unwrap();

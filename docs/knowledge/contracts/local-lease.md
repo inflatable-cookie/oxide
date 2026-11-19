@@ -92,12 +92,16 @@ record list also falls back to the inline call rather than grow the file.
 A mutating open drops a record whose recorded root path is absent, because Barge's
 rename already committed and its trash is swept by the unlocked settlement pass,
 even when no pending records remain. It also rolls a committed decision forward
-when its `(slot, incarnation, root)` row is still recorded — the state a ledger
-save that failed after the record left behind: the row is dropped and saved, and
-the record is removed instead when that save fails, so no record ever names a live
-row. An unreadable `idle-evictions.json` is quarantined beside itself and the open
-continues: no deletion is invented from it, its roots stay as recorded, and the
-library's ledger view reports the open as reconciliation-blocked.
+when its `(slot, incarnation, root)` row is still recorded — the state a crash
+between the record and its ledger save leaves behind: the row is dropped and
+saved, and the record is removed instead when that save fails, so no record ever
+names a live row. A ledger save that fails while the decision is being made is
+rolled back in place: the row stays recorded and the durable record is removed,
+so the settle pass that runs beside the command never evicts a root an admission
+can still grant. An unreadable `idle-evictions.json` is quarantined beside itself
+and the open continues: no deletion is invented from it, its roots stay as
+recorded, and the library's ledger view reports the open as
+reconciliation-blocked.
 
 A sweep failure is reported and does not prevent settlement of other recorded
 roots. A record whose root is still present stays for a later pass; recovery

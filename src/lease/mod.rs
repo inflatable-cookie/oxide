@@ -25,7 +25,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub use pool::{managed, LeaseRequest, SlotLayout};
@@ -942,8 +942,12 @@ fn ensure_private_dir(path: &Path) -> Result<(), LeaseError> {
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path).map_err(io_error)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(io_error)?;
+            // The mode is set at creation: `create_dir` followed by
+            // `set_permissions` leaves the umask-controlled mode in place for
+            // the window between the two calls (oxide#337).
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(path).map_err(io_error)?;
             if let Some(parent) = path.parent() {
                 File::open(parent)
                     .and_then(|directory| directory.sync_all())
