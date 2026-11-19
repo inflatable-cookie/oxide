@@ -3032,6 +3032,17 @@ fn lock_pool(pool: &Path) -> Result<File, LeaseError> {
 }
 
 fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, LeaseError> {
+    let (deadline, bound) = pool_lock_deadline(Instant::now());
+    lock_pool_until(pool, create, notice, deadline, bound)
+}
+
+fn lock_pool_until(
+    pool: &Path,
+    create: bool,
+    notice: bool,
+    deadline: Instant,
+    bound: &'static str,
+) -> Result<File, LeaseError> {
     let path = pool.join(LOCK_NAME);
     let existing = match fs::symlink_metadata(&path) {
         Ok(metadata) => {
@@ -3062,38 +3073,67 @@ fn lock_pool_inner(pool: &Path, create: bool, notice: bool) -> Result<File, Leas
     {
         return Err(LeaseError::UnsafePath("lock file must be private"));
     }
-    if notice {
-        wait_before_pool_notice(&file, Duration::from_secs(5), || {
-            let slot = read_ledger(pool).ok().and_then(|ledger| {
-                ledger
-                    .slots
-                    .into_iter()
-                    .find(|slot| slot.state == SlotPersistState::Evicting)
-            });
-            match slot {
-                Some(slot) => eprintln!("oxide: waiting for the pool lock (slot {} is recorded as being deleted; its current writer is unknown)", slot.id),
-                None => eprintln!("oxide: waiting for the pool lock (holder unknown)"),
-            }
-        })?;
-        return Ok(file);
-    }
-    // SAFETY: `file` is open for the pool lock; flock holds until File drop.
-    let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if status != 0 {
-        return Err(LeaseError::Io("exclusive pool lock failed".into()));
-    }
+    wait_for_pool_lock(
+        &file,
+        notice.then_some(POOL_LOCK_NOTICE),
+        deadline,
+        bound,
+        || match read_ledger(pool).ok().and_then(|ledger| {
+            ledger
+                .slots
+                .into_iter()
+                .find(|slot| slot.state == SlotPersistState::Evicting)
+        }) {
+            Some(slot) => format!(
+                "slot {} is recorded as being deleted; its current writer is unknown",
+                slot.id
+            ),
+            None => "holder unknown".to_owned(),
+        },
+    )?;
     Ok(file)
 }
 
-// Poll only until the one notice, then return to the ordinary blocking flock.
-fn wait_before_pool_notice(
+/// The longest a pool-lock wait may notice a holder before it gives up, after
+/// the one progress line.
+const POOL_LOCK_NOTICE: Duration = Duration::from_secs(5);
+/// The bound for a pool-lock wait with no admission budget. Holds on the pool
+/// lock are short (eviction moves trees out of the lock), so this is only a
+/// backstop against a stale or unreachable holder.
+const POOL_LOCK_BOUND_SECONDS: u64 = 120;
+const POOL_LOCK_POLL: Duration = Duration::from_millis(10);
+
+/// The latest instant a pool-lock wait started at `now` may last, and what
+/// bounds it for the message. A command whose admission window is still open
+/// is held to that window; otherwise the wait gets [`POOL_LOCK_BOUND_SECONDS`].
+/// An expired window never refuses a wait by itself: a release after a long
+/// build lands after its window has closed and must still be able to take the
+/// lock. Never unbounded: a stale or unknown holder ends the wait with a
+/// refusal naming what it waited on (oxide#325).
+fn pool_lock_deadline(now: Instant) -> (Instant, &'static str) {
+    let default = now + Duration::from_secs(POOL_LOCK_BOUND_SECONDS);
+    match crate::lease::admission_deadline() {
+        Some(expires) if expires > now && expires < default => {
+            (expires, "the admission budget expired")
+        }
+        _ => (default, "the pool-lock bound was reached"),
+    }
+}
+
+/// Take the pool lock with a poll that stops at `deadline`. `holder` names
+/// what the wait is on; it is read for the one progress line after
+/// `notice_after` and again for a refusal.
+fn wait_for_pool_lock(
     file: &File,
-    delay: Duration,
-    notice: impl FnOnce(),
+    notice_after: Option<Duration>,
+    deadline: Instant,
+    bound: &'static str,
+    holder: impl Fn() -> String,
 ) -> Result<(), LeaseError> {
     let started = Instant::now();
+    let mut noticed = false;
     loop {
-        // SAFETY: the descriptor stays open through this call and until release.
+        // SAFETY: the descriptor stays open through this call and owns the lock on success.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(());
         }
@@ -3103,15 +3143,19 @@ fn wait_before_pool_notice(
                 "exclusive pool lock failed: {error}"
             )));
         }
-        if started.elapsed() >= delay {
-            notice();
-            // SAFETY: the descriptor stays open and owns the lock on success.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                return Err(LeaseError::Io("exclusive pool lock failed".into()));
-            }
-            return Ok(());
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(LeaseError::Io(format!(
+                "gave up waiting for the pool lock after {:.1}s: {bound}; {}",
+                now.duration_since(started).as_secs_f64(),
+                holder()
+            )));
         }
-        std::thread::sleep(Duration::from_millis(100).min(delay.saturating_sub(started.elapsed())));
+        if !noticed && notice_after.is_some_and(|after| now.duration_since(started) >= after) {
+            eprintln!("oxide: waiting for the pool lock ({})", holder());
+            noticed = true;
+        }
+        std::thread::sleep(POOL_LOCK_POLL.min(deadline.saturating_duration_since(now)));
     }
 }
 
@@ -3501,5 +3545,62 @@ mod reserve_tests {
             assert!(storage.resolve(&roots[index]).is_ok());
         }
         drop(hold);
+    }
+}
+
+#[cfg(test)]
+mod pool_lock_wait_tests {
+    use super::*;
+    use crate::lease::tests::Fixture;
+
+    #[test]
+    fn a_pool_lock_wait_ends_at_its_bound_and_names_what_it_waited_on() {
+        let fixture = Fixture::new("pool-lock-bound");
+        let pool = fixture.dir("pool");
+        let holder = lock_pool_inner(&pool, true, false).unwrap();
+        let started = Instant::now();
+        let (deadline, bound) = (
+            started + Duration::from_millis(60),
+            "the pool-lock bound was reached",
+        );
+        let refusal = lock_pool_until(&pool, true, false, deadline, bound)
+            .map(|_| ())
+            .unwrap_err();
+        let text = refusal.to_string();
+        assert!(
+            text.starts_with("gave up waiting for the pool lock after "),
+            "{text}"
+        );
+        assert!(text.contains("the pool-lock bound was reached"), "{text}");
+        assert!(text.contains("holder unknown"), "{text}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        drop(holder);
+        assert!(lock_pool_until(
+            &pool,
+            true,
+            false,
+            Instant::now() + Duration::from_secs(5),
+            bound
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn the_admission_window_bounds_a_pool_lock_wait_when_it_is_nearer() {
+        crate::lease::set_admission_deadline(Some(Instant::now() + Duration::from_secs(30)));
+        let (deadline, bound) = pool_lock_deadline(Instant::now());
+        assert_eq!(bound, "the admission budget expired");
+        assert!(deadline <= Instant::now() + Duration::from_secs(30));
+        crate::lease::set_admission_deadline(None);
+        let (deadline, bound) = pool_lock_deadline(Instant::now());
+        assert_eq!(bound, "the pool-lock bound was reached");
+        assert!(deadline > Instant::now() + Duration::from_secs(100));
+        // A window that has already closed (a release after a long build)
+        // does not refuse the wait: it gets the default bound.
+        crate::lease::set_admission_deadline(Some(Instant::now() - Duration::from_secs(1)));
+        let (deadline, bound) = pool_lock_deadline(Instant::now());
+        assert_eq!(bound, "the pool-lock bound was reached");
+        assert!(deadline > Instant::now() + Duration::from_secs(100));
+        crate::lease::set_admission_deadline(None);
     }
 }

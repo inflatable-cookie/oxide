@@ -328,6 +328,8 @@ pub fn install(options: Options) -> Result<(), String> {
         limit,
         expires: started + limit,
     });
+    // The library's waits on the pool lock honour the same window (oxide#325).
+    oxide_storage::lease::set_admission_deadline(admission.as_ref().map(|entry| entry.expires));
     STATE.with(|cell| {
         *cell.borrow_mut() = Some(State {
             started,
@@ -821,19 +823,44 @@ pub fn sigpipe_ignored() -> bool {
 /// commands keep the existing blocking call; budgeted ones poll the existing
 /// nonblocking primitive so an expired window never waits forever.
 pub fn lock(file: &std::fs::File, what: &str) -> Result<(), String> {
-    match admission_deadline() {
-        None => crate::store::flock_blocking(file),
-        Some(_) => loop {
-            if crate::store::flock_nonblocking(file)? {
-                return Ok(());
-            }
-            if admission_expired() {
-                return Err(format!(
-                    "the admission budget expired while waiting for the {what} lock"
-                ));
-            }
-            std::thread::sleep(POLL);
-        },
+    bounded_lock(file, what, admission_deadline(), UNBUDGETED_LOCK_BOUND)
+}
+
+/// The longest an admission-class lock wait may last when the command has no
+/// admission budget (oxide#325). A lock held that long is a stale or
+/// unreachable holder, so the wait ends with a refusal instead of hanging.
+pub const UNBUDGETED_LOCK_BOUND: Duration = Duration::from_secs(120);
+
+/// Take `file`'s exclusive lock with a poll that never outlives `bound`, or the
+/// admission window when that ends first. A refusal names the lock it waited on.
+fn bounded_lock(
+    file: &std::fs::File,
+    what: &str,
+    admission: Option<Instant>,
+    bound: Duration,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let default = started + bound;
+    let (limit, budgeted) = match admission {
+        Some(expires) if expires <= default => (expires, true),
+        _ => (default, false),
+    };
+    loop {
+        if crate::store::flock_nonblocking(file)? {
+            return Ok(());
+        }
+        if Instant::now() >= limit {
+            return Err(if budgeted {
+                format!("the admission budget expired while waiting for the {what} lock")
+            } else {
+                format!(
+                    "gave up waiting for the {what} lock after {:.1}s (the {}s bound was reached; the holder is unknown)",
+                    started.elapsed().as_secs_f64(),
+                    bound.as_secs()
+                )
+            });
+        }
+        std::thread::sleep(POLL);
     }
 }
 
@@ -1658,5 +1685,50 @@ mod tests {
         let result = output(&mut command).expect("a plain child");
         assert!(result.status.success());
         assert_eq!(result.stdout, b"ready");
+    }
+}
+
+#[cfg(test)]
+mod lock_wait_tests {
+    use super::*;
+    use std::fs::OpenOptions;
+
+    #[test]
+    fn an_unbudgeted_admission_lock_wait_ends_at_its_bound() {
+        let path = std::env::temp_dir().join(format!(
+            "oxide-lock-wait-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let holder = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let waiter = OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(crate::store::flock_nonblocking(&holder).unwrap());
+        let started = Instant::now();
+        let refusal =
+            bounded_lock(&waiter, "admission", None, Duration::from_millis(60)).unwrap_err();
+        assert!(
+            refusal.starts_with("gave up waiting for the admission lock after "),
+            "{refusal}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let refusal = bounded_lock(
+            &waiter,
+            "admission",
+            Some(Instant::now()),
+            Duration::from_secs(120),
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal,
+            "the admission budget expired while waiting for the admission lock"
+        );
+        drop(holder);
+        assert!(bounded_lock(&waiter, "admission", None, Duration::from_secs(5)).is_ok());
+        std::fs::remove_file(path).unwrap();
     }
 }

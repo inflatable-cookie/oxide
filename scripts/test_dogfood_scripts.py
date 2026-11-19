@@ -370,6 +370,73 @@ class InstallerTests(unittest.TestCase):
             installer.preflight(True)
 
 
+FAKE_OXIDE = r'''#!__PYTHON__
+import json, os, sys
+from pathlib import Path
+CONFIG = json.loads(__CONFIG__)
+LIVE = CONFIG["live"]
+args = sys.argv[1:]
+if args == ["__oxide-build-capabilities"]:
+    print(json.dumps(CONFIG["probe"]))
+elif args == ["__oxide-build-identity"]:
+    print(json.dumps({"build_pin": CONFIG["pin"], "build_instance": CONFIG["instance"]}))
+else:
+    assert os.environ.get("OXIDE_INTERNAL_HANDED_OFF") == "1"
+    assert "OXIDE_SCRATCH_ROOT" not in os.environ
+    pool = os.environ.get("OXIDE_POOL", "")
+    mode = CONFIG["mode"]
+    # The first describe names the pool itself, so only commands that run
+    # against a pool (every check, and a format-change status) are pinned.
+    if args[0] == "check" or (args[0] == "status" and mode == "format"):
+        if mode == "live":
+            assert "OXIDE_POOL_CREATE" not in os.environ and pool == LIVE, pool
+        elif mode == "scratch":
+            assert os.environ.get("OXIDE_POOL_CREATE") == "1", "a fresh pool needs the explicit opt-in"
+            assert pool != LIVE and pool.startswith(CONFIG["scratch"] + "/"), pool
+        else:
+            assert "OXIDE_POOL_CREATE" not in os.environ and pool != LIVE, "format-change never names the live pool"
+            assert pool.startswith(CONFIG["scratch"] + "/") and Path(pool, "config.json").is_file(), pool
+    with open(CONFIG["log"], "a") as log:
+        print(json.dumps([args[0], os.getcwd(), pool]), file=log)
+    if args == ["pool", "describe", "--json"]:
+        print(json.dumps({"schema": "oxide.pool.describe/1", "selected": "internal",
+                          "internal": {"pool": LIVE}, "removable": None}))
+    elif args[0] == "check":
+        assert args[-1] == "--offline" and Path("target").is_dir()
+        assert Path("Cargo.toml").is_file() and Path("src/lib.rs").is_file()
+        assert Path.cwd().parent == Path(CONFIG["scratch"])
+        if mode == "scratch":
+            Path(pool).mkdir(parents=True, exist_ok=True)
+        if CONFIG["mutate_live"] and mode == "format":
+            # A writer that ignores the copy would change the live ledger.
+            Path(LIVE, "ledger.json").write_text('{"ledger": "changed"}')
+        slot = Path(pool) / "slot-9"
+        warm = slot.exists()
+        if not warm and mode == "format":
+            # The first mutating admission upgrades the copy's control state.
+            state = Path(pool) / "oxide-managed" / "state.json"
+            if state.exists():
+                document = json.loads(state.read_text())
+                document["version"] = CONFIG["probe"]["control_state_version"]
+                state.write_text(json.dumps(document))
+        slot.touch()
+        elapsed, wait, warmth = (CONFIG["warm_ms"], 0, "warm") if warm else (CONFIG["cold_ms"], CONFIG["queue_ns"], "cold")
+        print(f"oxide: admission queue wait {wait} ns", file=sys.stderr)
+        print(f"oxide: quick profile, build strategy, slot 9 {warmth}, 0.1s, "
+              "(directory-budget-v1, budget-only), pool lock 2.1 ms", file=sys.stderr)
+        writer = int(args[args.index("--budget-events") + 1])
+        for event in (
+            dict(seq=1, event="admitted_child_started", phase="primary_cargo",
+                 spawn_late=False, admission_elapsed_ms=elapsed),
+            dict(seq=2, event="finished", outcome="child_exit", exit_code=0,
+                 drain="complete", lease="released"),
+        ):
+            os.write(writer, (json.dumps(dict(v=1, invocation="example", **event)) + "\n").encode())
+    else:
+        assert args == ["status"], args
+'''
+
+
 class CanaryTests(unittest.TestCase):
     PIN = "a" * 40
     CAPABILITIES = {"control_state_version": 10, "registration_version": 2,
@@ -387,6 +454,7 @@ class CanaryTests(unittest.TestCase):
         self.pool.mkdir()
         self.scratch.mkdir()
         (self.pool / "config.json").write_text("{}")
+        (self.pool / "ledger.json").write_text('{"ledger": "live"}')
         (self.scratch / "unrelated").mkdir()
         self.destination.write_text("#!/bin/sh\nexit 99\n")
         self.destination.chmod(0o700)
@@ -403,50 +471,17 @@ class CanaryTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def fake_build(self, cold_ms=12_200, warm_ms=200, queue_ns=12_000_000_000, **capabilities):
+    def fake_build(self, cold_ms=12_200, warm_ms=200, queue_ns=12_000_000_000, mode="live",
+                   mutate_live=False, **capabilities):
         probe = {**self.CAPABILITIES, **capabilities, "test_controls": False}
 
         def build(pin, instance, staging):
             built = staging / "oxide"
-            built.write_text(f"#!{sys.executable}\n" + f"""
-import json, os, sys
-from pathlib import Path
-args = sys.argv[1:]
-if args == ["__oxide-build-capabilities"]:
-    print(json.dumps({probe!r}))
-elif args == ["__oxide-build-identity"]:
-    print(json.dumps({{"build_pin": {pin!r}, "build_instance": {instance!r}}}))
-else:
-    assert os.environ.get("OXIDE_INTERNAL_HANDED_OFF") == "1"
-    assert "OXIDE_SCRATCH_ROOT" not in os.environ and "OXIDE_POOL_CREATE" not in os.environ
-    with open({str(self.log)!r}, "a") as log:
-        print(json.dumps([args[0], os.getcwd()]), file=log)
-    if args == ["pool", "describe", "--json"]:
-        print(json.dumps({{"schema": "oxide.pool.describe/1", "selected": "internal",
-                          "internal": {{"pool": {str(self.pool)!r}}}, "removable": None}}))
-    elif args[0] == "check":
-        assert args[-1] == "--offline" and Path("target").is_dir()
-        assert Path("Cargo.toml").is_file() and Path("src/lib.rs").is_file()
-        assert Path.cwd().parent == Path({str(self.scratch)!r})
-        assert os.environ["OXIDE_POOL"] == {str(self.pool)!r}
-        slot = Path({str(self.pool / "slot-9")!r})
-        warm = slot.exists()
-        slot.touch()
-        elapsed, wait, warmth = ({warm_ms}, 0, "warm") if warm else ({cold_ms}, {queue_ns}, "cold")
-        print(f"oxide: admission queue wait {{wait}} ns", file=sys.stderr)
-        print(f"oxide: quick profile, build strategy, slot 9 {{warmth}}, 0.1s, "
-              "(directory-budget-v1, budget-only), pool lock 2.1 ms", file=sys.stderr)
-        writer = int(args[args.index("--budget-events") + 1])
-        for event in (
-            dict(seq=1, event="admitted_child_started", phase="primary_cargo",
-                 spawn_late=False, admission_elapsed_ms=elapsed),
-            dict(seq=2, event="finished", outcome="child_exit", exit_code=0,
-                 drain="complete", lease="released"),
-        ):
-            os.write(writer, (json.dumps(dict(v=1, invocation="example", **event)) + "\\n").encode())
-    else:
-        assert args == ["status"], args
-""")
+            config = dict(probe=probe, pin=pin, instance=instance, mode=mode, live=str(self.pool),
+                          scratch=str(self.scratch), log=str(self.log), cold_ms=cold_ms,
+                          warm_ms=warm_ms, queue_ns=queue_ns, mutate_live=mutate_live)
+            built.write_text(FAKE_OXIDE.replace("__PYTHON__", sys.executable)
+                             .replace("__CONFIG__", repr(json.dumps(config))))
             built.chmod(0o700)
             return built, {}
         return build
@@ -526,6 +561,92 @@ else:
         self.assertEqual(status, 1)
         self.assertIn("live canary needs matching writer_generation", stderr)
         self.assertFalse(self.log.exists())
+
+    def calls(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def live_bytes(self):
+        return {name: (self.pool / name).read_bytes() for name in ("config.json", "ledger.json")}
+
+    def write_live_state(self, version):
+        (self.pool / "oxide-managed").mkdir()
+        (self.pool / "oxide-managed" / "state.json").write_text(json.dumps({"version": version}))
+
+    def test_live_canary_still_refuses_a_control_state_version_change(self):
+        status, _, stderr, _ = self.invoke(["--canary"], self.fake_build(control_state_version=11))
+        self.assertEqual(status, 1)
+        self.assertIn("live canary needs matching control_state_version", stderr)
+        self.assertFalse(self.log.exists())
+
+    def test_scratch_root_runs_a_fresh_pool_with_no_live_contact(self):
+        flags = ["--canary", "--scratch-root", str(self.scratch)]
+        status, stdout, stderr, _ = self.invoke(flags, self.fake_build(mode="scratch", control_state_version=11))
+        self.assertEqual(status, 0, stderr)
+        self.assertIn("oxide:canary PASS for " + self.PIN + " (scratch-root)", stdout)
+        self.assertIn("new slot: admission", stdout)
+        calls = self.calls()
+        self.assertEqual([call[0] for call in calls], ["check", "check"])
+        self.assertTrue(all(call[2] != str(self.pool) for call in calls))
+        self.assertFalse((self.pool / "slot-9").exists())
+        self.assertEqual(list(self.scratch.iterdir()), [self.scratch / "unrelated"])
+        self.assertEqual(json.loads((self.receipts / "canary" / f"{self.PIN}.json").read_text())["mode"],
+                         "scratch-root")
+        installer.require_canary(self.PIN)
+
+    def test_format_change_upgrades_a_read_only_copy_and_never_writes_live(self):
+        self.write_live_state(10)
+        before = self.live_bytes()
+        before_state = (self.pool / "oxide-managed" / "state.json").read_bytes()
+        status, stdout, stderr, _ = self.invoke(
+            ["--canary", "--format-change", "--scratch-root", str(self.scratch)],
+            self.fake_build(mode="format", control_state_version=11),
+        )
+        self.assertEqual(status, 0, stderr)
+        self.assertIn("oxide:canary PASS for " + self.PIN + " (format-change)", stdout)
+        self.assertIn("format-change: control state 10 -> 11 (staged 11)", stdout)
+        self.assertIn("format-change: live documents unchanged", stdout)
+        self.assertEqual(self.live_bytes(), before)
+        self.assertEqual((self.pool / "oxide-managed" / "state.json").read_bytes(), before_state)
+        self.assertFalse((self.pool / "slot-9").exists())
+        self.assertNotIn(str(self.pool), [call[2] for call in self.calls() if call[0] != "pool"])
+        self.assertEqual(list(self.scratch.iterdir()), [self.scratch / "unrelated"])
+        # The PASS satisfies --require-canary for the same pin.
+        status, _, stderr, builder = self.invoke(["--replace", "--check", "--require-canary"], None)
+        self.assertEqual(status, 0, stderr)
+        builder.assert_not_called()
+
+    def test_format_change_without_a_control_state_still_passes(self):
+        status, stdout, stderr, _ = self.invoke(
+            ["--canary", "--format-change"], self.fake_build(mode="format", control_state_version=11),
+        )
+        self.assertEqual(status, 0, stderr)
+        self.assertIn("control state absent -> absent (staged 11)", stdout)
+
+    def test_format_change_refuses_when_the_live_documents_change(self):
+        self.write_live_state(10)
+        status, _, stderr, _ = self.invoke(
+            ["--canary", "--format-change"],
+            self.fake_build(mode="format", control_state_version=11, mutate_live=True),
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("live pool documents changed during the format-change canary", stderr)
+        self.assertEqual((self.pool / "ledger.json").read_text(), '{"ledger": "changed"}')
+        with self.assertRaises(installer.Refusal):
+            installer.require_canary(self.PIN)
+
+    def test_format_change_refuses_a_live_state_newer_than_the_staged_build(self):
+        self.write_live_state(12)
+        status, _, stderr, _ = self.invoke(
+            ["--canary", "--format-change"], self.fake_build(mode="format", control_state_version=11),
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("is newer than the staged build", stderr)
+        self.assertEqual([call[0] for call in self.calls()], ["pool"])
+
+    def test_format_flags_require_canary(self):
+        for flags in (["--format-change"], ["--scratch-root", str(self.scratch)]):
+            with self.subTest(flags=flags), self.assertRaises(SystemExit):
+                self.invoke(flags, None)
 
 
 class AuthenticatePinTests(unittest.TestCase):

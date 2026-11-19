@@ -311,6 +311,11 @@ explicit recovery.
   record's lock file. The kernel drops that lock when the process dies. The record
   names the holder (PID, process start time and holder string), the lease ID, the
   phase and Cargo's process-group ID.
+- Every wait on the pool lock or an admission-class lock is bounded (oxide#325).
+  It ends at the command's admission window when one is set, otherwise after
+  120 s, and refuses with a message naming what it waited on: the slot recorded
+  as being deleted, or an unknown holder. It prints one progress line after
+  5 s. No such wait is unbounded.
 - Ctrl-C and termination signals are forwarded to the group. Oxide releases only
   after the group is empty. A clean exit or Ctrl-C is never logged as a recovery.
 - A later command recovers a dead lease automatically only when all of these hold:
@@ -763,6 +768,21 @@ Oxide's own repository is the only adopter that installs the binary.
   300-second admission budget and a 60-second execution budget. The receipt records
   FAIL before the attempt, and PASS only after both checks and cleanup. The crate is
   removed only after writer closure is confirmed.
+- **Canary modes** (oxide#323). All modes share one receipt per pin:
+  - *Live* (default): as above. It refuses when the staged control-state version
+    differs from the installed receipt's.
+  - *`--scratch-root DIR`*: a fresh pool under `DIR`, created at an explicit path
+    with `OXIDE_POOL_CREATE=1`. No live pool is read or written and no live-version
+    check applies.
+  - *`--format-change`* (optionally with `--scratch-root DIR`): for a build that
+    changes the persisted format. Oxide reads the live `config.json`, `ledger.json`
+    and `oxide-managed/state.json` read-only and copies them into a scratch pool
+    layout. The staged binary then runs status, a new-slot check (which performs the
+    upgrade) and a warm rerun, all against the copy. It prints the control-state
+    version before and after the upgrade and refuses if the upgraded version is not
+    the staged one, if the live state is newer than the staged build, or if any live
+    document's bytes or file identity changed during the run. Its PASS satisfies
+    `--require-canary` for the pin.
 - **Required canary.** `--require-canary` on install or reinstall requires a PASS
   receipt for the same pin, less than one hour old. It is checked before the build
   and again under the install lock before the swap.
@@ -846,7 +866,9 @@ proof ladders, reviewer-native sessions or qualification selectors exist.
   `rust:barge-adoption-linux` compiles all targets, including the Linux pool
   regression. It makes no link or runtime claim.
 - Other surviving selectors: `rust:tree-duplicates`, `dogfood:scripts:test` (the
-  installer's synthetic install, rollback and canary cases), `offline-seed:test`.
+  installer's synthetic install, rollback and canary cases, including the three canary
+  modes with a fake staged binary and a check that the format-change run never names
+  or writes the live documents), `offline-seed:test`.
 - The independent reviewer judges the exact head, its regressions and the author's
   evidence. The reviewer does not repeat the covering selectors and reports missing
   evidence.
