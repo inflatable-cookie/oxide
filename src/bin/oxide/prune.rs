@@ -1542,6 +1542,27 @@ fn output_id(selected: &Selected) -> String {
 /// Re-pin an already owned Barge identity without using mutable Oxide marker
 /// fields as new storage authority. A first import requires the Oxide marker
 /// and selection to agree; a retired ID can never re-import its former path.
+/// An imported output root. `pinned` is true only when the Barge inventory
+/// that identified the root already showed a pin, so the caller can skip the
+/// pin write. Every other path reports `false` and pins.
+struct Imported {
+    area: barge::Area,
+    id: String,
+    pinned: bool,
+}
+
+/// Pin a selected root unless the inventory that identified it showed a pin.
+/// A second pin only rewrites the pin record and its timestamp.
+fn pin_selected(imported: &Imported) -> Result<(), String> {
+    if imported.pinned {
+        return Ok(());
+    }
+    imported
+        .area
+        .pin(&imported.id, "selected by an Oxide output receipt")
+        .map_err(|error| error.to_string())
+}
+
 /// `registry` is the caller's single read of the registry for this command.
 fn import_output(
     control: &Path,
@@ -1549,7 +1570,7 @@ fn import_output(
     checkout: &Path,
     checkout_id: &str,
     selected: &Selected,
-) -> Result<(barge::Area, String), String> {
+) -> Result<Imported, String> {
     if registry.is_some_and(|registry| {
         registry.rows.iter().any(|row| {
             row.root == selected.root()
@@ -1573,7 +1594,12 @@ fn import_output(
         if root.path != selected.root() {
             return Err("the recorded Barge output ID moved".to_owned());
         }
-        return Ok((area, id));
+        // This path reads no inventory, so it cannot know the pin state.
+        return Ok(Imported {
+            area,
+            id,
+            pinned: false,
+        });
     }
     // The Barge marker and account can already own this path even before
     // its first Oxide index row is committed. Re-pinning it is conservative;
@@ -1582,7 +1608,11 @@ fn import_output(
         .into_iter()
         .find(|root| root.path == selected.root());
     if let Some(root) = existing {
-        return Ok((area, root.id));
+        return Ok(Imported {
+            area,
+            id: root.id,
+            pinned: root.pinned,
+        });
     }
     let marker = outputs::read_marker_for_prune(selected.root())?;
     if !marker.is_owned_by(checkout, checkout_id)
@@ -1615,7 +1645,11 @@ fn import_output(
         }
         Err(error) => return Err(error.to_string()),
     }
-    Ok((area, id))
+    Ok(Imported {
+        area,
+        id,
+        pinned: false,
+    })
 }
 
 fn pin_references(control: &Path, receipt: &Receipt) -> Result<(), String> {
@@ -1647,15 +1681,14 @@ fn pin_references(control: &Path, receipt: &Receipt) -> Result<(), String> {
             {
                 continue;
             }
-            let (area, id) = import_output(
+            let imported = import_output(
                 control,
                 registry.as_ref(),
                 receipt.checkout(),
                 receipt.checkout_id(),
                 selected,
             )?;
-            area.pin(&id, "selected by an Oxide output receipt")
-                .map_err(|error| error.to_string())?;
+            pin_selected(&imported)?;
         }
     }
     Ok(())
@@ -1669,10 +1702,9 @@ pub(crate) fn pin_output(
     selected: &Selected,
 ) -> Result<(), String> {
     let registry = read_registry(control)?;
-    let (area, id) = import_output(control, registry.as_ref(), checkout, checkout_id, selected)?;
-    area.pin(&id, "selected by an Oxide output receipt")
-        .map_err(|error| error.to_string())?;
-    record_import(control, selected.root(), &id)
+    let imported = import_output(control, registry.as_ref(), checkout, checkout_id, selected)?;
+    pin_selected(&imported)?;
+    record_import(control, selected.root(), &imported.id)
 }
 
 /// Release old selections only after their replacement receipt is durable.
@@ -1732,17 +1764,17 @@ pub(crate) fn hold_outputs(
         if !receipt.holds_selection() || !ids.insert(selected.root().to_path_buf()) {
             continue;
         }
-        let (area, id) = import_output(
+        let imported = import_output(
             control,
             registry.as_ref(),
             receipt.checkout(),
             receipt.checkout_id(),
             selected,
         )?;
-        area.pin(&id, "selected by an Oxide output receipt")
-            .map_err(|error| error.to_string())?;
-        let hold = area
-            .try_hold(&id, barge::Mode::Shared)
+        pin_selected(&imported)?;
+        let hold = imported
+            .area
+            .try_hold(&imported.id, barge::Mode::Shared)
             .map_err(|error| error.to_string())?
             .ok_or("the output root is held exclusively")?;
         held.push(hold.into_inheritable().map_err(|error| error.to_string())?);
@@ -2438,5 +2470,41 @@ mod plan_identity_tests {
             Ok(Command::DryRun)
         ));
         assert!(!USAGE.contains("resolve-intent"));
+    }
+
+    /// Importing an unrecorded root reads the inventory that identifies it,
+    /// and that read reports whether a pin already protects the root. A pinned
+    /// root is reported as such, so its pin write is skipped; an unpinned root
+    /// is not, so it is pinned.
+    #[test]
+    fn import_reports_the_pin_its_inventory_already_shows() {
+        let Fixture {
+            _temp,
+            control,
+            area,
+            ..
+        } = fixture();
+        let pinned = area.create_root("already-pinned").unwrap();
+        area.pin(&pinned.id, "earlier pin").unwrap();
+        let plain = area.create_root("unpinned").unwrap();
+        let checkout = _temp.path().join("checkout");
+        let checkout_id = "a".repeat(64);
+        let import = |root: &barge::Root| {
+            let selected = Selected {
+                kind: RootKind::Local,
+                root: root.path.clone(),
+                volume_uuid: None,
+                nonce: None,
+                generation: 1,
+            };
+            import_output(&control, None, &checkout, &checkout_id, &selected).unwrap()
+        };
+
+        let already = import(&pinned);
+        assert_eq!(already.id, pinned.id);
+        assert!(already.pinned);
+        let fresh = import(&plain);
+        assert_eq!(fresh.id, plain.id);
+        assert!(!fresh.pinned);
     }
 }
