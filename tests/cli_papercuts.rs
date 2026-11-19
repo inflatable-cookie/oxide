@@ -433,6 +433,31 @@ fn assert_run_environment(args: &[&str]) {
 fn assert_run_environment_with_delay(args: &[&str], delay: Option<&str>) {
     let scratch = Scratch::new();
     let (manifest, program, bin, _log) = run_fixture(&scratch);
+    if delay.is_some() {
+        // macOS removes DYLD_* when a platform shell runs, so use a compiled
+        // fixture to observe what the actual program receives.
+        let source = scratch.path().join("environment_probe.rs");
+        fs::write(
+            &source,
+            r#"fn main() {
+    let text = std::env::vars().map(|(k, v)| format!("{k}={v}\n")).collect::<String>();
+    std::fs::write(std::env::var_os("FAKE_PROGRAM_OUT").unwrap(), text).unwrap();
+}"#,
+        )
+        .unwrap();
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let result = Command::new(rustc)
+            .arg(&source)
+            .arg("-o")
+            .arg(&program)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
     let pool = scratch.path().join("fixture-pool");
     let mut command = run_command(&scratch, &bin, &pool, &manifest, &program);
     if let Some(delay) = delay {
@@ -484,27 +509,27 @@ fn assert_run_environment_with_delay(args: &[&str], delay: Option<&str>) {
             "{name}"
         );
     }
-    // The loader searches beside the program, then the toolchain, then the
-    // caller's path: the program's own directory and its `deps` come first.
-    // A script fixture runs as `/bin/sh`, and macOS strips `DYLD_*` variables
-    // from the environment of a platform binary, so macOS observes this only
-    // through a compiled program (`identity`'s search-path tests pin the
-    // content).
-    #[cfg(not(target_os = "macos"))]
-    {
+    // macOS strips DYLD_* from the shell fixture, so inspect the compiled
+    // admission-budget fixture there and either fixture on other platforms.
+    if delay.is_some() || !cfg!(target_os = "macos") {
+        let variable = if cfg!(target_os = "macos") {
+            "DYLD_FALLBACK_LIBRARY_PATH"
+        } else {
+            "LD_LIBRARY_PATH"
+        };
         let search: Vec<&str> = environment
-            .get("LD_LIBRARY_PATH")
+            .get(variable)
             .map(|value| value.split(':').collect())
             .unwrap_or_default();
         assert_eq!(
             search.first().copied(),
-            app.join("target/debug").to_str(),
-            "LD_LIBRARY_PATH: {search:?}"
+            program.parent().unwrap().to_str(),
+            "{variable}: {search:?}"
         );
         assert_eq!(
             search.get(1).copied(),
-            app.join("target/debug/deps").to_str(),
-            "LD_LIBRARY_PATH: {search:?}"
+            program.parent().unwrap().join("deps").to_str(),
+            "{variable}: {search:?}"
         );
     }
 }
