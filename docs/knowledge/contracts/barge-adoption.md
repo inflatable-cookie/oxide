@@ -156,8 +156,10 @@ eviction. An eviction left in trash surfaces an error and earns no freed
 space. Warm reuse above the reserve walks no other payload. Barge's own
 soft caps use its release size records, with measurements of vanished roots
 reported as approximate. Identity and protection views use bytes-free Barge
-listings. See the [admission observations](local-lease.md#admission-observations-oxide317)
-for the difference between payload walks and Barge's internal marker enumeration.
+listings. Oxide counts byte walks separately and reports the unavailable
+count for Barge's internal marker enumeration. The
+[admission observations](local-lease.md#admission-observations-oxide317)
+own the measurement rules.
 
 Selecting a volume, refusing a mismatch, falling back while the drive is away
 and reporting the fallback in status are ordinary behaviour and do not wait on

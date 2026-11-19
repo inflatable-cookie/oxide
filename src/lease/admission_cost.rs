@@ -83,32 +83,24 @@ impl Sample {
                 || cost.opaque_listing
             {
                 phases.push(format!(
-                    "{} {:.1} ms, {} walked, {} listed{}",
+                    "{} {:.1} ms, byte walks {}, inventory entries {}{}",
                     phase.name(),
                     cost.micros as f64 / 1000.0,
                     cost.walked,
                     cost.listed,
                     if cost.opaque_listing {
-                        " + uncounted Barge listing"
+                        ", Barge listing count unavailable"
                     } else {
                         ""
                     }
                 ));
             }
         }
-        if self.opaque_listing() {
-            format!(
-                "pool lock {:.1} ms, root total unavailable ({})",
-                self.micros as f64 / 1000.0,
-                phases.join("; ")
-            )
-        } else {
-            format!(
-                "pool lock {:.1} ms ({})",
-                self.micros as f64 / 1000.0,
-                phases.join("; ")
-            )
-        }
+        format!(
+            "pool lock {:.1} ms ({})",
+            self.micros as f64 / 1000.0,
+            phases.join("; ")
+        )
     }
 }
 
@@ -189,10 +181,7 @@ impl Drop for PoolLock {
         trace.switch(trace.phase);
         trace.sample.micros = micros(trace.started.elapsed());
         let sample = trace.sample;
-        if sample.micros > SLOW_HOLD_MICROS
-            || sample.walked().max(sample.listed()) > 1
-            || sample.opaque_listing()
-        {
+        if sample.micros > SLOW_HOLD_MICROS || sample.walked() > 1 || sample.opaque_listing() {
             let phase = PHASES
                 .into_iter()
                 .max_by_key(|phase| {
@@ -200,7 +189,7 @@ impl Drop for PoolLock {
                     if sample.micros > SLOW_HOLD_MICROS {
                         (cost.micros, 0, cost.opaque_listing)
                     } else {
-                        (0, cost.walked.max(cost.listed), cost.opaque_listing)
+                        (0, cost.walked, cost.opaque_listing)
                     }
                 })
                 .unwrap_or(trace.phase);
@@ -210,7 +199,7 @@ impl Drop for PoolLock {
                 let weight = |s: &Sample| {
                     (
                         s.micros > SLOW_HOLD_MICROS,
-                        s.walked().max(s.listed()),
+                        s.walked(),
                         s.opaque_listing(),
                         s.micros,
                     )
@@ -331,11 +320,11 @@ pub fn recorded(pool: &Path) -> Result<Option<String>, String> {
         .max_by_key(|phase| slowest.phases[*phase as usize].micros)
         .unwrap_or(Phase::Accounting);
     Ok(Some(format!(
-        "recent admission maxima ({} holds): lock {:.1} ms ({}), {walked} walked, {listed} explicitly listed{}",
+        "recent admission maxima ({} holds): lock {:.1} ms ({}), byte walks {walked}, explicit inventory entries {listed}{}",
         history.len(),
         slowest.micros as f64 / 1000.0,
         slow_phase.name(),
-        if opaque == 0 { String::new() } else { format!(", total unavailable for {opaque} holds with Barge listings") }
+        if opaque == 0 { String::new() } else { format!(", Barge listing count unavailable for {opaque} holds") }
     )))
 }
 

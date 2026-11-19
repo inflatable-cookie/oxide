@@ -710,6 +710,78 @@ fn held_eviction_distinguishes_a_held_root_from_a_failed_trash_delete() {
 }
 
 #[test]
+fn an_eviction_counts_its_byte_walk_even_if_rename_cannot_start() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if super::current_uid() == 0 {
+        return; // The superuser can create trash in a non-writable directory.
+    }
+    let fixture = Fixture::new("eviction-walk-before-rename");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let leased = managed::lease(request(&pool, &project, &project, "first")).unwrap();
+    let victim = leased.grant.slot_id.parse().unwrap();
+    managed::release(&pool, &leased.grant.lease_id).unwrap();
+    let path = leased
+        .grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .unwrap()
+        .to_owned();
+    drop(leased);
+
+    let slots = path.parent().unwrap();
+    assert!(!slots.join(".trash").exists());
+    let other = fixture.dir("other");
+    let mut replacement = request(&pool, &other, &other, "replacement");
+    replacement.replace_slot = Some(victim);
+    fs::set_permissions(slots, fs::Permissions::from_mode(0o500)).unwrap();
+    let (attempt, walks) = count_pool_walks(|| managed::lease(replacement));
+    fs::set_permissions(slots, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let error = attempt
+        .err()
+        .expect("trash creation refuses while the parent is read-only");
+    assert!(
+        error.to_string().contains("cannot create the trash at"),
+        "{error}"
+    );
+    assert!(matches!(walks.as_slice(), [PoolWalk::Evict(_)]));
+    let (_, walked, listed, opaque) = super::admission_cost::latest(&pool);
+    assert_eq!((walked, listed, opaque), (1, 0, true));
+    assert!(path.is_dir());
+}
+
+#[test]
+fn sweeping_owned_trash_does_not_resample_the_roots_bytes() {
+    let fixture = Fixture::new("trash-byte-walks");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let leased = managed::lease(request(&pool, &project, &project, "first")).unwrap();
+    fill(&leased, 8192);
+    managed::release(&pool, &leased.grant.lease_id).unwrap();
+    let path = leased
+        .grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .unwrap()
+        .to_owned();
+    drop(leased);
+    // Reproduce the state left after Barge renames an owned root into trash.
+    let trash = path.parent().unwrap().join(".trash");
+    fs::create_dir(&trash).unwrap();
+    let evicted = trash.join(path.file_name().unwrap());
+    fs::rename(path, &evicted).unwrap();
+
+    managed::prepare_pool(&pool).unwrap();
+    let (_, walked, listed, opaque) = super::admission_cost::latest(&pool);
+    assert_eq!((walked, listed, opaque), (0, 1, false));
+    assert!(!evicted.exists());
+}
+
+#[test]
 fn admission_cost_and_protection_at_the_256_slot_ceiling() {
     use super::admission_cost;
     use std::io::Write;
@@ -777,11 +849,14 @@ fn admission_cost_and_protection_at_the_256_slot_ceiling() {
         (0, 0, true),
         "Barge hold resolves by enumerating markers"
     );
-    let summary =
-        admission_cost::take_summary().expect("unavailable total triggers the build summary");
-    assert!(summary.contains("root total unavailable"), "{summary}");
+    let summary = admission_cost::take_summary()
+        .expect("unavailable listing count triggers the build summary");
     assert!(
-        summary.contains("accounting") && summary.contains("0 walked"),
+        summary.contains("Barge listing count unavailable"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("accounting") && summary.contains("byte walks 0"),
         "{summary}"
     );
     managed::release(&pool, &warm.grant.lease_id).unwrap();
@@ -814,11 +889,14 @@ fn admission_cost_and_protection_at_the_256_slot_ceiling() {
         (1, 0, true),
         "Barge eviction also enumerates markers"
     );
-    let summary =
-        admission_cost::take_summary().expect("unavailable total triggers the build summary");
-    assert!(summary.contains("root total unavailable"), "{summary}");
+    let summary = admission_cost::take_summary()
+        .expect("unavailable listing count triggers the build summary");
     assert!(
-        summary.contains("eviction") && summary.contains("1 walked"),
+        summary.contains("Barge listing count unavailable"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("eviction") && summary.contains("byte walks 1"),
         "{summary}"
     );
     assert!(!pool.join("payload/slots").join(count.to_string()).exists());
@@ -860,8 +938,14 @@ fn admission_cost_and_protection_at_the_256_slot_ceiling() {
             r#"pinned roots by reason: 100 "keep build", 155 "keep evidence""#
         );
         let history = admission_cost::recorded(&pool).unwrap().unwrap();
-        assert!(history.contains("256 explicitly listed"), "{history}");
-        assert!(history.contains("total unavailable"), "{history}");
+        assert!(
+            history.contains("explicit inventory entries 256"),
+            "{history}"
+        );
+        assert!(
+            history.contains("Barge listing count unavailable"),
+            "{history}"
+        );
     });
     assert!(walks.is_empty(), "default status walks and lists no roots");
     let durations = [max_prepare_us, warm_us, reserve_us, eviction_us, refused_us];
@@ -870,7 +954,7 @@ fn admission_cost_and_protection_at_the_256_slot_ceiling() {
         "{durations:?}"
     );
     writeln!(std::io::stderr().lock(),
-        "256 slots, lock µs and root counts: adoption max {max_prepare_us} (8 rows per batch, 0 walks, marker total unavailable), warm {warm_us} (0 walks, marker total unavailable), reserve {reserve_us} (0 roots), eviction {eviction_us} (1 walk, marker total unavailable), refusal {refused_us} (0 walks, 256 explicitly listed, marker total unavailable), status 0 roots, warm and eviction summaries disclosed the unavailable total"
+        "256 slots, lock µs and root counts: adoption max {max_prepare_us} (8 rows per batch, 0 walks, marker count unavailable), warm {warm_us} (0 walks, marker count unavailable), reserve {reserve_us} (0 roots), eviction {eviction_us} (1 walk, marker count unavailable), refusal {refused_us} (0 walks, 256 explicit inventory entries, marker count unavailable), status 0 roots, warm and eviction summaries disclosed the unavailable listing count"
     ).unwrap();
 }
 

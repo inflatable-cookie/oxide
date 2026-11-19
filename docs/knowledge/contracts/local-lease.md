@@ -76,20 +76,18 @@ per-entry deletion journal, holding-area deleter or descriptor census.
 Oxide times each admission lock hold from acquisition through release,
 including front-door preparation and refused attempts. A private sidecar keeps
 the last 32 observations. The writer publishes after dropping the pool lock.
-The build summary reports a hold over two seconds or more than one observed
-root walk or listing. It also reports an unavailable root total whenever
-Barge's internal enumeration prevents evaluating the threshold. It names
-the phases that did the work. Default status
-reads recent per-pool maxima from the sidecar without taking the pool lock.
+The build summary names the phase for holds over two seconds, holds with
+more than one byte walk, and holds with an unavailable Barge listing count.
+Default status reads recent per-pool maxima without taking the pool lock.
 
-A payload walk visits one root. A Barge eviction's size measurement and
-deletion together count as one walk. Explicit inventories report their root
-entries separately. Barge also enumerates markers internally to resolve,
-hold, evict and adopt. The pinned API does not return that count. An
-observation with these calls marks the root total unavailable and still
-records their phase time. The 256-slot regression checks both the observable
-payload counts and the unavailable totals. Above reserve, the reserve check
-enumerates no roots.
+Count one byte walk for each root submitted to a sizing traversal, including
+a walk whose result is incomplete or whose eviction later fails. Barge's
+eviction sizes the root once before rename. A trash sweep removes entries and
+reports reclaimed bytes during deletion, without a separate sizing traversal.
+Report explicit inventory entries separately. Barge's internal marker
+enumeration during resolve, hold, eviction and adoption is timed and displayed
+as a listing with an unavailable count. The 256-slot regression checks both
+facts. Above reserve, the reserve check enumerates no roots.
 
 At the slot ceiling, Oxide first tries the oldest candidate through Barge. If
 it is protected, one bytes-free inventory identifies other held or pinned

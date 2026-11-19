@@ -851,7 +851,7 @@ impl PoolStorage {
             .map_err(barge::Error::unknown_state)?;
         admission_cost::opaque_listing();
         let eviction = area.evict(id);
-        if eviction.is_ok() || eviction.as_ref().err().is_some_and(eviction_moved) {
+        if eviction.is_ok() || eviction.as_ref().err().is_some_and(eviction_walked_bytes) {
             admission_cost::walked(1);
             #[cfg(test)]
             observe_pool_walk(PoolWalk::Evict(id.to_owned()));
@@ -928,7 +928,8 @@ impl PoolStorage {
                 admission_cost::opaque_listing();
                 format!("cannot sweep the pool trash: {error}")
             })?;
-            admission_cost::walked(swept.deleted.len());
+            // The sweep traverses trash for deletion and reports reclaimed
+            // bytes as it goes. Barge runs no separate sizing walk here.
             admission_cost::listed(swept.deleted.len() + swept.kept.len());
             if !swept.kept.is_empty() {
                 admission_cost::opaque_listing();
@@ -1013,6 +1014,19 @@ impl PoolStorage {
         #[cfg(test)]
         observe_pool_walk(PoolWalk::Inventory);
         self.storage.admit("pool")
+    }
+}
+
+/// At the pinned revision these outcomes follow the single sizing walk.
+fn eviction_walked_bytes(error: &barge::Error) -> bool {
+    let message = error.message();
+    match error.kind() {
+        barge::ErrorKind::Refused => message == "root marker changed before eviction",
+        barge::ErrorKind::Io if error.io_kind().is_some() => {
+            message.starts_with("cannot create the trash at ")
+                || message.starts_with("cannot evict the root to ")
+        }
+        _ => eviction_moved(error),
     }
 }
 
