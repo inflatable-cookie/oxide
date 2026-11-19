@@ -392,10 +392,25 @@ fn bounded(program: &str, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
             }
         }
     };
-    let bytes = receiver
-        .recv_timeout(READ_TIMEOUT)
-        .map_err(|_| format!("{program} output did not finish"))?
-        .map_err(|error| format!("cannot read {program}: {error}"))?;
+    // The output shares the one deadline the child was given: a grandchild that
+    // keeps the pipe open cannot extend the caller's wait past READ_TIMEOUT in
+    // total, as a second full bound after the child exited would.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let bytes = match receiver.recv_timeout(remaining) {
+        Ok(read) => read.map_err(|error| format!("cannot read {program}: {error}"))?,
+        Err(_) => {
+            // A process in the group still holds the pipe open. Stop the whole
+            // group so it cannot keep running unseen. The group id stays reserved
+            // while any member exists, so this signal reaches only that group.
+            if let Ok(pid) = i32::try_from(child.id()) {
+                // SAFETY: the negative PID addresses the group this child led.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+            return Err(format!("{program} output did not finish"));
+        }
+    };
     if bytes.len() > MAX_PLIST_BYTES {
         return Err(format!("{program} output is over the cap"));
     }
@@ -475,6 +490,52 @@ mod tests {
         }
         // SAFETY: as above.
         assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the grandchild survived");
+        fs::remove_dir_all(&dir).expect("remove own fixture");
+    }
+
+    /// Regression: after the direct child exited, the output read waited a second
+    /// full bound, so a slow command could hold the caller for nearly twice
+    /// READ_TIMEOUT. The child and its output now share one deadline.
+    #[test]
+    fn output_held_open_by_a_grandchild_stays_within_one_deadline() {
+        let dir = std::env::temp_dir().join(format!("oxide-describe-held-{}", std::process::id()));
+        fs::create_dir(&dir).expect("fresh fixture");
+        let pidfile = dir.join("pid");
+        // The shell exits after about 3 s, while a background sleep keeps the pipe open.
+        let script = "sleep 20 & echo $! > \"$1\"; sleep 3";
+        let started = Instant::now();
+        let result = bounded(
+            "/bin/sh",
+            &[
+                "-c",
+                script,
+                "oxide-test",
+                pidfile.to_str().expect("UTF-8 path"),
+            ],
+            None,
+        );
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "the held pipe must be refused");
+        assert!(
+            elapsed < Duration::from_secs(7),
+            "the output wait ran past the one deadline: {elapsed:?}"
+        );
+        let pid: i32 = fs::read_to_string(&pidfile)
+            .expect("the grandchild's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only probes the PID this test started.
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        // SAFETY: as above.
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the held pipe's group survived"
+        );
         fs::remove_dir_all(&dir).expect("remove own fixture");
     }
 
