@@ -1585,6 +1585,15 @@ mod tests {
     }
 
     #[test]
+    fn creation_probe_does_not_treat_unreadable_paths_as_absent() {
+        let temp = barge::testing::TempDir::new("oxide-removable-unknown").unwrap();
+        let loop_path = temp.path().join("loop");
+        std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+        let created = Created::note(&loop_path);
+        assert!(!created.payload && !created.slots);
+    }
+
+    #[test]
     fn a_rollback_keeps_drive_folders_that_predate_the_attempt() {
         let temp = barge::testing::TempDir::new("oxide-removable-preexisting").unwrap();
         let pool = temp.path().join("removable");

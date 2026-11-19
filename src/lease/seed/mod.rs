@@ -2686,6 +2686,36 @@ mod sidecar_regressions {
     }
 
     #[test]
+    fn old_source_cache_temps_are_reaped_but_live_and_foreign_names_stay() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = barge::testing::TempDir::new("oxide-source-orphans").unwrap();
+        let old = temp.path().join(".sources.json.tmp-123-4");
+        let fresh = temp.path().join(".sources.json.tmp-123-5");
+        let foreign = temp.path().join(".sources.json.tmp-not-ours");
+        for path in [&old, &fresh, &foreign] {
+            fs::write(path, b"keep").unwrap();
+        }
+        let name = std::ffi::CString::new(old.as_os_str().as_bytes()).unwrap();
+        let times = [libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        }; 2];
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, name.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+        let view = SeedPoolView {
+            store_id: "x".into(),
+            pool_root: temp.path().into(),
+            payload_root: None,
+            slots: vec![],
+        };
+        remove_orphan_sidecars(temp.path(), &view).unwrap();
+        assert!(!old.exists());
+        assert!(fresh.exists() && foreign.exists());
+    }
+
+    #[test]
     fn source_sidecar_uses_bounded_atomic_writer() {
         let temp = barge::testing::TempDir::new("oxide-sources-sidecar").unwrap();
         let path = temp.path().join(SOURCES_NAME);

@@ -340,11 +340,14 @@ fn verify_pass(
         packages,
         &hints,
         cache,
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "clock before Unix epoch")?
-            .as_secs(),
+        unix_seconds(SystemTime::now())?,
     )
+}
+
+fn unix_seconds(time: SystemTime) -> Result<u64, &'static str> {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| "clock before Unix epoch")
 }
 
 fn git_hint<'a>(cargo_home: &Path, package: &Package, hints: &'a [GitHint]) -> Option<&'a GitHint> {
@@ -806,6 +809,15 @@ mod tests {
             with("[lib]\nproc-macro=true\ncrate-type=['cdylib']\n"),
             None
         );
+    }
+
+    #[test]
+    fn verification_timestamp_uses_unix_seconds() {
+        assert_eq!(
+            unix_seconds(UNIX_EPOCH + Duration::from_millis(1_234_567)).unwrap(),
+            1234
+        );
+        assert!(unix_seconds(UNIX_EPOCH - Duration::from_secs(1)).is_err());
     }
 
     #[test]

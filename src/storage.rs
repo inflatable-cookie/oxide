@@ -238,7 +238,12 @@ fn containing_volume_identity(path: &Path) -> barge::Result<Option<String>> {
             path.display()
         ))
     })?;
-    facts.uuid.map(Some).ok_or_else(|| {
+    observed_volume_uuid(facts.uuid, path)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn observed_volume_uuid(uuid: Option<String>, path: &Path) -> barge::Result<Option<String>> {
+    uuid.map(Some).ok_or_else(|| {
         barge::Error::unknown_state(format!("volume identity at {} has no UUID", path.display()))
     })
 }
@@ -1273,6 +1278,18 @@ mod tests {
     use barge::{FakeOs, ManualClock, Mode, Os};
 
     const UUID: &str = "8E4A5C1D-0000-4000-8000-00000000BEEF";
+
+    #[test]
+    fn absent_observed_uuid_is_unknown_not_absent() {
+        let error = observed_volume_uuid(None, Path::new("/fixture")).unwrap_err();
+        assert_eq!(error.kind(), barge::ErrorKind::UnknownState);
+        assert_eq!(
+            observed_volume_uuid(Some(UUID.into()), Path::new("/fixture"))
+                .unwrap()
+                .as_deref(),
+            Some(UUID)
+        );
+    }
 
     #[test]
     fn directory_filesystem_identity_opens_and_reopens_barge_pool_storage() {

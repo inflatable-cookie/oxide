@@ -2325,6 +2325,53 @@ mod plan_identity_tests {
         }
     }
 
+    fn receipt_for(fixture: &Fixture, state: &str, selected: Option<&Selected>) -> Receipt {
+        let links = selected.map_or_else(Vec::new, |selected| {
+            vec![serde_json::json!({"member": "debug", "selected": selected})]
+        });
+        serde_json::from_value(serde_json::json!({
+            "version": "oxide.outputs.transition/3", "checkout": fixture.registry.rows[0].checkout,
+            "checkout_id": fixture.registry.rows[0].checkout_id, "generation": 1,
+            "state": state, "layout": "profile", "links": links, "updated_ms": 0
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn pinning_uses_the_updated_registry_not_its_stale_disk_preimage() {
+        let fixture = fixture();
+        let selected = Selected {
+            kind: RootKind::Local,
+            root: fixture.original.path.clone(),
+            volume_uuid: None,
+            nonce: None,
+            generation: 1,
+        };
+        let receipt = receipt_for(&fixture, "committed", Some(&selected));
+        let mut stale = fixture.registry.clone();
+        stale.rows[0].pruned_ms = Some(1);
+        write_registry(&fixture.control, &stale).unwrap();
+        pin_references(&fixture.control, &receipt, &fixture.registry).unwrap();
+        assert!(pin_record_exists(
+            &fixture.original.path,
+            &fixture.original.id
+        ));
+    }
+
+    #[test]
+    fn finishing_a_receipt_keeps_absent_historical_roots_without_failing() {
+        let fixture = fixture();
+        let receipt = receipt_for(&fixture, "detached", None);
+        // The already-unpinned historical root is harmless on repeated finish.
+        finish_receipt(&fixture.control, &receipt).unwrap();
+        let mut registry = fixture.registry.clone();
+        registry.rows[0].root = fixture._temp.path().join("absent-drive/outputs/gone");
+        registry.rows.truncate(1);
+        write_registry(&fixture.control, &registry).unwrap();
+        finish_receipt(&fixture.control, &receipt).unwrap();
+        assert!(!registry.rows[0].root.exists());
+    }
+
     #[test]
     fn registry_write_does_not_truncate_a_preexisting_temp() {
         let fixture = fixture();
