@@ -1706,12 +1706,17 @@ pub(crate) fn finish_receipt(control: &Path, receipt: &Receipt) -> Result<(), St
 
 /// Command holds use the same Barge roots as pruning. Descriptors survive the
 /// real child exec; a child that closes them leaves this cooperative contract.
-pub(crate) fn hold_outputs(control: &Path, receipt: &Receipt) -> Result<Vec<barge::Hold>, String> {
+pub(crate) fn hold_outputs(
+    control: &Path,
+    receipt: &Receipt,
+    uses_link: impl Fn(&str) -> bool,
+) -> Result<Vec<barge::Hold>, String> {
     let mut held = Vec::new();
     let mut ids = std::collections::HashSet::new();
     for selected in receipt
         .links()
         .iter()
+        .filter(|placement| uses_link(placement.member()))
         .filter_map(|placement| placement.selected_ref())
     {
         if !receipt.holds_selection() || !ids.insert(selected.root().to_path_buf()) {

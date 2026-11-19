@@ -5489,6 +5489,14 @@ author and reviewer native remain unactivated.
   foreign link refuses. Every first link also checks the actual Git
   ignore/tracked state of `target/<member>`; a winning parent `target/` ignore
   is allowed, unknown answers refuse.
+
+  In ephemeral mode a converted checkout keys a missing member as a real
+  local directory. Cargo or the tool can create it under a real or missing
+  `target` and triple directory. Existing links keep their receipt-recorded
+  roots after verification. A foreign link, non-directory ancestor or
+  unverified linked destination still refuses by name. The local placement
+  leaves the receipt and its durable pins intact.
+
   For a receiptless, nonempty real target, `oxide outputs plan` reports the
   explicit profile adoption member by member: nonempty real directories stay
   local, missing or empty members convert, and a foreign member refuses by

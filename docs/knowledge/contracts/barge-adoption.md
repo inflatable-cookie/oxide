@@ -105,7 +105,9 @@ selected prune target. A zero reserve retains Barge's default floor.
   roots use shared holds to preserve concurrent command behavior; their durable
   selection pins remain independent of running commands. The hold's descriptor is made inheritable before the real child
   launch, so the root stays held until the child that keeps the descriptor
-  exits.
+  exits. In ephemeral mode a profile member that is missing or a real local
+  directory needs no running hold on its receipt's root. Live owned links
+  still take their holds and the durable receipt pins remain in force.
 - Holds are cooperative: a child that closes the descriptor, and a process
   that writes into a root without holding it, are outside this guarantee. The
   docs say so; no process or descriptor census is restored to widen it.
