@@ -347,13 +347,7 @@ operator instruction; the general lean reset is not deletion authority.
 
 ## Validation policy
 
-Tom's 2026-11-17 lean reset, implemented by oxide#314, uses ordinary bounded
-unit/integration tests on private fixtures and retained independent exact-head
-review for the linked Barge adoption. It removes the supplier/capture/native
-qualification ladders for that change. Existing shared-runner safeguards and
-unrelated product verification stay. Installation and live migration remain
-separate owner actions; old evidence is historical, with no transferred credit.
-
+Tom's 2026-11-17 lean reset ("simplify this across all three projects… without all the ceremony") is the current validation policy for all Oxide work: ordinary bounded unit/integration tests on private fixtures and one independent exact-head review. No native-proof, reviewer-native, diagnostic or qualification ladder is required. Installation and live migration remain separate owner/planner actions. Before installing a storage-affecting binary, time one real admission on the live pool (2026-11-18 incident, decision `d9f8839e`). The rulings below are history; their evidence keeps no transferred credit.
 
 Tom decision `ea8ee47f-adc0-4cd3-b420-aaa30642d623` v2 (2026-11-16)
 adopts the reviewed cooperative qualification contract (retired 2026-11-18)
