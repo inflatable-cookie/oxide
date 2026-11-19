@@ -3,7 +3,7 @@
 This contract owns Oxide's own opt-in Cargo profiles for everyday Rust
 feedback: `oxide-light` and its explicit control, `oxide-full-debug`. They are
 named per invocation on the pinned stable toolchain (`rust-toolchain.toml`,
-channel 1.97.1). They do not change the default `dev`, `test` or `release`
+channel 1.100.0). They do not change the default `dev`, `test` or `release`
 profiles, any consumer, global Cargo configuration or the toolchain, and nothing
 selects them automatically.
 

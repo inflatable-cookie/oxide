@@ -54,7 +54,7 @@ fn private_home_uses_the_invoking_rustup_home() {
         .env("HOME", &home)
         .env("CARGO_HOME", &cargo_home)
         .env("RUSTUP_HOME", &rustup_home)
-        .env("RUSTUP_TOOLCHAIN", "1.97.1")
+        .env("RUSTUP_TOOLCHAIN", "1.100.0")
         .env("RUSTUP_AUTO_INSTALL", "0")
         .status()
         .expect("run installed rustc");

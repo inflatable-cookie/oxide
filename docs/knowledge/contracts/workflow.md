@@ -309,7 +309,7 @@ reuse.
 The gate, stray detection and dep-info decoder depend on Cargo internals. They run
 only on Cargo releases listed in `VERIFIED_CARGO` (`src/bin/oxide/freshness.rs`):
 1.95.0, 1.96.1, 1.97.1, 1.98.1, 1.99.1 and 1.100.0, matched by their `cargo -V`
-prefix. Oxide itself is pinned to 1.97.1 in `rust-toolchain.toml`.
+prefix. Oxide itself is pinned to 1.100.0 in `rust-toolchain.toml`.
 
 | Cargo | Default build-dir layout | Stray detection reads | Cold-slot seeding |
 | --- | --- | --- | --- |
@@ -666,9 +666,10 @@ itself.
 - `oxide clean --cargo-cache` takes no other argument. It runs one pass of Cargo's
   own automatic cleanup, with `cache.auto-clean-frequency="always"`, and with
   network refused. Oxide's loopback listener closes every connection, and the
-  libcurl proxy variables are removed. It runs only under Cargo 1.97.1, and it
-  refuses before Cargo runs when the environment or config could disable,
-  redirect or fetch:
+  libcurl proxy variables are removed. It runs only under Cargo 1.97.1, so it
+  refuses inside Oxide's own checkout, which builds on the pinned 1.100.0, until
+  that release is qualified. It refuses before Cargo runs when the environment or
+  config could disable, redirect or fetch:
   - environment that disables cleanup, uses the Git CLI, or redirects registries,
     sources or unstable features;
   - config keys outside the contained set: sources, registries, credential
