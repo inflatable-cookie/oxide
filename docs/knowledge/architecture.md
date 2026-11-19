@@ -10,7 +10,7 @@ proposed user workflow lives in
 ## Storage and ownership
 
 **Barge owns storage mechanics.** The linked library at full pin
-`3aacee23f5b8f9788525b41511cc2345a2066375` owns volume registration and
+`7c91e356ecf71f90680f6d58870c800132c6d130` owns volume registration and
 identity, declared areas and locations, marked roots, cooperative
 shared/exclusive holds, durable selected-output pins, reserve/floor pruning,
 idle LRU eviction and marker-checked trash ([adoption

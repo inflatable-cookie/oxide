@@ -99,11 +99,6 @@ row. An unreadable `idle-evictions.json` is quarantined beside itself and the op
 continues: no deletion is invented from it, its roots stay as recorded, and the
 library's ledger view reports the open as reconciliation-blocked.
 
-Barge's trash sweep holds its area lock
-while deleting a tree. An admission can therefore wait for that lock while
-holding the pool lock, including when one command's sweep deletes another
-command's in-flight trash from an ordinary eviction. This limitation is accepted
-for now; Oxide leaves ownership checks and deletion to Barge.
 A sweep failure is reported and does not prevent settlement of other recorded
 roots. A record whose root is still present stays for a later pass; recovery
 never deletes it directly.

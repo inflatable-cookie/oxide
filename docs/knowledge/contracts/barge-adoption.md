@@ -13,7 +13,7 @@ storage invariants still apply.
 
 `barge` is a Git dependency pinned by a full 40-hex revision in `Cargo.toml` and
 `Cargo.lock`, never a branch or tag. The current pin is Barge main
-`3aacee23f5b8f9788525b41511cc2345a2066375`. Only test builds request Barge's
+`7c91e356ecf71f90680f6d58870c800132c6d130`. Only test builds request Barge's
 `testing` feature. `scripts/offline_seed.py` derives the Git revision from
 `Cargo.lock`; a missing revision is an offline failure.
 
