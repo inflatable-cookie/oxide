@@ -1,6 +1,6 @@
 //! Cross-checkout freshness gate (W-8).
 //!
-//! Cargo 1.97.1 keys workspace units by relative path and treats an input as
+//! Cargo 1.97.1 and 1.100.0 key workspace units by relative path and treat an input as
 //! fresh when its mtime is not newer than the unit's dep-info. A slot shared
 //! by two checkouts therefore needs the second checkout's differing files to
 //! look newer than the slot's last build. Each slot records its last compile
@@ -2519,8 +2519,8 @@ mod tests {
         };
         assert_eq!(run(&first), "1");
         assert!(crate::cargo_layout::holds_v2_build(&slot.join("debug")));
-        // Inspect Cargo's actual v2 fingerprint, not rustc's text .d file in
-        // out/. The gate's layout adapter must consume these same bytes.
+        // Check Cargo's actual v2 fingerprint and dep-info, which Cargo itself
+        // uses when the gate refreshes checkout files.
         let package = slot.join("debug/build/probe");
         let mut decoded_units = 0;
         for entry in fs::read_dir(package).expect("unit directories") {
@@ -2567,6 +2567,34 @@ mod tests {
             run(&second),
             "2",
             "the refreshed file must rebuild the unit"
+        );
+        let warm = cargo_1_100(&second)
+            .args(["run", "-v"])
+            .env("CARGO_BUILD_BUILD_DIR", &slot)
+            .output()
+            .expect("warm cargo run");
+        assert!(warm.status.success());
+        let stderr = String::from_utf8_lossy(&warm.stderr);
+        assert!(stderr.contains("Fresh probe"), "{stderr}");
+        assert!(!stderr.contains("Compiling probe"), "{stderr}");
+
+        // A tracked input redirecting outside this checkout must refuse
+        // rather than touch the other checkout's file.
+        let outside = first.join("src/lib.rs");
+        let before = mtime_ns(&fs::metadata(&outside).expect("outside file"));
+        std::os::unix::fs::symlink(&outside, second.join("src/outside.rs"))
+            .expect("outside symlink");
+        let refusal = refresh(
+            &second,
+            &["src/outside.rs".to_owned()],
+            anchor_ns,
+            &BTreeMap::new(),
+        )
+        .expect_err("outside symlink must refuse");
+        assert!(refusal.contains("links outside the checkout"), "{refusal}");
+        assert_eq!(
+            mtime_ns(&fs::metadata(outside).expect("outside file")),
+            before
         );
     }
 
