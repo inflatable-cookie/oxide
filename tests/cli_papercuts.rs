@@ -141,10 +141,11 @@ fn help_is_cargos_help_without_a_slot_or_pool() {
             "oxide build {spelling}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        // The request is forwarded as the caller spelled it.
         assert_eq!(
             fs::read_to_string(&log).unwrap(),
-            "build --help\n",
-            "oxide build {spelling} did not forward exactly Cargo's help request"
+            format!("build {spelling}\n"),
+            "oxide build {spelling} did not forward the help request unchanged"
         );
         assert!(
             !pool.exists(),
@@ -156,6 +157,21 @@ fn help_is_cargos_help_without_a_slot_or_pool() {
             "help touched the private home"
         );
     }
+    // Oxide's own budget options are not Cargo's, so they are dropped from a
+    // forwarded help request; the rest of the request is kept.
+    let _ = fs::remove_file(&log);
+    let output = private_env(scratch.path(), &bin, &pool)
+        .current_dir(manifest.parent().unwrap())
+        .args(["build", "--admission-budget", "30s", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "oxide build --admission-budget 30s --help: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(&log).unwrap(), "build --help\n");
+
     // `oxide help <cmd>` is the existing plain passthrough: Cargo's help with
     // no pool either.
     let _ = fs::remove_file(&log);
@@ -211,6 +227,319 @@ fn help_is_cargos_help_without_a_slot_or_pool() {
             "the program's own help argument was forwarded to Cargo: {log}"
         );
     }
+}
+
+/// oxide#326: `oxide nextest run --help` must ask Cargo for that whole
+/// request. Counterfactual: the front door kept only the command name and
+/// `--help`, so `oxide nextest run --help` printed top-level help and every
+/// argument before `--help` was lost.
+#[test]
+fn external_subcommand_help_keeps_every_argument() {
+    let scratch = Scratch::new();
+    let manifest = scratch.path().join("app/Cargo.toml");
+    fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+    fs::write(
+        &manifest,
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let (bin, log) = fake_cargo(scratch.path(), &manifest);
+    let pool = scratch.path().join("outside-pool");
+    for request in [
+        &["nextest", "run", "--help"][..],
+        &["nextest", "run", "-h"],
+        &["nextest", "--cargo-profile", "debug", "--help"],
+    ] {
+        let _ = fs::remove_file(&log);
+        let output = private_env(scratch.path(), &bin, &pool)
+            .current_dir(manifest.parent().unwrap())
+            .args(request)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "oxide {request:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            format!("{}\n", request.join(" ")),
+            "oxide {request:?} did not forward the whole help request"
+        );
+        assert!(
+            !pool.exists(),
+            "help created the pool at {}",
+            pool.display()
+        );
+    }
+}
+
+/// One recording fake Cargo for `oxide run`: the workspace lookup, `metadata`,
+/// and one built binary — the fixture script named by `FAKE_CARGO_PROGRAM` —
+/// as Cargo's JSON reports it. `FAKE_CARGO_SIGNAL_PARENT` makes it signal this
+/// command before it exits, standing for a Ctrl-C that arrives while Cargo
+/// runs.
+fn fake_run_cargo(scratch: &Path, manifest: &Path) -> (PathBuf, PathBuf) {
+    let bin = scratch.join("run-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let log = scratch.join("run-cargo.log");
+    let metadata = scratch.join("metadata.json");
+    fs::write(
+        &metadata,
+        serde_json::to_vec(&json!({"packages": [{
+            "name": "app",
+            "version": "2.3.4-beta.7+build.9",
+            "manifest_path": manifest.display().to_string(),
+            "authors": ["A One <a@example.com>", "B Two <b@example.com>"],
+            "license": "MIT",
+            "readme": "README.md",
+        }]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let cargo = bin.join("cargo");
+    fs::write(
+        &cargo,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "{log}"
+case "$1" in
+  locate-project) echo "{manifest}"; exit 0 ;;
+  metadata) cat "{metadata}"; exit 0 ;;
+esac
+if [ -n "$FAKE_CARGO_SIGNAL_PARENT" ]; then kill -INT "$PPID"; fi
+printf '{{"reason":"compiler-artifact","target":{{"name":"demo","kind":["bin"]}},"executable":"%s","manifest_path":"{manifest}"}}\n' "$FAKE_CARGO_PROGRAM"
+exit 0
+"#,
+            log = log.display(),
+            manifest = manifest.display(),
+            metadata = metadata.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    (bin, log)
+}
+
+/// The `oxide run` fixture: a manifest, a fake Cargo, an existing private pool,
+/// and the built program's script, which records the environment it was given in
+/// `program.env` inside the scratch and writes nothing to stdout.
+fn run_fixture(scratch: &Scratch) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let app = scratch.path().join("app");
+    let manifest = app.join("Cargo.toml");
+    fs::create_dir_all(&app).unwrap();
+    fs::write(
+        &manifest,
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let program = app.join("program.sh");
+    fs::write(&program, "#!/bin/sh\nenv | sort > \"$FAKE_PROGRAM_OUT\"\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    let (bin, log) = fake_run_cargo(scratch.path(), &manifest);
+    let pool = scratch.path().join("fixture-pool");
+    created_pool(scratch, &bin, &manifest, &pool);
+    (manifest, program, bin, log)
+}
+
+/// The fixture's `oxide run` command, with the built program named by the fake
+/// Cargo and the marker file it records its environment in.
+fn run_command(
+    scratch: &Scratch,
+    bin: &Path,
+    pool: &Path,
+    manifest: &Path,
+    program: &Path,
+) -> Command {
+    let mut command = private_env(scratch.path(), bin, pool);
+    command
+        .current_dir(manifest.parent().unwrap())
+        .env("FAKE_CARGO_PROGRAM", program)
+        .env("FAKE_PROGRAM_OUT", scratch.path().join("program.env"));
+    command
+}
+
+fn environment_file(path: &Path) -> std::collections::HashMap<String, String> {
+    fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect()
+}
+
+/// oxide#326: a program under `oxide run` reads the environment `cargo run`
+/// would give it. Counterfactual: only `CARGO_MANIFEST_DIR` was set, so
+/// `CARGO`, `CARGO_MANIFEST_PATH`, every `CARGO_PKG_*` fact and the dylib
+/// search path were missing (or inherited from the caller).
+#[test]
+fn run_gives_the_program_cargos_run_environment() {
+    let scratch = Scratch::new();
+    let (manifest, program, bin, _log) = run_fixture(&scratch);
+    let pool = scratch.path().join("fixture-pool");
+    let output = run_command(&scratch, &bin, &pool, &manifest, &program)
+        .args(["run", "--bin", "demo"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "oxide run: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let environment = environment_file(&scratch.path().join("program.env"));
+    let app = manifest.parent().unwrap();
+    assert_eq!(
+        environment.get("CARGO_MANIFEST_DIR").map(String::as_str),
+        Some(app.to_str().unwrap())
+    );
+    assert_eq!(
+        environment.get("CARGO_MANIFEST_PATH").map(String::as_str),
+        Some(manifest.to_str().unwrap())
+    );
+    // The Cargo this Oxide runs, resolved on the fixture's `PATH`.
+    assert_eq!(
+        environment.get("CARGO").map(String::as_str),
+        Some(bin.join("cargo").to_str().unwrap())
+    );
+    for (name, value) in [
+        ("CARGO_PKG_NAME", "app"),
+        ("CARGO_PKG_VERSION", "2.3.4-beta.7+build.9"),
+        ("CARGO_PKG_VERSION_MAJOR", "2"),
+        ("CARGO_PKG_VERSION_MINOR", "3"),
+        ("CARGO_PKG_VERSION_PATCH", "4"),
+        ("CARGO_PKG_VERSION_PRE", "beta.7"),
+        // Cargo joins the authors with a colon.
+        (
+            "CARGO_PKG_AUTHORS",
+            "A One <a@example.com>:B Two <b@example.com>",
+        ),
+        ("CARGO_PKG_LICENSE", "MIT"),
+        ("CARGO_PKG_README", "README.md"),
+        // A fact the package does not have is an empty string, as Cargo sets it.
+        ("CARGO_PKG_DESCRIPTION", ""),
+        ("CARGO_PKG_RUST_VERSION", ""),
+    ] {
+        assert_eq!(
+            environment.get(name).map(String::as_str),
+            Some(value),
+            "{name}"
+        );
+    }
+    // The loader searches beside the program, then the toolchain, then the
+    // caller's path: the program's own directory and its `deps` come first.
+    // A script fixture runs as `/bin/sh`, and macOS strips `DYLD_*` variables
+    // from the environment of a platform binary, so macOS observes this only
+    // through a compiled program (`identity`'s search-path tests pin the
+    // content).
+    #[cfg(not(target_os = "macos"))]
+    {
+        let search: Vec<&str> = environment
+            .get("LD_LIBRARY_PATH")
+            .map(|value| value.split(':').collect())
+            .unwrap_or_default();
+        assert_eq!(
+            search.first().copied(),
+            app.join("target/debug").to_str(),
+            "LD_LIBRARY_PATH: {search:?}"
+        );
+        assert_eq!(
+            search.get(1).copied(),
+            app.join("target/debug/deps").to_str(),
+            "LD_LIBRARY_PATH: {search:?}"
+        );
+    }
+}
+
+/// A closed stdout must not panic while the lease is held: forwarding stops
+/// and the program still runs. Counterfactual: `println!` panicked on the
+/// closed pipe, the command unwound and the program never started.
+#[test]
+fn run_keeps_draining_after_a_closed_stdout() {
+    use std::os::unix::io::FromRawFd;
+    let scratch = Scratch::new();
+    let (manifest, program, bin, _log) = run_fixture(&scratch);
+    let pool = scratch.path().join("fixture-pool");
+    let mut fds = [0; 2];
+    // SAFETY: `pipe` writes two owned descriptors into `fds`.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: the read end is closed exactly once, so every write to the pipe
+    // fails with EPIPE; the write end is given to the child.
+    unsafe { libc::close(fds[0]) };
+    let closed = unsafe { std::process::Stdio::from_raw_fd(fds[1]) };
+    let output = run_command(&scratch, &bin, &pool, &manifest, &program)
+        // The caller's own json format is what Oxide forwards and prints.
+        .args(["run", "--bin", "demo", "--message-format=json"])
+        .stdout(closed)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(output.status.success(), "oxide run: {stderr}");
+    assert!(
+        scratch.path().join("program.env").is_file(),
+        "the closed stdout stopped the program from running: {stderr}"
+    );
+}
+
+/// A signal that arrives while Cargo runs ends the command and never launches
+/// the program. Counterfactual: the release-then-exec hand-off ran the program
+/// anyway and returned its exit code.
+#[test]
+fn a_signal_after_cargo_never_launches_the_program() {
+    let scratch = Scratch::new();
+    let (manifest, program, bin, _log) = run_fixture(&scratch);
+    let pool = scratch.path().join("fixture-pool");
+    let output = run_command(&scratch, &bin, &pool, &manifest, &program)
+        .env("FAKE_CARGO_SIGNAL_PARENT", "1")
+        .args(["run", "--bin", "demo"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "the interrupted run did not return the signal code: {stderr}"
+    );
+    assert!(
+        !scratch.path().join("program.env").exists(),
+        "the program ran after the signal: {stderr}"
+    );
+}
+
+/// A release binary carries no test hooks: `OXIDE_TEST_LAUNCH_SOURCE` cannot
+/// make it copy and execute a file named in the environment. This release-only
+/// test runs when the suite itself is a release build; in a debug build the
+/// hooks are the integration tests' own controls.
+#[cfg(all(not(debug_assertions), target_os = "macos"))]
+#[test]
+fn a_release_binary_ignores_the_launch_test_hooks() {
+    let scratch = Scratch::new();
+    let app = scratch.path().join("app");
+    fs::create_dir_all(&app).unwrap();
+    let manifest = app.join("Cargo.toml");
+    fs::write(
+        &manifest,
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let (bin, _log) = fake_cargo(scratch.path(), &manifest);
+    let pool = scratch.path().join("fixture-pool");
+    created_pool(&scratch, &bin, &manifest, &pool);
+    let missing = scratch.path().join("absent-probe");
+    let output = private_env(scratch.path(), &bin, &pool)
+        .current_dir(&app)
+        .env("OXIDE_TEST_LAUNCH_SOURCE", &missing)
+        .env("OXIDE_TEST_LAUNCH_LIMIT_MS", "900")
+        .args(["status", "--launch-check"])
+        .output()
+        .unwrap();
+    // A debug build answers `oxide: could not read <source>` here.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("absent-probe") && !stderr.contains("could not read"),
+        "a release binary honoured a test hook: {stderr}"
+    );
 }
 
 /// An absent pool named by `OXIDE_POOL` refuses by name instead of being

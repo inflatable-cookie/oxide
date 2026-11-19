@@ -52,8 +52,10 @@ Rules:
   calls inherit them: `CARGO_BUILD_BUILD_DIR` points at the slot,
   `CARGO_TARGET_DIR` at `<workspace>/target`, and `CARGO_PROFILE_DEV_*` carry the
   recipe.
-- `oxide <cmd> --help` is exactly `cargo <cmd> --help`, with no storage touched.
-  After `--`, `--help` belongs to the program.
+- `oxide <cmd> --help` forwards the caller's whole request to Cargo unchanged —
+  `oxide nextest run --help` runs `cargo nextest run --help` — with no storage,
+  pool or lease touched. Oxide's own leading budget options are dropped, because
+  they are not Cargo's. After `--`, `--help` belongs to the program.
 - `oxide --version` (or `-V`) prints Oxide's identity, then Cargo's version. See
   [version identity](#version-identity). `oxide --list` passes straight to Cargo.
 - Plain `cargo` still works and builds privately. `oxide status` reports that
@@ -75,8 +77,9 @@ oxide exec [--manifest-path <Cargo.toml>] [--profile quick|debug|release] [--out
   passes its own `--target` needs the matching `<triple>/debug` or
   `<triple>/release` declaration.
 - The tool leads a recorded process group. The lease is held until the leader
-  exits and the group is empty. Ctrl-C and termination signals are forwarded to
-  the group.
+  exits and the group is empty. Ctrl-C and termination signals (INT, TERM, HUP,
+  QUIT) are forwarded to the group, and the group is continued after them so a
+  stopped member acts on the signal.
 - Exit code: the tool's, or 128 plus the signal. `127` means not found and `126`
   means it could not start.
 - A terminal standard input is replaced by `/dev/null`. Interactive prompts are
@@ -126,6 +129,22 @@ digest and the receipt digest are reported under separate labels.
 - `run` resolves its binary as `cargo run` does: `--bin`, `--example`, then
   `default-run` or the only binary. Several candidates refuse with Cargo's error,
   before any lease.
+- `run` gives the program the environment `cargo run` gives it: `CARGO` (the
+  Cargo Oxide itself runs, resolved on `PATH`), `CARGO_MANIFEST_DIR`,
+  `CARGO_MANIFEST_PATH`, every `CARGO_PKG_*` fact of its package (read from
+  Cargo's own metadata, so workspace inheritance is resolved), and the loader's
+  search path — the program's directory, its `deps`, the toolchain's
+  `target-libdir` and `sysroot/lib`, then the caller's own
+  `DYLD_FALLBACK_LIBRARY_PATH` or `LD_LIBRARY_PATH`, or the loader's default. A
+  failure to read the package facts is one warning and the program still runs.
+  The lease-holding `run` path (a bounded run, a converted checkout, an owned
+  temporary directory) keeps `CARGO_MANIFEST_DIR` only, because a metadata query
+  there would consume the run's own execution deadline.
+- `run` needs Cargo's JSON to find the program, so `--message-format` takes a
+  json variant (`json`, `json-render-diagnostics`, `json-diagnostic-short`,
+  `json-diagnostic-rendered-ansi`): the caller's variant is forwarded as given
+  and its messages are printed, and a human format refuses by name. With no
+  caller format Oxide asks for `json-render-diagnostics` and prints nothing.
 
 ## Slots and admission
 
@@ -316,8 +335,17 @@ explicit recovery.
   120 s, and refuses with a message naming what it waited on: the slot recorded
   as being deleted, or an unknown holder. It prints one progress line after
   5 s. No such wait is unbounded.
-- Ctrl-C and termination signals are forwarded to the group. Oxide releases only
-  after the group is empty. A clean exit or Ctrl-C is never logged as a recovery.
+- Ctrl-C and termination signals (INT, TERM, HUP, QUIT) are forwarded to the
+  group, and the group is continued after them so a stopped member acts on the
+  signal. Oxide releases only after the group is empty. A clean exit or Ctrl-C is
+  never logged as a recovery.
+- A group that does not own the terminal's foreground reads `/dev/null` instead
+  of a terminal standard input, so a background read cannot stop the job. A
+  program Oxide runs in the foreground owns it, and a job-control stop (Ctrl-Z)
+  hands the terminal back, stops Oxide with the job, and on resume gives the
+  terminal and SIGCONT back to the group.
+- A signal received while Cargo runs ends the command with 128 plus the signal:
+  a `run` never launches its program after it.
 - A later command recovers a dead lease automatically only when all of these hold:
   the record lock is free; the lease is the record's own; and either Cargo never
   started or `killpg(pgid, 0)` returns `ESRCH`. On macOS, `EPERM` means a group
@@ -817,8 +845,9 @@ the installed binary, instead of refusing:
   documents trigger nothing. Plain passthrough, usage-only `exec` and the launch
   probe skip the check.
 - **Candidate:** exactly one executable, the newest install receipt's path, opened
-  without following links, verified against the receipt's size and SHA-256, and
-  reached through `PATH`. No other executable is searched or installed.
+  without following links, verified against the receipt's size and SHA-256, owned
+  by this user, executable, not group- or world-writable, and reached through
+  `PATH`. No other executable is searched or installed.
 - **Hand-off:** prints one notice, `oxide: handing off to the installed binary (state is newer than this one).`,
   then executes the candidate with the caller's arguments and environment, adding
   `OXIDE_INTERNAL_HANDED_OFF=1`. That marker prevents a second hand-off. Signals and

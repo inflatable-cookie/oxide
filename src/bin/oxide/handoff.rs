@@ -281,6 +281,11 @@ fn attempt(inputs: &Inputs, observed: Observed) -> Result<Prepared, Refusal> {
     if !opened.is_file() || opened.uid() != uid || opened.mode() & 0o100 == 0 {
         return Err(Refusal("the candidate is not an owned executable file"));
     }
+    // A group- or world-writable candidate can be replaced under the hand-off;
+    // `version` applies the same private-file rule to the installed binary.
+    if opened.mode() & 0o022 != 0 {
+        return Err(Refusal("the candidate is writable by another user"));
+    }
     if inputs.current == Some((opened.dev(), opened.ino())) {
         return Err(Refusal("the candidate is the running binary"));
     }
@@ -660,6 +665,15 @@ mod tests {
         }
     }
 
+    /// The reason `attempt` refuses with: a test asserts the refusal that
+    /// actually happened, not merely that something refused.
+    fn refusal(inputs: &Inputs, observed: Observed) -> &'static str {
+        match attempt(inputs, observed) {
+            Ok(_) => panic!("the hand-off was prepared, not refused"),
+            Err(refusal) => refusal.0,
+        }
+    }
+
     fn hash(bytes: &[u8]) -> String {
         Sha256::digest(bytes)
             .iter()
@@ -784,10 +798,17 @@ mod tests {
             "20260201T000000Z-bbbbbbbbbbbb.json",
             "{\"installed\":{\"path\":\"/elsewhere/oxide\",\"sha256\":\"x\",\"size\":1}}",
         );
-        assert!(attempt(&fixture.inputs(), newer_state()).is_err());
+        assert_eq!(
+            refusal(&fixture.inputs(), newer_state()),
+            "the newest receipt is for another destination"
+        );
+        // The internal marker that makes a successor refuse a second hand-off.
         let mut inputs = fixture.inputs();
         inputs.marker = true;
-        assert!(attempt(&inputs, newer_state()).is_err());
+        assert_eq!(
+            refusal(&inputs, newer_state()),
+            "the internal hand-off marker is already set"
+        );
     }
 
     #[test]
@@ -802,7 +823,10 @@ mod tests {
             STATE_VERSION,
             REGISTRATION_VERSION,
         );
-        assert!(attempt(&fixture.inputs(), newer_state()).is_err());
+        assert_eq!(
+            refusal(&fixture.inputs(), newer_state()),
+            "the receipt does not cover the newer versions"
+        );
         fixture.receipt_for(
             "2.json",
             &hash(bytes),
@@ -825,7 +849,10 @@ mod tests {
             bytes.len()
         );
         fixture.receipt("1.json", &receipt);
-        assert!(attempt(&fixture.inputs(), newer_state()).is_err());
+        assert_eq!(
+            refusal(&fixture.inputs(), newer_state()),
+            "the receipt has no control-state capability"
+        );
         let one = format!(
             "{{\"installed\":{{\"path\":\"{}\",\"sha256\":\"{}\",\"size\":{}}},\"control_state_version\":3}}",
             fixture.destination().display(),
@@ -833,7 +860,10 @@ mod tests {
             bytes.len()
         );
         fixture.receipt("2.json", &one);
-        assert!(attempt(&fixture.inputs(), newer_state()).is_err());
+        assert_eq!(
+            refusal(&fixture.inputs(), newer_state()),
+            "the receipt has no registration capability"
+        );
         let stringly = format!(
             "{{\"installed\":{{\"path\":\"{}\",\"sha256\":\"{}\",\"size\":{}}},\"control_state_version\":\"3\",\"registration_version\":2}}",
             fixture.destination().display(),
@@ -841,7 +871,10 @@ mod tests {
             bytes.len()
         );
         fixture.receipt("3.json", &stringly);
-        assert!(attempt(&fixture.inputs(), newer_state()).is_err());
+        assert_eq!(
+            refusal(&fixture.inputs(), newer_state()),
+            "the receipt has no control-state capability"
+        );
     }
 
     #[test]
@@ -849,9 +882,17 @@ mod tests {
         let fixture = Fixture::new();
         let bytes = b"candidate";
         fixture.candidate(bytes, 0o755);
-        for (sha256, size) in [
-            (hash(b"other"), bytes.len() as u64),
-            (hash(bytes), bytes.len() as u64 + 1),
+        for (sha256, size, reason) in [
+            (
+                hash(b"other"),
+                bytes.len() as u64,
+                "the candidate hash differs from the receipt",
+            ),
+            (
+                hash(bytes),
+                bytes.len() as u64 + 1,
+                "the candidate size differs from the receipt",
+            ),
         ] {
             fixture.receipt_for(
                 "1.json",
@@ -860,7 +901,7 @@ mod tests {
                 STATE_VERSION + 1,
                 REGISTRATION_VERSION,
             );
-            assert!(attempt(&fixture.inputs(), newer_state()).is_err());
+            assert_eq!(refusal(&fixture.inputs(), newer_state()), reason);
         }
         // A non-executable or symlinked candidate refuses.
         fixture.receipt_for(
@@ -871,13 +912,29 @@ mod tests {
             REGISTRATION_VERSION,
         );
         fs::set_permissions(fixture.destination(), fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(attempt(&fixture.inputs(), newer_state()).is_err());
+        assert_eq!(
+            refusal(&fixture.inputs(), newer_state()),
+            "the candidate is not an owned executable file"
+        );
+        // A group- or world-writable candidate can be replaced under the
+        // hand-off, so it refuses even though it is executable.
+        for mode in [0o775, 0o757, 0o777] {
+            fs::set_permissions(fixture.destination(), fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                refusal(&fixture.inputs(), newer_state()),
+                "the candidate is writable by another user",
+                "{mode:o}"
+            );
+        }
         fs::set_permissions(fixture.destination(), fs::Permissions::from_mode(0o755)).unwrap();
         let real = fixture.destination();
         let elsewhere = fixture.root.join("elsewhere");
         fs::rename(&real, &elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &real).unwrap();
-        assert!(attempt(&fixture.inputs(), newer_state()).is_err());
+        assert_eq!(
+            refusal(&fixture.inputs(), newer_state()),
+            "the candidate cannot be opened"
+        );
     }
 
     #[test]
@@ -894,10 +951,16 @@ mod tests {
         );
         let mut inputs = fixture.inputs();
         inputs.current = Some((candidate.dev, candidate.ino));
-        assert!(attempt(&inputs, newer_state()).is_err());
+        assert_eq!(
+            refusal(&inputs, newer_state()),
+            "the candidate is the running binary"
+        );
         let mut inputs = fixture.inputs();
         inputs.path = fixture.root.join("empty").into_os_string();
-        assert!(attempt(&inputs, newer_state()).is_err());
+        assert_eq!(
+            refusal(&inputs, newer_state()),
+            "the installed oxide is not reachable through PATH"
+        );
         // Another oxide earlier on PATH refuses even when the destination is
         // also reachable.
         let other = fixture.root.join("other");
@@ -909,7 +972,7 @@ mod tests {
         joined.push(fixture.destination().parent().unwrap());
         let mut inputs = fixture.inputs();
         inputs.path = joined;
-        assert!(attempt(&inputs, newer_state()).is_err());
+        assert_eq!(refusal(&inputs, newer_state()), "another oxide is on PATH");
     }
 
     #[test]
@@ -929,7 +992,10 @@ mod tests {
             fs::Permissions::from_mode(0o777),
         )
         .unwrap();
-        assert!(attempt(&fixture.inputs(), newer_state()).is_err());
+        assert_eq!(
+            refusal(&fixture.inputs(), newer_state()),
+            "a destination directory is not owned only by this user"
+        );
         fs::set_permissions(
             fixture.home().join(".local/bin"),
             fs::Permissions::from_mode(0o700),
@@ -940,7 +1006,10 @@ mod tests {
         let moved = fixture.root.join("moved-bin");
         fs::rename(&bin, &moved).unwrap();
         std::os::unix::fs::symlink(&moved, &bin).unwrap();
-        assert!(attempt(&fixture.inputs(), newer_state()).is_err());
+        assert_eq!(
+            refusal(&fixture.inputs(), newer_state()),
+            "a destination directory is not owned only by this user"
+        );
     }
 
     #[test]
@@ -959,6 +1028,9 @@ mod tests {
         let real = fixture.root.join("real-home");
         fs::rename(&home, &real).unwrap();
         std::os::unix::fs::symlink(&real, &home).unwrap();
-        assert!(attempt(&fixture.inputs(), newer_state()).is_err());
+        assert_eq!(
+            refusal(&fixture.inputs(), newer_state()),
+            "a destination directory is not owned only by this user"
+        );
     }
 }

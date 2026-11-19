@@ -1,7 +1,7 @@
 //! Command classes, Oxide profiles and argument translation.
 
 use crate::budget;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 /// How one `oxide` command reaches Cargo.
@@ -321,7 +321,7 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
     let args = &args[..];
     refuse_storage_overrides(args)?;
     let package = package_selection(args);
-    let manifest_path = flag_value(args, "--manifest-path").map(PathBuf::from);
+    let manifest_path = flag_value_os(args, "--manifest-path").map(PathBuf::from);
     let targets = flag_values(args, "--target");
     let target = targets.first().cloned();
     let modelled = classify(command) == Class::Modelled;
@@ -349,7 +349,7 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
     let run = command == "run";
     let mut selected = None;
     let mut release = false;
-    let mut json_messages = false;
+    let mut message_format: Option<String> = None;
     let mut cargo_args = vec![OsString::from(if run { "build" } else { command })];
     let mut program_args = Vec::new();
     let mut iter = args.iter();
@@ -394,7 +394,15 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
                 text.strip_prefix("--message-format=")
             };
             if let Some(format) = format {
-                json_messages = format.starts_with("json");
+                // `run` reads Cargo's JSON messages to find the program, so it
+                // keeps the caller's json variant as given and refuses a human
+                // format instead of quietly overriding either choice.
+                if !format.starts_with("json") {
+                    return Err(format!(
+                        "--message-format {format} is refused: oxide run reads Cargo's JSON messages to find the program, so it takes a json variant (json, json-render-diagnostics, json-diagnostic-short or json-diagnostic-rendered-ansi)"
+                    ));
+                }
+                message_format = Some(format.to_owned());
                 continue;
             }
         }
@@ -427,14 +435,19 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
         .unwrap_or(cargo_args.len());
     cargo_args.splice(position..position, flags);
     if run {
-        cargo_args.push(OsString::from("--message-format=json-render-diagnostics"));
+        // Without a caller format, Oxide asks for the rendered diagnostics it
+        // otherwise never sees. A caller's json variant keeps its meaning.
+        let format = message_format
+            .as_deref()
+            .unwrap_or("json-render-diagnostics");
+        cargo_args.push(OsString::from(format!("--message-format={format}")));
     }
     Ok(Invocation {
         command: command.to_owned(),
         profile,
         cargo_args,
         program_args,
-        json_messages,
+        json_messages: message_format.is_some(),
         manifest_path,
         target,
         targets,
@@ -496,26 +509,33 @@ pub fn refuse_storage_overrides(args: &[OsString]) -> Result<(), String> {
     Ok(())
 }
 
-/// The value of `--flag value` or `--flag=value` before any `--`.
-fn flag_value(args: &[OsString], flag: &str) -> Option<String> {
+/// The value of `--flag value` or `--flag=value` before any `--`, as given.
+///
+/// The scan compares bytes, so one non-UTF-8 argument never hides a later
+/// match (a `--manifest-path` may name a path that is not UTF-8 at all).
+fn flag_value_os(args: &[OsString], flag: &str) -> Option<OsString> {
+    use std::os::unix::ffi::OsStrExt;
     let mut iter = args.iter();
     let prefix = format!("{flag}=");
+    let flag = flag.as_bytes();
     while let Some(argument) = iter.next() {
-        let text = argument.to_str()?;
-        if text == "--" {
+        let bytes = argument.as_os_str().as_bytes();
+        if bytes == b"--" {
             return None;
         }
-        if text == flag {
-            return iter
-                .next()
-                .and_then(|value| value.to_str())
-                .map(str::to_owned);
+        if bytes == flag {
+            return iter.next().cloned();
         }
-        if let Some(value) = text.strip_prefix(&prefix) {
-            return Some(value.to_owned());
+        if let Some(value) = bytes.strip_prefix(prefix.as_bytes()) {
+            return Some(OsStr::from_bytes(value).to_owned());
         }
     }
     None
+}
+
+/// [`flag_value_os`] for a flag whose value must be UTF-8.
+fn flag_value(args: &[OsString], flag: &str) -> Option<String> {
+    flag_value_os(args, flag).and_then(|value| value.into_string().ok())
 }
 
 /// Every value of `--flag value` and `--flag=value` before any `--`, in the
@@ -555,9 +575,10 @@ pub fn cargo_help(args: &[OsString]) -> bool {
         .any(|argument| matches!(argument.to_str(), Some("-h" | "--help")))
 }
 
-/// `--manifest-path`, for commands Oxide does not otherwise parse.
+/// `--manifest-path`, for commands Oxide does not otherwise parse. The path is
+/// kept exactly as given, including when it is not UTF-8.
 pub fn manifest_path(args: &[OsString]) -> Option<PathBuf> {
-    flag_value(args, "--manifest-path").map(PathBuf::from)
+    flag_value_os(args, "--manifest-path").map(PathBuf::from)
 }
 
 /// `-p`/`--package` without any `@version` suffix, before any `--`.
@@ -839,8 +860,58 @@ mod tests {
             ]),
         )
         .unwrap();
+        // The caller's json variant is kept, not replaced.
         assert_eq!(
             run.cargo_args,
+            args(&["build", "--bin", "demo", "--message-format=json"])
+        );
+        assert_eq!(run.program_args, args(&["--flag", "x"]));
+        assert!(run.json_messages);
+        assert_eq!(run_selection(&run.cargo_args).as_deref(), Some("demo"));
+    }
+
+    /// `run` must keep JSON to find the program, so a caller's json variant is
+    /// forwarded as given, a human format refuses instead of being silently
+    /// replaced, and no caller flag still asks Cargo to render diagnostics.
+    #[test]
+    fn run_message_format_keeps_json_and_refuses_a_human_format() {
+        for variant in [
+            "json",
+            "json-render-diagnostics",
+            "json-diagnostic-short",
+            "json-diagnostic-rendered-ansi",
+        ] {
+            let joined = format!("--message-format={variant}");
+            for given in [
+                args(&["--message-format", variant]),
+                args(&[joined.as_str()]),
+            ] {
+                let run = parse_leased("run", &given).unwrap();
+                assert_eq!(
+                    run.cargo_args,
+                    args(&["build", joined.as_str()]),
+                    "{given:?}"
+                );
+                assert!(run.json_messages, "{given:?}");
+            }
+        }
+        // The last json variant wins, as before.
+        let repeated = parse_leased(
+            "run",
+            &args(&[
+                "--message-format=json",
+                "--message-format=json-diagnostic-short",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            repeated.cargo_args,
+            args(&["build", "--message-format=json-diagnostic-short"])
+        );
+        // No caller format: Oxide still reads Cargo's JSON, and prints nothing.
+        let implicit = parse_leased("run", &args(&["--bin", "demo"])).unwrap();
+        assert_eq!(
+            implicit.cargo_args,
             args(&[
                 "build",
                 "--bin",
@@ -848,9 +919,49 @@ mod tests {
                 "--message-format=json-render-diagnostics"
             ])
         );
-        assert_eq!(run.program_args, args(&["--flag", "x"]));
-        assert!(run.json_messages);
-        assert_eq!(run_selection(&run.cargo_args).as_deref(), Some("demo"));
+        assert!(!implicit.json_messages);
+        // A human format refuses by name and names the variants that work.
+        for refused in ["short", "human"] {
+            let given = format!("--message-format={refused}");
+            let error = parse_leased("run", &args(&[given.as_str()])).unwrap_err();
+            assert!(error.contains("--message-format"), "{error}");
+            assert!(
+                error.contains("refused") && error.contains("json"),
+                "{error}"
+            );
+        }
+        // A json-prefixed value is kept and left to Cargo's own validation,
+        // rather than Oxide guessing which json variants a later Cargo adds.
+        let unknown = parse_leased("run", &args(&["--message-format=json-bogus"])).unwrap();
+        assert_eq!(
+            unknown.cargo_args,
+            args(&["build", "--message-format=json-bogus"])
+        );
+        // After `--` the flag belongs to the program.
+        let program = parse_leased("run", &args(&["--", "--message-format=short"])).unwrap();
+        assert_eq!(program.program_args, args(&["--message-format=short"]));
+        assert_eq!(
+            program.cargo_args,
+            args(&["build", "--message-format=json-render-diagnostics"])
+        );
+        assert!(!program.json_messages);
+    }
+
+    /// One non-UTF-8 argument must not hide a later `--manifest-path`, and the
+    /// path itself is kept as the caller gave it.
+    #[test]
+    fn a_non_utf8_argument_never_hides_the_manifest_path() {
+        use std::os::unix::ffi::OsStringExt;
+        let odd = OsString::from_vec(vec![b'a', 0xff, b'b']);
+        let odd_path = OsString::from_vec(b"/w/\xfe/app/Cargo.toml".to_vec());
+        let mut given = vec![odd.clone(), OsString::from("--manifest-path")];
+        given.push(odd_path.clone());
+        let parsed = parse_leased("check", &given).unwrap();
+        assert_eq!(parsed.manifest_path, Some(PathBuf::from(odd_path.clone())));
+        // The joined spelling is matched by bytes too.
+        let mut joined = OsString::from("--manifest-path=");
+        joined.push(&odd_path);
+        assert_eq!(manifest_path(&[odd, joined]), Some(PathBuf::from(odd_path)));
     }
 
     #[test]

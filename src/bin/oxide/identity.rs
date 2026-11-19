@@ -2,7 +2,7 @@
 //! configuration: identity is inferred from Git, then the canonical path.
 
 use sha2::{Digest, Sha256};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -397,6 +397,251 @@ pub fn digest(value: &str) -> String {
         .collect()
 }
 
+/// The package facts Cargo exports to a program it runs as `CARGO_PKG_*`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PackageFacts {
+    name: String,
+    version: String,
+    authors: String,
+    description: String,
+    homepage: String,
+    repository: String,
+    license: String,
+    license_file: String,
+    readme: String,
+    rust_version: String,
+}
+
+impl PackageFacts {
+    /// The facts of the package whose manifest is `manifest`, read from Cargo
+    /// itself so workspace inheritance resolves exactly as the build saw it.
+    pub fn read(cargo: &str, manifest: &Path) -> Result<Self, String> {
+        let mut command = Command::new(cargo);
+        command.args(["metadata", "--no-deps", "--format-version", "1"]);
+        command.arg("--manifest-path").arg(manifest);
+        crate::wrapper::apply(&mut command);
+        let output = crate::budget::output(&mut command)
+            .map_err(|error| format!("could not ask Cargo for the package facts: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "could not read the package facts: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("Cargo metadata is not JSON: {error}"))?;
+        Self::from_metadata(&metadata, manifest)
+            .ok_or_else(|| format!("Cargo metadata does not describe {}", manifest.display()))
+    }
+
+    /// The one package whose manifest is `manifest` in a metadata document.
+    fn from_metadata(metadata: &serde_json::Value, manifest: &Path) -> Option<Self> {
+        let packages = metadata["packages"].as_array()?;
+        let package = packages.iter().find(|package| {
+            package["manifest_path"]
+                .as_str()
+                .is_some_and(|path| same_path(Path::new(path), manifest))
+        })?;
+        let text = |field: &str| package[field].as_str().unwrap_or_default().to_owned();
+        let authors = package["authors"]
+            .as_array()
+            .map(|authors| {
+                authors
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(":")
+            })
+            .unwrap_or_default();
+        Some(Self {
+            name: text("name"),
+            version: text("version"),
+            authors,
+            description: text("description"),
+            homepage: text("homepage"),
+            repository: text("repository"),
+            license: text("license"),
+            license_file: text("license_file"),
+            readme: text("readme"),
+            rust_version: text("rust_version"),
+        })
+    }
+
+    /// Cargo's variables for these facts. A fact the package does not have is
+    /// an empty string, which is what Cargo sets.
+    fn variables(&self) -> Vec<(&'static str, String)> {
+        let (major, minor, patch, pre) = version_parts(&self.version);
+        vec![
+            ("CARGO_PKG_NAME", self.name.clone()),
+            ("CARGO_PKG_VERSION", self.version.clone()),
+            ("CARGO_PKG_VERSION_MAJOR", major),
+            ("CARGO_PKG_VERSION_MINOR", minor),
+            ("CARGO_PKG_VERSION_PATCH", patch),
+            ("CARGO_PKG_VERSION_PRE", pre),
+            ("CARGO_PKG_AUTHORS", self.authors.clone()),
+            ("CARGO_PKG_DESCRIPTION", self.description.clone()),
+            ("CARGO_PKG_HOMEPAGE", self.homepage.clone()),
+            ("CARGO_PKG_REPOSITORY", self.repository.clone()),
+            ("CARGO_PKG_LICENSE", self.license.clone()),
+            ("CARGO_PKG_LICENSE_FILE", self.license_file.clone()),
+            ("CARGO_PKG_README", self.readme.clone()),
+            ("CARGO_PKG_RUST_VERSION", self.rust_version.clone()),
+        ]
+    }
+}
+
+/// Two spellings of one manifest (`Cargo.toml` reached through a symlink, or a
+/// relative and an absolute path).
+fn same_path(left: &Path, right: &Path) -> bool {
+    left == right
+        || matches!(
+            (fs::canonicalize(left), fs::canonicalize(right)),
+            (Ok(left), Ok(right)) if left == right
+        )
+}
+
+/// Cargo's numeric version fields and pre-release, from a manifest version.
+fn version_parts(version: &str) -> (String, String, String, String) {
+    let (version, _build) = version.split_once('+').unwrap_or((version, ""));
+    let (numbers, pre) = version.split_once('-').unwrap_or((version, ""));
+    let mut numbers = numbers.split('.');
+    let part = |value: Option<&str>| value.unwrap_or_default().to_owned();
+    (
+        part(numbers.next()),
+        part(numbers.next()),
+        part(numbers.next()),
+        pre.to_owned(),
+    )
+}
+
+/// Reproduce the environment `cargo run` gives the program it launches:
+/// `CARGO`, `CARGO_MANIFEST_DIR`/`CARGO_MANIFEST_PATH`, the `CARGO_PKG_*` facts
+/// and the dynamic loader's library search path.
+///
+/// A program that reads any of these under `cargo run` reads the same values
+/// under `oxide run`, which otherwise execs it with only this process's
+/// inherited environment.
+pub fn apply_run_environment(
+    command: &mut Command,
+    program: &Path,
+    manifest: &Path,
+) -> Result<(), String> {
+    let facts = PackageFacts::read(crate::CARGO, manifest)?;
+    command.env("CARGO", cargo_program());
+    command.env(
+        "CARGO_MANIFEST_DIR",
+        manifest.parent().unwrap_or(Path::new("")),
+    );
+    command.env("CARGO_MANIFEST_PATH", manifest);
+    for (name, value) in facts.variables() {
+        command.env(name, value);
+    }
+    let search = dylib_search_path(
+        program,
+        &toolchain_libraries(),
+        std::env::var_os(dylib_path_variable()).as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    );
+    let joined = std::env::join_paths(&search)
+        .map_err(|error| format!("the program's library search path cannot be written: {error}"))?;
+    command.env(dylib_path_variable(), joined);
+    Ok(())
+}
+
+/// The Cargo this Oxide runs, as an absolute path when `PATH` names one: what
+/// a program sees as `CARGO`.
+fn cargo_program() -> OsString {
+    cargo_program_in(std::env::var_os("PATH").as_deref())
+}
+
+fn cargo_program_in(path: Option<&OsStr>) -> OsString {
+    let found = path.and_then(|path| {
+        std::env::split_paths(path)
+            .map(|directory| directory.join(crate::CARGO))
+            .find(|candidate| is_executable_file(candidate))
+    });
+    found.map_or_else(|| OsString::from(crate::CARGO), PathBuf::into_os_string)
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+/// The variable the platform's dynamic loader reads for library search paths.
+fn dylib_path_variable() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "DYLD_FALLBACK_LIBRARY_PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    }
+}
+
+/// The loader's own default search path, which `cargo run` starts from when
+/// the variable is unset: dyld's `$HOME/lib:/usr/local/lib:/usr/lib` on macOS,
+/// nothing elsewhere.
+fn default_dylib_path(home: Option<&OsStr>) -> Vec<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    if let Some(home) = home.filter(|home| !home.is_empty()) {
+        paths.push(PathBuf::from(home).join("lib"));
+    }
+    paths.push(PathBuf::from("/usr/local/lib"));
+    paths.push(PathBuf::from("/usr/lib"));
+    paths
+}
+
+fn dylib_search_path(
+    program: &Path,
+    toolchain: &[PathBuf],
+    caller: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(directory) = program.parent() {
+        // The program's own output directory, then its `deps`: `cargo run`
+        // prepends both so a dynamically linked build loads beside itself.
+        paths.push(directory.to_path_buf());
+        paths.push(directory.join("deps"));
+    }
+    paths.extend_from_slice(toolchain);
+    match caller {
+        Some(caller) => paths.extend(std::env::split_paths(caller)),
+        None => paths.extend(default_dylib_path(home)),
+    }
+    paths
+}
+
+/// The rustc's two library directories, so a dynamically linked `std` loads:
+/// the target's own `--print target-libdir` and the sysroot's `lib`, in the
+/// order `cargo run` writes them. Empty when rustc cannot answer; the program
+/// then searches only its own directory and the caller's path.
+fn toolchain_libraries() -> Vec<PathBuf> {
+    let rustc = std::env::var_os("RUSTC")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsString::from("rustc"));
+    let mut command = Command::new(rustc);
+    command.args(["--print", "sysroot", "--print", "target-libdir"]);
+    let Ok(output) = crate::budget::output(&mut command) else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let (Some(sysroot), Some(target_libdir)) = (lines.next(), lines.next()) else {
+        return Vec::new();
+    };
+    vec![
+        PathBuf::from(target_libdir),
+        PathBuf::from(sysroot).join("lib"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,5 +961,180 @@ mod tests {
             "12d9fc45c5c84a2e41a4e96d4918b08d421b41fd92114cbecd1eecb4b0a16936"
         );
         assert_eq!(slot_folders("oxide", &identity)[0], "oxide-4344f928");
+    }
+
+    /// The run environment's version fields follow Cargo's own split of a
+    /// manifest version: numbers from before `-`, pre-release without build
+    /// metadata.
+    #[test]
+    fn a_manifest_version_splits_into_cargos_numeric_fields() {
+        assert_eq!(
+            version_parts("2.3.4-beta.7+build.9"),
+            (
+                "2".to_owned(),
+                "3".to_owned(),
+                "4".to_owned(),
+                "beta.7".to_owned()
+            )
+        );
+        assert_eq!(
+            version_parts("0.10.0"),
+            (
+                "0".to_owned(),
+                "10".to_owned(),
+                "0".to_owned(),
+                String::new()
+            )
+        );
+        assert_eq!(
+            version_parts("1.2.3+only.build"),
+            (
+                "1".to_owned(),
+                "2".to_owned(),
+                "3".to_owned(),
+                String::new()
+            )
+        );
+    }
+
+    /// The package the program belongs to is selected by its manifest, and its
+    /// facts are the ones Cargo exports; a fact the package lacks is empty.
+    #[test]
+    fn package_facts_are_the_selected_package_and_cargos_variables() {
+        let metadata = serde_json::json!({"packages": [
+            {"manifest_path": "/w/other/Cargo.toml", "name": "other", "version": "9.9.9"},
+            {"manifest_path": "/w/app/Cargo.toml", "name": "app", "version": "2.3.4-beta.7+build.9",
+             "authors": ["A One <a@example.com>", "B Two <b@example.com>"],
+             "description": "A rich probe", "homepage": "https://example.invalid/home",
+             "repository": "https://example.invalid/repo", "license": "MIT",
+             "license_file": "LICENCE.txt", "readme": "README.md", "rust_version": "1.80"},
+        ]});
+        let facts = PackageFacts::from_metadata(&metadata, Path::new("/w/app/Cargo.toml"))
+            .expect("the package");
+        let variables: std::collections::HashMap<_, _> = facts.variables().into_iter().collect();
+        for (name, expected) in [
+            ("CARGO_PKG_NAME", "app"),
+            ("CARGO_PKG_VERSION", "2.3.4-beta.7+build.9"),
+            ("CARGO_PKG_VERSION_MAJOR", "2"),
+            ("CARGO_PKG_VERSION_MINOR", "3"),
+            ("CARGO_PKG_VERSION_PATCH", "4"),
+            ("CARGO_PKG_VERSION_PRE", "beta.7"),
+            (
+                "CARGO_PKG_AUTHORS",
+                "A One <a@example.com>:B Two <b@example.com>",
+            ),
+            ("CARGO_PKG_DESCRIPTION", "A rich probe"),
+            ("CARGO_PKG_HOMEPAGE", "https://example.invalid/home"),
+            ("CARGO_PKG_REPOSITORY", "https://example.invalid/repo"),
+            ("CARGO_PKG_LICENSE", "MIT"),
+            ("CARGO_PKG_LICENSE_FILE", "LICENCE.txt"),
+            ("CARGO_PKG_README", "README.md"),
+            ("CARGO_PKG_RUST_VERSION", "1.80"),
+        ] {
+            assert_eq!(variables[name], expected, "{name}");
+        }
+        let bare = serde_json::json!({"packages": [
+            {"manifest_path": "/w/bare/Cargo.toml", "name": "bare", "version": "0.0.1"},
+        ]});
+        let bare = PackageFacts::from_metadata(&bare, Path::new("/w/bare/Cargo.toml"))
+            .expect("the bare package");
+        let variables: std::collections::HashMap<_, _> = bare.variables().into_iter().collect();
+        assert_eq!(variables["CARGO_PKG_LICENSE"], "");
+        assert_eq!(variables["CARGO_PKG_AUTHORS"], "");
+        // Another manifest's packages are not this program's facts.
+        assert!(
+            PackageFacts::from_metadata(&metadata, Path::new("/w/missing/Cargo.toml")).is_none()
+        );
+    }
+
+    /// The search path is Cargo's: the program's directory, its `deps`, the
+    /// toolchain's libraries, then the caller's path — or the loader's own
+    /// default when the caller has none.
+    #[test]
+    fn the_library_search_path_is_cargos_order() {
+        let program = Path::new("/w/target/debug/app");
+        let toolchain = vec![
+            PathBuf::from("/toolchain/lib/rustlib/host/lib"),
+            PathBuf::from("/toolchain/lib"),
+        ];
+        let caller = OsStr::new("/caller/one:/caller/two");
+        assert_eq!(
+            dylib_search_path(program, &toolchain, Some(caller), None),
+            [
+                PathBuf::from("/w/target/debug"),
+                PathBuf::from("/w/target/debug/deps"),
+                PathBuf::from("/toolchain/lib/rustlib/host/lib"),
+                PathBuf::from("/toolchain/lib"),
+                PathBuf::from("/caller/one"),
+                PathBuf::from("/caller/two"),
+            ]
+        );
+        let default = dylib_search_path(program, &[], None, Some(OsStr::new("/home/tom")));
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                default,
+                [
+                    PathBuf::from("/w/target/debug"),
+                    PathBuf::from("/w/target/debug/deps"),
+                    PathBuf::from("/home/tom/lib"),
+                    PathBuf::from("/usr/local/lib"),
+                    PathBuf::from("/usr/lib"),
+                ]
+            );
+        } else {
+            assert_eq!(
+                default,
+                [
+                    PathBuf::from("/w/target/debug"),
+                    PathBuf::from("/w/target/debug/deps"),
+                ]
+            );
+        }
+    }
+
+    /// The toolchain libraries are the target's own directory and the
+    /// sysroot's `lib`, which is what a dynamically linked `std` needs.
+    #[test]
+    fn the_toolchain_libraries_are_the_target_directory_and_sysroot_lib() {
+        let paths = toolchain_libraries();
+        if paths.is_empty() {
+            // The rustc did not answer; the search path omits these entries.
+            return;
+        }
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].is_dir(), "{}", paths[0].display());
+        assert!(paths[1].is_dir(), "{}", paths[1].display());
+        assert_eq!(
+            paths[1].file_name().and_then(|name| name.to_str()),
+            Some("lib")
+        );
+    }
+
+    /// `CARGO` names the Cargo this Oxide runs, resolved on `PATH`, and stays
+    /// the bare name when nothing is found.
+    #[test]
+    fn the_programs_cargo_is_the_one_on_path() {
+        let dir = scratch("run-cargo");
+        let empty = dir.join("empty");
+        let bin = dir.join("bin");
+        fs::create_dir_all(&empty).expect("empty dir");
+        fs::create_dir_all(&bin).expect("bin dir");
+        let cargo = bin.join("cargo");
+        fs::write(&cargo, "#!/bin/sh\nexit 0\n").expect("stand-in cargo");
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).expect("executable");
+        let path = std::env::join_paths([&empty, &bin]).expect("a path list");
+        assert_eq!(cargo_program_in(Some(&path)), OsString::from(cargo.clone()));
+        assert_eq!(
+            cargo_program_in(None),
+            OsString::from(crate::CARGO),
+            "nothing on PATH keeps the bare name"
+        );
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o644)).expect("not executable");
+        assert_eq!(
+            cargo_program_in(Some(&path)),
+            OsString::from(crate::CARGO),
+            "a non-executable file is not Cargo"
+        );
+        fs::remove_dir_all(&dir).expect("remove scratch");
     }
 }
