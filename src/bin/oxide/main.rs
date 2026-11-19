@@ -23,7 +23,6 @@ mod identity;
 mod incremental;
 mod launch;
 mod layout;
-mod one_use;
 mod outputs;
 mod process;
 mod prune;
@@ -461,48 +460,10 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
             .clone()
             .unwrap_or_else(|| "the removable pool is not selected".to_owned())
     });
-    // One-use workspace classification (design §3.1): once per command, after
-    // the pool selection and before the first step that can write an owned
-    // output effect. It reads no receipt, slot, child temp path or payload,
-    // and it is computed only while the feature is active, so a dormant build
-    // does exactly what it did before.
-    let classification = one_use::is_active().then(|| {
-        one_use::classify(
-            &checkout,
-            &one_use::Facts::from_control(Some(&output_control)),
-        )
-    });
-    if let Some(classification) = &classification {
-        for note in &classification.notes {
-            eprintln!("oxide: {note}");
-        }
-    }
-    let guarded = classification
-        .as_ref()
-        .is_some_and(one_use::Classification::guarded);
-    let local_guard: Option<String> = classification
-        .as_ref()
-        .filter(|classification| classification.guarded())
-        .map(one_use::Classification::reason);
-    // The record class of the slot this command leases (design §3.6, §5.1).
-    // Classification is only computed while the feature is active, so a
-    // dormant build always admits a normal record and writes no class field.
-    let class_reason = classification
-        .as_ref()
-        .filter(|classification| classification.one_use())
-        .map(one_use::Classification::reason);
-    let admission = match class_reason.as_deref() {
-        Some(reason) => store::WorkspaceAdmission::one_use(reason),
-        None => store::WorkspaceAdmission::NORMAL,
-    };
     // A fresh checkout on the selected permanent drive converts its target
     // before the destination is planned and keyed (oxide#121). Its barrier is
-    // released before this command takes a slot. A guarded workspace skips it
-    // entirely, silently: no barrier, fence, receipt, root, link or notice
-    // (design §4.1).
-    if !guarded {
-        prep!(outputs::auto_adopt(&selected.store, &checkout, &selected));
-    }
+    // released before this command takes a slot.
+    prep!(outputs::auto_adopt(&selected.store, &checkout, &selected));
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
@@ -518,42 +479,12 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
     // function as a derived `exec`. One path, one key, one set of refusals.
     let derives_from_receipt =
         cli::derives_from_receipt(&invocation.command, &invocation.declared_outputs);
-    // A guarded workspace declares the members its own command writes, from
-    // its command line alone: it never derives a set from a receipt (design
-    // §4.1, §4.3). The set is used only to name the components the guard
-    // inspects, so an unmodelled command simply declares none.
-    let declaration = if guarded {
-        outputs::guarded_declaration(&invocation)?
-    } else {
-        outputs::lease_declaration(
-            &invocation,
-            Some(&output_control),
-            &checkout,
-            pool_fallback.as_deref(),
-        )?
-    };
-    let guarded_members: Vec<String> = if guarded {
-        declaration
-            .members()
-            .iter()
-            .map(|member| member.name().to_owned())
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let local_outputs = local_guard.as_deref().map(|reason| outputs::LocalOutputs {
-        members: &guarded_members,
-        reason,
-    });
-    if let Some(local) = &local_outputs {
-        // The guard's fast precheck (design §4.1 part 1): a read-only decision
-        // that may refuse here, before any reservation, lease or ticket.
-        prep!(outputs::guarded_precheck(
-            Some(&output_control),
-            &checkout,
-            local.members,
-        ));
-    }
+    let declaration = outputs::lease_declaration(
+        &invocation,
+        Some(&output_control),
+        &checkout,
+        pool_fallback.as_deref(),
+    )?;
     // A future owned root gets its durable random nonce reserved before the
     // destination is planned and keyed (oxide#129); the binding lock is
     // released again before this command waits for a slot. A derived profile
@@ -562,9 +493,7 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
     // set that is EMPTY names no placement, and a whole-target plan there can
     // name a FUTURE root (the first local fallback), so it keeps the shipped
     // reservation path (oxide#164 review finding).
-    // A guarded command never reserves a future root, so it never occupies a
-    // nonce or a registry row (design §4.1).
-    if !guarded && outputs::needs_reservation(derives_from_receipt, &declaration) {
+    if outputs::needs_reservation(derives_from_receipt, &declaration) {
         prep!(outputs::reserve(
             &store,
             Some(&output_control),
@@ -583,7 +512,6 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         &checkout,
         &declaration,
         pool_fallback.as_deref(),
-        guarded,
     ));
     let destination = outputs::destination_facts(planned.as_ref());
     let incremental_key = prep!({ incremental::key_component(&checkout, &invocation) });
@@ -622,7 +550,6 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         &store,
         &key,
         invocation.profile,
-        admission,
         &resolution,
         label.as_deref(),
         &mut waits,
@@ -664,7 +591,6 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         // keeps the existing refusal (`derives_from_receipt` is false for
         // them).
         derives_from_receipt,
-        local_outputs.as_ref(),
     ) {
         Ok(binding) => binding,
         Err(reason) => {
@@ -702,7 +628,6 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
                         &store,
                         &key,
                         invocation.profile,
-                        admission,
                         &resolution,
                         label.as_deref(),
                         &mut waits,
@@ -712,7 +637,6 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
                         planned.as_ref(),
                         pool_fallback.as_deref(),
                         derives_from_receipt,
-                        local_outputs.as_ref(),
                     )? {
                         Ok(leased) => leased,
                         Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
@@ -1479,7 +1403,6 @@ fn abandon_seed_and_reacquire(
     store: &Store,
     key: &SlotKey,
     profile: cli::Profile,
-    admission: store::WorkspaceAdmission<'_>,
     resolution: &cli::Resolution,
     label: Option<&str>,
     waits: &mut store::WaitAccounting,
@@ -1489,17 +1412,12 @@ fn abandon_seed_and_reacquire(
     planned: Option<&outputs::Plan>,
     pool_fallback: Option<&str>,
     derives_from_receipt: bool,
-    // The guarded local-output decision of this command, exactly as its first
-    // binding received it (oxide#170 added this parameter; the cold re-bind
-    // must not lose it).
-    local_outputs: Option<&outputs::LocalOutputs<'_>>,
 ) -> Result<Result<(store::Lease, Gate, outputs::OutputBinding), Stop>, String> {
     drop(binding);
     store.release(held, None)?;
     grants.share = false;
-    let (held, gate) = match lease_with_gate(
-        store, key, profile, admission, resolution, label, waits, grants,
-    )? {
+    let (held, gate) = match lease_with_gate(store, key, profile, resolution, label, waits, grants)?
+    {
         Ok(leased) => leased,
         Err(stop) => return Ok(Err(stop)),
     };
@@ -1510,7 +1428,6 @@ fn abandon_seed_and_reacquire(
         planned,
         pool_fallback,
         derives_from_receipt,
-        local_outputs,
     ) {
         Ok(binding) => Ok(Ok((held, gate, binding))),
         Err(reason) => {
@@ -1529,7 +1446,6 @@ fn lease_with_gate(
     store: &Store,
     key: &SlotKey,
     profile: cli::Profile,
-    admission: store::WorkspaceAdmission<'_>,
     resolution: &cli::Resolution,
     label: Option<&str>,
     waits: &mut store::WaitAccounting,
@@ -1539,7 +1455,7 @@ fn lease_with_gate(
     // a new or evicted slot. At most one grant per project slot plus one cold
     // fallback (oxide#118, oxide#177).
     while grants.remaining > 0 {
-        let mut held = match store.acquire(key, profile, admission, grants.share, label, waits)? {
+        let mut held = match store.acquire(key, profile, grants.share, label, waits)? {
             Acquired::Lease(held) => held,
             Acquired::Interrupted(signal) => return Ok(Err(Stop::Signal(signal))),
             Acquired::AdmissionExpired => return Ok(Err(Stop::Admission)),
@@ -2472,12 +2388,6 @@ fn print_pool(
         report.slots.len(),
         report.waiting
     );
-    // One bounded class line, only for a pool that actually holds a one-use
-    // member (design §5.6, §10.5). It never claims a byte figure: this view
-    // measures nothing, and an unattributed row makes any figure a lower bound.
-    if let Some(line) = one_use_slots_line(&report.class) {
-        println!("  {line}");
-    }
     for waiter in &report.waiters {
         let age = waiter.age.as_ref().map_or_else(
             || "age unknown".to_owned(),
@@ -2542,12 +2452,6 @@ fn print_pool(
             (None, false) => "not managed by oxide".to_owned(),
         };
         println!("{}", slot_line(slot, &state, &owner));
-        if let Some(reason) = &slot.class_reason {
-            // The stored classification reason, one bounded line (design
-            // §5.1, §10.5). It explains why this record is one-use and is
-            // never a savings or free-space claim.
-            println!("    one-use reason: {reason}");
-        }
         let diagnostic_scan = report
             .measured
             .as_ref()
@@ -2601,41 +2505,13 @@ fn slot_line(slot: &store::SlotView, state: &str, owner: &str) -> String {
         || format!("slots/{} (legacy path)", slot.slot_id),
         |dir| format!("slots/{dir}"),
     );
-    // The bounded per-slot class label (design §10.5). A normal record adds
-    // nothing, so an ordinary pool's status is unchanged.
-    let class = match slot.class {
-        Some(store::WorkspaceClass::OneUse) => " (one_use)",
-        Some(store::WorkspaceClass::Normal) | None => "",
-    };
     format!(
-        "  slot {} {state}{class} {} project {} {owner} {}, {place}",
+        "  slot {} {state} {} project {} {owner} {}, {place}",
         slot.slot_id,
         slot.profile.as_deref().unwrap_or("-"),
         slot.label.as_deref().unwrap_or("unknown"),
         slot.size.describe()
     )
-}
-
-/// The one bounded class line of `status`: the sanctioned `one-use slots:
-/// unmeasured (...)` form of design §10.5, with the member count and an
-/// explicit lower-bound note when any ledger row has no owning record (§5.6).
-/// `None` when the pool holds no one-use member, which is every pool a dormant
-/// build can produce.
-fn one_use_slots_line(class: &store::ClassMembership) -> Option<String> {
-    if class.members.is_empty() {
-        return None;
-    }
-    let mut facts = format!(
-        "status does not measure the slice; {} member slot(s)",
-        class.members.len()
-    );
-    if !class.unknown.is_empty() {
-        facts.push_str(&format!(
-            "; {} class-unknown ledger row(s) make any figure a lower bound",
-            class.unknown.len()
-        ));
-    }
-    Some(format!("one-use slots: unmeasured ({facts})"))
 }
 
 /// Slot allocation from the payload walk. The pool's own coverage is used, so
@@ -2843,16 +2719,9 @@ mod tests {
         let (root, store, key) = store::tests::seed_fixture();
         let held = store::tests::seed_fixture_lease(&store, &key);
         std::fs::write(held.build_dir.join("partial"), b"untrusted").unwrap();
-        let binding = outputs::bind_for_command(
-            &store,
-            &key.checkout,
-            held.record_id(),
-            None,
-            None,
-            false,
-            None,
-        )
-        .unwrap();
+        let binding =
+            outputs::bind_for_command(&store, &key.checkout, held.record_id(), None, None, false)
+                .unwrap();
         let mut grants = LeaseGrants::new();
         grants.taken();
         let mut waits = store::WaitAccounting::default();
@@ -2860,7 +2729,6 @@ mod tests {
             &store,
             &key,
             cli::Profile::Quick,
-            store::WorkspaceAdmission::NORMAL,
             &cli::Resolution::default(),
             None,
             &mut waits,
@@ -2870,7 +2738,6 @@ mod tests {
             None,
             None,
             false,
-            None,
         )
         .unwrap();
         let Ok((cold, _, binding)) = result else {
@@ -2890,16 +2757,9 @@ mod tests {
         let (root, store, key) = store::tests::seed_fixture();
         let held = store::tests::seed_fixture_lease(&store, &key);
         std::fs::write(held.build_dir.join("partial"), b"untrusted").unwrap();
-        let binding = outputs::bind_for_command(
-            &store,
-            &key.checkout,
-            held.record_id(),
-            None,
-            None,
-            false,
-            None,
-        )
-        .unwrap();
+        let binding =
+            outputs::bind_for_command(&store, &key.checkout, held.record_id(), None, None, false)
+                .unwrap();
         assert!(
             matches!(refuse_seed(&store, held, binding, "seed fault".into()), Err(ref reason) if reason == "seed fault")
         );
@@ -2996,62 +2856,7 @@ mod tests {
             retired: None,
             holder: None,
             size: store::SlotSize::NotMeasured("not measured".to_owned()),
-            class: Some(store::WorkspaceClass::Normal),
-            class_reason: None,
         }
-    }
-
-    /// The one-use labels of `status` (design §5.6, §10.5): a normal slot adds
-    /// nothing, a one-use slot carries the bounded `one_use` label beside the
-    /// state, and the pool line is the sanctioned `unmeasured` form — never a
-    /// byte figure and never free quota. A pool with no one-use member prints
-    /// no line, which is every pool a dormant build can produce.
-    #[test]
-    fn one_use_status_labels_are_bounded_and_normal_pools_add_nothing() {
-        let normal = view("1", None, "/work/tmp/repo");
-        let normal_line = slot_line(&normal, "idle", "/work/tmp/repo");
-        assert!(!normal_line.contains("one_use"), "{normal_line}");
-        assert_eq!(one_use_slots_line(&store::ClassMembership::default()), None);
-
-        let mut one_use = view("2", Some("tmp-0a1b2c3d/quick-2"), "/work/tmp/repo");
-        one_use.class = Some(store::WorkspaceClass::OneUse);
-        one_use.class_reason = Some("this workspace is under the temporary root '/tmp'".to_owned());
-        let one_use_line = slot_line(&one_use, "idle", "/work/tmp/repo");
-        assert!(
-            one_use_line.contains("idle (one_use) quick project tmp-0a1b2c3d "),
-            "{one_use_line}"
-        );
-        assert!(
-            one_use_line.ends_with("slots/tmp-0a1b2c3d/quick-2"),
-            "{one_use_line}"
-        );
-
-        let member = || store::ClassMember {
-            slot_id: "2".to_owned(),
-            incarnation: "incarnation".to_owned(),
-        };
-        let members_only = store::ClassMembership {
-            members: vec![member()],
-            unknown: Vec::new(),
-        };
-        let line = one_use_slots_line(&members_only).expect("a member pool has a line");
-        assert_eq!(
-            line,
-            "one-use slots: unmeasured (status does not measure the slice; 1 member slot(s))"
-        );
-        let with_unknown = store::ClassMembership {
-            members: vec![member()],
-            unknown: vec![store::ClassMember {
-                slot_id: "9".to_owned(),
-                incarnation: "other".to_owned(),
-            }],
-        };
-        let line = one_use_slots_line(&with_unknown).expect("a member pool has a line");
-        assert!(
-            line.contains("1 class-unknown ledger row(s) make any figure a lower bound"),
-            "{line}"
-        );
-        assert!(!line.contains("MiB") && !line.contains("bytes"), "{line}");
     }
 
     /// A slot whose last walk stopped partial is rendered as

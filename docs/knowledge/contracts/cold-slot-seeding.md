@@ -443,9 +443,6 @@ because the producer identity is keyed by version.
 - **Clean, prune and eviction.** `oxide clean` waits for the recipient lease, as
   before. Evicting a donor only stops its donation.
 - **Hand-off and install.** Unchanged. Installation stays planner-gated.
-- **One-use workspaces.** This contract neither classifies nor special-cases
-  them. A one-use slot is neither a donor nor a recipient special case until its
-  own design says so.
 
 ## 12. Not implemented
 

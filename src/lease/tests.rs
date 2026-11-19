@@ -3,10 +3,7 @@
 //! These replace the retired engine's tests: each one asserts a preserved
 //! product behaviour on a fresh temporary pool, not a removed mechanism.
 
-use super::{
-    managed, AdmissionClass, LeaseError, LeaseRequest, Profile, SlotLayout, SlotOccupancy,
-    VictimPolicy,
-};
+use super::{managed, LeaseError, LeaseRequest, Profile, SlotLayout, SlotOccupancy};
 use crate::storage::{count_pool_walks, PoolBacking, PoolStorage, PoolWalk};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -262,13 +259,9 @@ pub(super) fn request(pool: &Path, project: &Path, workspace: &Path, holder: &st
         reserve_bytes: None,
         layout: Some(SlotLayout {
             folders: vec!["repo".to_owned()],
-            same_repository: Vec::new(),
             profile: "dev".to_owned(),
         }),
         replace_slot: None,
-        class: AdmissionClass::Normal,
-        victims: VictimPolicy::Any,
-        slice: None,
     }
 }
 

@@ -5,7 +5,6 @@ mod pending;
 
 use super::admission_cost::{self, Phase, PoolLock};
 use super::backing::BackingPaths;
-use super::slice::{AdmissionClass, OneUseSlice, RestoreOutcome, SliceReport, VictimPolicy};
 use super::{
     canonical_existing_dir, current_uid, ensure_private_dir, io_error, is_finder_metadata,
     is_tolerated_metadata_file, persist_private_file, random_hex, read_private_file,
@@ -23,7 +22,7 @@ use crate::volume::Binding;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
@@ -50,7 +49,7 @@ pub struct LeaseRequest {
     /// the pool budget. Below reserve, admission tries idle slots until free
     /// space recovers or no eligible root remains. The floor decides refusal.
     pub reserve_bytes: Option<u64>,
-    /// Where a new slot goes. `None` keeps the legacy `slots/<id>` path.
+    /// Presentation label facts for a new slot's Barge root.
     pub layout: Option<SlotLayout>,
     /// A front-door **count** replacement, never byte pressure: retire this
     /// idle whole slot as part of this admission, before the new slot is
@@ -63,34 +62,17 @@ pub struct LeaseRequest {
     /// recorded rank; the library rechecks its identity, ownership, occupancy
     /// and accounting under the pool lock.
     pub replace_slot: Option<u64>,
-    /// This admission's workspace class (design §6.1). `Normal` for every
-    /// production command while the one-use feature is dormant; a one-use
-    /// admission is reachable from tests and, later, from the activated proof
-    /// slice only.
-    pub class: AdmissionClass,
-    /// Which victims every pressure path of this admission may select
-    /// (design §6.7). [`VictimPolicy::Any`] is the default and leaves a
-    /// library caller's behaviour exactly as shipped.
-    pub victims: VictimPolicy,
-    /// The bounded member observation `restore` runs before admission
-    /// (design §6.3): `Some` for every new-slot admission and every one-use
-    /// admission, `None` where no measurement is allowed (normal warm reuse).
-    pub slice: Option<OneUseSlice>,
 }
 
-/// Presentation path of a new slot: `slots/<folder>/<profile>-<id>`. It is
-/// recorded in the ledger at creation and never changes; the slot key,
-/// identity and ledger semantics do not depend on it.
+/// Presentation label facts of a new slot's Barge root. The root's recorded
+/// folder and id come from Barge; the slot key, identity and ledger semantics
+/// do not depend on them.
 #[derive(Clone, Debug, Default)]
 pub struct SlotLayout {
-    /// Project folder names, preferred first. The first one that holds no
-    /// other repository's slot and no unknown entry is used; when none
-    /// qualifies the slot keeps the legacy path.
+    /// Project folder names, preferred first. The first one labels the new
+    /// root; when none is usable the profile alone does.
     pub folders: Vec<String>,
-    /// Ledger projects of the same repository: a folder whose slots all
-    /// belong to these is this repository's folder.
-    pub same_repository: Vec<PathBuf>,
-    /// Leaf prefix, the Oxide profile label.
+    /// The Oxide profile label.
     pub profile: String,
 }
 
@@ -175,41 +157,6 @@ fn split_slot_dir(dir: &str, id: u64) -> Option<(&str, &str)> {
         // not the numeric slot id: `<label>-<16 hex>`.
         None => (valid_slot_name(dir) && !dir.starts_with('.')).then_some(("", dir)),
     }
-}
-
-/// The folder a new slot of `layout` goes into, or `None` for the legacy
-/// path. A folder already holding a slot of another project (or of a
-/// project not known to share this repository) is a display collision and
-/// is skipped; so is an existing folder with no recorded slot that is not
-/// empty apart from Finder metadata (`occupied`). Nothing existing is moved
-/// or adopted.
-fn choose_folder(
-    slots: &[SlotRecord],
-    layout: &SlotLayout,
-    occupied: impl Fn(&str) -> Result<bool, LeaseError>,
-) -> Result<Option<String>, LeaseError> {
-    for folder in &layout.folders {
-        if !valid_slot_name(folder) {
-            return Err(LeaseError::InvalidInput("invalid slot project folder"));
-        }
-        let mut members = slots.iter().filter(|slot| {
-            slot.dir
-                .as_deref()
-                .and_then(|dir| dir.split_once('/'))
-                .is_some_and(|(name, _)| name == folder)
-        });
-        let first = members.next();
-        let usable = match first {
-            Some(first) => std::iter::once(first)
-                .chain(members)
-                .all(|slot| layout.same_repository.contains(&slot.project)),
-            None => !occupied(folder)?,
-        };
-        if usable {
-            return Ok(Some(folder.clone()));
-        }
-    }
-    Ok(None)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -690,12 +637,11 @@ fn open_seed_inner(
 /// Where slots live. Neither payload is an OS-enforced bound.
 enum Payload {
     Budget(PathBuf),
-    /// A directory on a verified removable volume, held open. Slot
-    /// directories are created through `fd`, never by path.
+    /// A directory on a verified removable volume. Barge creates every slot
+    /// root through the retained binding, never by path.
     Volume {
         binding: Binding,
         root: PathBuf,
-        fd: OwnedFd,
     },
 }
 
@@ -1937,19 +1883,6 @@ impl Pool {
                 self.evict_for_reserve(candidate.map(|(id, _)| id))
             })?;
         }
-        // One-use workspaces are dormant; their bounded slice report is still
-        // returned so a caller sees the outcome it supplied.
-        let slice_report = match request.slice.as_ref() {
-            Some(slice) => {
-                if !slice.members.is_bounded() || slice.max_slots == 0 || slice.max_bytes == 0 {
-                    return Err(LeaseError::InvalidInput(
-                        "the one-use slice bounds are not usable",
-                    ));
-                }
-                Some(self.restore(slice, candidate)?)
-            }
-            None => None,
-        };
         if let Some((idle, incarnation)) = candidate {
             let grant = self.take_idle(idle, incarnation, project, workspace, request)?;
             return Ok(Leased {
@@ -1957,7 +1890,6 @@ impl Pool {
                 hold: None,
                 measured: None,
                 admission_note: None,
-                slice: slice_report,
                 unmeasured: Vec::new(),
             });
         }
@@ -1969,7 +1901,6 @@ impl Pool {
             hold: None,
             measured: None,
             admission_note: self.admission_note.take(),
-            slice: slice_report,
             unmeasured,
         })
     }
@@ -2087,76 +2018,23 @@ impl Pool {
                 return Err(LeaseError::InvalidInput("invalid slot profile name"));
             }
         }
-        // A new slot is a Barge root when this pool has a storage authority:
-        // the library mints the id and path, writes the ownership marker and
-        // gives us the cooperative hold that keeps the root through the
-        // command. A pool opened without storage (a library fixture with a
-        // fake volume identity) keeps the pre-adoption directory path.
-        let mut root_id = None;
-        let dir = match self.storage.clone() {
-            Some(storage) => {
-                let root = storage
-                    .create(&barge_label(request.layout.as_ref()))
-                    .map_err(LeaseError::Barge)?;
-                // From here on this is a marked Barge root with no ledger row.
-                // A failure before the row is durable drops the hold and evicts
-                // the fresh id again, so no marked root is ever left behind.
-                if let Err(error) = self.prepare_fresh_root(&storage, &root) {
-                    self.discard_unrecorded_root(&storage, &root.id);
-                    return Err(error);
-                }
-                root_id = Some(root.id.clone());
-                Some(root.folder)
-            }
-            None => {
-                let dir = match &request.layout {
-                    Some(layout) => {
-                        let same_repository: Vec<PathBuf> = layout
-                            .same_repository
-                            .iter()
-                            .filter_map(|project| fs::canonicalize(project).ok())
-                            .collect();
-                        let layout = SlotLayout {
-                            same_repository,
-                            ..layout.clone()
-                        };
-                        let slots_root = self.backing.payload_root().join(SLOTS_NAME);
-                        choose_folder(&self.ledger.slots, &layout, |folder| {
-                            folder_occupied(&slots_root.join(folder))
-                        })?
-                        .map(|folder| format!("{folder}/{}-{slot_id}", layout.profile))
-                    }
-                    None => None,
-                };
-                let slot_path = self.slot_path_in(slot_id, dir.as_deref())?;
-                match &self.backing {
-                    Payload::Volume { binding, fd, .. } => {
-                        let create = |dir: std::os::fd::BorrowedFd<'_>, name: &str, new: bool| {
-                            binding
-                                .dir_at(dir, name, new)
-                                .map_err(|_| LeaseError::BackingMismatch)
-                        };
-                        let slots = create(fd.as_fd(), SLOTS_NAME, false)?;
-                        let slot = match dir.as_deref().and_then(|dir| dir.split_once('/')) {
-                            Some((folder, leaf)) => {
-                                let folder = create(slots.as_fd(), folder, true)?;
-                                create(folder.as_fd(), leaf, true)?
-                            }
-                            None => create(slots.as_fd(), &slot_id.to_string(), true)?,
-                        };
-                        create(slot.as_fd(), "build", true)?;
-                    }
-                    Payload::Budget(_) => {
-                        if let Some(folder) = slot_path.parent() {
-                            ensure_private_dir(folder)?;
-                        }
-                        ensure_private_dir(&slot_path)?;
-                        ensure_private_dir(&slot_path.join("build"))?;
-                    }
-                }
-                dir
-            }
-        };
+        // A new slot is a Barge root: the library mints the id and path,
+        // writes the ownership marker and gives us the cooperative hold that
+        // keeps the root through the command. Every mutating open has a
+        // storage authority; one that does not cannot allocate.
+        let storage = self.storage.clone().ok_or(LeaseError::UnknownAccounting)?;
+        let root = storage
+            .create(&barge_label(request.layout.as_ref()))
+            .map_err(LeaseError::Barge)?;
+        // From here on this is a marked Barge root with no ledger row. A
+        // failure before the row is durable drops the hold and evicts the
+        // fresh id again, so no marked root is ever left behind.
+        if let Err(error) = self.prepare_fresh_root(&storage, &root) {
+            self.discard_unrecorded_root(&storage, &root.id);
+            return Err(error);
+        }
+        let root_id = Some(root.id.clone());
+        let dir = Some(root.folder);
         self.ledger.slots.push(SlotRecord {
             id: slot_id,
             incarnation,
@@ -2334,24 +2212,6 @@ impl Pool {
 
     fn slot_mut(&mut self, id: u64) -> Option<&mut SlotRecord> {
         self.ledger.slots.iter_mut().find(|slot| slot.id == id)
-    }
-
-    /// A bounded one-use restore observation. The dormant feature's slice
-    /// carries its own member set; with no walk in this engine the outcome is
-    /// "not needed", which every caller treats as no measurement.
-    fn restore(
-        &mut self,
-        slice: &OneUseSlice,
-        _candidate: Option<(u64, u64)>,
-    ) -> Result<SliceReport, LeaseError> {
-        Ok(SliceReport {
-            outcome: RestoreOutcome::NotNeeded,
-            members: 0,
-            protected: 0,
-            unverified: 0,
-            max_slots: slice.max_slots,
-            max_bytes: slice.max_bytes,
-        })
     }
 
     /// Retire one idle recorded slot: the decision is committed durably and
@@ -2980,8 +2840,8 @@ fn same_generations(snapshot: &PassiveSnapshot, config: &PoolConfig, ledger: &Le
 /// Open one pool's Barge storage authority from its own recorded config.
 ///
 /// The account is the pool's control directory, so the literal `oxide/pool`
-/// declaration is unambiguous: every pool — removable, internal, one-use or a
-/// test fixture — owns its own volume and area. A budget pool's volume is the
+/// declaration is unambiguous: every pool — removable, internal or a test
+/// fixture — owns its own volume and area. A budget pool's volume is the
 /// pool directory itself; a removable pool's is the drive at its registered
 /// mount point with the recorded identity, so a different volume there is a
 /// refusal, never a silent reuse.
@@ -3059,15 +2919,13 @@ fn open_volume_payload(paths: &BackingPaths, config: &PoolConfig) -> Result<Payl
     }
     let binding = Binding::open(&volume.mount_point, Some(&volume.volume_uuid))
         .map_err(|_| LeaseError::BackingMismatch)?;
-    let fd = binding
+    let payload_fd = binding
         .dir_at(binding.fd(), &volume.payload_dir, false)
         .map_err(|_| LeaseError::BackingMismatch)?;
     let root = volume.mount_point.join(&volume.payload_dir);
     let payload = canonical_existing_dir(&root, true).map_err(|_| LeaseError::BackingMismatch)?;
     let by_path = fs::symlink_metadata(&payload).map_err(io_error)?;
-    let by_fd = fs::File::from(fd.try_clone().map_err(io_error)?)
-        .metadata()
-        .map_err(io_error)?;
+    let by_fd = fs::File::from(payload_fd).metadata().map_err(io_error)?;
     if payload != root || by_path.dev() != by_fd.dev() || by_path.ino() != by_fd.ino() {
         return Err(LeaseError::BackingMismatch);
     }
@@ -3075,7 +2933,6 @@ fn open_volume_payload(paths: &BackingPaths, config: &PoolConfig) -> Result<Payl
     Ok(Payload::Volume {
         binding,
         root: payload,
-        fd,
     })
 }
 
@@ -3131,28 +2988,6 @@ fn validate_lease_payload_entries(
     }
     canonical_existing_dir(&payload_root.join(SLOTS_NAME), true)?;
     Ok(())
-}
-/// Whether a project folder with no recorded slot holds anything: missing
-/// is free, an empty owned directory (Finder metadata aside) is free, and
-/// anything else is occupied.
-fn folder_occupied(folder: &Path) -> Result<bool, LeaseError> {
-    let metadata = match fs::symlink_metadata(folder) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(io_error(error)),
-        Ok(metadata) => metadata,
-    };
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_dir()
-        || metadata.uid() != current_uid()
-    {
-        return Ok(true);
-    }
-    for entry in fs::read_dir(folder).map_err(io_error)? {
-        if !is_finder_metadata(&entry.map_err(io_error)?.file_name()) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// The hard floor for an unknown-size admission with nothing left to prune.
