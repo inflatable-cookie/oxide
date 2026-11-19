@@ -29,7 +29,7 @@ Tom's 2026-11-17 lean reset ([vision](docs/knowledge/vision.md#validation-policy
 - Gate experiments on wall-clock time and scratch disk. Report resource figures as observations. Preserve product correctness, isolation, ownership and conservative handling of unknown writers.
 - Run targeted checks through Effigy. Don't run full `effigy qa` or repeat completed validation without a changed input or an unresolved finding. Milestone QA stays separate.
 - Tom may accept a task as-is. Record that as operator acceptance, keep the independent findings, and close out without another publication-only review loop. A direct GitHub merge needs explicit scoped authorization and is reconciled through Nucleus's external-merge closeout.
-- Installing a storage-affecting binary is a separate planner step after merge. Time one real new-slot admission on the live pool before replacing the installed binary, and check for old-binary processes afterwards (2026-11-18 incident, decision `d9f8839e`).
+- Installing a storage-affecting binary is a separate planner step after merge. Run the staged live-pool canary on the intended pin before replacing the installed binary, and check for old-binary processes afterwards (2026-11-18 incident, decision `d9f8839e`).
 
 ## Effigy command map
 
@@ -53,8 +53,11 @@ dogfood finding. Preserve the ordinary routing and existing compiler profiles.
 - `proof:supervisor:test` / `:preflight`: pure cases / effect-free host readiness.
   Native `proof:supervisor:qualify` and its diagnostic still require their own
   owner activation; adoption does not promote its candidate.
+- `oxide:canary`: planner-only staged live-pool check after reviewed merge.
+  `--new-seconds` and `--warm-seconds` override the 10 s and 5 s limits.
 - `oxide:install` / `oxide:reinstall`: planner-only installation after reviewed
-  merge, with receipt matching; source adoption authorizes neither.
+  merge. `--require-canary` requires a same-pin PASS less than an hour old.
+- `dogfood:scripts:test`: synthetic installer, rollback and canary cases.
 
 `rust:barge-adoption` creates one private per-run directory below the invoking
 `TMPDIR`, passes it as TMPDIR/TMP/TEMP and the test fixture roots, and removes

@@ -2,7 +2,10 @@
 //! Recovery can retire a ledger row only from an intent for its exact lease
 //! and root, under the original backing directory.
 
-use super::{pool_backing, validate_lease_id, LeaseError, Pool, SlotPersistState, SlotRecord};
+use super::{
+    admission_cost, pool_backing, require_deleted, validate_lease_id, LeaseError, Pool,
+    SlotPersistState, SlotRecord,
+};
 use crate::lease::{
     canonical_existing_dir, control::WRITER_GENERATION, current_uid, fence_admission_writer,
     io_error, persist_private_file, read_private_file_bounded, reserve_eviction_fence,
@@ -90,24 +93,24 @@ impl HeldEvictionIntent {
         path: &Path,
         parent_device: u64,
     ) -> Result<bool, LeaseError> {
+        let resolve = || {
+            admission_cost::opaque_listing();
+            area.resolve(&self.root_id)
+        };
         match fs::symlink_metadata(path) {
             Ok(metadata)
                 if metadata.is_dir()
                     && metadata.uid() == current_uid()
                     && metadata.dev() == parent_device
                     && metadata.ino() == self.root_inode
-                    && area
-                        .resolve(&self.root_id)
-                        .is_ok_and(|root| root.path == path) =>
+                    && resolve().is_ok_and(|root| root.path == path) =>
             {
                 Ok(true)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match area.resolve(&self.root_id) {
-                    Err(error) if error.kind() == barge::ErrorKind::NotFound => Ok(false),
-                    _ => Err(LeaseError::UnknownAccounting),
-                }
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match resolve() {
+                Err(error) if error.kind() == barge::ErrorKind::NotFound => Ok(false),
+                _ => Err(LeaseError::UnknownAccounting),
+            },
             _ => Err(LeaseError::UnknownAccounting),
         }
     }
@@ -284,12 +287,27 @@ impl Pool {
         }
         #[cfg(test)]
         interrupt_at(Interruption::BeforeRename).map_err(post)?;
-        if area.evict(&intent.root_id).is_err() {
-            intent.clear(&self.root).map_err(post)?;
-            return Err(pre(LeaseError::UnknownAccounting));
+        // Once the rename commits, settle the intent even if Barge could not
+        // remove the trash entry. A refusal before rename leaves the row held.
+        let deletion = match area.evict(&intent.root_id) {
+            Ok(evicted) => require_deleted(evicted),
+            Err(error) if crate::storage::eviction_moved(&error) => {
+                Err(LeaseError::EvictionIncomplete(error.to_string()))
+            }
+            Err(_) => {
+                intent.clear(&self.root).map_err(post)?;
+                return Err(pre(LeaseError::UnknownAccounting));
+            }
+        };
+        if let Err(settlement) = self.settle_held_eviction(&intent, &parent, admission.is_some()) {
+            return Err(match deletion {
+                Ok(()) => post(settlement),
+                Err(error) => HeldEvictionFailure::PostCommit(format!(
+                    "held eviction of slot {id} requires settlement: {settlement}; {error}"
+                )),
+            });
         }
-        self.settle_held_eviction(&intent, &parent, admission.is_some())
-            .map_err(post)?;
+        deletion.map_err(|error| HeldEvictionFailure::PostCommit(error.to_string()))?;
         Ok(Vec::new())
     }
 }
@@ -480,6 +498,6 @@ mod tests {
         let before = fs::read(pool.join("ledger.json")).unwrap();
         managed::prepare_pool(&pool).unwrap();
         assert_eq!(fs::read(pool.join("ledger.json")).unwrap(), before);
-        assert!(retained.join(barge::root::MARKER_NAME).is_file());
+        assert!(retained.join(crate::storage::ROOT_MARKER).is_file());
     }
 }

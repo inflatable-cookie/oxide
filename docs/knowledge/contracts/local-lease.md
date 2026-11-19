@@ -29,8 +29,9 @@ unrecorded stray at an old path never becomes a successor.
 
 Pool preparation adopts idle legacy rows when the kernel confirms that the
 recorded Oxide holder PID is absent. A live or unverifiable holder keeps the
-row unavailable. Held legacy rows still need the existing explicit
-writer-closure check. Adoption creates no pin, so an unpinned root can be
+row unavailable. An admission whose compatible idle row awaits the next
+batch returns a retry message. A matching held legacy row still needs an
+explicit writer-closure check. Adoption creates no pin, so an unpinned root can be
 evicted without a warm grant. Existing pins remain protected by Barge.
 
 ## Oxide front door control directory
@@ -77,12 +78,42 @@ A normal refusal clears the intent and leaves the control and ledger
 unchanged. When the fence must advance, Oxide reserves the existing admission
 lock and publishes the fence after the rename, before saving the revised
 ledger. A settlement failure retains the intent for recovery.
+If Barge moves the root and cannot delete the trash entry, Oxide settles the
+intent and reports the deletion failure as post-commit.
 
 On the next ordinary locked open or exact retry, Oxide clears an intent
 whose original root is still present. It retires the matching ledger row
 when the original parent is verified and both the recorded root ID and
 its path are absent. Recovery leaves unrelated missing roots, substituted
 paths and uncertain custody alone. It never repeats the Barge eviction.
+
+### Admission observations (oxide#317)
+
+Oxide times each admission lock hold from acquisition through release,
+including front-door preparation and refused attempts. A private sidecar keeps
+the last 32 observations. The writer publishes after dropping the pool lock.
+The build summary names the phase for holds over two seconds, holds with
+more than one byte walk, and holds with an unavailable Barge listing count.
+Default status reads recent per-pool maxima without taking the pool lock.
+
+Count one byte walk for each root submitted to a sizing traversal, including
+a walk whose result is incomplete or whose eviction later fails. Barge's
+eviction sizes the root once before rename. A trash sweep removes entries and
+reports reclaimed bytes during deletion, without a separate sizing traversal.
+Report explicit inventory entries separately. Barge's internal marker
+enumeration during resolve, hold, eviction and adoption is timed and displayed
+as a listing with an unavailable count. The 256-slot regression checks both
+facts. Above reserve, the reserve check enumerates no roots.
+
+At the slot ceiling, Oxide first tries the oldest candidate through Barge. If
+it is protected, one bytes-free inventory identifies other held or pinned
+candidates before Oxide tries the remaining roots. A refusal reports held and
+pinned counts (which can overlap), other unavailable rows, pending legacy
+adoption and pin reasons. If this checkout can wait for a compatible
+holder, the first ceiling diagnosis is printed with its wait message.
+Default status reads bound pin records at the
+ledger's known paths without enumerating directories or reading payloads.
+Pin reasons are diagnostic. Unreadable records are reported as unknown.
 
 ### Normal warm reuse (oxide#280)
 

@@ -348,7 +348,7 @@ enum Wait {
     #[allow(dead_code)]
     ProjectCap,
     Uncertain,
-    Capacity,
+    Capacity(Option<String>),
 }
 
 impl Wait {
@@ -360,7 +360,7 @@ impl Wait {
             Self::Clean => WaitCategory::Clean,
             Self::ProjectCap => WaitCategory::ProjectCap,
             Self::Uncertain => WaitCategory::Uncertain,
-            Self::Capacity => WaitCategory::Capacity,
+            Self::Capacity(_) => WaitCategory::Capacity,
         }
     }
 
@@ -378,7 +378,8 @@ impl Wait {
             Self::Uncertain => {
                 "a slot held by an interrupted command whose Cargo may still run".to_owned()
             }
-            Self::Capacity => "pool capacity held by running builds".to_owned(),
+            Self::Capacity(None) => "pool capacity held by running builds".to_owned(),
+            Self::Capacity(Some(diagnosis)) => format!("pool capacity ({diagnosis})"),
         }
     }
 }
@@ -591,6 +592,7 @@ pub(crate) struct WaitAccounting {
     last_announced: Option<WaitCategory>,
     reason_lines: usize,
     suppression_announced: bool,
+    ceiling_announced: bool,
 }
 
 impl Default for WaitAccounting {
@@ -605,6 +607,7 @@ impl Default for WaitAccounting {
             last_announced: None,
             reason_lines: 0,
             suppression_announced: false,
+            ceiling_announced: false,
         }
     }
 }
@@ -622,6 +625,14 @@ impl WaitAccounting {
         self.observed_categories[category.index()] = true;
         self.active = Some((category, now));
 
+        // The first ceiling diagnosis matters even after a generic capacity
+        // wait or after the ordinary wait notices reached their limit.
+        if matches!(wait, Wait::Capacity(Some(_))) && !self.ceiling_announced {
+            self.ceiling_announced = true;
+            self.last_announced = Some(category);
+            eprintln!("oxide: waiting for {reason}; Ctrl-C cancels");
+            return;
+        }
         if self.last_announced == Some(category) || self.suppression_announced {
             return;
         }
@@ -692,6 +703,14 @@ impl WaitAccounting {
         if let Some(line) = self.completion_line(ending) {
             eprintln!("{line}");
         }
+    }
+
+    /// Time behind other tickets or the active-build limit, excluding time
+    /// spent retrying admission and taking the pool locks.
+    pub(crate) fn admission_queue_wait(&self) -> Option<Duration> {
+        self.duration_available.then_some(())?;
+        self.totals[WaitCategory::Queue.index()]
+            .checked_add(self.totals[WaitCategory::HostLimit.index()])
     }
 
     pub(crate) fn summary_suffix(&self) -> Option<String> {
@@ -2208,24 +2227,22 @@ impl Store {
         let mut reported_waiting = false;
         let ticket = self.register_ticket()?;
         loop {
+            // End the polling interval before doing any admission work. A
+            // slow attempt that finally grants must count as work, even
+            // when the preceding attempt found the queue or host limit full.
+            waits.stop(Instant::now());
             if crate::budget::admission_expired() {
-                waits.stop(Instant::now());
                 self.remove_ticket(ticket.0)?;
                 return Ok(Acquired::AdmissionExpired);
             }
             if let Some(signal) = process::received_signal() {
-                waits.stop(Instant::now());
                 self.remove_ticket(ticket.0)?;
                 return Ok(Acquired::Interrupted(signal));
             }
             let attempt = self.attempt(ticket.0, key, profile, max_active, admission, share, label);
             match attempt {
-                Err(error) => {
-                    waits.stop(Instant::now());
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
                 Ok(Ok(lease)) => {
-                    waits.stop(Instant::now());
                     self.remove_ticket(ticket.0)?;
                     if crate::budget::admission_expired() {
                         // The window closed while this attempt ran: the lease
@@ -4504,7 +4521,10 @@ impl Store {
                     // checkout. Nothing promises that an unrelated build's
                     // completion frees a count or byte ceiling.
                     LeaseError::Full | LeaseError::LedgerExhausted if busy => {
-                        Ok(Err(Wait::Capacity))
+                        Ok(Err(Wait::Capacity(None)))
+                    }
+                    LeaseError::SlotCeiling(diagnosis) if busy => {
+                        Ok(Err(Wait::Capacity(Some(diagnosis))))
                     }
                     // A full one-use slice waits only for a holder that can
                     // finish (design §6.9); a control-uncertain member is
@@ -6084,6 +6104,10 @@ pub(crate) mod tests {
         // Freshness work between lease attempts is outside measured waiting.
         waits.observe(&Wait::HostLimit(2), 2, start + Duration::from_secs(10));
         waits.stop(start + Duration::from_millis(11_100));
+        assert_eq!(
+            waits.admission_queue_wait(),
+            Some(Duration::from_millis(1_400))
+        );
 
         assert_eq!(
             waits.completion_line("slot ready").as_deref(),
@@ -6098,7 +6122,7 @@ pub(crate) mod tests {
         let mut waits = WaitAccounting::default();
         waits.observe(&Wait::Queue(1), 2, start);
         waits.stop(start + Duration::from_secs(1));
-        waits.observe(&Wait::Capacity, 2, start + Duration::from_secs(3));
+        waits.observe(&Wait::Capacity(None), 2, start + Duration::from_secs(3));
         waits.stop(start + Duration::from_secs(2));
 
         assert_eq!(
@@ -6138,7 +6162,7 @@ pub(crate) mod tests {
             Wait::Clean,
             Wait::ProjectCap,
             Wait::Uncertain,
-            Wait::Capacity,
+            Wait::Capacity(None),
         ];
         for reason in reasons {
             waits.observe(&reason, 2, start);
@@ -9416,6 +9440,140 @@ pub(crate) mod tests {
             compatibility: "quick-key".to_owned(),
         };
         (root, store, key)
+    }
+
+    #[test]
+    fn a_legacy_match_past_the_first_batch_refuses_and_the_next_command_reuses_it() {
+        let (root, store, key) = class_fixture("pending-legacy-adoption");
+        let lease = lease(&store, &key, None).unwrap();
+        let slot_id = lease.slot_id.clone();
+        let affinity = store.affinity_dir(lease.record);
+        store.release(lease, None).unwrap();
+
+        let ledger_path = store.pool.join("ledger.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+        let store_id = ledger["store_id"].as_str().unwrap().to_owned();
+        oxide_storage::lease::managed::evict_idle_slot(&store.pool, &slot_id).unwrap();
+
+        let slots: Vec<_> = (1..=9)
+            .map(|id| {
+                let path = store.payload.join("slots").join(id.to_string());
+                fs::create_dir_all(path.join("build")).unwrap();
+                fs::write(path.join("build/artifact"), b"legacy").unwrap();
+                let project = if id == 9 { &affinity } else { &key.checkout };
+                serde_json::json!({
+                    "id": id, "incarnation": 1, "state": "idle",
+                    "project": project, "workspace": key.checkout, "profile": "dev",
+                    "holder": format!("oxide-{}-1", libc::pid_t::MAX),
+                    "lease_id": null, "last_lease_id": format!("v1.{store_id}.{id}.1.1"),
+                    "rank": id,
+                })
+            })
+            .collect();
+        ledger["slots"] = slots.into();
+        ledger["next_slot"] = 10.into();
+        ledger["next_rank"] = 10.into();
+        fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+
+        prepare_pool(&store.pool).unwrap();
+        let path = store.payload.join("slots/9");
+        assert!(!path.join(oxide_storage::storage::ROOT_MARKER).exists());
+        let (ticket, _lock) = store.register_ticket().unwrap();
+        let attempt = store.attempt(
+            ticket,
+            &key,
+            Profile::Quick,
+            16,
+            WorkspaceAdmission::NORMAL,
+            false,
+            None,
+        );
+        let refusal = attempt
+            .err()
+            .expect("pending adoption finishes this attempt without entering the wait loop");
+        assert!(
+            refusal.contains("compatible legacy slot 9 is pending adoption"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("retry the Oxide command"), "{refusal}");
+        assert!(!path.join(oxide_storage::storage::ROOT_MARKER).exists());
+        store.remove_ticket(ticket).unwrap();
+
+        prepare_pool(&store.pool).unwrap();
+        let reused = match lease_as(&store, &key, WorkspaceAdmission::NORMAL, false) {
+            Ok(reused) => reused,
+            Err(wait) => panic!("the next command reuses the adopted row: {wait:?}"),
+        };
+        assert!(reused.reused);
+        assert_eq!(reused.slot_id, "9");
+        assert_eq!(
+            fs::read(reused.build_dir.join("artifact")).unwrap(),
+            b"legacy"
+        );
+        store.release(reused, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_ceiling_wait_keeps_the_held_and_pinned_diagnosis() {
+        use oxide_storage::lease::{MAX_SLOTS, RAISED_CAPACITY_POLICY_VERSION};
+        use oxide_storage::storage::{PoolBacking, PoolStorage};
+
+        let (root, store, key) = class_fixture("pinned-ceiling-wait");
+        let held = lease(&store, &key, None).unwrap();
+        let storage = PoolStorage::open(
+            &store.control,
+            &PoolBacking::budget(&store.pool, store.recorded_budget),
+        )
+        .unwrap();
+        let ledger_path = store.pool.join("ledger.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+        let store_id = ledger["store_id"].as_str().unwrap().to_owned();
+        let slots = ledger["slots"].as_array_mut().unwrap();
+        for id in 2..=MAX_SLOTS {
+            let pinned = storage.create("pinned").unwrap();
+            storage.pin_in(None, &pinned.id, "keep evidence").unwrap();
+            slots.push(serde_json::json!({
+                "id": id, "incarnation": 1, "state": "idle",
+                "project": key.checkout, "workspace": key.checkout, "profile": "dev",
+                "holder": format!("oxide-{}-{id}", std::process::id()), "lease_id": null, "last_lease_id": format!("v1.{store_id}.{id}.1.1"),
+                "rank": id, "root": pinned.id, "dir": pinned.folder, "owned": true,
+            }));
+        }
+        ledger["next_slot"] = (MAX_SLOTS + 1).into();
+        ledger["next_rank"] = (MAX_SLOTS + 1).into();
+        ledger["capacity_policy"] = RAISED_CAPACITY_POLICY_VERSION.into();
+        fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+
+        let wait = match lease_as(&store, &key, WorkspaceAdmission::NORMAL, false) {
+            Err(wait @ Wait::Capacity(Some(_))) => wait,
+            Err(other) => panic!("expected the detailed ceiling wait, got {other:?}"),
+            Ok(_) => panic!("admitted past the ceiling"),
+        };
+        let message = wait.describe(16);
+        assert!(message.contains("1 held, 255 pinned"), "{message}");
+        assert!(message.contains(r#"255 "keep evidence""#), "{message}");
+        let mut waits = WaitAccounting::default();
+        waits.observe(&Wait::Capacity(None), 16, Instant::now());
+        waits.suppression_announced = true;
+        waits.observe(&wait, 16, Instant::now());
+        assert!(
+            waits.ceiling_announced,
+            "the first diagnosis bypasses generic wait suppression"
+        );
+
+        let held_slot = held.slot_id.clone();
+        store.release(held, None).unwrap();
+        let reused = match lease_as(&store, &key, WorkspaceAdmission::NORMAL, false) {
+            Ok(reused) => reused,
+            Err(wait) => panic!("the released slot makes progress at the ceiling: {wait:?}"),
+        };
+        assert!(reused.reused);
+        assert_eq!(reused.slot_id, held_slot);
+        store.release(reused, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn lease_as(

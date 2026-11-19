@@ -420,7 +420,12 @@ fn cold_seed_notice_when(qualified: bool, value: Option<&std::ffi::OsStr>) -> Op
 }
 
 fn run_invocation(invocation: Invocation) -> Result<u8, String> {
-    handoff_trace::phase("invocation", || run_invocation_inner(invocation))
+    oxide_storage::lease::admission_cost::start_summary();
+    let outcome = handoff_trace::phase("invocation", || run_invocation_inner(invocation));
+    if let Some(summary) = oxide_storage::lease::admission_cost::take_summary() {
+        eprintln!("oxide: {summary}");
+    }
+    outcome
 }
 
 fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
@@ -885,6 +890,9 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         cargo.stdout(Stdio::piped());
     }
     waits.print_completion("slot ready");
+    if let (true, Some(queued)) = (budget::has_events(), waits.admission_queue_wait()) {
+        eprintln!("oxide: admission queue wait {} ns", queued.as_nanos());
+    }
     // The last check before the launch attempt: an already-observed expiry
     // forbids starting a primary child.
     if budget::admission_expired() {
@@ -1750,8 +1758,10 @@ fn print_summary(
         };
         let note = note.map(|note| format!(", {note}")).unwrap_or_default();
         let wait = waits.summary_suffix().unwrap_or_default();
+        let admission = oxide_storage::lease::admission_cost::take_summary()
+            .map_or_else(String::new, |summary| format!(", {summary}"));
         eprintln!(
-        "oxide: {} profile, {strategy} strategy, slot {slot} {}, {:.1}s, {pool}{backend}{note}{wait}",
+        "oxide: {} profile, {strategy} strategy, slot {slot} {}, {:.1}s, {pool}{backend}{note}{wait}{admission}",
         invocation.profile.label(),
         if warm { "warm" } else { "cold" },
         started.elapsed().as_secs_f64()
@@ -2338,6 +2348,15 @@ fn print_pool(
 ) -> Result<(), String> {
     let measured = mode == StatusMode::Measure;
     println!("{header}");
+    match oxide_storage::lease::admission_cost::recorded(&store.pool) {
+        Ok(Some(line)) => println!("  {line}"),
+        Ok(None) => println!("  recent admission costs: none recorded"),
+        Err(error) => println!("  recent admission costs: unavailable ({error})"),
+    }
+    match oxide_storage::lease::managed::pinned_roots(&store.pool) {
+        Ok(line) => println!("  {line}"),
+        Err(error) => println!("  pinned roots by reason: unavailable ({error})"),
+    }
     for line in details {
         println!("{line}");
     }

@@ -374,6 +374,164 @@ class InstallerTests(unittest.TestCase):
             installer.preflight(True)
 
 
+class CanaryTests(unittest.TestCase):
+    PIN = "a" * 40
+    CAPABILITIES = {"control_state_version": 10, "registration_version": 2,
+                    "ledger_version": 3, "writer_generation": 1}
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(dir=SCRATCH))
+        self.destination = self.root / ".local/bin/oxide"
+        self.receipts = self.root / ".local/state/oxide/install"
+        self.pool = self.root / "live-pool"
+        self.scratch = self.root / "scratch"
+        self.log = self.root / "calls.jsonl"
+        self.destination.parent.mkdir(parents=True)
+        self.receipts.mkdir(parents=True)
+        self.pool.mkdir()
+        self.scratch.mkdir()
+        (self.pool / "config.json").write_text("{}")
+        (self.scratch / "unrelated").mkdir()
+        self.destination.write_text("#!/bin/sh\nexit 99\n")
+        self.destination.chmod(0o700)
+        (self.receipts / "previous.json").write_text(json.dumps({
+            "installed": {"path": str(self.destination), "sha256": installer.sha256(self.destination)},
+            **self.CAPABILITIES,
+        }))
+        for patcher in (
+            mock.patch.multiple(installer, HOME=self.root, DESTINATION=self.destination, RECEIPTS=self.receipts),
+            mock.patch.object(tempfile, "tempdir", str(self.root)),
+            mock.patch.dict(os.environ, {"PATH": str(self.destination.parent), "OXIDE_POOL_CREATE": "1",
+                                         "OXIDE_SCRATCH_ROOT": "must not reach the candidate"}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def fake_build(self, cold_ms=12_200, warm_ms=200, queue_ns=12_000_000_000, **capabilities):
+        probe = {**self.CAPABILITIES, **capabilities, "test_controls": False}
+
+        def build(pin, instance, staging):
+            built = staging / "oxide"
+            built.write_text(f"#!{sys.executable}\n" + f"""
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+if args == ["__oxide-build-capabilities"]:
+    print(json.dumps({probe!r}))
+elif args == ["__oxide-build-identity"]:
+    print(json.dumps({{"build_pin": {pin!r}, "build_instance": {instance!r}}}))
+else:
+    assert os.environ.get("OXIDE_INTERNAL_HANDED_OFF") == "1"
+    assert "OXIDE_SCRATCH_ROOT" not in os.environ and "OXIDE_POOL_CREATE" not in os.environ
+    with open({str(self.log)!r}, "a") as log:
+        print(json.dumps([args[0], os.getcwd()]), file=log)
+    if args == ["pool", "describe", "--json"]:
+        print(json.dumps({{"schema": "oxide.pool.describe/1", "selected": "internal",
+                          "internal": {{"pool": {str(self.pool)!r}}}, "removable": None}}))
+    elif args[0] == "check":
+        assert args[-1] == "--offline" and Path("target").is_dir()
+        assert Path("Cargo.toml").is_file() and Path("src/lib.rs").is_file()
+        assert Path.cwd().parent == Path({str(self.scratch)!r})
+        assert os.environ["OXIDE_POOL"] == {str(self.pool)!r}
+        slot = Path({str(self.pool / "slot-9")!r})
+        warm = slot.exists()
+        slot.touch()
+        elapsed, wait, warmth = ({warm_ms}, 0, "warm") if warm else ({cold_ms}, {queue_ns}, "cold")
+        print(f"oxide: admission queue wait {{wait}} ns", file=sys.stderr)
+        print(f"oxide: quick profile, build strategy, slot 9 {{warmth}}, 0.1s, "
+              "(directory-budget-v1, budget-only), pool lock 2.1 ms", file=sys.stderr)
+        writer = int(args[args.index("--budget-events") + 1])
+        for event in (
+            dict(seq=1, event="admitted_child_started", phase="primary_cargo",
+                 spawn_late=False, admission_elapsed_ms=elapsed),
+            dict(seq=2, event="finished", outcome="child_exit", exit_code=0,
+                 drain="complete", lease="released"),
+        ):
+            os.write(writer, (json.dumps(dict(v=1, invocation="example", **event)) + "\\n").encode())
+    else:
+        assert args == ["status"], args
+""")
+            built.chmod(0o700)
+            return built, {}
+        return build
+
+    def invoke(self, flags, build):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(sys, "argv", ["oxide-install.py", *flags]))
+            stack.enter_context(mock.patch.object(
+                installer, "authenticate_pin", return_value=(self.PIN, "tree", self.PIN)
+            ))
+            builder = stack.enter_context(mock.patch.object(installer, "build", side_effect=build))
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            stack.enter_context(contextlib.redirect_stderr(stderr))
+            status = installer.main()
+        return status, stdout.getvalue(), stderr.getvalue(), builder
+
+    def assert_only_crate_removed(self):
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertEqual([call[0] for call in calls], ["status", "pool", "check", "check"])
+        self.assertEqual(calls[2][1], calls[3][1])
+        self.assertFalse(Path(calls[2][1]).exists())
+        self.assertEqual(list(self.scratch.iterdir()), [self.scratch / "unrelated"])
+        self.assertTrue((self.pool / "slot-9").is_file())
+        self.assertEqual(self.destination.read_text(), "#!/bin/sh\nexit 99\n")
+
+    def test_pass_uses_same_slot_and_excludes_queue_time(self):
+        status, stdout, stderr, builder = self.invoke(["--canary"], self.fake_build())
+        self.assertEqual(status, 0, stderr)
+        builder.assert_called_once()
+        self.assertIn("oxide:canary PASS", stdout)
+        self.assertIn("new slot: queue wait 12.000s", stdout)
+        self.assertIn("new slot: admission 0.200s", stdout)
+        self.assertIn("pool lock 2.1 ms", stderr)
+        self.assert_only_crate_removed()
+        installer.require_canary(self.PIN)
+        status, _, stderr, builder = self.invoke(["--replace", "--check", "--require-canary"], None)
+        self.assertEqual(status, 0, stderr)
+        builder.assert_not_called()
+
+    def test_threshold_fail_invalidates_pass_and_cleans_only_the_crate(self):
+        installer.write_canary_receipt(self.PIN, "PASS")
+        flags = ["--canary", "--new-seconds", "0.1", "--warm-seconds", "0.1"]
+        status, stdout, stderr, _ = self.invoke(flags, self.fake_build())
+        self.assertEqual(status, 1)
+        self.assertIn("oxide:canary FAIL", stderr)
+        self.assertIn("new slot admission exceeded 0.1s", stderr)
+        self.assertIn("warm reuse admission exceeded 0.1s", stderr)
+        self.assertNotIn("oxide:canary PASS", stdout)
+        self.assert_only_crate_removed()
+        with self.assertRaises(installer.Refusal):
+            installer.require_canary(self.PIN)
+
+    def test_install_and_reinstall_refuse_missing_pass_before_building(self):
+        for flags in ([], ["--replace"]):
+            status, stdout, stderr, builder = self.invoke([*flags, "--require-canary"], None)
+            self.assertEqual(status, 1)
+            self.assertIn("Run effigy oxide:canary", stdout)
+            self.assertIn("no fresh canary PASS", stderr)
+            builder.assert_not_called()
+
+    def test_pins_and_receipt_age_are_checked(self):
+        installer.write_canary_receipt(self.PIN, "PASS")
+        with self.assertRaises(installer.Refusal):
+            installer.require_canary("b" * 40)
+        path = self.receipts / "canary" / f"{self.PIN}.json"
+        receipt = json.loads(path.read_text())
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for delta in (datetime.timedelta(hours=-1), datetime.timedelta(seconds=30)):
+            with self.subTest(delta=delta):
+                path.write_text(json.dumps({**receipt, "finished": (now + delta).isoformat()}))
+                with self.assertRaises(installer.Refusal):
+                    installer.require_canary(self.PIN)
+
+    def test_forward_only_candidate_refuses_before_live_commands(self):
+        status, _, stderr, _ = self.invoke(["--canary"], self.fake_build(writer_generation=2))
+        self.assertEqual(status, 1)
+        self.assertIn("live canary needs matching writer_generation", stderr)
+        self.assertFalse(self.log.exists())
+
+
 class AuthenticatePinTests(unittest.TestCase):
     """The installer authenticates its own fetched source (oxide#302).
 

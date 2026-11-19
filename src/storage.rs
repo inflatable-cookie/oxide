@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::lease::admission_cost;
 use barge::{
     Absent, Area, AreaSpec, Barge, Hold, Location, Mode, PruneReport, Space, SweepReport, Volume,
     VolumeRegistration, VolumeState, VolumeStatus,
@@ -23,6 +24,8 @@ use barge::{
 
 /// The namespace every Oxide area lives under.
 pub const NAMESPACE: &str = "oxide";
+/// Barge marker leaf, used only for passive identity checks.
+pub const ROOT_MARKER: &str = ".barge-root.json";
 /// The pool area's name.
 pub const POOL_AREA: &str = "pool";
 /// The output-roots area's name.
@@ -798,6 +801,7 @@ impl PoolStorage {
             .map_err(barge::Error::unknown_state)?;
         #[cfg(test)]
         observe_pool_walk(PoolWalk::Adopt(id.to_owned()));
+        admission_cost::opaque_listing();
         area.adopt_root(folder, label, id)
     }
 
@@ -850,8 +854,9 @@ impl PoolStorage {
         project_folder: Option<&str>,
         id: &str,
     ) -> Result<Option<Hold>, String> {
-        self.area_for(project_folder)?
-            .try_hold(id, Mode::Exclusive)
+        let area = self.area_for(project_folder)?;
+        admission_cost::opaque_listing();
+        area.try_hold(id, Mode::Exclusive)
             .map_err(|error| format!("cannot test slot root {id}: {error}"))
     }
 
@@ -860,14 +865,34 @@ impl PoolStorage {
         &self,
         project_folder: Option<&str>,
         id: &str,
-    ) -> Result<barge::area::Eviction, String> {
-        let eviction = self
-            .area_for(project_folder)?
-            .evict(id)
-            .map_err(|error| format!("cannot evict slot root {id}: {error}"))?;
-        #[cfg(test)]
-        observe_pool_walk(PoolWalk::Evict(id.to_owned()));
-        Ok(eviction)
+    ) -> barge::Result<barge::area::Eviction> {
+        let area = self
+            .area_for(project_folder)
+            .map_err(barge::Error::unknown_state)?;
+        admission_cost::opaque_listing();
+        let eviction = area.evict(id);
+        if eviction.is_ok() || eviction.as_ref().err().is_some_and(eviction_walked_bytes) {
+            admission_cost::walked(1);
+            #[cfg(test)]
+            observe_pool_walk(PoolWalk::Evict(id.to_owned()));
+        }
+        eviction
+    }
+
+    /// One metadata-only inventory for a ceiling refusal or a protected victim.
+    pub(crate) fn list_protection(&self) -> Result<Vec<barge::RootInfo>, String> {
+        let mut roots = Vec::new();
+        for area in self.areas()? {
+            #[cfg(test)]
+            observe_pool_walk(PoolWalk::Inventory);
+            let listing = area.list_without_bytes().map_err(|error| {
+                admission_cost::opaque_listing();
+                error.to_string()
+            })?;
+            admission_cost::listed(listing.roots.len() + listing.stragglers.len());
+            roots.extend(listing.roots);
+        }
+        Ok(roots)
     }
 
     /// Evict one root from whichever area holds it.
@@ -919,9 +944,16 @@ impl PoolStorage {
     pub fn sweep_all_trash(&self) -> Result<barge::SweepReport, String> {
         let mut report = barge::SweepReport::default();
         for area in self.areas()? {
-            let swept = area
-                .sweep_trash()
-                .map_err(|error| format!("cannot sweep the pool trash: {error}"))?;
+            let swept = area.sweep_trash().map_err(|error| {
+                admission_cost::opaque_listing();
+                format!("cannot sweep the pool trash: {error}")
+            })?;
+            // The sweep traverses trash for deletion and reports reclaimed
+            // bytes as it goes. Barge runs no separate sizing walk here.
+            admission_cost::listed(swept.deleted.len() + swept.kept.len());
+            if !swept.kept.is_empty() {
+                admission_cost::opaque_listing();
+            }
             report.deleted.extend(swept.deleted);
             report.kept.extend(swept.kept);
         }
@@ -937,6 +969,7 @@ impl PoolStorage {
 
     /// Take a waiting exclusive hold on a root.
     pub fn hold(&self, id: &str) -> Result<Hold, String> {
+        admission_cost::opaque_listing();
         self.area
             .hold(id, Mode::Exclusive)
             .map_err(|error| format!("cannot hold slot root {id}: {error}"))
@@ -1001,6 +1034,126 @@ impl PoolStorage {
         #[cfg(test)]
         observe_pool_walk(PoolWalk::Inventory);
         self.storage.admit("pool")
+    }
+}
+
+/// At the pinned revision these outcomes follow the single sizing walk.
+fn eviction_walked_bytes(error: &barge::Error) -> bool {
+    let message = error.message();
+    match error.kind() {
+        barge::ErrorKind::Refused => message == "root marker changed before eviction",
+        barge::ErrorKind::Io if error.io_kind().is_some() => {
+            message.starts_with("cannot create the trash at ")
+                || message.starts_with("cannot evict the root to ")
+        }
+        _ => eviction_moved(error),
+    }
+}
+
+/// The pinned Barge API reports a post-rename deletion error as source-less
+/// I/O with this trash diagnosis. Ordinary path I/O still has its source kind.
+pub(crate) fn eviction_moved(error: &barge::Error) -> bool {
+    error.kind() == barge::ErrorKind::Io
+        && error.io_kind().is_none()
+        && error
+            .message()
+            .contains("; evicted root remains in trash at ")
+}
+
+/// Read a single Barge pin record for a known slot. Barge has no public pin
+/// reason accessor at the pinned revision. This private-layout read is only
+/// for diagnostics. A missing, raced or unreadable fact cannot permit eviction.
+pub(crate) fn slot_pin_reason(
+    path: &Path,
+    folder: Option<&str>,
+    id: &str,
+) -> Result<Option<String>, ()> {
+    use crate::fs_util::{entry_label, open_directory_at};
+    use std::ffi::{CStr, CString, OsStr};
+    use std::fs::{File, OpenOptions};
+    use std::io::Read;
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    const MAX_RECORD: u64 = 16 * 1024;
+    fn read_json(parent: &File, name: &CStr) -> std::io::Result<serde_json::Value> {
+        // SAFETY: the held directory and C string are live for the call.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new descriptor, now owned by File.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file.metadata()?;
+        // SAFETY: geteuid is infallible and needs no arguments.
+        if !metadata.is_file()
+            || metadata.len() > MAX_RECORD
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_RECORD + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_RECORD {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        serde_json::from_slice(&bytes).map_err(std::io::Error::other)
+    }
+
+    let parent = path.parent().ok_or(())?;
+    if std::fs::canonicalize(parent).map_err(|_| ())? != parent {
+        return Err(());
+    }
+    let parent = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)
+        .map_err(|_| ())?;
+    let open_child =
+        |parent: &File, name: &CStr| open_directory_at(parent.as_fd(), name).map(File::from);
+    let leaf = CString::new(path.file_name().and_then(OsStr::to_str).ok_or(())?).map_err(|_| ())?;
+    let root = open_child(&parent, &leaf).map_err(|_| ())?;
+    let marker = read_json(&root, c".barge-root.json").map_err(|_| ())?;
+    let area = folder.map_or_else(
+        || format!("{NAMESPACE}/{POOL_AREA}"),
+        |folder| format!("{NAMESPACE}/{POOL_AREA}-{}", slug(folder)),
+    );
+    if marker["id"].as_str() != Some(id) || marker["area"].as_str() != Some(area.as_str()) {
+        return Err(());
+    }
+    if !id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        || id.is_empty()
+        || id.len() > 64
+    {
+        return Err(());
+    }
+    let pin_name = CString::new(format!("{id}.json")).map_err(|_| ())?;
+    let pin = open_child(&parent, c".barge")
+        .and_then(|barge| open_child(&barge, c"pins"))
+        .and_then(|pins| read_json(&pins, &pin_name));
+    match pin {
+        Ok(pin)
+            if pin["schema"].as_str() == Some(barge::pin::PIN_SCHEMA)
+                && pin["root_id"].as_str() == Some(id) =>
+        {
+            let reason = pin["reason"]
+                .as_str()
+                .filter(|reason| !reason.is_empty())
+                .ok_or(())?;
+            Ok(Some(entry_label(OsStr::new(reason))))
+        }
+        Ok(_) => Err(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
     }
 }
 
@@ -1262,17 +1415,44 @@ mod tests {
         fixture.clock.advance(1_000);
         let newer = area.create_root("quick").expect("root");
         fixture.clock.advance(1_000);
+        // Barge samples the filesystem again after deleting a root. The
+        // fake mount gains space only after the older root has disappeared.
+        #[derive(Debug)]
+        struct FreeAfterEviction {
+            volume: FakeOs,
+            older: PathBuf,
+            reserve: u64,
+        }
+
+        impl Os for FreeAfterEviction {
+            fn volume_identity(&self, mount: &Path) -> barge::Result<Option<String>> {
+                self.volume.volume_identity(mount)
+            }
+
+            fn free_bytes(&self, mount: &Path) -> barge::Result<u64> {
+                let before = self.volume.free_bytes(mount)?;
+                Ok(if self.older.exists() {
+                    before
+                } else {
+                    self.reserve
+                })
+            }
+        }
+
         let reserve = 20_u64 << 30;
-        let older_bytes = area
-            .list()
-            .expect("list")
-            .get(&older.id)
-            .map(|root| root.bytes)
-            .expect("older");
-        assert!(older_bytes > 0);
-        // Just below the reserve: evicting the older root alone returns above it.
-        fixture.os.set_free(&fixture.mount, reserve - older_bytes);
-        let report = fixture.storage.prune("Builds", false).expect("prune");
+        fixture.os.set_free(&fixture.mount, reserve - 1);
+        let storage = Storage::open_with(
+            fixture.storage.state_dir().to_path_buf(),
+            Arc::new(FreeAfterEviction {
+                volume: fixture.os.clone(),
+                older: older.path.clone(),
+                reserve,
+            }),
+            fixture.clock.clone(),
+        )
+        .expect("storage");
+        let report = storage.prune("Builds", false).expect("prune");
+        assert_eq!(report.free_after_bytes, reserve);
         assert_eq!(report.evicted.len(), 1, "{report:?}");
         assert_eq!(report.evicted[0].id, older.id);
         assert!(!older.path.exists());
@@ -1422,7 +1602,7 @@ mod tests {
             .adopt_root("oxide-72ea0e6b", "checkout", "deadbeef00c0ffee")
             .expect("adopt");
         assert_eq!(root.path, legacy);
-        assert_eq!(root.folder_name(), "oxide-72ea0e6b");
+        assert_eq!(root.folder, "oxide-72ea0e6b");
         assert!(legacy.join("payload.bin").is_file(), "nothing moved");
         let marker: serde_json::Value = serde_json::from_slice(
             &std::fs::read(legacy.join(".barge-root.json")).expect("marker"),
