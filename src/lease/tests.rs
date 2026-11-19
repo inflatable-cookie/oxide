@@ -647,6 +647,69 @@ fn an_unfinished_legacy_transition_preserves_existing_barge_pins() {
 }
 
 #[test]
+fn held_eviction_distinguishes_a_held_root_from_a_failed_trash_delete() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new("held-eviction-failure");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let leased = managed::lease(request(&pool, &project, &project, "held")).unwrap();
+    let slot = leased.grant.slot_id.clone();
+    let lease_id = leased.grant.lease_id.clone();
+    let path = leased
+        .grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .unwrap()
+        .to_owned();
+
+    let before = fs::read(pool.join("ledger.json")).unwrap();
+    let refusal = managed::evict_held_slot(&pool, &slot, &lease_id).unwrap_err();
+    assert!(matches!(refusal, super::HeldEvictionFailure::PreCommit(_)));
+    assert_eq!(fs::read(pool.join("ledger.json")).unwrap(), before);
+    assert!(path.is_dir());
+    drop(leased);
+
+    // Unlinking a file from a non-writable directory fails for the pool's
+    // ordinary owner. Privileged users bypass this permission on both hosts.
+    if super::current_uid() == 0 {
+        return;
+    }
+    let protected = path.join("protected");
+    fs::create_dir(&protected).unwrap();
+    fs::write(protected.join("file"), b"kept after failed unlink").unwrap();
+    fs::set_permissions(&protected, fs::Permissions::from_mode(0o500)).unwrap();
+    let failure = managed::evict_held_slot(&pool, &slot, &lease_id);
+    let retained_path = if path.exists() {
+        path.clone()
+    } else {
+        let trash = path.parent().unwrap().join(".trash");
+        fs::read_dir(trash).unwrap().next().unwrap().unwrap().path()
+    };
+    fs::set_permissions(
+        retained_path.join("protected"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+
+    let error = failure.unwrap_err();
+    assert!(
+        matches!(error, super::HeldEvictionFailure::PostCommit(_)),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("evicted root remains in trash at"),
+        "{error}"
+    );
+    assert!(!path.exists());
+    assert!(retained_path.join("protected/file").is_file());
+    assert!(managed::snapshot(&pool).unwrap().slots.is_empty());
+}
+
+#[test]
 fn admission_cost_and_protection_at_the_256_slot_ceiling() {
     use super::admission_cost;
     use std::io::Write;
@@ -702,6 +765,7 @@ fn admission_cost_and_protection_at_the_256_slot_ceiling() {
         "pinned roots by reason: none"
     );
 
+    admission_cost::start_summary();
     let (warm, walks) =
         count_pool_walks(|| managed::lease(request(&pool, &project, &workspace, "warm")));
     let warm = warm.unwrap();
@@ -713,9 +777,17 @@ fn admission_cost_and_protection_at_the_256_slot_ceiling() {
         (0, 0, true),
         "Barge hold resolves by enumerating markers"
     );
+    let summary =
+        admission_cost::take_summary().expect("unavailable total triggers the build summary");
+    assert!(summary.contains("root total unavailable"), "{summary}");
+    assert!(
+        summary.contains("accounting") && summary.contains("0 walked"),
+        "{summary}"
+    );
     managed::release(&pool, &warm.grant.lease_id).unwrap();
     drop(warm);
 
+    admission_cost::start_summary();
     let (reserve, walks) = count_pool_walks(|| {
         super::pool::check_ample_reserve(&pool, &fixture.dir("reserve-account"))
     });
@@ -724,6 +796,12 @@ fn admission_cost_and_protection_at_the_256_slot_ceiling() {
     let (reserve_us, walked, listed, opaque) = admission_cost::latest(&pool);
     assert_eq!((walked, listed, opaque), (0, 0, false));
 
+    let ample_summary = admission_cost::take_summary();
+    if reserve_us <= 2_000_000 {
+        assert_eq!(ample_summary, None);
+    }
+
+    admission_cost::start_summary();
     let other = fixture.dir("other");
     let (admitted, walks) =
         count_pool_walks(|| managed::lease(request(&pool, &other, &workspace, "new")));
@@ -735,6 +813,13 @@ fn admission_cost_and_protection_at_the_256_slot_ceiling() {
         (walked, listed, opaque),
         (1, 0, true),
         "Barge eviction also enumerates markers"
+    );
+    let summary =
+        admission_cost::take_summary().expect("unavailable total triggers the build summary");
+    assert!(summary.contains("root total unavailable"), "{summary}");
+    assert!(
+        summary.contains("eviction") && summary.contains("1 walked"),
+        "{summary}"
     );
     assert!(!pool.join("payload/slots").join(count.to_string()).exists());
     assert!(pool.join("payload/slots/1").is_dir());
@@ -785,7 +870,7 @@ fn admission_cost_and_protection_at_the_256_slot_ceiling() {
         "{durations:?}"
     );
     writeln!(std::io::stderr().lock(),
-        "256 slots, lock µs and root counts: adoption max {max_prepare_us} (8 rows per batch, 0 walks, marker total unavailable), warm {warm_us} (0 walks, marker total unavailable), reserve {reserve_us} (0 roots), eviction {eviction_us} (1 walk, marker total unavailable), refusal {refused_us} (0 walks, 256 explicitly listed, marker total unavailable), status 0 roots"
+        "256 slots, lock µs and root counts: adoption max {max_prepare_us} (8 rows per batch, 0 walks, marker total unavailable), warm {warm_us} (0 walks, marker total unavailable), reserve {reserve_us} (0 roots), eviction {eviction_us} (1 walk, marker total unavailable), refusal {refused_us} (0 walks, 256 explicitly listed, marker total unavailable), status 0 roots, warm and eviction summaries disclosed the unavailable total"
     ).unwrap();
 }
 

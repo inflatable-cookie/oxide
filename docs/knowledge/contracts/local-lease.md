@@ -29,8 +29,9 @@ unrecorded stray at an old path never becomes a successor.
 
 Pool preparation adopts idle legacy rows when the kernel confirms that the
 recorded Oxide holder PID is absent. A live or unverifiable holder keeps the
-row unavailable. Held legacy rows still need the existing explicit
-writer-closure check. Adoption creates no pin, so an unpinned root can be
+row unavailable. An admission whose compatible idle row awaits the next
+batch returns a retry message. A matching held legacy row still needs an
+explicit writer-closure check. Adoption creates no pin, so an unpinned root can be
 evicted without a warm grant. Existing pins remain protected by Barge.
 
 ## Oxide front door control directory
@@ -76,7 +77,9 @@ Oxide times each admission lock hold from acquisition through release,
 including front-door preparation and refused attempts. A private sidecar keeps
 the last 32 observations. The writer publishes after dropping the pool lock.
 The build summary reports a hold over two seconds or more than one observed
-root walk or listing. It names the phases that did the work. Default status
+root walk or listing. It also reports an unavailable root total whenever
+Barge's internal enumeration prevents evaluating the threshold. It names
+the phases that did the work. Default status
 reads recent per-pool maxima from the sidecar without taking the pool lock.
 
 A payload walk visits one root. A Barge eviction's size measurement and
@@ -92,7 +95,9 @@ At the slot ceiling, Oxide first tries the oldest candidate through Barge. If
 it is protected, one bytes-free inventory identifies other held or pinned
 candidates before Oxide tries the remaining roots. A refusal reports held and
 pinned counts (which can overlap), other unavailable rows, pending legacy
-adoption and pin reasons. Default status reads bound pin records at the
+adoption and pin reasons. If this checkout can wait for a compatible
+holder, the first ceiling diagnosis is printed with its wait message.
+Default status reads bound pin records at the
 ledger's known paths without enumerating directories or reading payloads.
 Pin reasons are diagnostic. Unreadable records are reported as unknown.
 

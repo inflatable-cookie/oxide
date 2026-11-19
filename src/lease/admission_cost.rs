@@ -14,6 +14,7 @@ use std::time::Instant;
 
 const HISTORY: &str = "admission-cost.json";
 const HISTORY_LEN: usize = 32;
+const SLOW_HOLD_MICROS: u64 = 2_000_000;
 const HISTORY_BYTES: u64 = 32 * 1024;
 const PHASES: [Phase; 4] = [
     Phase::Accounting,
@@ -76,7 +77,11 @@ impl Sample {
         let mut phases = Vec::new();
         for phase in PHASES {
             let cost = self.phases[phase as usize];
-            if cost.micros != 0 || cost.walked != 0 || cost.listed != 0 || cost.opaque_listing {
+            if (self.micros > SLOW_HOLD_MICROS && cost.micros != 0)
+                || cost.walked != 0
+                || cost.listed != 0
+                || cost.opaque_listing
+            {
                 phases.push(format!(
                     "{} {:.1} ms, {} walked, {} listed{}",
                     phase.name(),
@@ -129,12 +134,12 @@ fn micros(duration: std::time::Duration) -> u64 {
 
 thread_local! {
     static TRACE: RefCell<Option<Trace>> = const { RefCell::new(None) };
-    static SUMMARY: Cell<Option<[Option<Sample>; PHASES.len()]>> = const { Cell::new(None) };
+    static SUMMARY: Cell<Option<[Option<Sample>; PHASES.len() * 2]>> = const { Cell::new(None) };
 }
 
 /// Collect notable holds for this CLI command, including preparation and retries.
 pub fn start_summary() {
-    SUMMARY.set(Some([None; PHASES.len()]));
+    SUMMARY.set(Some([None; PHASES.len() * 2]));
 }
 
 /// Consume this command's notable holds. Each phase keeps its strongest sample.
@@ -184,22 +189,32 @@ impl Drop for PoolLock {
         trace.switch(trace.phase);
         trace.sample.micros = micros(trace.started.elapsed());
         let sample = trace.sample;
-        if sample.micros > 2_000_000 || sample.walked().max(sample.listed()) > 1 {
+        if sample.micros > SLOW_HOLD_MICROS
+            || sample.walked().max(sample.listed()) > 1
+            || sample.opaque_listing()
+        {
             let phase = PHASES
                 .into_iter()
                 .max_by_key(|phase| {
                     let cost = sample.phases[*phase as usize];
-                    if sample.micros > 2_000_000 {
-                        (cost.micros, 0)
+                    if sample.micros > SLOW_HOLD_MICROS {
+                        (cost.micros, 0, cost.opaque_listing)
                     } else {
-                        (0, cost.walked.max(cost.listed))
+                        (0, cost.walked.max(cost.listed), cost.opaque_listing)
                     }
                 })
                 .unwrap_or(trace.phase);
             if let Some(mut summary) = SUMMARY.get() {
-                let current = &mut summary[phase as usize];
-                let weight =
-                    |s: &Sample| (s.micros > 2_000_000, s.walked().max(s.listed()), s.micros);
+                let current =
+                    &mut summary[phase as usize * 2 + usize::from(sample.opaque_listing())];
+                let weight = |s: &Sample| {
+                    (
+                        s.micros > SLOW_HOLD_MICROS,
+                        s.walked().max(s.listed()),
+                        s.opaque_listing(),
+                        s.micros,
+                    )
+                };
                 if current
                     .as_ref()
                     .is_none_or(|old| weight(&sample) > weight(old))

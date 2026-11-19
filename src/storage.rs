@@ -850,11 +850,13 @@ impl PoolStorage {
             .area_for(project_folder)
             .map_err(barge::Error::unknown_state)?;
         admission_cost::opaque_listing();
-        let eviction = area.evict(id)?;
-        admission_cost::walked(1);
-        #[cfg(test)]
-        observe_pool_walk(PoolWalk::Evict(id.to_owned()));
-        Ok(eviction)
+        let eviction = area.evict(id);
+        if eviction.is_ok() || eviction.as_ref().err().is_some_and(eviction_moved) {
+            admission_cost::walked(1);
+            #[cfg(test)]
+            observe_pool_walk(PoolWalk::Evict(id.to_owned()));
+        }
+        eviction
     }
 
     /// One metadata-only inventory for a ceiling refusal or a protected victim.
@@ -1012,6 +1014,16 @@ impl PoolStorage {
         observe_pool_walk(PoolWalk::Inventory);
         self.storage.admit("pool")
     }
+}
+
+/// The pinned Barge API reports a post-rename deletion error as source-less
+/// I/O with this trash diagnosis. Ordinary path I/O still has its source kind.
+pub(crate) fn eviction_moved(error: &barge::Error) -> bool {
+    error.kind() == barge::ErrorKind::Io
+        && error.io_kind().is_none()
+        && error
+            .message()
+            .contains("; evicted root remains in trash at ")
 }
 
 /// Read a single Barge pin record for a known slot. Barge has no public pin

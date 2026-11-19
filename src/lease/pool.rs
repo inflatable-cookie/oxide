@@ -1306,11 +1306,8 @@ impl Pool {
         Self::open_inner(root, true, lease_id, true, None)
     }
 
-    /// The held eviction's locked open (oxide#196): the pool lock is taken, but
-    /// no control fence is written and nothing is reconciled before the
-    /// caller's held-row validation and its durable hold intent. A pre-commit
-    /// failure therefore leaves the pool bytes and identity unchanged. A pool
-    /// with pending recorded reconciliation refuses in the caller.
+    /// Keep the exact held ledger row for the explicit eviction. Barge
+    /// establishes whether its root can be evicted under the root and area locks.
     fn open_held_eviction(root: &Path) -> Result<Self, LeaseError> {
         Self::open_inner(root, false, None, false, None)
     }
@@ -1319,7 +1316,7 @@ impl Pool {
         root: &Path,
         trace_release: bool,
         releasing: Option<&str>,
-        fence_control: bool,
+        reconcile: bool,
         observed_phase: Option<Phase>,
     ) -> Result<Self, LeaseError> {
         let root = canonical_existing_dir(root, true)?;
@@ -1335,7 +1332,7 @@ impl Pool {
         // state reaches the current fence version before this open can start a
         // recovery journal or finish a recorded deletion. A library fixture
         // has no control state and nothing to fence.
-        if fence_control {
+        if reconcile {
             super::fence_managed_control(&root)?;
         }
         let config = read_config(&root)?;
@@ -1373,13 +1370,15 @@ impl Pool {
             ledger,
             admission_note: None,
         };
-        admission_cost::in_phase(Phase::Accounting, || {
-            pool.recover_abandoned_holds(releasing)
-        })?;
-        admission_cost::in_phase(Phase::Eviction, || {
-            pool.retire_missing_idle_roots()?;
-            pool.sweep_trash()
-        })?;
+        if reconcile {
+            admission_cost::in_phase(Phase::Accounting, || {
+                pool.recover_abandoned_holds(releasing)
+            })?;
+            admission_cost::in_phase(Phase::Eviction, || {
+                pool.retire_missing_idle_roots()?;
+                pool.sweep_trash()
+            })?;
+        }
         Ok(pool)
     }
 
@@ -1740,11 +1739,29 @@ impl Pool {
             })
             .cloned()
         {
+            if !held.owned {
+                return Err(LeaseError::LegacyWriterUnverified(held.id));
+            }
             if held.holder != request.holder {
                 return Err(LeaseError::Busy);
             }
         }
         let candidate = self.idle_compatible(&project, request.profile);
+        if candidate.is_none() {
+            if let Some(legacy) = self.ledger.slots.iter().find(|slot| {
+                slot.is_idle()
+                    && !slot.owned
+                    && !slot.adoption_refused
+                    && slot.project == project
+                    && slot.profile == request.profile
+            }) {
+                return Err(if legacy_writer_absent(&legacy.holder) {
+                    LeaseError::LegacyAdoptionPending(legacy.id)
+                } else {
+                    LeaseError::LegacyWriterUnverified(legacy.id)
+                });
+            }
+        }
         if self
             .storage
             .as_ref()
@@ -1798,7 +1815,13 @@ impl Pool {
         self.ledger
             .slots
             .iter()
-            .find(|slot| slot.is_idle() && slot.project == project && slot.profile == profile)
+            .find(|slot| {
+                slot.is_idle()
+                    && slot.owned
+                    && slot.root.is_some()
+                    && slot.project == project
+                    && slot.profile == profile
+            })
             .map(|slot| (slot.id, slot.incarnation))
     }
 
@@ -2202,7 +2225,10 @@ impl Pool {
         let Some(slot) = self.slot(id) else {
             return Err(pre(LeaseError::Busy));
         };
-        if slot.state != SlotPersistState::Held || slot.lease_id.as_deref() != Some(lease_id) {
+        if slot.state != SlotPersistState::Held
+            || !slot.owned
+            || slot.lease_id.as_deref() != Some(lease_id)
+        {
             return Err(pre(LeaseError::Busy));
         }
         let root = slot
@@ -2218,13 +2244,23 @@ impl Pool {
             .storage
             .as_ref()
             .ok_or(pre(LeaseError::UnknownAccounting))?;
-        let evicted = storage
-            .evict_in(project.as_deref(), &root)
-            .map_err(|error| pre(LeaseError::EvictionIncomplete(error.to_string())))?;
+        let deletion = match storage.evict_in(project.as_deref(), &root) {
+            Ok(evicted) => require_deleted(evicted),
+            Err(error) if crate::storage::eviction_moved(&error) => {
+                Err(LeaseError::EvictionIncomplete(error.to_string()))
+            }
+            Err(error) => return Err(pre(LeaseError::EvictionIncomplete(error.to_string()))),
+        };
         self.ledger.slots.retain(|slot| slot.id != id);
-        self.persist_revised().map_err(pre)?;
-        require_deleted(evicted)
-            .map_err(|error| HeldEvictionFailure::PostCommit(error.to_string()))?;
+        if let Err(error) = self.persist_revised() {
+            let mut message =
+                format!("slot {id} moved to trash; could not publish the ledger: {error}");
+            if let Err(deletion) = deletion {
+                message.push_str(&format!("; {deletion}"));
+            }
+            return Err(HeldEvictionFailure::PostCommit(message));
+        }
+        deletion.map_err(|error| HeldEvictionFailure::PostCommit(error.to_string()))?;
         Ok(Vec::new())
     }
 

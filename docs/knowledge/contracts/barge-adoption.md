@@ -110,9 +110,10 @@ selected prune target. A zero reserve retains Barge's default floor.
   exclusive lock without waiting, then rechecks the pin under the area lock
   before renaming the root into `.trash/`. An earlier "idle and unpinned"
   reading never authorises an eviction by itself.
-- A workflow publication failure after Barge eviction fails the command and
-  reports that eviction occurred. It is never described as a retained root,
-  and the dispatcher stops before attempting another planned root.
+- Barge's rename into trash is the held eviction's commit point. A reported
+  post-rename deletion failure retires workflow membership and surfaces the
+  trash failure. A workflow publication failure after the rename reports
+  that the root moved. Neither failure gives freed-space credit.
 - Deletion never follows a symlink and never descends into another filesystem;
   a trash entry is removed only when its marker still names the area.
   Eviction renames first, so a crash leaves owned trash, which the next prune

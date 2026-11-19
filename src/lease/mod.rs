@@ -250,15 +250,16 @@ pub enum LeaseError {
     BackingMismatch,
     LedgerExhausted,
     SlotCeiling(String),
+    LegacyAdoptionPending(u64),
+    LegacyWriterUnverified(u64),
     EvictionIncomplete(String),
     Unsupported(&'static str),
     Io(String),
 }
 
-/// A held eviction's failure class (oxide#196). The durable hold intent is
-/// the commit point: a pre-commit failure leaves the pool bytes and identity
-/// unchanged, while a post-commit failure names the recorded partial state
-/// that the next locked open resumes or rolls back.
+/// A held eviction's failure class. Barge's rename into trash is the commit
+/// point. A post-commit failure reports that the root moved and identifies
+/// any problem with trash removal or publication of the workflow ledger.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeldEvictionFailure {
     PreCommit(LeaseError),
@@ -290,6 +291,8 @@ impl LeaseError {
             | Self::OneUseBudget { .. }
             | Self::LedgerExhausted
             | Self::SlotCeiling(_)
+            | Self::LegacyAdoptionPending(_)
+            | Self::LegacyWriterUnverified(_)
             | Self::EvictionIncomplete(_) => 3,
             Self::UnsafePath(_) | Self::BackingMismatch => 4,
             Self::NotFound => 5,
@@ -313,6 +316,8 @@ impl LeaseError {
             Self::NotFound => "not_found",
             Self::BackingMismatch => "backing_mismatch",
             Self::LedgerExhausted | Self::SlotCeiling(_) => "ledger_exhausted",
+            Self::LegacyAdoptionPending(_) => "legacy_adoption_pending",
+            Self::LegacyWriterUnverified(_) => "legacy_writer_unverified",
             Self::Unsupported(_) => "unsupported",
             Self::Io(_) => "io",
         }
@@ -390,6 +395,14 @@ impl std::fmt::Display for LeaseError {
             Self::LedgerExhausted => {
                 formatter.write_str("finite ledger or slot count is exhausted")
             }
+            Self::LegacyAdoptionPending(slot) => write!(
+                formatter,
+                "compatible legacy slot {slot} is pending adoption; retry the Oxide command to advance the next batch"
+            ),
+            Self::LegacyWriterUnverified(slot) => write!(
+                formatter,
+                "compatible legacy slot {slot} needs its previous writer verified closed before Oxide can use it"
+            ),
             Self::Unsupported(message) => formatter.write_str(message),
             Self::Io(message) | Self::SlotCeiling(message) | Self::EvictionIncomplete(message) => formatter.write_str(message),
         }
