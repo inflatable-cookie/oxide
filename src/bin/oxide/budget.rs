@@ -728,7 +728,7 @@ impl Events {
     fn open(fd: RawFd) -> Result<Self, String> {
         if !sigpipe_ignored() {
             return Err(
-                "refusing --budget-events: this runtime does not ignore SIGPIPE in the parent, so a broken reader would kill oxide; the typed channel needs the pinned 1.97.1 disposition"
+                "refusing --budget-events: this runtime does not ignore SIGPIPE in the parent, so a broken reader would kill oxide; the typed channel needs the pinned 1.100.0 disposition"
                     .to_owned(),
             );
         }
@@ -805,7 +805,7 @@ impl Drop for Events {
     }
 }
 
-/// Whether this process ignores SIGPIPE, as pinned Rust 1.97.1 `std` does at
+/// Whether this process ignores SIGPIPE, as pinned Rust 1.100.0 `std` does at
 /// startup. Read-only query: no disposition is installed or changed.
 pub fn sigpipe_ignored() -> bool {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };

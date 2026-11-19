@@ -1,21 +1,29 @@
 # Rust toolchain and quality
 
-The repository pins the already-installed Rust 1.97.1 toolchain in
+The repository pins the already-installed Rust 1.100.0 toolchain in
 [`rust-toolchain.toml`](../../rust-toolchain.toml). The selected compiler is
-`rustc 1.97.1` and its matching Cargo is `cargo 1.97.1`; this is the local
-development and validation toolchain.
+`rustc 1.100.0` and its matching Cargo is `cargo 1.100.0`; this is the local
+development and validation toolchain. The pin also declares the `rustfmt`
+component, which `rust:format` uses; rustup installs it with the channel.
 
-Tom's ruling, 2026-10-09: Oxide's initial minimum supported Rust version is
-**1.97.1**. Package manifests must declare `rust-version = "1.97.1"`. The
-prototype's recorded checks exercised this compiler. Supporting an older
-compiler requires deliberate compatibility validation and a revised policy.
+Tom's ruling, 2026-11-19, supersedes the 2026-10-09 initial minimum: Oxide's own
+toolchain and minimum supported Rust version are **1.100.0**. Package manifests
+must declare `rust-version = "1.100.0"`. The recorded checks exercised this
+compiler after Cargo 1.100.0 became a verified release (oxide#334). Supporting
+an older compiler requires deliberate compatibility validation and a revised
+policy.
 This minimum governs building Oxide itself; consumer project compilers remain
 independently resolved inputs to their build-storage identity. The Cargo
 releases the freshness gate, stray detection and dep-info decoder support are
 listed in the [Cargo version matrix](contracts/workflow.md#cargo-version-matrix).
 
+Moving the pin changed only Oxide's own build. Oxide still reads other projects'
+Cargo releases independently: cold-slot seeding keeps its 1.97.1 adapter and is
+skipped on a v2 layout, and `clean --cargo-cache` still runs only under Cargo
+1.97.1 until that release is qualified.
+
 The unpublished root package uses Rust edition 2021 and declares
-`rust-version = "1.97.1"`. Its internal name is `oxide-storage`; publication
+`rust-version = "1.100.0"`. Its internal name is `oxide-storage`; publication
 names remain subject to [Q-005](questions.md#q-005--what-names-are-safe-to-publish).
 It contains a Unix-only local storage library, the unpublished `oxide` and
 `oxide-storage-inventory` binaries (the standalone lease binary was retired in
@@ -38,7 +46,7 @@ take the locked Barge source from the bounded seeder, as they do for Longhorn.
 
 Oxide's Cargo invocations set `CARGO_BUILD_BUILD_DIR` to the storage-owned build
 directory and keep `CARGO_TARGET_DIR` in the checkout. That setting is stable
-from Cargo 1.91, and the pinned Cargo 1.97.1 supports it. Cross-checkout
+from Cargo 1.91, and the pinned Cargo 1.100.0 supports it. Cross-checkout
 correctness is qualified only to the limits in
 [qualification readiness](qualification-readiness.md). See
 [storage boundaries](architecture.md).

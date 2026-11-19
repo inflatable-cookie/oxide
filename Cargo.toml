@@ -2,7 +2,7 @@
 name = "oxide-storage"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.97.1"
+rust-version = "1.100.0"
 publish = false
 
 [dependencies]
@@ -49,7 +49,7 @@ path = "src/bin/oxide/main.rs"
 path = "src/lib.rs"
 
 # Opt-in development profiles (oxide#068). These are explicit recipes for the
-# frozen stable Cargo 1.97.1 toolchain; they do not change the default
+# frozen stable Cargo 1.100.0 toolchain; they do not change the default
 # dev/test/release profiles or any consumer. `oxide-light` keeps line tables
 # for workspace units only; `oxide-full-debug` is the explicit control that
 # restores full debug information for workspace, dependency and build-time

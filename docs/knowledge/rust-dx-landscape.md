@@ -2,7 +2,7 @@
 
 Read-only research findings and candidate remedies for Rust build, check and test feedback in Oxide's development workflow. This file owns the sourced findings, their evidence limits and the candidate remedies that remain open. [Vision](vision.md) owns the desired experience. Queue and Nucleus own plans, briefs and execution. [Workflow](contracts/workflow.md) owns the shipped command contracts, and [qualification readiness](qualification-readiness.md) owns the storage correctness findings.
 
-Findings are dated 2026-10-09 to 2026-11-12 and apply to Cargo 1.97.1 on macOS arm64 unless stated. Check tool behaviour on the pinned version before adopting anything. No candidate here is a selected default or permission to change a repository.
+Findings are dated 2026-10-09 to 2026-11-12 and apply to Cargo 1.97.1 on macOS arm64 unless stated. The repository's own toolchain is now 1.100.0 ([toolchain and quality](rust-toolchain-and-quality.md)); re-check a finding on the pinned version before adopting anything, since no cited measurement was taken on that release. No candidate here is a selected default or permission to change a repository.
 
 ## Evidence limits
 

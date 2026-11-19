@@ -85,7 +85,7 @@ fn status_qualified_modes_match_baseline_without_side_effects() {
             .env("CARGO_HOME", &cargo_home)
             .env("RUSTUP_HOME", &rustup_home)
             .env("RUSTUP_AUTO_INSTALL", "0")
-            .env("RUSTUP_TOOLCHAIN", "1.97.1")
+            .env("RUSTUP_TOOLCHAIN", "1.100.0")
             .env("OXIDE_POOL", &pool)
             .env("OXIDE_CONFIG", scratch.0.join("missing-config"))
             .env_remove("OXIDE_COLD_SEED");
@@ -194,7 +194,7 @@ fn tiny_build_matches_staged_base_when_seed_is_off() {
             .env("CARGO_HOME", &cargo_home)
             .env("RUSTUP_HOME", &rustup_home)
             .env("RUSTUP_AUTO_INSTALL", "0")
-            .env("RUSTUP_TOOLCHAIN", "1.97.1")
+            .env("RUSTUP_TOOLCHAIN", "1.100.0")
             .env("OXIDE_POOL", &pool)
             .env("OXIDE_CONFIG", scratch.0.join("missing-config"))
             .env("OXIDE_COLD_SEED", "0")
