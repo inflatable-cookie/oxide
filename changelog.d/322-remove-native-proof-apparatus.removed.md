@@ -1,0 +1,1 @@
+Removed the historical native-proof apparatus (shared proof supervisor, removable-pool runner, research scripts, `test-*.py` proofs and their Effigy selectors) and the test-only proof hooks they used. Ordinary workspace tests and installer checks remain.

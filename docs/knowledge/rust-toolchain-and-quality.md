@@ -24,22 +24,24 @@ persisted lease-token hashes. It pins `basic-toml` `=0.1.10` (oxide#095), the
 strict-profile exception in Tom's
 [2026-10-19 ruling](vision.md#product-workflow-direction), only to parse Cargo
 config for [`clean --cargo-cache`](contracts/workflow.md#cargo-home-hygiene)
-and, since oxide#102, the [user config file](contracts/workflow.md#budget-only-default-pool-and-user-configuration):
+and, since oxide#102, the [user config file](contracts/workflow.md):
 a TOML 1.0 parser whose only dependency is the already-pinned `serde`, so
 `Cargo.lock` gains this one package; it was resolved offline from the local
 cache (checksum `ba62675e8242a4c4e806d12f11d136e626e6c8361d6b829310732241652a178a`, matching the cached archive). This does not establish production host support.
 
 Since oxide#314 the package depends on Barge's lean storage core at one full
-40-hex commit, `26caf67e9cf7715b9945d625ac110610aa54e791`. It includes the
+40-hex commit, the `rev` pinned in [`Cargo.toml`](../../Cargo.toml). It includes the
 lean core, adopted-root seam, under-lock eviction identity checks and read-only
 account opener (Barge PRs 65, 66, 68 and 67). `Cargo.lock` gains only the `barge`
 package; its `serde`, `serde_json` and `libc` are already pinned. Offline builds
 take the locked Barge source from the bounded seeder, as they do for Longhorn.
 
-The reviewed design selects Cargo build-dir redirection as the smallest
-mechanism to qualify later. That setting is stable from Cargo 1.91; the pinned
-Cargo 1.97.1 supports it. The prototype does not configure Cargo storage or
-prove cross-checkout correctness. See [storage boundaries](architecture.md).
+Oxide's Cargo invocations set `CARGO_BUILD_BUILD_DIR` to the storage-owned build
+directory and keep `CARGO_TARGET_DIR` in the checkout. That setting is stable
+from Cargo 1.91, and the pinned Cargo 1.97.1 supports it. Cross-checkout
+correctness is qualified only to the limits in
+[qualification readiness](qualification-readiness.md). See
+[storage boundaries](architecture.md).
 
 Repository validation selectors are listed in [`AGENTS.md`](../../AGENTS.md).
 The release profile carries no diagnostic allowance: `effigy

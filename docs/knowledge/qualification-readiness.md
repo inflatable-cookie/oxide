@@ -1,212 +1,153 @@
 # Qualification findings: freshness, paths, containment and capacity
 
-This file keeps the findings from the 2026-10-09 to 2026-10-16 qualification
-work that the proposed [workflow](contracts/workflow.md) builds on. They are
-historical evidence, not a current qualification or execution authority. The
-machinery that produced them was retired on 2026-10-18; the full narrative stays in Git history and the
-raw receipts stay under [`evidence/`](evidence/). [Architecture](architecture.md)
-owns the storage invariants, [vision](vision.md) owns authority and
-[questions](questions.md) owns open decisions.
+Historical findings from the 2026-10-09 to 2026-10-16 qualification work that
+the storage design rests on. They are not a current qualification or an
+execution authority. The machinery that produced them was retired on 2026-10-18.
+Raw receipts are kept under [evidence](evidence/), and they authorise nothing.
+[Architecture](architecture.md) owns the storage invariants, [vision](vision.md)
+owns authority, [questions](questions.md) owns open decisions, and
+[workflow](contracts/workflow.md) owns current behaviour.
 
 ## Cargo freshness
 
-Pinned Cargo 1.97.1 (`c980f4866`) fingerprints workspace units by relative path
-and file mtime. Evidence: the preserved v4 fixture root
-`/private/var/tmp/oxide-rust-probe-proof-613d9b91-v4` and the Task 018
-diagnosis of the Cargo fingerprint source.
+Pinned Cargo 1.97.1 decides freshness of workspace units from relative paths and
+file mtimes.
 
-- `find_stale_file` treats an input as fresh when `path_mtime <=
-  reference_mtime`, so equal timestamps are also a hit.
-- A build script's `rerun-if-changed` inputs are recorded relative to the
-  package (`RerunIfChanged {output, paths: ["marker.txt"]}`) and compared
-  against the mtime of the script's `output` file.
-- Library and test units use `CheckDepInfo` with `checksum: false`. Encoded
-  dep-info lists package-relative sources and slot-relative generated files.
-  `translate_dep_info` drops rustc-synthesised environment dependencies such
-  as `CARGO_MANIFEST_DIR`, on the assumption they are tracked elsewhere. They
-  are not.
-- Fingerprint `path` is workspace-relative. Cargo never hashes the absolute
-  checkout path, so that a renamed project directory can reuse artifacts
-  ([fingerprint module](https://github.com/rust-lang/cargo/blob/c980f4866/src/cargo/core/compiler/fingerprint/mod.rs)).
-- Unstable [checksum-freshness](https://doc.rust-lang.org/cargo/reference/unstable.html#checksum-freshness)
-  needs nightly, replaces rustc dep-info mtimes only, and leaves build-script
-  `RerunIfChanged` on mtimes. It is not a stable 1.97.1 fix.
+- An input is fresh when its mtime is at or before the reference mtime, so equal
+  timestamps count as fresh.
+- Library and test units read package-relative dep-info. Rustc's environment
+  dependencies, such as `CARGO_MANIFEST_DIR`, are dropped on the assumption that
+  they are tracked elsewhere. They are not.
+- Fingerprint paths are workspace-relative, and Cargo does not hash the absolute
+  checkout path.
+- The unstable checksum-freshness option needs nightly and is not a stable fix.
 
-Observed failure (v4, 2026-10-10): checkout B built a changed marker on a slot;
-a later request at checkout A reused that slot. A's unchanged files were older
-than B's anchors, so Cargo reported zero rebuilt units. The test executed and
-failed: the compiled value was B's `changed-marker`, the runtime file A's
-baseline. Generated `OUT_DIR` code and dep-info still named B's paths. The
-lease became uncertain and was retained.
+Observed failure (2026-10-10): a slot built for checkout B was reused for
+checkout A. A's unchanged files were older than B's anchors, so Cargo reported
+zero rebuilt units. The test ran and failed. The binary held B's compiled value,
+while the runtime file was A's baseline. The lease was retained as uncertain.
 
-Proven: Oxide admitted an idle slot across compile-origin trees and roots, and
-Cargo treated older-or-equal relative inputs as fresh. Not proven: that every
-cross-worktree reuse is impossible, that Cargo invalidation is generally
-broken, or that touching sources or editing fingerprints is a supported fix.
-Within one root, Cargo did the right forward miss: a newer relative input reran
-the build script and rebuilt the affected units.
+Proven: Cargo treated older-or-equal relative inputs as fresh across checkouts.
+Not proven: that every cross-worktree reuse is impossible, that Cargo
+invalidation is generally broken, or that touching sources is a supported fix.
+Within one root, Cargo handled a newer input correctly.
 
-Consequence for W-8: before reusing a slot across checkouts, Oxide must
-account for source content, mtimes against the slot's build anchor, Cargo's
-named inputs, build-script environment and the physical root. Incomplete
-evidence refuses or falls back to a checkout-affine slot.
-The bounded `EncodedDepInfo` v1 decoder kept in `oxide_storage::dep_info`
-reads those per-unit file references and environment entries; decoding alone
-does not establish freshness.
+Rule: before reusing a slot across checkouts, Oxide must account for source
+content, mtimes against the slot's build anchor, Cargo's named inputs, the
+build-script environment and the physical root. Incomplete evidence refuses, or
+falls back to a checkout-affine slot. See [cross-checkout
+freshness](contracts/workflow.md#cross-checkout-freshness) for the current
+rules.
 
 ## Compiler and behavior paths
-
-Standalone pilot run 5 (2026-10-09, [review](https://github.com/inflatable-cookie/oxide/pull/9#issuecomment-6088502764))
-reused a released slot at checkout B with zero rebuilt units; tests ran and
-passed. The reused `planning` test binary held 484 occurrences of the
-checkout-A path and none of B; `build_diagnostics` held 56 and none. Review
-classified them as rustc source names for debug and panic metadata, with no
-`CARGO_MANIFEST_DIR` string or B load path. That failed the strict path proof
-without showing wrong-source execution on identical trees.
 
 Keep three path classes apart:
 
 - **Compiler source identity:** debug information, diagnostics, `file!()` and
-  panic locations. The last two are program-visible values.
-- **Behavior-bearing paths:** `CARGO_MANIFEST_DIR`, `OUT_DIR`, `include!`
+  panic locations. The last two are visible to the program.
+- **Behaviour-bearing paths:** `CARGO_MANIFEST_DIR`, `OUT_DIR`, `include!`
   targets, build-script and proc-macro inputs and outputs, generated code and
   runtime resource lookup. Path remapping rewrites none of these.
-- **Debugger lookup:** a logical path in debug information is useful only if
-  it maps back to the exact source tree of that run.
+- **Debugger lookup:** a logical path in debug information helps only if it maps
+  back to the exact source tree of that run.
 
-Remapping findings (Tasks 014–017):
+Findings on pinned rustc 1.97.1:
 
-- Pinned rustc 1.97.1 accepts stable `--remap-path-prefix` and
-  `--remap-path-scope`. The default scope also rewrites `file!()` and panic
-  strings. Remapping is best effort and does not rewrite Apple linker OSO
-  entries.
-- Cargo 1.97.1 includes Rust flags in its freshness fingerprint. A map whose
-  source roots differ between checkouts therefore misses; only an identical,
-  complete, ordered flag vector at every checkout can hit, and adding a root
-  is a cold rebuild.
+- Stable `--remap-path-prefix` is best effort. Its default scope also rewrites
+  `file!()` and panic strings. It does not rewrite Apple linker OSO entries.
+- Cargo includes rust flags in its freshness fingerprint. A remap whose source
+  roots differ between checkouts therefore misses, and adding a root forces a
+  cold rebuild.
 - Cargo can pass relative source paths, so relative prefixes need remapping as
   well as absolute ones.
-- On macOS the default `split-debuginfo = "unpacked"` leaves debug data in
-  objects referenced from the build directory; an empty executable debug
-  section does not mean debug information is off. A full-debug lookup must
-  inspect the exact companion or use an explicit `packed` profile.
+- On macOS, the default unpacked split debug info leaves debug data in objects
+  referenced from the build directory. An empty executable debug section does
+  not mean debug info is off. A full-debug lookup must inspect the companion
+  objects or use packed debug info.
 - No stable Cargo option presents arbitrary worktrees as one source root.
 
-Consequence for the workflow: reused workspace units carry the compiling
-checkout's paths. That is tolerable for `quick` backtraces and wrong for
-`debug` sessions after that checkout is gone. No cheap general remap exists on
-1.97.1.
+Consequence: reused workspace units carry the compiling checkout's paths. That
+is tolerable for `quick` backtraces and wrong for `debug` sessions after that
+checkout is gone. No cheap general remap exists on 1.97.1.
 
 ## Cross-path results
 
-- **Same-root fixture (Task 021, positive).** At one physical root, a changed
-  task reused its slot, kept unchanged dependency and proc-macro work, and
-  executed current generated, proc-macro and runtime values; stale-source and
-  post-failure requests refused before Cargo. Review at
-  `faf1490484af174dcb5ec4e98b116c408d2680ca`
-  ([verdict](https://github.com/inflatable-cookie/oxide/pull/21#issuecomment-6101426638)).
-  Tiny-fixture evidence only; the [Nucleus core reuse record](contracts/nucleus-core-reuse.md)
-  keeps its limits.
-- **Mapped logical roots (v4, negative).** Stale changed-source reuse, above.
-- **Ordinary Cargo across fresh checkout paths (#064, positive, narrow).** One
-  shared `dev` slot and the pinned Nucleus planning/diagnostics workflow: a
-  different-path checkout rebuilt only its changed test unit, with
-  `libsqlite3-sys` fresh, and tests ran every time. The old/equal-mtime case
-  was not isolated. The [project adoption boundary](contracts/project-adoption.md#focused-cross-worktree-result)
-  owns its summary; the raw receipt is
-  [`oxide-064-cross-path-qualification.json`](evidence/oxide-064-cross-path-qualification.json).
+- **Same-root fixture (positive, narrow).** At one physical root, a changed task
+  reused its slot, kept unchanged dependency and proc-macro work, and executed
+  current generated, proc-macro and runtime values. Stale-source and
+  post-failure requests were refused before Cargo ran. This was a tiny fixture.
+- **Mapped logical roots (negative).** Stale changed-source reuse, described
+  above under freshness.
+- **Ordinary Cargo across fresh checkout paths (positive, narrow, 2026-10-16).**
+  One shared `dev` slot and Nucleus's planning and diagnostics tests. A
+  different-path checkout rebuilt only its changed test unit, with the SQLite
+  system crate reused, and the tests ran every time. The equal-mtime and
+  input-only timestamp cases were not isolated. The [project adoption
+  boundary](contracts/project-adoption.md#focused-cross-worktree-result) owns
+  the summary.
 
 None of these qualifies general source-path correctness, cross-checkout
-freshness or a storage benefit claim.
+freshness or a storage benefit.
 
 ## Process containment
 
-Read-only readiness review, native arm64 macOS 26.6.2, 2026-10-09:
+Read-only review on native arm64 macOS 26.6.2 (2026-10-09), with a probe on
+2026-10-18.
 
-- A dedicated process group (`POSIX_SPAWN_SETPGROUP` / `setpgid`, then
-  `killpg`) is supported. `ESRCH` from `kill(-pgid, 0)` means no member is
-  currently visible. A descendant can leave with `setsid` or a new spawn group.
-- Probe, 2026-10-18: `kill(-pgid, 0)` returns `EPERM` when every remaining
-  member is an unreaped zombie, and `ESRCH` once they are reaped. A group whose
-  leader exited while another member lives reports members visible. So `EPERM`
-  is not proof of a live writer, and not proof of absence either. A recovering
-  command treats it as held and retries later. A test harness must reap its own
-  children before probing.
-- A start-identity environment marker plus PID and start time detects PID
-  reuse. A process can drop the marker; whole-second start times accept a
-  same-second reuse.
-- `lsof`/cwd scans of the slot see only processes still holding files there.
-  `Unknown` is not quiet. A writer that closed its descriptors and changed
-  directory disappears.
-- `kqueue` `NOTE_TRACK` is unsupported since 10.5. `NOTE_EXIT`/`NOTE_FORK` and
-  `proc_listchildpids` are racy helpers, not a tree proof. `sandbox-exec` is
-  deprecated.
-- Inherited App Sandbox rights are static; parent exit does not revoke a
-  surviving child's access or an open descriptor.
-- Endpoint Security's write event is notification-only, `AUTH_OPEN` does not
-  revoke an existing descriptor, the descendant client is preliminary and
-  blind to unrelated processes, and the entitlement and system extension are a
-  large host boundary.
-- An APFS unmount failing on open files is an observation, not a fence.
-- `RLIMIT_FSIZE` caps one file, not a tree.
+- A dedicated process group (`setpgid` at spawn, `killpg` to signal) is
+  supported. A descendant can leave the group with `setsid` or a new spawn
+  group.
+- `kill(-pgid, 0)` returning `ESRCH` means no member is visible. In the probe,
+  `EPERM` meant every remaining member was an unreaped zombie. That is neither
+  proof of a live writer nor proof of absence, so it is treated as held and
+  retried later. A test harness must reap its own children before probing.
+- A start-identity marker plus PID and start time detects PID reuse. A process
+  can drop the marker, and whole-second start times accept a same-second reuse.
+- `lsof` or cwd scans see only processes that still hold files. `Unknown` is not
+  quiet. A writer that closed its descriptors and changed directory disappears
+  from the scan.
+- `kqueue` `NOTE_TRACK` is unsupported since macOS 10.5. `proc_listchildpids` is
+  a racy helper, not a tree proof. `sandbox-exec` is deprecated.
+- Inherited sandbox rights are static: a parent's exit does not revoke a
+  surviving child's access. Endpoint Security write events are notifications and
+  do not revoke an open descriptor. `RLIMIT_FSIZE` caps one file, not a tree. An
+  APFS unmount that fails on open files is an observation, not a fence.
 
 No reviewed public mechanism proves that arbitrary descendants, transferred
 descriptors, writable mappings and unrelated same-user writers have lost write
-access. Group emptiness, PID exit, age and quiet scans are observations.
+access. Group emptiness, PID exit, age and quiet scans are observations only.
 
-What did qualify, inside a stated cooperative workflow promise: the native
-fixture boundary (six scenarios, review at
-`1f76bc1f5d3ee8cdbfc552abecb3c1c30d82eda1`,
-[PR8](https://github.com/inflatable-cookie/oxide/pull/8#issuecomment-6083800151))
-and standalone pilot S1–S3 with real Cargo, including release and reacquire.
-Cancellation, a retained writer and capture mismatch stayed uncertain.
+What qualified, inside a stated cooperative promise, was the native fixture
+boundary and standalone pilot runs with real Cargo, including release and
+reacquire. Cancellation, a retained writer and capture mismatch stayed
+uncertain.
 
 Consequence for crash recovery: an empty group plus a dropped lock is the
-cooperative signal Oxide's own commands may use under Tom's 2026-10-18 ruling.
-It needs the group-escape test named in W-4 and never extends to standalone
-consumer leases.
+cooperative closure signal that Oxide's own commands may use. It needs a
+group-escape test before anything relies on it, and it never extends to
+standalone consumer leases.
 
 ## Capacity
 
-- **Host reserve.** Tom set 20 GiB free host space as a monitored start/abort
-  threshold on 2026-10-09, not a guarantee against concurrent writers.
+- **Host reserve.** The 20 GiB free-space figure from Tom's 2026-10-09 ruling is
+  a monitored floor, not a guarantee against concurrent writers. Current reserve
+  semantics are in [workflow](contracts/workflow.md).
 - **Temporary output.** Cargo, rustc, `cc` and tests also write through
-  `TMPDIR` (default per-user `/var/folders/…/T/`), `TMP` and `TEMP`, and
-  integration tests through `CARGO_TARGET_TMPDIR`. A footprint claim must force
-  those into an accounted directory. Tools that hard-code `/tmp` remain a
-  residual bypass.
-- **Accounting.** Occupied bytes are unique `(device, inode)` `st_blocks *
-  512`; file lengths over-count hard links. APFS compression, clones and
-  snapshots make any walk approximate. Unknown size is unknown, not zero.
-  Occupied-space deltas are not write volume.
-- **Hard bound.** A sampled walk is accounting plus abort. The kernel bound
-  Oxide used until oxide#102 retired it was one fixed-size APFS volume in a
-  sparse image; its oxide#055 proof
-  observed genuine ENOSPC under an open lease with the control ledger outside
-  the payload staying durable. Sparse image logical size is not host
-  allocation; do not add image and slot figures.
-- **Sizes.** The Nucleus planning/diagnostics pair measured about 2.3 GiB of
-  unique artifacts under line-table debug information; full-debug size was
-  not measured. The #064 run's union footprint was about 3.46 GB. Neither is a
-  representative workload or a production budget.
+  `TMPDIR`, `TMP` and `TEMP`, and integration tests write through
+  `CARGO_TARGET_TMPDIR`. A footprint claim must force those into an accounted
+  directory. Tools that hard-code `/tmp` remain a residual bypass.
+- **Accounting.** Occupied bytes are unique `(device, inode)` `st_blocks × 512`,
+  so hard links count once. APFS compression, clones and snapshots make any walk
+  approximate. Unknown size is unknown, not zero. Occupied-space deltas are not
+  write volume.
+- **Hard bound.** A sampled walk is accounting plus abort. The kernel bound used
+  until oxide#102 retired it was one fixed-size APFS volume in a sparse image.
+  Its proof observed genuine ENOSPC under an open lease, and its control ledger
+  stayed durable outside the payload. Sparse image logical size is not host
+  allocation, so do not add image and slot figures.
+- **Sizes.** Nucleus's planning and diagnostics pair measured about 2.3 GiB of
+  unique artifacts under line-table debug info. Full-debug size was not
+  measured. Neither figure is representative or a production budget.
 
 The retired 128 MiB lease selector proved the lease lifecycle on a fresh owned
 payload. It did not fill the filesystem or qualify a real Cargo footprint.
-[Workflow](contracts/workflow.md#budget-only-default-pool-and-user-configuration)
-owns current capacity semantics.
-
-## Preserved receipts
-
-- [`oxide-064-cross-path-qualification.json`](evidence/oxide-064-cross-path-qualification.json):
-  reviewed ordinary-Cargo cross-path session and limits.
-- [`cargo-unit-graph-and-tool-fit-041.json`](evidence/cargo-unit-graph-and-tool-fit-041.json):
-  Cargo unit-graph and tool-fit findings.
-- [`cargo-graph-route-and-installation-evidence-042.json`](evidence/cargo-graph-route-and-installation-evidence-042.json):
-  route and installation evidence boundary.
-- [`nucleus-core-test-behavior-audit-040.json`](evidence/nucleus-core-test-behavior-audit-040.json):
-  read-only Nucleus core-test behavior audit.
-- Registry archive receipts 037–039: see
-  [Nucleus input roots](contracts/nucleus-input-roots.md).
-
-These receipts do not authorize a live project probe, installation, consumer
-change or host mutation.
