@@ -1722,8 +1722,13 @@ The control document for each managed pool records
 the binary's generation under that pool's admission lock. Admission,
 registry publication, removable registration and the mutating library paths
 check the minimum after taking their lock, before any protected write.
-If a pool-only caller has to raise the minimum, it also takes the admission
-lock without blocking and rereads state there. A stale writer exits 76 with
+The upgrade from version 9 preserves its existing fences, records and
+history. If a pool-only caller has to raise the minimum, it tries the
+admission lock without blocking and rereads state there. If admission is
+held, the caller gets a named refusal. The CLI drops the pool lock before
+waiting for admission within its usual budget, then rereads state and
+publishes the fence under admission. Invalid state reports the failing
+control rule. A stale writer exits 76 with
 `oxide was updated while this command waited; rerun it`. A command that
 already held a lock can finish that critical section. It checks again on
 the next acquisition. Passive readers of the same schema ignore the minimum.

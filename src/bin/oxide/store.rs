@@ -1985,8 +1985,7 @@ impl Store {
     ) -> Result<Self, String> {
         let pool = fs::canonicalize(root)
             .map_err(|error| format!("cannot open the removable pool: {error}"))?;
-        let view = prepare_pool(&pool)
-            .map_err(|error| lease_error("cannot open the removable pool", &error))?;
+        let view = prepare_front_door_pool(&pool, "cannot open the removable pool")?;
         if Backend::recorded(&view.backend)? != Backend::ApfsVolume {
             return Err("the removable pool records another backend".to_owned());
         }
@@ -2148,8 +2147,7 @@ impl Store {
     fn open_at(path: &Path, settings: &Settings) -> Result<Self, String> {
         let pool =
             fs::canonicalize(path).map_err(|error| format!("cannot open the pool: {error}"))?;
-        let view =
-            prepare_pool(&pool).map_err(|error| lease_error("cannot open the pool", &error))?;
+        let view = prepare_front_door_pool(&pool, "cannot open the pool")?;
         let backend = Backend::recorded(&view.backend)?;
         if backend != Backend::DirectoryBudget {
             return Err(format!(
@@ -5431,6 +5429,22 @@ pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
     lock_admission_inner(control, None)
 }
 
+fn prepare_front_door_pool(pool: &Path, context: &str) -> Result<LedgerView, String> {
+    let result = prepare_pool(pool);
+    if result != Err(LeaseError::WriterFenceBusy) {
+        return result.map_err(|error| lease_error(context, &error));
+    }
+    // The pool-first open has dropped the pool lock. Wait for admission in
+    // the normal order, under the command's budget, and reread the state
+    // before publishing. Subsequent pool opens see the durable generation.
+    let control = pool.join(MANAGED_NAME);
+    {
+        let _admission = lock_admission(&control)?;
+        publish_writer_generation(&control)?;
+    }
+    prepare_pool(pool).map_err(|error| lease_error(context, &error))
+}
+
 pub(crate) fn publish_writer_generation(control: &Path) -> Result<(), String> {
     fence_admission_writer(control)
         .map_err(|error| lease_error("cannot fence the Oxide writer", &error))
@@ -6908,7 +6922,7 @@ pub(crate) mod tests {
             .unwrap();
         let error = refuses(&internal, &removable, "unknown paired fence");
         assert!(
-            error.contains("unsupported version"),
+            error.contains("invalid owned_outputs fence"),
             "unknown paired fence: {error}"
         );
         fs::remove_dir_all(root).unwrap();
@@ -8860,7 +8874,7 @@ pub(crate) mod tests {
             .expect("a repeated fence is a no-op");
         let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(after, fenced, "a repeated fence rewrote the state");
-        // Genuine absence at version 8 refuses, and an explicit JSON null is a
+        // Genuine absence at the current version refuses, and an explicit JSON null is a
         // present non-string field that the shared parser refuses too.
         let mut unfenced = fenced.clone();
         unfenced
@@ -8869,7 +8883,10 @@ pub(crate) mod tests {
             .remove("recorded_accounting");
         write_private(&path, &serde_json::to_vec(&unfenced).unwrap());
         let error = store.load().unwrap_err();
-        assert!(error.contains("unsupported version"), "{error}");
+        assert!(
+            error.contains("lacks the recorded_accounting fence"),
+            "{error}"
+        );
         let mut nulled = fenced.clone();
         nulled["recorded_accounting"] = serde_json::Value::Null;
         write_private(&path, &serde_json::to_vec(&nulled).unwrap());
@@ -8879,7 +8896,10 @@ pub(crate) mod tests {
         unknown["recorded_accounting"] = serde_json::json!("oxide.accounting/9");
         write_private(&path, &serde_json::to_vec(&unknown).unwrap());
         let error = store.load().unwrap_err();
-        assert!(error.contains("unsupported version"), "{error}");
+        assert!(
+            error.contains("invalid recorded_accounting fence"),
+            "{error}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -9661,15 +9681,12 @@ pub(crate) mod tests {
             }
             Err(error) => panic!("{label}: {error}"),
         };
-        let refuse = |label: &str| {
+        let refuse = |label: &str, expected: &str| {
             let error = store
                 .load()
                 .err()
                 .unwrap_or_else(|| panic!("{label}: accepted"));
-            assert!(
-                error.contains("class field") || error.contains("unsupported version"),
-                "{label}: {error}"
-            );
+            assert!(error.contains(expected), "{label}: {error}");
         };
 
         write(document(5, false, ""));
@@ -9678,11 +9695,11 @@ pub(crate) mod tests {
         assert_eq!(absent.records[0].class, WorkspaceClass::Normal);
 
         write(document(5, false, ",\"class\":\"normal\""));
-        refuse("v5 with an explicit normal class");
+        refuse("v5 with an explicit normal class", "class field");
         write(document(5, false, ",\"class_reason\":null"));
-        refuse("v5 with an explicit null reason");
+        refuse("v5 with an explicit null reason", "class field");
         write(document(5, false, ",\"class\":\"one_use\""));
-        refuse("v5 with a one-use class");
+        refuse("v5 with a one-use class", "class field");
 
         write(document(6, true, ",\"class\":\"one_use\""));
         let fenced = accept("v6 with the fence and a class");
@@ -9690,7 +9707,7 @@ pub(crate) mod tests {
         assert_eq!(fenced.version, ONE_USE_STATE_VERSION);
 
         write(document(6, false, ""));
-        refuse("v6 without the fence");
+        refuse("v6 without the fence", "lacks the one_use_workspaces fence");
         let version_seven = |fields: &str| {
             document(7, false, fields).replace(
                 "\"recorded_accounting\":\"oxide.accounting/1\"",
@@ -9700,15 +9717,24 @@ pub(crate) mod tests {
         write(version_seven(""));
         accept("v7 normal with eviction fence");
         write(version_seven(",\"class\":\"normal\""));
-        refuse("v7 explicit class without one-use fence");
+        refuse("v7 explicit class without one-use fence", "class field");
         write(version_seven(",\"class_reason\":null"));
-        refuse("v7 explicit null reason without one-use fence");
+        refuse(
+            "v7 explicit null reason without one-use fence",
+            "class field",
+        );
         // Both version/fence directions the design names: a fence below the
         // one-use version refuses, and an unknown fence value refuses.
         write(document(5, true, ""));
-        refuse("the one-use fence at version 5");
+        refuse(
+            "the one-use fence at version 5",
+            "one_use_workspaces before version 6",
+        );
         write(document(6, true, "").replace("oxide.one-use/1", "oxide.one-use/9"));
-        refuse("an unknown one-use fence value");
+        refuse(
+            "an unknown one-use fence value",
+            "invalid one_use_workspaces fence",
+        );
 
         // Non-vacuity of the pass: the same document with the class key
         // removed loads, so the refusal above is the field, not the shape.

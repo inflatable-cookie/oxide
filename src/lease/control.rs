@@ -92,8 +92,7 @@ pub const EVICTION_ACCOUNTING_FENCE: &str = super::CONTROL_EVICTION_ACCOUNTING_F
 /// one value.
 pub const SLOT_CEILING_FENCE: &str = super::CONTROL_SLOT_CEILING_FENCE;
 /// The whole-tree holding fence value (oxide#190); see [`State::holding`]. A
-/// document carrying it is always at version 9, and a version-9 document
-/// always carries it.
+/// document carrying it is at version 9 or later, and those versions require it.
 pub const HOLDING_FENCE: &str = super::CONTROL_HOLDING_FENCE;
 
 /// UTF-8 byte caps for control-state fields (oxide#118).
@@ -612,15 +611,12 @@ pub fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
     // fence; a fence value this binary does not know refuses rather than being
     // guessed at.
     match state.recorded_accounting.as_deref() {
-        None => {
-            if state.version >= RECORDED_ACCOUNTING_STATE_VERSION {
-                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
-            }
+        None if state.version >= RECORDED_ACCOUNTING_STATE_VERSION => {
+            return Err("Oxide state lacks the recorded_accounting fence".to_owned());
         }
+        None => {}
         Some(fence) if fence == RECORDED_ACCOUNTING_FENCE => {}
-        Some(_) => {
-            return Err("Oxide state has an unsupported version or exceeds a limit".to_owned())
-        }
+        Some(_) => return Err("Oxide state has an invalid recorded_accounting fence".to_owned()),
     }
     // The eviction-accounting fence and version 7 are equivalent (oxide#175):
     // a version-7 or version-8 document always carries it, a smaller one never
@@ -646,7 +642,7 @@ pub fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
     match state.one_use_workspaces.as_deref() {
         None => {
             if state.version == ONE_USE_STATE_VERSION {
-                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
+                return Err("Oxide state lacks the one_use_workspaces fence".to_owned());
             }
             if state
                 .records
@@ -660,47 +656,30 @@ pub fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
         }
         Some(fence) if fence == ONE_USE_FENCE => {
             if state.version < ONE_USE_STATE_VERSION {
-                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
+                return Err("Oxide state has one_use_workspaces before version 6".to_owned());
             }
         }
-        Some(_) => {
-            return Err("Oxide state has an unsupported version or exceeds a limit".to_owned())
-        }
+        Some(_) => return Err("Oxide state has an invalid one_use_workspaces fence".to_owned()),
     }
     // The raised-ceiling fence and version 8 are equivalent (oxide#177): a
     // version-8 document always carries it, and a smaller pool never does. An
     // unknown fence value refuses rather than being guessed at.
     match state.slot_ceiling.as_deref() {
-        None => {
-            if state.version >= SLOT_CEILING_STATE_VERSION {
-                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
-            }
+        None if state.version >= SLOT_CEILING_STATE_VERSION => {
+            return Err("Oxide state lacks the slot_ceiling fence".to_owned());
         }
-        Some(fence) if fence == SLOT_CEILING_FENCE => {
-            if state.version < SLOT_CEILING_STATE_VERSION {
-                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
-            }
-        }
-        Some(_) => {
-            return Err("Oxide state has an unsupported version or exceeds a limit".to_owned())
-        }
+        None => {}
+        Some(SLOT_CEILING_FENCE) if state.version >= SLOT_CEILING_STATE_VERSION => {}
+        Some(_) => return Err("Oxide state has an invalid slot_ceiling fence".to_owned()),
     }
-    // The whole-tree holding fence and version 9 are equivalent (oxide#190): a
-    // version-9 document always carries it, and a smaller pool never does.
+    // The whole-tree holding fence is required from version 9 onwards.
     match state.holding.as_deref() {
-        None => {
-            if state.version >= HOLDING_STATE_VERSION {
-                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
-            }
+        None if state.version >= HOLDING_STATE_VERSION => {
+            return Err("Oxide state lacks the holding fence".to_owned());
         }
-        Some(fence) if fence == HOLDING_FENCE => {
-            if state.version < HOLDING_STATE_VERSION {
-                return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
-            }
-        }
-        Some(_) => {
-            return Err("Oxide state has an unsupported version or exceeds a limit".to_owned())
-        }
+        None => {}
+        Some(HOLDING_FENCE) if state.version >= HOLDING_STATE_VERSION => {}
+        Some(_) => return Err("Oxide state has an invalid holding fence".to_owned()),
     }
     if state
         .outputs_init
@@ -967,7 +946,12 @@ pub fn parse_state(bytes: &[u8]) -> Result<State, String> {
         | SLOT_CEILING_STATE_VERSION
         | HOLDING_STATE_VERSION
         | WRITER_STATE_VERSION => false,
-        _ => return Err("Oxide state has an unsupported version or exceeds a limit".to_owned()),
+        _ => {
+            return Err(format!(
+                "Oxide state has an unsupported version ({})",
+                state.version
+            ))
+        }
     };
     if legacy && bytes.len() as u64 > LEGACY_MAX_STATE_BYTES {
         return Err("Oxide state exceeds its byte limit".to_owned());
@@ -975,7 +959,7 @@ pub fn parse_state(bytes: &[u8]) -> Result<State, String> {
     if state.owned_outputs.as_deref().is_some_and(|fence| {
         fence != OWNED_OUTPUTS_FENCE && !predecessor_owned_outputs_fence(fence)
     }) {
-        return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
+        return Err("Oxide state has an invalid owned_outputs fence".to_owned());
     }
     validate_state(&state, legacy)?;
     Ok(state)

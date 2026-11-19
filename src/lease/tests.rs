@@ -15,6 +15,72 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
 #[test]
+fn real_shape_v9_control_fences_on_mutating_open() {
+    use super::control::{
+        parse_state, HOLDING_STATE_VERSION, WRITER_GENERATION, WRITER_STATE_VERSION,
+    };
+    use serde_json::{json, Value};
+    use std::os::unix::fs::PermissionsExt;
+
+    // Scrubbed control documents from an installed version-9 writer, with
+    // the original record shapes, collection counts and optional fields.
+    for (name, bytes) in [
+        (
+            "internal",
+            include_bytes!("../../tests/fixtures/control-v9/internal.json").as_slice(),
+        ),
+        (
+            "removable",
+            include_bytes!("../../tests/fixtures/control-v9/removable.json").as_slice(),
+        ),
+    ] {
+        let fixture = Fixture::new(name);
+        let pool = fixture.pool();
+        let control = pool.join(super::MANAGED_NAME);
+        fs::create_dir_all(&control).unwrap();
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = control.join("state.json");
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(parse_state(bytes).unwrap().version, HOLDING_STATE_VERSION);
+
+        // A library caller already holds the pool lock. It must refuse
+        // while admission is held and preserve the predecessor's state.
+        let admission = super::open_control_admission(&control, true).unwrap();
+        let busy = managed::prepare_pool(&pool).unwrap_err();
+        assert_eq!(busy, LeaseError::WriterFenceBusy);
+        assert!(busy.to_string().contains("admission lock is held"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        drop(admission);
+
+        managed::prepare_pool(&pool).unwrap();
+        let fenced = fs::read(&path).unwrap();
+        let state = parse_state(&fenced).unwrap();
+        assert_eq!(state.version, WRITER_STATE_VERSION);
+        assert_eq!(state.minimum_writer_generation, Some(WRITER_GENERATION));
+        let mut expected: Value = serde_json::from_slice(bytes).unwrap();
+        expected["version"] = json!(WRITER_STATE_VERSION);
+        expected["minimum_writer_generation"] = json!(WRITER_GENERATION);
+        assert_eq!(serde_json::from_slice::<Value>(&fenced).unwrap(), expected);
+
+        expected["version"] = json!(HOLDING_STATE_VERSION);
+        let fields = expected.as_object_mut().unwrap();
+        fields.remove("minimum_writer_generation");
+        fields.remove("holding");
+        let invalid = serde_json::to_vec(&expected).unwrap();
+        fs::write(&path, &invalid).unwrap();
+        let ledger_before = fs::read(pool.join("ledger.json")).unwrap();
+        let error = managed::prepare_pool(&pool).unwrap_err();
+        assert_eq!(
+            error,
+            LeaseError::ControlState("Oxide state lacks the holding fence".to_owned())
+        );
+        assert_eq!(fs::read(&path).unwrap(), invalid);
+        assert_eq!(fs::read(pool.join("ledger.json")).unwrap(), ledger_before);
+    }
+}
+
+#[test]
 fn held_eviction_publishes_the_writer_fence_only_after_commit() {
     use super::control::{
         fenced_state, parse_state, State, HOLDING_STATE_VERSION, WRITER_GENERATION,

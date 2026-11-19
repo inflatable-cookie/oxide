@@ -72,9 +72,13 @@ fn fake_cargo(scratch: &Path, manifest: &Path) -> (PathBuf, PathBuf) {
 /// A private environment: a fresh home, an absent config file and an absent
 /// pool outside any task scratch root, plus the fake Cargo first on `PATH`.
 fn private_env(scratch: &Path, bin: &Path, pool: &Path) -> Command {
+    private_env_for(Path::new(OXIDE), scratch, bin, pool)
+}
+
+fn private_env_for(executable: &Path, scratch: &Path, bin: &Path, pool: &Path) -> Command {
     let home = scratch.join("home");
     fs::create_dir_all(&home).unwrap();
-    let mut command = Command::new(OXIDE);
+    let mut command = Command::new(executable);
     command
         .env_clear()
         .env(
@@ -591,6 +595,110 @@ fn tree_snapshot(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
     let mut out = Vec::new();
     walk(root, root, &mut out);
     out
+}
+
+#[test]
+fn the_first_writer_waits_for_admission_before_upgrading_v9() {
+    use oxide_storage::lease::control::{
+        HOLDING_STATE_VERSION, WRITER_GENERATION, WRITER_STATE_VERSION,
+    };
+    use std::os::fd::AsRawFd;
+
+    let scratch = Scratch::new();
+    let app = scratch.path().join("app");
+    let manifest = app.join("Cargo.toml");
+    fs::create_dir_all(app.join("src")).unwrap();
+    fs::write(
+        &manifest,
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(app.join("src/lib.rs"), "").unwrap();
+    let (bin, log) = fake_cargo(scratch.path(), &manifest);
+    let pool = scratch.path().join("fixture-pool");
+    created_pool(&scratch, &bin, &manifest, &pool);
+    let control = pool.join("oxide-managed");
+    let state_path = control.join("state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    state["version"] = json!(HOLDING_STATE_VERSION);
+    state
+        .as_object_mut()
+        .unwrap()
+        .remove("minimum_writer_generation");
+    write_private(&state_path, &serde_json::to_vec(&state).unwrap());
+
+    let lock = fs::File::open(control.join("admission.lock")).unwrap();
+    // SAFETY: the descriptor belongs to this fixture only.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    // A refused open records a timing observation. Every other byte and path
+    // must stay unchanged while the predecessor holds admission.
+    let history = "oxide-managed/admission-cost.json";
+    let sample_count = || {
+        serde_json::from_slice::<Vec<Value>>(&fs::read(pool.join(history)).unwrap())
+            .unwrap()
+            .len()
+    };
+    let pool_without_history = || {
+        tree_snapshot(&pool)
+            .into_iter()
+            .filter(|(path, _)| path != history)
+            .collect::<Vec<_>>()
+    };
+    let before = pool_without_history();
+    let samples_before = sample_count();
+    let waiting = private_env(scratch.path(), &bin, &pool)
+        .current_dir(&app)
+        .args(["check", "--admission-budget=2s"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&waiting.stderr);
+    assert_eq!(waiting.status.code(), Some(124), "{stderr}");
+    assert!(
+        stderr.contains("stopped by the admission budget"),
+        "{stderr}"
+    );
+    assert_eq!(sample_count(), samples_before + 1);
+    assert_eq!(pool_without_history(), before);
+    drop(lock);
+
+    let upgraded = private_env(scratch.path(), &bin, &pool)
+        .current_dir(&app)
+        .arg("check")
+        .output()
+        .unwrap();
+    assert!(
+        upgraded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upgraded.stderr)
+    );
+    let fenced: Value = serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
+    assert_eq!(fenced["version"], json!(WRITER_STATE_VERSION));
+    assert_eq!(
+        fenced["minimum_writer_generation"],
+        json!(WRITER_GENERATION)
+    );
+
+    // The covering suite can also exercise an available version-9 executable.
+    // Status runs the same schema preflight with a read-only fallback.
+    if let Some(predecessor) = std::env::var_os("OXIDE_TEST_V9_PREDECESSOR") {
+        let before = tree_snapshot(&pool);
+        let cargo_before = fs::read(&log).unwrap();
+        let old = private_env_for(Path::new(&predecessor), scratch.path(), &bin, &pool)
+            .env_remove("OXIDE_TEST_HOME_FROM_ENV")
+            .env("OXIDE_INTERNAL_HANDED_OFF", "1")
+            .current_dir(app)
+            .arg("status")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&old.stderr);
+        assert_eq!(old.status.code(), Some(75), "{stderr}");
+        assert!(
+            stderr.contains("oxide was upgraded during this command; re-run."),
+            "{stderr}"
+        );
+        assert_eq!(tree_snapshot(&pool), before);
+        assert_eq!(fs::read(log).unwrap(), cargo_before);
+    }
 }
 
 #[cfg(debug_assertions)]
