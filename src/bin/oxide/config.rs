@@ -23,6 +23,7 @@ use serde::Deserialize;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 /// 100 GB, decimal: the built-in soft budget of the internal pool.
@@ -325,6 +326,16 @@ impl ActiveBuildLimit {
 }
 
 impl Facts {
+    /// The account's absolute home, the one `~/.local/state/oxide/install/` and
+    /// `~/.local/bin/oxide` derive from. `$HOME` is never consulted: a harness
+    /// that overrides it must not move where the install receipt is read.
+    pub fn account_home(&self) -> Option<PathBuf> {
+        self.home
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute())
+    }
+
     pub fn from_env() -> Self {
         let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
         let env_home = var("HOME");
@@ -967,11 +978,29 @@ fn read_config(path: &Path) -> Result<FileConfig, String> {
     if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
         return Err(named("not a small regular file".to_owned()));
     }
+    let source = fs::File::open(path).map_err(|error| named(error.to_string()))?;
+    let text = read_bounded_config(source, named)?;
+    parse_config(&text).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Read a config of at most `MAX_CONFIG_BYTES`. A source that holds more, for
+/// example a file that grew after its size was read, is refused: a truncated
+/// read would parse as a different config without any error.
+fn read_bounded_config(
+    source: impl Read,
+    named: impl Fn(String) -> String,
+) -> Result<String, String> {
     let mut text = String::new();
-    fs::File::open(path)
-        .and_then(|file| file.take(MAX_CONFIG_BYTES).read_to_string(&mut text))
+    source
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_string(&mut text)
         .map_err(|error| named(error.to_string()))?;
-    parse_config(&text).map_err(named)
+    if text.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(named(format!(
+            "grew past {MAX_CONFIG_BYTES} bytes while it was read"
+        )));
+    }
+    Ok(text)
 }
 
 fn parse_config(text: &str) -> Result<FileConfig, String> {
@@ -1280,9 +1309,23 @@ pub fn remember_pool(facts: &Facts, pool: &Path) -> Result<(), String> {
     fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     let bytes = serde_json::to_vec(&pools).map_err(|error| error.to_string())?;
     let temp = parent.join(format!("pools.json.tmp-{}", std::process::id()));
-    fs::write(&temp, bytes)
-        .and_then(|()| fs::rename(&temp, &path))
-        .map_err(|error| format!("{}: {error}", path.display()))
+    // A leftover from an earlier run with this PID is ours and stale: clear it
+    // so the exclusive create below names only this write.
+    let _ = fs::remove_file(&temp);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .and_then(|mut file| {
+            std::io::Write::write_all(&mut file, &bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&temp, &path));
+    written.map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("{}: {error}", path.display())
+    })
 }
 
 /// The Time Machine exclusion of a pool root Oxide just created, or must
@@ -1451,6 +1494,24 @@ mod tests {
         let home = passwd_home().expect("the test account has a passwd home");
         assert!(Path::new(&home).is_absolute(), "{home:?}");
         assert_eq!(passwd_home(), Ok(home), "one fact per process");
+    }
+
+    /// Regression: the install receipt and provenance paths read `$HOME`. The
+    /// account home is the only home they may use, even when `$HOME` differs.
+    #[test]
+    fn install_paths_derive_from_the_account_home_not_home() {
+        let facts = Facts {
+            home: Some(OsString::from("/Users/account")),
+            env_home: Some(OsString::from("/tmp/harness-home")),
+            ..Facts::default()
+        };
+        assert_eq!(facts.account_home(), Some(PathBuf::from("/Users/account")));
+        let relative = Facts {
+            home: Some(OsString::from("Users/account")),
+            ..Facts::default()
+        };
+        assert_eq!(relative.account_home(), None);
+        assert_eq!(Facts::default().account_home(), None);
     }
 
     #[test]
@@ -2486,6 +2547,47 @@ mod tests {
             Some(Path::new("/pools/5"))
         );
         assert_eq!(known.iter().filter(|path| path.ends_with("5")).count(), 1);
+    }
+
+    /// Regression: the record was written with `fs::write`, which follows a
+    /// planted link and uses the umask mode. It is now created exclusively,
+    /// owner-only, and leaves no temporary behind.
+    #[test]
+    fn remember_pool_writes_an_owner_only_record_and_no_temporary() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("remember");
+        let mut linux = facts(false);
+        environment(&mut linux, |env| {
+            env.with_xdg_state_home(Some(scratch.0.clone()))
+        });
+        remember_pool(&linux, Path::new("/pools/owner")).expect("remember");
+        let record = known_pools_file(&linux).expect("record path");
+        let mode = fs::metadata(&record).expect("record").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        let leftovers: Vec<_> = fs::read_dir(record.parent().expect("parent"))
+            .expect("state dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "a temporary was left behind");
+    }
+
+    /// Regression: a config that grew past the cap after its size was read was
+    /// truncated and parsed silently. It is now refused, and a config exactly at
+    /// the cap is still read.
+    #[test]
+    fn a_config_that_grows_past_the_cap_is_refused_not_truncated() {
+        let named = |error: String| format!("config: {error}");
+        let at_cap = vec![b'#'; MAX_CONFIG_BYTES as usize];
+        assert_eq!(
+            read_bounded_config(&at_cap[..], named)
+                .expect("a config at the cap")
+                .len(),
+            at_cap.len()
+        );
+        let grown = vec![b'#'; MAX_CONFIG_BYTES as usize + 1];
+        let error = read_bounded_config(&grown[..], named).expect_err("refused");
+        assert!(error.contains("grew past"), "{error}");
     }
 }
 

@@ -539,6 +539,19 @@ pub fn latch(origin: Origin) {
     });
 }
 
+/// Time left before the armed execution stop, read without changing any state:
+/// `None` when no stop is armed or it has already been requested.
+pub fn execution_remaining() -> Option<Duration> {
+    with(|state| {
+        let state = state?;
+        if state.stop_requested {
+            return None;
+        }
+        let stop = state.execution.as_ref()?.stop?;
+        Some(stop.saturating_duration_since(Instant::now()))
+    })
+}
+
 /// The latched origin, if a controlled stop happened.
 pub fn origin() -> Option<Origin> {
     with(|state| state.and_then(|state| state.origin))

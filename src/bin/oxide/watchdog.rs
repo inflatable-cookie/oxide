@@ -124,7 +124,7 @@ impl Watchdog {
         match &mut self.stop {
             None => {
                 if reading.is_none_or(|bytes| bytes < self.trigger) {
-                    signal_group(group, libc::SIGTERM);
+                    crate::process::terminate_group(group);
                     self.stop = Some(Stop {
                         at: now,
                         reading,

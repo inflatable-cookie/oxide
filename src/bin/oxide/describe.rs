@@ -16,6 +16,7 @@ use oxide_storage::volume::{self, Binding};
 use serde::Serialize;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -353,6 +354,7 @@ fn bounded(program: &str, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .map_err(|error| format!("cannot run {program}: {error}"))?;
     let stdout = child
@@ -381,13 +383,11 @@ fn bounded(program: &str, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_group_and_reap(&mut child);
                 return Err(format!("{program} timed out"));
             }
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_group_and_reap(&mut child);
                 return Err(format!("cannot wait for {program}: {error}"));
             }
         }
@@ -403,6 +403,19 @@ fn bounded(program: &str, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
         return Err(format!("{program} exited with {status}"));
     }
     Ok(bytes)
+}
+
+/// Stop a child that outlived its bound: SIGKILL its whole process group, which
+/// the caller made with `process_group(0)`, so a grandchild that inherited the
+/// pipes cannot outlive it, then reap the leader inside a finite bound.
+pub(crate) fn stop_group_and_reap(child: &mut std::process::Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: the negative PID addresses the group this child leads.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    crate::budget::kill_and_reap(child);
 }
 
 fn lossy(path: &Path) -> String {
@@ -439,6 +452,31 @@ fn rfc3339(unix_seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a timed-out command's grandchild, which inherited the pipes,
+    /// outlived the KILL of its direct child. The whole group is stopped now.
+    #[test]
+    fn a_timed_out_command_leaves_no_grandchild_behind() {
+        let dir = std::env::temp_dir().join(format!("oxide-describe-group-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("fixture");
+        let pidfile = dir.join("pid");
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        assert!(bounded("/bin/sh", &["-c", &script], None).is_err());
+        let pid: i32 = fs::read_to_string(&pidfile)
+            .expect("the grandchild's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only probes the PID this test started.
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        // SAFETY: as above.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the grandchild survived");
+        fs::remove_dir_all(&dir).expect("remove own fixture");
+    }
 
     #[test]
     fn timestamps_are_utc_rfc3339() {

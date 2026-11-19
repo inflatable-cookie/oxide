@@ -26,6 +26,12 @@ use store::{CheckoutCustody, Cleaning, Store, WaitAccounting};
 /// Enumeration bounds: past either, the plan refuses instead of truncating.
 const MAX_ENTRIES: usize = 1_000_000;
 const MAX_DEPTH: usize = 256;
+
+/// Whether a plan already holds the most entries it may, so recording the next
+/// one would exceed the bound. Checked before that entry is recorded.
+fn entry_limit_reached(entries: usize) -> bool {
+    entries >= MAX_ENTRIES
+}
 /// Foreign names shown in one refusal.
 const SHOWN: usize = 20;
 
@@ -375,7 +381,7 @@ fn plan(
                 let relative = path.strip_prefix(target).unwrap_or(&path).to_path_buf();
                 plan.foreign.push(relative.into_os_string());
             }
-            if plan.entries.len() > MAX_ENTRIES {
+            if entry_limit_reached(plan.entries.len()) {
                 return Err(format!(
                     "{} holds more than {MAX_ENTRIES} entries; Oxide refuses rather than remove an incomplete list",
                     target.display()
@@ -989,6 +995,14 @@ mod tests {
 
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    /// Regression: the plan accepted MAX_ENTRIES + 1 entries before refusing,
+    /// because the check used `>` and ran before the entry was recorded.
+    #[test]
+    fn the_entry_bound_refuses_the_entry_that_would_exceed_it() {
+        assert!(!entry_limit_reached(MAX_ENTRIES - 1));
+        assert!(entry_limit_reached(MAX_ENTRIES));
     }
 
     #[test]

@@ -11,6 +11,7 @@ use crate::CARGO;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -284,24 +285,23 @@ impl Ignored {
 /// A symlink or oversized file is refused rather than rewritten.
 fn ensure_local_outputs_ignored(workspace: &Path) -> Result<Ignored, String> {
     let path = workspace.join(GITIGNORE);
-    let existing = match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            if metadata.len() > GITIGNORE_LIMIT {
-                return Err(format!(
-                    "{} is larger than {GITIGNORE_LIMIT} bytes; not edited",
-                    path.display()
-                ));
-            }
-            fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?
+    let existing = match read_regular(&path, GITIGNORE_LIMIT) {
+        Ok(existing) => existing.unwrap_or_default(),
+        Err(Unreadable::Oversize) => {
+            return Err(format!(
+                "{} is larger than {GITIGNORE_LIMIT} bytes; not edited",
+                path.display()
+            ))
         }
-        Ok(_) => {
+        Err(Unreadable::NotRegular) => {
             return Err(format!(
                 "{} is not a regular file; left alone",
                 path.display()
             ))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+        Err(Unreadable::Io(error)) => {
+            return Err(format!("cannot read {}: {error}", path.display()))
+        }
     };
     let text = String::from_utf8_lossy(&existing);
     if text.lines().any(|line| ignores_local_outputs(line.trim())) {
@@ -355,19 +355,57 @@ fn ignores_local_outputs(line: &str) -> bool {
 /// A regular `AGENTS.md` read within [`AGENTS_LIMIT`]: `None` when absent.
 /// A link, directory or oversize file is an error, never followed.
 pub fn read_bounded(agents: &Path) -> Result<Option<Vec<u8>>, String> {
-    match fs::symlink_metadata(agents) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            if metadata.len() > AGENTS_LIMIT {
-                return Err(format!("is larger than {AGENTS_LIMIT} bytes"));
-            }
-            fs::read(agents)
-                .map(Some)
-                .map_err(|error| format!("cannot read: {error}"))
+    read_regular(agents, AGENTS_LIMIT).map_err(|problem| match problem {
+        Unreadable::Oversize => format!("is larger than {AGENTS_LIMIT} bytes"),
+        Unreadable::NotRegular => "is not a regular file (a link or directory)".to_owned(),
+        Unreadable::Io(error) => format!("cannot read: {error}"),
+    })
+}
+
+/// Why a file could not be read whole as a regular file.
+#[derive(Debug)]
+enum Unreadable {
+    Oversize,
+    NotRegular,
+    Io(std::io::Error),
+}
+
+/// Read a regular file of at most `limit` bytes; `Ok(None)` when it is absent.
+///
+/// The open refuses a final link (`O_NOFOLLOW`) and never blocks on a FIFO, and
+/// the type and size are read from that same descriptor. A name swapped for a
+/// link after a separate check therefore cannot redirect the read.
+fn read_regular(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, Unreadable> {
+    use std::io::Read;
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(Unreadable::NotRegular)
         }
-        Ok(_) => Err("is not a regular file (a link or directory)".to_owned()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("cannot inspect: {error}")),
+        Err(error) => return Err(Unreadable::Io(error)),
+    };
+    let metadata = file.metadata().map_err(Unreadable::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(Unreadable::NotRegular);
     }
+    if metadata.len() > limit {
+        return Err(Unreadable::Oversize);
+    }
+    let mut bytes = Vec::new();
+    // One byte past the limit, so a file that grew since its size was read is refused.
+    (&mut file)
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(Unreadable::Io)?;
+    if bytes.len() as u64 > limit {
+        return Err(Unreadable::Oversize);
+    }
+    Ok(Some(bytes))
 }
 
 /// [`read_bounded`] for a write. A refusal names the file and prints the
@@ -486,8 +524,15 @@ pub fn find_block(text: &[u8]) -> Result<Option<(usize, usize)>, String> {
 /// original permissions, so a crash never leaves a truncated file.
 fn replace_file(path: &Path, contents: &[u8]) -> Result<(), String> {
     let directory = path.parent().ok_or("AGENTS.md has no parent directory")?;
-    let permissions = fs::metadata(path)
+    // The mode is read from the file itself without following a link, and the
+    // rename below replaces the name rather than writing through it.
+    let permissions = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .and_then(|file| file.metadata())
         .ok()
+        .filter(|metadata| metadata.file_type().is_file())
         .map(|metadata| metadata.permissions());
     let temporary = directory.join(format!(".{AGENTS}.oxide-{}.tmp", std::process::id()));
     let written = OpenOptions::new()
@@ -553,7 +598,7 @@ fn print_readiness(workspace: &Path, placement: &Placement, guidance: &Guidance)
             println!("  configured internal pool: {configured}");
         }
     }
-    report_effigy(workspace);
+    report_effigy(workspace, placement);
 }
 
 /// The pool a build would select, and the configured internal pool, as
@@ -645,15 +690,14 @@ fn pool_state(settings: &config::Settings) -> String {
 /// Every `effigy.toml` from the workspace root up to the Git top level, with
 /// the selectors that still call plain `cargo`. Effigy files are never
 /// edited.
-fn report_effigy(workspace: &Path) {
-    let top = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(workspace)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| fs::canonicalize(String::from_utf8_lossy(&output.stdout).trim()).ok())
-        .filter(|top| workspace.starts_with(top));
+fn report_effigy(workspace: &Path, placement: &Placement) {
+    // The work-tree root is already resolved for this readiness report, so it
+    // is reused rather than asking Git again without a bound.
+    let top = match placement {
+        Placement::Worktree(root) => Some(root.clone()),
+        Placement::Outside => None,
+    }
+    .filter(|top| workspace.starts_with(top));
     let mut found = false;
     let mut acknowledged: Vec<String> = Vec::new();
     for directory in workspace.ancestors() {
@@ -870,6 +914,40 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    /// Regression: the reads checked the name with `symlink_metadata`, then read
+    /// it by name again, so a link swapped in between was followed. The open
+    /// itself now refuses the link, and the size is checked on the descriptor.
+    #[test]
+    fn a_guidance_read_refuses_a_link_and_bounds_the_size() {
+        let dir = std::env::temp_dir().join(format!("oxide-adopt-read-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("fixture");
+        let outside = dir.join("outside");
+        fs::write(&outside, b"secret").expect("outside");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&outside, &link).expect("link");
+        assert!(matches!(
+            read_regular(&link, 64),
+            Err(Unreadable::NotRegular)
+        ));
+        let regular = dir.join("regular");
+        fs::write(&regular, b"hello").expect("regular");
+        assert_eq!(
+            read_regular(&regular, 64).expect("a read").as_deref(),
+            Some(b"hello".as_slice())
+        );
+        assert!(matches!(
+            read_regular(&regular, 4),
+            Err(Unreadable::Oversize)
+        ));
+        assert_eq!(read_regular(&dir.join("absent"), 64).expect("absent"), None);
+        assert!(matches!(
+            read_regular(&dir, 64),
+            Err(Unreadable::NotRegular)
+        ));
+        fs::remove_dir_all(&dir).expect("remove own fixture");
     }
 
     #[test]
