@@ -76,7 +76,7 @@ pub fn print_identity() {
                 "  build: source pin {pin}, installer instance {instance}\n"
             ));
             let running = std::env::current_exe().ok();
-            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let home = crate::config::Facts::from_env().account_home();
             let provenance = provenance_in(running.as_deref(), home.as_deref(), pin, instance);
             text.push_str(&format!("  provenance: {}\n", provenance.describe()));
         }
@@ -153,7 +153,9 @@ pub(crate) fn provenance_in(
         return unverified("the running executable is unknown");
     };
     let Some(home) = home.filter(|home| home.is_absolute()) else {
-        return unverified("HOME is not an absolute path, so no install receipt can be checked");
+        return unverified(
+            "the account home is not an absolute path, so no install receipt can be checked",
+        );
     };
     let destination = home.join(".local/bin/oxide");
     let (receipt, bytes, private) = match handoff::newest_receipt_bytes(home) {

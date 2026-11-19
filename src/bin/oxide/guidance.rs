@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::unix::io::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -67,7 +68,9 @@ pub fn placement(workspace: &Path) -> Result<Placement, String> {
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Its own group, so a timeout stops anything Git started as well.
+        .process_group(0);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -76,8 +79,7 @@ pub fn placement(workspace: &Path) -> Result<Placement, String> {
         Err(error) => return Err(format!("cannot run git: {error}")),
     };
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        let _ = child.kill();
-        let _ = child.wait();
+        crate::describe::stop_group_and_reap(&mut child);
         return Err("git kept no output pipes".to_owned());
     };
     let (out_sender, out_receiver) = mpsc::channel();
@@ -94,13 +96,11 @@ pub fn placement(workspace: &Path) -> Result<Placement, String> {
             Ok(Some(status)) => break status.code(),
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::describe::stop_group_and_reap(&mut child);
                 return Err("git rev-parse did not finish in 5 s; nothing was written".to_owned());
             }
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::describe::stop_group_and_reap(&mut child);
                 return Err(format!("cannot wait for git: {error}"));
             }
         }
@@ -134,7 +134,10 @@ pub(crate) fn remove_git_environment(command: &mut Command) {
     remove_git_environment_named(command, std::env::vars_os().map(|(name, _)| name));
 }
 
-fn remove_git_environment_named(command: &mut Command, names: impl IntoIterator<Item = OsString>) {
+pub(crate) fn remove_git_environment_named(
+    command: &mut Command,
+    names: impl IntoIterator<Item = OsString>,
+) {
     for name in names {
         if name.as_encoded_bytes().starts_with(b"GIT_") {
             command.env_remove(name);

@@ -126,6 +126,13 @@ fn signal_group(group: i32, signal: libc::c_int) {
     }
 }
 
+/// Ask a group to terminate. TERM alone is not acted on by a group stopped by
+/// job control until it is continued, so CONT always follows TERM.
+pub fn terminate_group(group: i32) {
+    signal_group(group, libc::SIGTERM);
+    signal_group(group, libc::SIGCONT);
+}
+
 /// The budget stop trigger, polled by every wait loop. It is independent of
 /// the space/volume watchdog: a budgeted stop happens even when no watchdog
 /// exists (a `DirectoryBudget` run-program wait, for example).
@@ -150,7 +157,7 @@ impl Stop {
                 return false;
             }
             self.term_at = Some(now);
-            signal_group(group, libc::SIGTERM);
+            terminate_group(group);
             return false;
         }
         if self.kill_at.is_none() && now.duration_since(self.term_at.unwrap()) >= STOP_GRACE {
@@ -170,6 +177,10 @@ pub struct Group {
     /// This group owns the terminal's foreground while it runs, so its stops
     /// are this command's business.
     foreground: bool,
+    /// The leader's status once a direct `waitpid` reaped it. `child` knows
+    /// nothing of that reap, so it must never be waited on or signalled again:
+    /// its PID may be recycled by then.
+    reaped: Option<ExitStatus>,
 }
 
 /// Start `command` as the leader of a new process group.
@@ -200,6 +211,7 @@ fn start_group_with(command: &mut Command, owns_terminal: bool) -> std::io::Resu
         child,
         id,
         foreground: owns_terminal,
+        reaped: None,
     })
 }
 
@@ -240,6 +252,9 @@ enum Harvest {
 /// business. A group that owns the terminal is harvested with `WUNTRACED`, so a
 /// Ctrl-Z is observed instead of looking like a child that never exits.
 fn harvest(group: &mut Group) -> Result<Harvest, String> {
+    if let Some(status) = group.reaped {
+        return Ok(Harvest::Exited(status));
+    }
     if !group.foreground {
         return group
             .child
@@ -259,7 +274,9 @@ fn harvest(group: &mut Group) -> Result<Harvest, String> {
         )),
         _ if libc::WIFSTOPPED(status) => Ok(Harvest::Stopped),
         _ if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) => {
-            Ok(Harvest::Exited(ExitStatus::from_raw(status)))
+            let status = ExitStatus::from_raw(status);
+            group.reaped = Some(status);
+            Ok(Harvest::Exited(status))
         }
         _ => Ok(Harvest::Running),
     }
@@ -413,6 +430,33 @@ pub fn wait_group_empty_budgeted(group: i32, stop: &mut Stop) -> Option<Instant>
     Some(Instant::now())
 }
 
+/// Stop a group Oxide started but could not record as running. TERM and CONT
+/// go first, KILL follows once the stop grace has passed, and the wait is
+/// bounded: it returns `true` only when the group was observed empty. `false`
+/// leaves custody with the caller, so nothing here blocks on a group that
+/// survives KILL.
+pub fn stop_unrecorded(group: &mut Group) -> bool {
+    terminate_group(group.id);
+    let started = Instant::now();
+    let mut killed: Option<Instant> = None;
+    loop {
+        // Reaps the leader once it has exited; a stop is observed, not waited on.
+        let _ = harvest(group);
+        if group_empty(group.id) {
+            return true;
+        }
+        match killed {
+            None if started.elapsed() >= STOP_GRACE => {
+                signal_group(group.id, libc::SIGKILL);
+                killed = Some(Instant::now());
+            }
+            Some(at) if at.elapsed() >= STOP_CLOSE_BOUND => return false,
+            _ => {}
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
 /// True only when the kernel reports no process in the group.
 pub fn group_empty(group: i32) -> bool {
     if group <= 1 {
@@ -525,7 +569,9 @@ impl Drop for OwnedGroup {
         if group_empty(id) {
             // Nothing left to signal. Collect the leader if it has exited but
             // was not yet reaped; this never blocks on a live child.
-            let _ = self.0.child.try_wait();
+            if self.0.reaped.is_none() {
+                let _ = self.0.child.try_wait();
+            }
             return;
         }
         signal_group(id, libc::SIGKILL);
@@ -534,7 +580,8 @@ impl Drop for OwnedGroup {
         let started = Instant::now();
         let mut reaped = false;
         loop {
-            reaped = reaped || matches!(self.0.child.try_wait(), Ok(Some(_)));
+            reaped =
+                reaped || self.0.reaped.is_some() || matches!(self.0.child.try_wait(), Ok(Some(_)));
             if (reaped && group_empty(id)) || started.elapsed() >= OWNED_CLOSE {
                 break;
             }
@@ -706,6 +753,67 @@ mod tests {
         assert!(!detaches_stdin(true, true));
         assert!(!detaches_stdin(false, false));
         assert!(!detaches_stdin(true, false));
+    }
+
+    /// Regression: a leader reaped by the foreground harvest was waited on again
+    /// through `waitpid`, which fails with ECHILD (or, once its PID is recycled,
+    /// reaps an unrelated child). The recorded status must answer instead.
+    #[test]
+    fn a_foreground_leader_reaped_by_harvest_is_not_waited_for_again() {
+        let mut group = OwnedGroup::spawn(Command::new("/bin/sh").args(["-c", "exit 3"]));
+        group.foreground = true;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let first = loop {
+            match harvest(&mut group).expect("a wait") {
+                Harvest::Exited(status) => break status,
+                Harvest::Stopped => panic!("the leader was not stopped"),
+                Harvest::Running if Instant::now() >= deadline => panic!("no exit"),
+                Harvest::Running => std::thread::sleep(POLL),
+            }
+        };
+        assert_eq!(first.code(), Some(3));
+        match harvest(&mut group) {
+            Ok(Harvest::Exited(again)) => assert_eq!(again, first),
+            Ok(_) => panic!("a second harvest reported a different state"),
+            Err(error) => panic!("a second harvest waited on the reaped leader: {error}"),
+        }
+    }
+
+    /// Regression: TERM alone does not end a group stopped by job control; the
+    /// group must be continued with CONT for TERM to land.
+    #[test]
+    fn terminate_group_continues_a_stopped_group_so_term_lands() {
+        let mut group = OwnedGroup::spawn(Command::new("/bin/sh").args(["-c", "sleep 30"]));
+        std::thread::sleep(Duration::from_millis(100));
+        signal_group(group.id, libc::SIGSTOP);
+        std::thread::sleep(Duration::from_millis(100));
+        terminate_group(group.id);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Ok(Some(status)) = group.child.try_wait() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "the stopped group ignored TERM");
+            std::thread::sleep(POLL);
+        };
+        assert!(!status.success(), "the group exited cleanly: {status}");
+    }
+
+    /// Regression: an unrecorded group that ignores TERM was waited on without
+    /// bound. It must be KILLed after the grace and confirmed closed.
+    #[test]
+    fn an_unrecorded_group_that_ignores_term_is_killed_and_confirmed_closed() {
+        let mut group = OwnedGroup::spawn(
+            Command::new("/bin/sh").args(["-c", "trap '' TERM; while :; do sleep 0.05; done"]),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        assert!(
+            stop_unrecorded(&mut group),
+            "the group was not confirmed closed"
+        );
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(group_empty(group.id));
     }
 
     #[test]

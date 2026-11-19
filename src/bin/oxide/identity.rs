@@ -363,6 +363,13 @@ pub fn slot_folders(label: &str, identity: &str) -> Vec<String> {
 fn git(workspace: &Path, args: &[&str]) -> Option<String> {
     let mut command = Command::new("git");
     command.args(args).current_dir(workspace);
+    // An inherited GIT_DIR, GIT_WORK_TREE or GIT_INDEX_FILE would steer the
+    // query at a repository other than the workspace's own.
+    crate::guidance::remove_git_environment(&mut command);
+    // A read-only identity query takes no index lock and never prompts.
+    command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
     let output = crate::budget::output(&mut command).ok()?;
     output
         .status
@@ -673,6 +680,28 @@ fn toolchain_libraries() -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// Regression: an inherited `GIT_DIR` reached identity queries. Removal is
+    /// applied to every `GIT_*` name and nothing else.
+    #[test]
+    fn identity_queries_drop_inherited_git_redirection() {
+        let mut command = Command::new("git");
+        crate::guidance::remove_git_environment_named(
+            &mut command,
+            [
+                OsString::from("GIT_DIR"),
+                OsString::from("GIT_INDEX_FILE"),
+                OsString::from("HOME"),
+            ],
+        );
+        let envs: Vec<_> = command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(|v| v.to_owned())))
+            .collect();
+        assert!(envs.contains(&(OsString::from("GIT_DIR"), None)));
+        assert!(envs.contains(&(OsString::from("GIT_INDEX_FILE"), None)));
+        assert!(!envs.iter().any(|(key, _)| key == &OsString::from("HOME")));
+    }
 
     #[test]
     fn run_environment_query_stops_a_hung_child() {

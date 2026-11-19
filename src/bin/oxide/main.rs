@@ -128,10 +128,10 @@ unavailable core counts use 2.
 Leased builds bypass any inherited rustc wrapper (such as sccache);
 OXIDE_ALLOW_RUSTC_WRAPPER=1 keeps it, unqualified for Oxide's interruption
 and toolchain identity.
-OXIDE_POOL_CAP sets a new pool's cap (bytes, KiB, MiB, GiB or TiB; default
-24 GiB); an existing pool keeps its recorded cap.
-OXIDE_POOL_BACKEND=directory-budget creates a budget-only directory pool (the
-Linux default; macOS defaults to a hard-capped APFS image).
+OXIDE_POOL_CAP sets a new pool's soft budget (bytes, KB, MB, GB, TB, KiB, MiB,
+GiB or TiB; default 100 GB); an existing pool keeps its recorded budget.
+OXIDE_POOL_BACKEND=directory-budget is the only internal backend: a budget-only
+directory pool on every platform. The APFS image backend is retired.
 ";
 
 fn main() -> ExitCode {
@@ -946,6 +946,9 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
     // running, so no peer can repoint the link between the check and Cargo.
     let marked = store.mark_running(&held, group.id);
     drop(binding);
+    // Set only when the group could not be recorded and was stopped here: the
+    // bounded stop's own verdict on closure replaces the waits below.
+    let mut unrecorded_closed = None;
     let outcome = match marked {
         Ok(()) if run => collect_run(&mut group, &invocation, watchdog.as_mut(), &mut budget_stop),
         Ok(()) => match watchdog.as_mut() {
@@ -955,26 +958,28 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
                 .map(|status| (status, None, true)),
         },
         Err(error) => {
-            // SAFETY: the negative PID addresses the group this command created.
-            unsafe {
-                libc::kill(-group.id, libc::SIGTERM);
-            }
-            let _ = process::wait_leader(&mut group);
+            // The group never recorded as running: stop it with a bounded
+            // escalation rather than waiting on it unbounded.
+            unrecorded_closed = Some(process::stop_unrecorded(&mut group));
             Err(error)
         }
     };
     // Release only after positive closure. A watchdog that cannot confirm
     // the stopped group closed leaves the lease held and the record naming
     // the group, so a later command recovers it once the group is empty.
-    let mut closed = oxide_storage::release_trace::phase("cargo group closure", || {
-        match (watchdog.as_mut(), &outcome) {
-            (Some(_), Ok((None, _, _))) => None,
-            (Some(watchdog), _) => {
-                process::wait_group_empty_watched(group.id, watchdog, &mut budget_stop)
+    let mut closed = match unrecorded_closed {
+        Some(true) => Some(Instant::now()),
+        Some(false) => None,
+        None => oxide_storage::release_trace::phase("cargo group closure", || {
+            match (watchdog.as_mut(), &outcome) {
+                (Some(_), Ok((None, _, _))) => None,
+                (Some(watchdog), _) => {
+                    process::wait_group_empty_watched(group.id, watchdog, &mut budget_stop)
+                }
+                (None, _) => process::wait_group_empty_budgeted(group.id, &mut budget_stop),
             }
-            (None, _) => process::wait_group_empty_budgeted(group.id, &mut budget_stop),
-        }
-    });
+        }),
+    };
     if budget::closure_stuck() {
         // Debug proof control: report the group and drain as unconfirmed even
         // though the kernel says otherwise, so the held-custody path is
@@ -1063,6 +1068,7 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
                 && status.success()
                 && stopped.is_none()
                 && budget::origin().is_none()
+                && process::received_signal().is_none()
                 && (root.is_some() || bounded_run) =>
         {
             // #133 maps only a linked member beneath its owned root and
@@ -1124,7 +1130,11 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
     // protect keeps the plain release-then-exec path.
     let fenced_program = match (&outcome, chosen_temp.owned()) {
         (Ok((Some(status), Some(Ok(target)), _drained)), Some(_))
-            if run && status.success() && stopped.is_none() =>
+            if run
+                && status.success()
+                && stopped.is_none()
+                && budget::origin().is_none()
+                && process::received_signal().is_none() =>
         {
             Some(target.clone())
         }
@@ -1243,7 +1253,9 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         },
         code,
     );
-    if stopped.is_some() || interrupted.is_some() {
+    // A latched budget stop (an expired window) ends the command the same way:
+    // the program is never launched after it.
+    if stopped.is_some() || interrupted.is_some() || budget::origin().is_some() {
         return Ok(code);
     }
     if !run || !status.success() {
@@ -1340,13 +1352,25 @@ fn run_owned_program(
         Backend::DirectoryBudget => None,
     };
     if let Err(error) = store.mark_running(&held, group.id) {
-        // SAFETY: the negative PID addresses the group this command created.
-        unsafe {
-            libc::kill(-group.id, libc::SIGTERM);
-        }
-        let _ = process::wait_leader(&mut group);
-        process::wait_group_empty(group.id);
+        // The group never recorded as running. It is stopped with a bounded
+        // escalation; the lease is released only once the group is confirmed
+        // empty, and otherwise stays held for a later command to recover.
+        let closed = process::stop_unrecorded(&mut group);
         drop(foreground);
+        if !closed {
+            budget::finished(
+                budget::Outcome::UnconfirmedClosure,
+                None,
+                execution_started,
+                budget::Drain::NotReached,
+                budget::Lease::Held,
+                1,
+            );
+            return Err(format!(
+                "{error}; program group {} did not close after KILL, so slot {} stays held",
+                group.id, held.slot_id
+            ));
+        }
         store.release(held, None)?;
         budget::finished(
             budget::Outcome::InternalError,
@@ -1391,10 +1415,20 @@ fn run_owned_program(
             budget::Lease::Held,
             1,
         );
-        store.quarantine_lost(
-            &held,
-            &format!("run program group {} did not close after KILL", group.id),
-        )?;
+        // Only a removable volume's removal stop is unknown custody worth a
+        // quarantine. An internal pool keeps the lease held, and the record
+        // names the group, so a later command recovers it once it is empty.
+        if stopped.is_some_and(Watchdog::removal) {
+            store.quarantine_lost(
+                &held,
+                &format!("run program group {} did not close after KILL", group.id),
+            )?;
+            return Ok(1);
+        }
+        eprintln!(
+            "oxide: could not confirm program group {} closed after the stop; slot {} stays held, and a later oxide command recovers it once the group is empty",
+            group.id, held.slot_id
+        );
         return Ok(1);
     }
     if let Some(producing) = production {
@@ -1873,13 +1907,13 @@ impl TrashSettler {
     /// worker still running at the bound is detached: its durable record stays,
     /// and the next command resumes it.
     fn finish(&mut self) {
-        self.finish_while(|| process::received_signal().is_some());
+        self.finish_while(|| process::received_signal().is_some() || budget::origin().is_some());
     }
 
     /// [`Self::finish`] giving up as soon as `interrupted` reports that this
-    /// command is already ending. A signal has asked it to stop, so it never
-    /// waits out the settle bound: the deletion's durable record stays and the
-    /// next command resumes it.
+    /// command is already ending. A signal or a latched budget stop has asked
+    /// it to stop, so it never waits out the settle bound: the deletion's
+    /// durable record stays and the next command resumes it.
     fn finish_while(&mut self, interrupted: impl Fn() -> bool) {
         // Ending the channel lets the worker leave its loop after the pass it
         // is running.
@@ -1888,6 +1922,11 @@ impl TrashSettler {
             return;
         }
         let started = Instant::now();
+        let bound = settle_bound(
+            budget::clamp(TRASH_SETTLE_WAIT),
+            budget::execution_remaining(),
+            budget::origin().is_some(),
+        );
         let mut next_report = TRASH_SETTLE_REPORT;
         loop {
             let finished = self
@@ -1906,7 +1945,7 @@ impl TrashSettler {
                 return;
             }
             let elapsed = started.elapsed();
-            if elapsed >= TRASH_SETTLE_WAIT {
+            if elapsed >= bound {
                 self.worker = None;
                 eprintln!("{}", trash_wait_message(elapsed.as_secs()));
                 return;
@@ -1925,6 +1964,23 @@ impl Drop for TrashSettler {
     /// happy one.
     fn drop(&mut self) {
         self.finish();
+    }
+}
+
+/// The longest an exiting command waits for its settle worker. A latched budget
+/// stop leaves no wait at all: the command is already over its window, and the
+/// durable record carries the deletion to the next command.
+fn settle_bound(
+    bound: Duration,
+    execution_left: Option<Duration>,
+    budget_stopped: bool,
+) -> Duration {
+    if budget_stopped {
+        return Duration::ZERO;
+    }
+    match execution_left {
+        Some(left) => bound.min(left),
+        None => bound,
     }
 }
 
@@ -3336,6 +3392,48 @@ mod tests {
             settler.worker.is_none(),
             "the still-running worker stays detached"
         );
+    }
+
+    /// Regression: an exit after a latched budget stop (an expired window)
+    /// waited out the whole settle bound for the deletion. It now detaches at
+    /// once, and the bound itself is zero while the stop is latched.
+    #[test]
+    fn a_latched_budget_stop_does_not_wait_out_the_settle_bound() {
+        assert_eq!(settle_bound(TRASH_SETTLE_WAIT, None, true), Duration::ZERO);
+        assert_eq!(
+            settle_bound(TRASH_SETTLE_WAIT, None, false),
+            TRASH_SETTLE_WAIT
+        );
+        // An execution window that is nearly spent cuts the wait to what is left.
+        assert_eq!(
+            settle_bound(TRASH_SETTLE_WAIT, Some(Duration::from_millis(200)), false),
+            Duration::from_millis(200)
+        );
+        budget::clear();
+        budget::install(budget::Options {
+            admission: None,
+            execution: Some(Duration::from_secs(60)),
+            events: None,
+        })
+        .expect("a budget");
+        budget::latch(budget::Origin::Execution);
+        let mut settler = TrashSettler {
+            worker: Some(
+                std::thread::Builder::new()
+                    .name("oxide-test-trash-latched".to_owned())
+                    .spawn(|| std::thread::sleep(Duration::from_secs(3)))
+                    .expect("a worker"),
+            ),
+            kick: None,
+        };
+        let started = Instant::now();
+        settler.finish_while(|| budget::origin().is_some());
+        budget::clear();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the settle wait ran out the bound after a budget stop"
+        );
+        assert!(settler.worker.is_none());
     }
 
     fn budget_invocation() -> Invocation {

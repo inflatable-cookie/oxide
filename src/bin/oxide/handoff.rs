@@ -222,10 +222,9 @@ struct Inputs {
 
 impl Inputs {
     fn from_environment() -> Option<Self> {
-        let home = PathBuf::from(std::env::var_os("HOME")?);
-        if !home.is_absolute() {
-            return None;
-        }
+        // The account's home, never `$HOME`: the receipt and install paths
+        // derive from it (workflow contract).
+        let home = crate::config::Facts::from_env().account_home()?;
         let current = std::env::current_exe()
             .ok()
             .and_then(|exe| fs::metadata(exe).ok())

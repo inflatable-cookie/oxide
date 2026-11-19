@@ -598,17 +598,59 @@ pub(crate) fn remove(path: &std::path::Path, dev: u64, identity: &Identity) -> R
     })
 }
 
-/// Remove everything inside `dir`, children first, refusing any other device.
-fn remove_contents(dir: &Dir, dev: u64, label: &std::path::Path) -> Result<(), String> {
-    let names = dir.names().map_err(|error| {
+/// Deepest nesting removed below the directory being emptied. Matches the
+/// bound `clean.rs` applies, so the two walks refuse the same trees.
+const MAX_DEPTH: usize = 256;
+
+/// One directory below the one being emptied: its open handle, its name in the
+/// parent, and the entries not yet visited.
+struct Level {
+    dir: Dir,
+    name: OsString,
+    label: std::path::PathBuf,
+    names: std::vec::IntoIter<OsString>,
+}
+
+fn entry_names(dir: &Dir, label: &std::path::Path) -> Result<std::vec::IntoIter<OsString>, String> {
+    dir.names().map(Vec::into_iter).map_err(|error| {
         format!(
             "cannot read the per-command temporary directory {}: {error}",
             reported(label)
         )
-    })?;
-    for name in names {
-        let child = label.join(&name);
-        let entry = dir
+    })
+}
+
+/// Remove everything inside `dir`, children first, refusing any other device.
+///
+/// The walk keeps an explicit stack of open directories rather than recursing,
+/// so a deep tree cannot exhaust the call stack, and it refuses past
+/// [`MAX_DEPTH`] rather than remove an incomplete tree.
+fn remove_contents(dir: &Dir, dev: u64, label: &std::path::Path) -> Result<(), String> {
+    let mut root_names = entry_names(dir, label)?;
+    let mut levels: Vec<Level> = Vec::new();
+    loop {
+        let next = match levels.last_mut() {
+            Some(level) => level.names.next(),
+            None => root_names.next(),
+        };
+        let Some(name) = next else {
+            // The innermost directory is empty: remove it from its parent and
+            // continue with the parent's remaining entries.
+            let Some(finished) = levels.pop() else {
+                return Ok(());
+            };
+            let parent = levels.last().map_or(dir, |level| &level.dir);
+            parent
+                .remove(&finished.name, true)
+                .map_err(|error| format!("cannot remove {}: {error}", reported(&finished.label)))?;
+            continue;
+        };
+        let (current, current_label) = match levels.last() {
+            Some(level) => (&level.dir, level.label.clone()),
+            None => (dir, label.to_path_buf()),
+        };
+        let child = current_label.join(&name);
+        let entry = current
             .entry(&name)
             .map_err(|error| format!("cannot read {}: {error}", reported(&child)))?;
         if entry.dev != dev {
@@ -617,25 +659,35 @@ fn remove_contents(dir: &Dir, dev: u64, label: &std::path::Path) -> Result<(), S
                 reported(&child)
             ));
         }
-        if entry.dir {
-            let inner = dir
-                .open_dir(&name)
-                .map_err(|error| format!("cannot open {}: {error}", reported(&child)))?;
-            if inner.identity().ok() != Some((entry.dev, entry.ino)) {
-                return Err(format!(
-                    "{} changed while it was being removed, so it is kept",
-                    reported(&child)
-                ));
-            }
-            remove_contents(&inner, dev, &child)?;
-            dir.remove(&name, true)
+        if !entry.dir {
+            current
+                .remove(&name, false)
                 .map_err(|error| format!("cannot remove {}: {error}", reported(&child)))?;
-        } else {
-            dir.remove(&name, false)
-                .map_err(|error| format!("cannot remove {}: {error}", reported(&child)))?;
+            continue;
         }
+        if levels.len() + 1 >= MAX_DEPTH {
+            return Err(format!(
+                "{} is nested deeper than {MAX_DEPTH} levels; the directory is kept",
+                reported(&child)
+            ));
+        }
+        let inner = current
+            .open_dir(&name)
+            .map_err(|error| format!("cannot open {}: {error}", reported(&child)))?;
+        if inner.identity().ok() != Some((entry.dev, entry.ino)) {
+            return Err(format!(
+                "{} changed while it was being removed, so it is kept",
+                reported(&child)
+            ));
+        }
+        let names = entry_names(&inner, &child)?;
+        levels.push(Level {
+            dir: inner,
+            name,
+            label: child,
+            names,
+        });
     }
-    Ok(())
 }
 
 fn effective_uid() -> u32 {
@@ -1114,6 +1166,46 @@ mod tests {
         assert!(fs::symlink_metadata(tree.join("link")).is_err());
         assert!(fs::symlink_metadata(tree.join("own")).is_err());
         assert_eq!(fs::read(outside.join("keep")).unwrap(), b"keep");
+    }
+
+    /// A nested tree within the bound is removed completely, with its siblings.
+    #[test]
+    fn a_nested_tree_is_removed_completely_by_the_explicit_walk() {
+        let fixture = Fixture::new("nested");
+        let tree = fixture.0.join("tree");
+        fs::create_dir(&tree).unwrap();
+        let mut deep = tree.clone();
+        for depth in 0..40 {
+            fs::write(deep.join(format!("file{depth}")), b"x").unwrap();
+            deep = deep.join("d");
+            fs::create_dir(&deep).unwrap();
+        }
+        fs::create_dir_all(tree.join("sibling/a/b")).unwrap();
+        fs::write(tree.join("sibling/a/b/leaf"), b"leaf").unwrap();
+        let held = Dir::open(&tree).unwrap();
+        let dev = fs::metadata(&tree).unwrap().dev();
+        remove_contents(&held, dev, &tree).unwrap();
+        assert_eq!(fs::read_dir(&tree).unwrap().count(), 0);
+    }
+
+    /// Regression: the recursive walk had no depth bound, so a tree nested
+    /// without limit could exhaust the stack. It now refuses past `MAX_DEPTH`,
+    /// keeping the tree rather than removing an incomplete part of it.
+    #[test]
+    fn a_tree_nested_past_the_depth_bound_is_refused() {
+        let fixture = Fixture::new("deep");
+        let tree = fixture.0.join("tree");
+        fs::create_dir(&tree).unwrap();
+        let mut deep = tree.clone();
+        for _ in 0..MAX_DEPTH + 4 {
+            deep = deep.join("d");
+            fs::create_dir(&deep).unwrap();
+        }
+        let held = Dir::open(&tree).unwrap();
+        let dev = fs::metadata(&tree).unwrap().dev();
+        let error = remove_contents(&held, dev, &tree).expect_err("the walk must refuse");
+        assert!(error.contains("nested deeper"), "{error}");
+        assert!(deep.is_dir(), "the deepest directory must be kept");
     }
 
     #[test]

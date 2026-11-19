@@ -1,0 +1,1 @@
+Harden `oxide run`, cleanup, git identity queries, install-path lookups, and config, guidance and describe reads: no launch after a signal or expired budget, bounded stops and waits, no `$HOME` or `GIT_*` steering, no followed links or silent truncation.

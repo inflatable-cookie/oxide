@@ -332,6 +332,65 @@ fn refuse_resolved(metadata: &serde_json::Value) -> Option<String> {
 /// Cargo config files Cargo would read: `.cargo/config.toml` and
 /// `.cargo/config` in the current directory and every ancestor, then in the
 /// Cargo home. Each is parsed; see [`refuse_config`].
+/// The bounds on `cargo -V`: a Cargo that hangs or prints without end is
+/// refused rather than waited on.
+const VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const VERSION_CAP: u64 = 4096;
+
+/// Run `command` with its own process group, capture at most `cap` bytes of
+/// stdout and wait at most `timeout`. A timeout or an overrun stops the whole
+/// group; nothing is waited on without a bound.
+fn bounded_stdout(
+    mut command: Command,
+    timeout: std::time::Duration,
+    cap: u64,
+) -> Result<Vec<u8>, String> {
+    use std::os::unix::process::CommandExt;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| format!("could not start Cargo: {error}"))?;
+    let stdout = child.stdout.take().ok_or("Cargo stdout was not captured")?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        // One byte past the cap tells an overrun apart from a complete read.
+        let read = stdout.take(cap + 1).read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(read);
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(None) => {
+                crate::describe::stop_group_and_reap(&mut child);
+                return Err(format!(
+                    "Cargo -V did not finish within {} s",
+                    timeout.as_secs()
+                ));
+            }
+            Err(error) => {
+                crate::describe::stop_group_and_reap(&mut child);
+                return Err(format!("cannot wait for Cargo: {error}"));
+            }
+        }
+    }
+    let bytes = receiver
+        .recv_timeout(timeout)
+        .map_err(|_| "Cargo -V output did not finish".to_owned())?
+        .map_err(|error| format!("cannot read Cargo -V output: {error}"))?;
+    if bytes.len() as u64 > cap {
+        return Err(format!("Cargo -V output is over {cap} bytes"));
+    }
+    Ok(bytes)
+}
+
 fn config_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut candidates: Vec<PathBuf> = cwd
@@ -642,12 +701,10 @@ pub fn run_cache_clean(args: &[OsString]) -> Result<u8, String> {
             )));
         }
     }
-    let version = Command::new(CARGO)
-        .arg("-V")
-        .env_remove("CARGO_LOG")
-        .output()
-        .map_err(|error| format!("could not start Cargo: {error}"))?;
-    let version = String::from_utf8_lossy(&version.stdout);
+    let mut version = Command::new(CARGO);
+    version.arg("-V").env_remove("CARGO_LOG");
+    let version = bounded_stdout(version, VERSION_TIMEOUT, VERSION_CAP)?;
+    let version = String::from_utf8_lossy(&version);
     if !version.starts_with(QUALIFIED_CARGO) {
         return Err(refuse(format!(
             "{} is not the qualified Cargo 1.97.1, whose cleanup trigger and trace Oxide reads",
@@ -795,6 +852,36 @@ pub fn run_cache_clean(args: &[OsString]) -> Result<u8, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: `cargo -V` was run with an unbounded `output()`. A command
+    /// that never exits is now stopped at the timeout, its group included.
+    #[test]
+    fn a_hung_version_query_is_stopped_at_its_bound() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let started = std::time::Instant::now();
+        let error = bounded_stdout(command, std::time::Duration::from_millis(300), VERSION_CAP)
+            .expect_err("a hung query must be refused");
+        assert!(error.contains("did not finish"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    /// Regression: a version query's output was read without a cap.
+    #[test]
+    fn an_overlong_version_query_is_refused() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "head -c 10000 /dev/zero"]);
+        let error = bounded_stdout(command, std::time::Duration::from_secs(10), 100)
+            .expect_err("an overlong answer must be refused");
+        assert!(error.contains("over 100 bytes"), "{error}");
+        let mut short = Command::new("/bin/sh");
+        short.args(["-c", "printf 'cargo 1.97.1 (x)'"]);
+        assert_eq!(
+            bounded_stdout(short, std::time::Duration::from_secs(10), VERSION_CAP)
+                .expect("a version"),
+            b"cargo 1.97.1 (x)"
+        );
+    }
 
     #[test]
     fn cargo_home_resolution_matches_cargo() {

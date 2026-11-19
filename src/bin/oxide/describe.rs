@@ -16,6 +16,7 @@ use oxide_storage::volume::{self, Binding};
 use serde::Serialize;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -353,6 +354,7 @@ fn bounded(program: &str, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .map_err(|error| format!("cannot run {program}: {error}"))?;
     let stdout = child
@@ -381,21 +383,34 @@ fn bounded(program: &str, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_group_and_reap(&mut child);
                 return Err(format!("{program} timed out"));
             }
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_group_and_reap(&mut child);
                 return Err(format!("cannot wait for {program}: {error}"));
             }
         }
     };
-    let bytes = receiver
-        .recv_timeout(READ_TIMEOUT)
-        .map_err(|_| format!("{program} output did not finish"))?
-        .map_err(|error| format!("cannot read {program}: {error}"))?;
+    // The output shares the one deadline the child was given: a grandchild that
+    // keeps the pipe open cannot extend the caller's wait past READ_TIMEOUT in
+    // total, as a second full bound after the child exited would.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let bytes = match receiver.recv_timeout(remaining) {
+        Ok(read) => read.map_err(|error| format!("cannot read {program}: {error}"))?,
+        Err(_) => {
+            // A process in the group still holds the pipe open. Stop the whole
+            // group so it cannot keep running unseen. The group id stays reserved
+            // while any member exists, so this signal reaches only that group.
+            if let Ok(pid) = i32::try_from(child.id()) {
+                // SAFETY: the negative PID addresses the group this child led.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+            return Err(format!("{program} output did not finish"));
+        }
+    };
     if bytes.len() > MAX_PLIST_BYTES {
         return Err(format!("{program} output is over the cap"));
     }
@@ -403,6 +418,19 @@ fn bounded(program: &str, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
         return Err(format!("{program} exited with {status}"));
     }
     Ok(bytes)
+}
+
+/// Stop a child that outlived its bound: SIGKILL its whole process group, which
+/// the caller made with `process_group(0)`, so a grandchild that inherited the
+/// pipes cannot outlive it, then reap the leader inside a finite bound.
+pub(crate) fn stop_group_and_reap(child: &mut std::process::Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: the negative PID addresses the group this child leads.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    crate::budget::kill_and_reap(child);
 }
 
 fn lossy(path: &Path) -> String {
@@ -439,6 +467,77 @@ fn rfc3339(unix_seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a timed-out command's grandchild, which inherited the pipes,
+    /// outlived the KILL of its direct child. The whole group is stopped now.
+    #[test]
+    fn a_timed_out_command_leaves_no_grandchild_behind() {
+        let dir = std::env::temp_dir().join(format!("oxide-describe-group-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("fixture");
+        let pidfile = dir.join("pid");
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        assert!(bounded("/bin/sh", &["-c", &script], None).is_err());
+        let pid: i32 = fs::read_to_string(&pidfile)
+            .expect("the grandchild's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only probes the PID this test started.
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        // SAFETY: as above.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the grandchild survived");
+        fs::remove_dir_all(&dir).expect("remove own fixture");
+    }
+
+    /// Regression: after the direct child exited, the output read waited a second
+    /// full bound, so a slow command could hold the caller for nearly twice
+    /// READ_TIMEOUT. The child and its output now share one deadline.
+    #[test]
+    fn output_held_open_by_a_grandchild_stays_within_one_deadline() {
+        let dir = std::env::temp_dir().join(format!("oxide-describe-held-{}", std::process::id()));
+        fs::create_dir(&dir).expect("fresh fixture");
+        let pidfile = dir.join("pid");
+        // The shell exits after about 3 s, while a background sleep keeps the pipe open.
+        let script = "sleep 20 & echo $! > \"$1\"; sleep 3";
+        let started = Instant::now();
+        let result = bounded(
+            "/bin/sh",
+            &[
+                "-c",
+                script,
+                "oxide-test",
+                pidfile.to_str().expect("UTF-8 path"),
+            ],
+            None,
+        );
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "the held pipe must be refused");
+        assert!(
+            elapsed < Duration::from_secs(7),
+            "the output wait ran past the one deadline: {elapsed:?}"
+        );
+        let pid: i32 = fs::read_to_string(&pidfile)
+            .expect("the grandchild's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only probes the PID this test started.
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        // SAFETY: as above.
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the held pipe's group survived"
+        );
+        fs::remove_dir_all(&dir).expect("remove own fixture");
+    }
 
     #[test]
     fn timestamps_are_utc_rfc3339() {
