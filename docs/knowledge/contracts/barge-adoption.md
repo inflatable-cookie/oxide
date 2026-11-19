@@ -13,7 +13,7 @@ storage invariants still apply.
 
 `barge` is a Git dependency pinned by a full 40-hex revision in `Cargo.toml` and
 `Cargo.lock`, never a branch or tag. The current pin is Barge main
-`3320dd276856356c5a9e59bafa6f091c0df71ac3`. Only test builds request Barge's
+`3aacee23f5b8f9788525b41511cc2345a2066375`. Only test builds request Barge's
 `testing` feature. `scripts/offline_seed.py` derives the Git revision from
 `Cargo.lock`; a missing revision is an offline failure.
 
@@ -117,6 +117,12 @@ matching marker as a straggler and never reuses, evicts or deletes it.
 - Removable admission checks free space through Barge. It starts reserve eviction
   only below the reserve and rereads free space after each completed eviction.
 - An eviction left in trash surfaces an error and earns no freed space.
+- Oxide's slot ceiling and byte budget commit the eviction decision under the pool
+  lock and let Barge evict afterwards, with the pool and admission locks released
+  (oxide#324). Barge still rechecks the hold, the pin and the marker, and the same
+  run-then-sweep rules apply. Reserve pressure keeps its inline eviction because it
+  needs the bytes a completed deletion returns; see the
+  [local lease contract](local-lease.md#deferred-eviction-oxide324).
 - Warm reuse above the reserve walks no other payload.
 - Oxide's byte walks are counted separately from Barge's internal marker
   enumeration, which is reported as a listing with an unavailable count. Output

@@ -468,6 +468,9 @@ fn a_pinned_root_is_not_evicted_by_pressure() {
     drop(idle);
     let admitted = managed::lease(request(&pool, &fixture.dir("next"), &workspace, "next"));
     assert!(admitted.is_ok(), "pressure can skip the oldest pinned root");
+    // The decision is committed under the pool lock; the settle runs Barge's
+    // eviction with that lock released.
+    managed::settle_pending_evictions(&pool).expect("settle the committed eviction");
     assert!(info.path.exists(), "the pinned slot stays");
     assert!(!other_path.exists(), "the next eligible slot was evicted");
 }
@@ -627,6 +630,7 @@ fn an_evicted_legacy_root_gets_a_fresh_successor_path() {
     managed::prepare_pool(&pool).expect("adopt closed legacy root");
     let workspace = fixture.dir("workspace");
     managed::evict_idle_slot(&pool, "44").expect("evicted without a prior grant");
+    managed::settle_pending_evictions(&pool).expect("settle the committed eviction");
     assert!(!dir.exists(), "the recorded legacy root is deleted whole");
     let fresh =
         managed::lease_measured(request(&pool, &project, &workspace, "new")).expect("admit");
@@ -776,6 +780,7 @@ fn an_idle_legacy_root_stays_out_of_eviction_while_its_old_holder_lives() {
     managed::prepare_pool(&pool).expect("adopt once the older holder is absent");
     assert!(!fixture_storage(&pool).all_roots().unwrap()[0].1.pinned);
     managed::evict_idle_slot(&pool, "61").expect("the now-closed root can be evicted");
+    managed::settle_pending_evictions(&pool).expect("settle the committed eviction");
     assert!(!path.exists());
 }
 
@@ -843,6 +848,7 @@ fn an_unfinished_legacy_transition_preserves_existing_barge_pins() {
         assert!(path.is_dir());
         storage.unpin_in(None, &root.id).unwrap();
         managed::evict_idle_slot(&pool, "62").expect("evict after explicit unpin");
+        managed::settle_pending_evictions(&pool).expect("settle the committed eviction");
         assert!(!path.exists());
     }
 }
@@ -911,7 +917,7 @@ fn held_eviction_distinguishes_a_held_root_from_a_failed_trash_delete() {
 }
 
 #[test]
-fn an_eviction_counts_its_byte_walk_even_if_rename_cannot_start() {
+fn an_eviction_reports_a_trash_that_cannot_be_created_from_the_settle() {
     use std::os::unix::fs::PermissionsExt;
 
     if super::current_uid() == 0 {
@@ -921,7 +927,7 @@ fn an_eviction_counts_its_byte_walk_even_if_rename_cannot_start() {
     let pool = fixture.pool();
     let project = fixture.dir("project");
     let leased = managed::lease(request(&pool, &project, &project, "first")).unwrap();
-    let victim = leased.grant.slot_id.parse().unwrap();
+    let slot = leased.grant.slot_id.clone();
     managed::release(&pool, &leased.grant.lease_id).unwrap();
     let path = leased
         .grant
@@ -934,24 +940,69 @@ fn an_eviction_counts_its_byte_walk_even_if_rename_cannot_start() {
 
     let slots = path.parent().unwrap();
     assert!(!slots.join(".trash").exists());
-    let other = fixture.dir("other");
-    let mut replacement = request(&pool, &other, &other, "replacement");
-    replacement.replace_slot = Some(victim);
+    // The decision is committed under the pool lock: no trash is created and
+    // no sizing walk runs there.
     fs::set_permissions(slots, fs::Permissions::from_mode(0o500)).unwrap();
-    let (attempt, walks) = count_pool_walks(|| managed::lease(replacement));
-    fs::set_permissions(slots, fs::Permissions::from_mode(0o700)).unwrap();
-
-    let error = attempt
-        .err()
-        .expect("trash creation refuses while the parent is read-only");
+    let (decided, walks) = count_pool_walks(|| managed::evict_idle_slot(&pool, &slot));
     assert!(
-        error.to_string().contains("cannot create the trash at"),
-        "{error}"
+        walks.iter().all(|walk| !matches!(walk, PoolWalk::Evict(_))),
+        "{walks:?}"
     );
-    assert!(matches!(walks.as_slice(), [PoolWalk::Evict(_)]));
-    let (_, walked, listed, opaque) = super::admission_cost::latest(&pool);
-    assert_eq!((walked, listed, opaque), (1, 0, true));
+    assert!(decided.unwrap().is_empty());
+    assert!(!slots.join(".trash").exists());
+    assert!(path.is_dir(), "the decision alone moves nothing");
+
+    // The settle asks Barge to evict. Creating the trash fails on the
+    // read-only parent: the failure is reported, the root stays, and the
+    // durable record stays so a later pass can finish it.
+    let (messages, settle_walks) = count_pool_walks(|| managed::settle_pending_evictions(&pool));
+    assert!(matches!(settle_walks.as_slice(), [PoolWalk::Evict(_)]));
+    assert!(super::pool::last_settle_held_no_pool_lock());
+    let messages = messages.unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("cannot create the trash at")),
+        "{messages:?}"
+    );
     assert!(path.is_dir());
+    assert!(pool.join("oxide-managed/idle-evictions.json").is_file());
+
+    // With the parent writable again the same record finishes: the retry is
+    // Barge's own eviction, and the record is cleared.
+    fs::set_permissions(slots, fs::Permissions::from_mode(0o700)).unwrap();
+    let messages = managed::settle_pending_evictions(&pool).unwrap();
+    assert!(messages.is_empty(), "{messages:?}");
+    assert!(!path.exists());
+    assert!(!pool.join("oxide-managed/idle-evictions.json").exists());
+}
+
+#[test]
+fn a_failed_trash_sweep_does_not_block_recorded_eviction() {
+    let fixture = Fixture::new("sweep-failure-eviction");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let leased = managed::lease(request(&pool, &project, &project, "first")).unwrap();
+    let slot = leased.grant.slot_id.clone();
+    let path = leased
+        .grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .unwrap()
+        .to_owned();
+    managed::release(&pool, &leased.grant.lease_id).unwrap();
+    drop(leased);
+    managed::evict_idle_slot(&pool, &slot).unwrap();
+    super::pool::fail_next_trash_sweep();
+    let (messages, walks) = count_pool_walks(|| managed::settle_pending_evictions(&pool));
+    assert!(messages
+        .unwrap()
+        .iter()
+        .any(|message| message.contains("injected sweep failure")));
+    assert!(walks.iter().any(|walk| matches!(walk, PoolWalk::Evict(_))));
+    assert!(!path.exists());
+    assert!(!pool.join("oxide-managed/idle-evictions.json").exists());
 }
 
 #[test]
@@ -978,7 +1029,14 @@ fn sweeping_owned_trash_does_not_resample_the_roots_bytes() {
 
     managed::prepare_pool(&pool).unwrap();
     let (_, walked, listed, opaque) = super::admission_cost::latest(&pool);
-    assert_eq!((walked, listed, opaque), (0, 1, false));
+    assert_eq!((walked, listed, opaque), (0, 0, false));
+    assert!(
+        evicted.exists(),
+        "opening under the pool lock must not sweep trash"
+    );
+    let messages = managed::settle_pending_evictions(&pool).unwrap();
+    assert!(messages.is_empty(), "{messages:?}");
+    assert!(super::pool::last_settle_held_no_pool_lock());
     assert!(!evicted.exists());
 }
 
@@ -1079,28 +1137,45 @@ fn admission_cost_and_protection_at_the_256_slot_ceiling() {
 
     admission_cost::start_summary();
     let other = fixture.dir("other");
+    let started = std::time::Instant::now();
     let (admitted, walks) =
         count_pool_walks(|| managed::lease(request(&pool, &other, &workspace, "new")));
+    let admission_wall = started.elapsed();
     let admitted = admitted.unwrap();
     assert_eq!(admitted.grant.slot_id, (count + 1).to_string());
-    assert!(matches!(walks.as_slice(), [PoolWalk::Evict(_)]));
+    assert!(
+        walks
+            .iter()
+            .all(|walk| !matches!(walk, PoolWalk::Evict(_) | PoolWalk::Measure(_))),
+        "a ceiling eviction walks no evicted tree under the pool lock: {walks:?}"
+    );
     let (eviction_us, walked, listed, opaque) = admission_cost::latest(&pool);
     assert_eq!(
         (walked, listed, opaque),
-        (1, 0, true),
-        "Barge eviction also enumerates markers"
+        (0, 256, true),
+        "one bytes-free protection listing, no sizing walk"
     );
-    let summary = admission_cost::take_summary()
-        .expect("unavailable listing count triggers the build summary");
+    // The probe in this fixture is tiny, so this is an observation bound: a
+    // deleted tree must not be what the admission's lock hold is spent on.
     assert!(
-        summary.contains("Barge listing count unavailable"),
-        "{summary}"
+        eviction_us < 2_000_000 && admission_wall < std::time::Duration::from_secs(2),
+        "the ceiling decision held the pool lock for {eviction_us} us (wall {admission_wall:?})"
     );
+    // The evicted root is still at its path: Barge's eviction, including the
+    // identity-checked rename, is the settle's work, and the same is true of
+    // the deletion. The oldest rank is slot `count`.
+    let victim_path = pool.join("payload/slots").join(count.to_string());
     assert!(
-        summary.contains("eviction") && summary.contains("byte walks 1"),
-        "{summary}"
+        victim_path.is_dir(),
+        "the decided eviction moved nothing under the pool lock"
     );
-    assert!(!pool.join("payload/slots").join(count.to_string()).exists());
+    // The settle runs with the pool lock released and reports one eviction.
+    let (settled, settle_walks) = count_pool_walks(|| managed::settle_pending_evictions(&pool));
+    assert!(matches!(settle_walks.as_slice(), [PoolWalk::Evict(_)]));
+    assert!(super::pool::last_settle_held_no_pool_lock());
+    assert!(settled.unwrap().is_empty());
+    assert!(!victim_path.exists());
+    assert!(!pool.join("oxide-managed/idle-evictions.json").exists());
     assert!(pool.join("payload/slots/1").is_dir());
 
     let storage = fixture_storage(&pool);
@@ -1216,7 +1291,18 @@ fn admission_release_and_status_only_walk_the_roots_they_need() {
         .1;
     let (lease, walks) = count_pool_walks(|| managed::lease(eviction));
     let lease = lease.unwrap();
-    assert_eq!(walks, vec![PoolWalk::Evict(victim.id)]);
+    assert_eq!(
+        walks,
+        vec![PoolWalk::Inventory],
+        "the decision lists protection; it does not evict under the pool lock"
+    );
+    assert!(
+        roots[0].exists(),
+        "the eviction runs after the lock is released"
+    );
+    let (settled, settle_walks) = count_pool_walks(|| managed::settle_pending_evictions(&pool));
+    assert_eq!(settle_walks, vec![PoolWalk::Evict(victim.id)]);
+    assert!(settled.unwrap().is_empty());
     assert!(!roots[0].exists());
     managed::release(&pool, &lease.grant.lease_id).unwrap();
 

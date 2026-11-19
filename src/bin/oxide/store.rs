@@ -405,11 +405,6 @@ pub struct Lease {
     /// The library's reuse walk of this slot generation when it was leased;
     /// `None` for a new slot or a held replay.
     pub measured: Option<ReuseMeasurement>,
-    /// The holding entries **this admission created** by evicting idle slots
-    /// (oxide#190), in creation order. The command publishes exactly these
-    /// outside the pool lock, so its own eviction is identified rather than
-    /// guessed from a rotation.
-    pub created_holding: Vec<String>,
     lease_id: String,
     record: u64,
     _lock: File,
@@ -429,18 +424,6 @@ impl Lease {
     /// The library's lease identity, recorded in its ledger for this grant.
     pub fn lease_id(&self) -> &str {
         &self.lease_id
-    }
-
-    /// This generation's holding entry name, when this command evicts it
-    /// (oxide#190): the same derivation the library performs, from facts this
-    /// lease already holds.
-    pub fn holding_entry_name(&self) -> Option<String> {
-        oxide_storage::lease::managed::holding_entry_name(
-            &self.store_id,
-            &self.slot_id,
-            &self.incarnation,
-            &self.lease_id,
-        )
     }
 }
 
@@ -977,10 +960,6 @@ pub struct Report {
     /// Slots with no current ledger record: they make `recorded_total` a
     /// stated lower bound.
     pub unrecorded_slots: usize,
-    /// Slot trees already renamed into the payload's holding area and pending
-    /// deletion outside the pool lock (oxide#190). Recorded facts only: this
-    /// view performs no walk and starts no deletion.
-    pub holding: Vec<oxide_storage::lease::HoldingEntry>,
     /// The bounded class facts of this pool's ledger (design §5.5, §5.6).
     pub class: ClassMembership,
 }
@@ -3839,7 +3818,6 @@ impl Store {
             recorded_total: snapshot.recorded_total,
             recorded_slots: snapshot.recorded_slots,
             unrecorded_slots: snapshot.unrecorded_slots,
-            holding: snapshot.holding,
             class,
         })
     }
@@ -4485,7 +4463,7 @@ impl Store {
             .iter()
             .position(|entry| entry.id == record)
             .ok_or("Oxide slot record disappeared")?;
-        let (grant, measured, unmeasured, created_holding) = match outcome {
+        let (grant, measured, unmeasured) = match outcome {
             Ok(leased) => {
                 if let Some(note) = &leased.admission_note {
                     eprintln!("oxide: warning: {note}");
@@ -4502,12 +4480,7 @@ impl Store {
                         format!("cannot make the slot hold inheritable: {error}")
                     })?;
                 }
-                (
-                    leased.grant,
-                    leased.measured,
-                    leased.unmeasured,
-                    leased.holding,
-                )
+                (leased.grant, leased.measured, leased.unmeasured)
             }
             Err(error) => {
                 state.settle_idle(index);
@@ -4597,7 +4570,6 @@ impl Store {
             prior,
             shared_from,
             measured,
-            created_holding,
             lease_id: grant.lease_id,
             record,
             _lock: lock,
@@ -6820,6 +6792,9 @@ pub(crate) mod tests {
         quarantine(1);
         let mut state = store.load().unwrap();
         store.discard_lost(&mut state).unwrap();
+        // The decision is committed under the pool lock; Barge's eviction and
+        // deletion are the settle's work, with that lock released.
+        oxide_storage::lease::managed::settle_pending_evictions(&store.pool).unwrap();
         assert!(!slot_dir.exists(), "the boot-closed slot was not deleted");
         assert!(
             store.load().unwrap().records.is_empty(),

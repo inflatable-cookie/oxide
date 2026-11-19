@@ -647,12 +647,11 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
     let mut grants = LeaseGrants::new();
     let resolution = cli::resolution(&invocation.cargo_args);
     let label = exec_label(&invocation.tool);
-    // The sweep runs before the admission as well as beside the writer
-    // (oxide#190): a pool over its budget because of a pending holding row
-    // refuses the very admission that could delete it, so this command's pass
-    // takes that entry (at most one, under a brief lock, deleted outside it)
-    // and its own evicted tree is deleted the same way once the lease is held.
-    let mut holding_sweep = HoldingSweep::start(store.pool.clone(), None);
+    // The settle worker starts before the admission so trash an earlier
+    // command could not finish is deleted outside the locks this command is
+    // about to take, and a later kick picks up this admission's own evictions
+    // (oxide#324). It never deletes under the pool lock.
+    let mut trash = TrashSettler::start(store.pool.clone());
     let lease = lease_with_gate(
         &store,
         &key,
@@ -663,40 +662,7 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         &mut waits,
         &mut grants,
     );
-    let lease = match lease {
-        Ok(inner) => Ok(inner),
-        Err(error) => {
-            // A capacity refusal can be caused by holding bytes this command is
-            // able to free. The eviction decision takes **one** bounded victim
-            // per attempt, so this command publishes one pending tree outside
-            // the pool lock, retries, and re-evaluates from the resulting
-            // figure. The bound is small; a round that removes nothing, or the
-            // bound, leaves the last refusal standing.
-            let first_removed = holding_sweep.finish().is_some_and(|drain| drain.gone);
-            reacquire_after_capacity(
-                error,
-                first_removed,
-                HOLDING_RECLAIM_ROUNDS,
-                || {
-                    let mut pass = HoldingSweep::start(store.pool.clone(), None);
-                    pass.finish().is_some_and(|drain| drain.gone)
-                },
-                || {
-                    lease_with_gate(
-                        &store,
-                        &key,
-                        invocation.profile,
-                        admission,
-                        &resolution,
-                        label.as_deref(),
-                        &mut waits,
-                        &mut grants,
-                    )
-                },
-            )
-        }
-    };
-    let (mut held, mut gate, mut pending) = match lease? {
+    let (mut held, mut gate) = match lease? {
         Ok(leased) => leased,
         Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
         Err(Stop::Cargo(code)) => return Ok(code),
@@ -767,7 +733,7 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
                     production = Some(prepared);
                 }
                 Ok(store::SeedRun::Abandoned) => {
-                    (held, gate, binding, pending) = match abandon_seed_and_reacquire(
+                    (held, gate, binding) = match abandon_seed_and_reacquire(
                         &store,
                         &key,
                         invocation.profile,
@@ -809,15 +775,11 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         }
     }
     // The lease this command finally holds may itself have evicted idle slots
-    // (including through the seeding re-acquire above), whose trees are already
-    // renamed into the holding area and recorded. The library reports exactly
-    // the entries it created and `discard` names the one it evicted by ID, so
-    // this command publishes its own eviction — named, never selected by
-    // rotation — beside its own writer (oxide#190). Several entries can be
-    // pending from one admission; the pass takes the first and a later command
-    // takes the rest.
-    pending.extend(held.created_holding.iter().cloned());
-    let mut holding_sweep = HoldingSweep::start(store.pool.clone(), pending.first().cloned());
+    // (including through the seeding re-acquire above). The admission recorded
+    // each decision under its pool lock; this kicks the worker so Barge's
+    // eviction and trash deletion run beside this command's own writer, with
+    // the pool and admission locks released (oxide#324).
+    trash.kick();
     for warning in &binding.outcome.warnings {
         eprintln!("oxide: WARNING: {warning}");
     }
@@ -1049,8 +1011,8 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
     }
     // The command's own deletion finishes before the summary, inside its
     // bounded wait, so the pool is not left holding a tree this command could
-    // have removed (oxide#190).
-    holding_sweep.finish();
+    // have removed (oxide#324).
+    trash.finish();
     let mut notes = [gate.describe(), wrapper_note, output_note]
         .into_iter()
         .flatten()
@@ -1510,11 +1472,11 @@ fn abandon_seed_and_reacquire(
     // binding received it (oxide#170 added this parameter; the cold re-bind
     // must not lose it).
     local_outputs: Option<&outputs::LocalOutputs<'_>>,
-) -> Result<Result<(store::Lease, Gate, outputs::OutputBinding, Vec<String>), Stop>, String> {
+) -> Result<Result<(store::Lease, Gate, outputs::OutputBinding), Stop>, String> {
     drop(binding);
     store.release(held, None)?;
     grants.share = false;
-    let (held, gate, pending) = match lease_with_gate(
+    let (held, gate) = match lease_with_gate(
         store, key, profile, admission, resolution, label, waits, grants,
     )? {
         Ok(leased) => leased,
@@ -1529,7 +1491,7 @@ fn abandon_seed_and_reacquire(
         derives_from_receipt,
         local_outputs,
     ) {
-        Ok(binding) => Ok(Ok((held, gate, binding, pending))),
+        Ok(binding) => Ok(Ok((held, gate, binding))),
         Err(reason) => {
             let origin = held.prior.unchanged();
             store.release(held, origin)?;
@@ -1551,12 +1513,10 @@ fn lease_with_gate(
     label: Option<&str>,
     waits: &mut store::WaitAccounting,
     grants: &mut LeaseGrants,
-) -> Result<Result<(store::Lease, Gate, Vec<String>), Stop>, String> {
+) -> Result<Result<(store::Lease, Gate), Stop>, String> {
     // A refusal leaves this checkout without a record, so the next lease is
     // a new or evicted slot. At most one grant per project slot plus one cold
-    // fallback (oxide#118, oxide#177). `pending` collects the holding entries
-    // this call evicted by ID, so the command publishes exactly those.
-    let mut pending: Vec<String> = Vec::new();
+    // fallback (oxide#118, oxide#177).
     while grants.remaining > 0 {
         let mut held = match store.acquire(key, profile, admission, grants.share, label, waits)? {
             Acquired::Lease(held) => held,
@@ -1569,7 +1529,7 @@ fn lease_with_gate(
         // that died before Cargo.
         let foreign = held.prior.foreign(&key.checkout);
         let reason = match refusal {
-            Ok(gate) => return Ok(Ok((held, gate, pending))),
+            Ok(gate) => return Ok(Ok((held, gate))),
             Err(Refusal::Unvouched(reason)) => reason,
             Err(Refusal::Lock { code, message }) => {
                 eprint!("{message}");
@@ -1600,9 +1560,7 @@ fn lease_with_gate(
                 "oxide: freshness gate cannot vouch for slot {} ({reason}); evicting it and building cold",
                 held.slot_id
             );
-            let entry = held.holding_entry_name();
             store.discard(held)?;
-            pending.extend(entry);
         }
     }
     Err("the freshness gate kept refusing slots".to_owned())
@@ -1800,211 +1758,130 @@ impl StatusMode {
     }
 }
 
-/// How long a command waits for its own holding deletion before it reports the
-/// tree as left for a later command. The deletion itself is unbounded in the
-/// product (it runs beside the build and is resumed by the next command); this
-/// is only the wait at exit, so one huge tree never holds a command open.
-const HOLDING_SWEEP_WAIT: Duration = Duration::from_secs(60);
-/// How many publish-and-re-evaluate rounds one command makes after a capacity
-/// refusal. Each round deletes exactly one pending tree outside the pool lock
-/// and then lets the admission decide again: the deletion is what changes the
-/// figure, so nothing is evicted ahead of the decision that needs it.
-const HOLDING_RECLAIM_ROUNDS: usize = 4;
+/// How long a command waits at exit for the post-rename trash deletion of an
+/// idle slot it evicted. The deletion itself runs beside the writer and is
+/// resumed by a later command; this bound only keeps one exit from hanging on a
+/// huge tree.
+const TRASH_SETTLE_WAIT: Duration = Duration::from_secs(60);
 /// How often the bounded exit wait reports its progress.
-const HOLDING_SWEEP_REPORT: Duration = Duration::from_secs(2);
+const TRASH_SETTLE_REPORT: Duration = Duration::from_secs(2);
 
-/// The asynchronous deletion of one held slot tree, owned by the command that
-/// evicted it (oxide#190).
+/// Deletes the Barge trash of idle slots this command evicted, and of any an
+/// earlier command left, with the pool and admission locks released
+/// (oxide#324).
 ///
-/// The worker claims at most one recorded holding entry under a brief pool
-/// lock, then deletes that tree outside the lock while this command's own
-/// writer runs. It never waits for another deleter: the per-entry custody lock
-/// is taken without blocking, so a command that loses the race simply leaves
-/// the entry to the process that holds it.
-///
-/// The guard joins the worker before this command exits, with a bounded wait
-/// whose progress is printed. A worker that is still running at the bound is
-/// detached: the entry stays recorded and charged, and a later command's own
-/// pass resumes it from whatever is left.
-struct HoldingSweep {
-    worker: Option<std::thread::JoinHandle<Option<oxide_storage::lease::HoldingDrain>>>,
+/// The admission commits the decision (the root leaves the ledger) under its
+/// pool lock and records it durably; Barge's eviction, which rechecks the
+/// marker, the hold and the pin and renames into `.trash/`, then runs here,
+/// beside the writer. A command that exits mid-deletion leaves the durable
+/// record and the trash, and the next command resumes it.
+struct TrashSettler {
+    worker: Option<std::thread::JoinHandle<()>>,
+    kick: Option<std::sync::mpsc::Sender<()>>,
 }
 
-impl HoldingSweep {
-    /// Start the pass for this command's pool.
-    ///
-    /// `prefer` names the holding entry this command itself just created. When
-    /// it is set, the pass claims exactly that entry — not whichever row a
-    /// rotation happens to select — so a publishing command always deletes its
-    /// own eviction. A pool with nothing of its own pending costs one short
-    /// locked open that finds no entry.
-    fn start(pool: PathBuf, prefer: Option<String>) -> Self {
+impl TrashSettler {
+    /// Start the settle worker for this command's pool. It settles at once and
+    /// again after every [`Self::kick`].
+    fn start(pool: PathBuf) -> Self {
+        let (kick, waits) = std::sync::mpsc::channel();
         let worker = std::thread::Builder::new()
-            .name("oxide-holding".to_owned())
-            .spawn(move || report_holding_pass(&pool, prefer.as_deref()))
+            .name("oxide-trash".to_owned())
+            .spawn(move || {
+                report_trash_settle(&pool);
+                while waits.recv().is_ok() {
+                    report_trash_settle(&pool);
+                }
+            })
             .ok();
-        Self { worker }
+        Self {
+            worker,
+            kick: Some(kick),
+        }
     }
 
-    /// Wait for the pass with a bounded wait, printing its progress. Returns
-    /// the pass's own result when it finished inside the bound: `Some` means
-    /// this command claimed and worked on one holding entry, which is the
-    /// evidence a caller uses to retry an admission the pending charge refused.
-    fn finish(&mut self) -> Option<oxide_storage::lease::HoldingDrain> {
+    /// Ask for another pass: this command's admission has committed more
+    /// evictions since the worker's last one.
+    fn kick(&self) {
+        if let Some(kick) = self.kick.as_ref() {
+            let _ = kick.send(());
+        }
+    }
+
+    /// Wait for the worker with a bounded wait, printing its progress. A
+    /// worker still running at the bound is detached: its durable record stays,
+    /// and the next command resumes it.
+    fn finish(&mut self) {
+        // Ending the channel lets the worker leave its loop after the pass it
+        // is running.
+        self.kick.take();
+        if self.worker.is_none() {
+            return;
+        }
         let started = Instant::now();
-        let mut next_report = HOLDING_SWEEP_REPORT;
+        let mut next_report = TRASH_SETTLE_REPORT;
         loop {
             let finished = self
                 .worker
                 .as_ref()
                 .is_some_and(|worker| worker.is_finished());
             if finished {
-                return self
-                    .worker
-                    .take()
-                    .and_then(|worker| worker.join().ok().flatten());
+                if let Some(worker) = self.worker.take() {
+                    let _ = worker.join();
+                }
+                return;
             }
             let elapsed = started.elapsed();
-            if elapsed >= HOLDING_SWEEP_WAIT {
-                // Detach the worker: the process is about to exit, and the
-                // entry keeps its record and charge for the next command.
+            if elapsed >= TRASH_SETTLE_WAIT {
                 self.worker = None;
-                eprintln!("{}", holding_wait_message(elapsed.as_secs()));
-                return None;
+                eprintln!("{}", trash_wait_message(elapsed.as_secs()));
+                return;
             }
             if elapsed >= next_report {
-                eprintln!("{}", holding_progress_message(elapsed.as_secs()));
-                next_report += HOLDING_SWEEP_REPORT;
+                eprintln!("{}", trash_progress_message(elapsed.as_secs()));
+                next_report += TRASH_SETTLE_REPORT;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
     }
 }
 
-impl Drop for HoldingSweep {
+impl Drop for TrashSettler {
     /// Every return path of a command joins its own deletion, never only the
     /// happy one.
     fn drop(&mut self) {
-        if self.worker.is_none() {
-            return;
-        }
-        let _ = self.finish();
+        self.finish();
     }
 }
 
-/// The bounded publish-and-re-evaluate loop after a capacity refusal.
-///
-/// `first_removed` is the **pre-admission** pass's own outcome. That pass runs
-/// beside the refused admission, so it may positively remove a tree *after* the
-/// refusal was decided; the charge has then changed even though a later pass
-/// would find nothing. The admission is therefore re-evaluated for that removal
-/// too — the figure, not a pass, decides. Each later round publishes one more
-/// tree and re-evaluates again, so a command never retries against an unchanged
-/// figure and never gives up while a removal has already changed it.
-fn reacquire_after_capacity<T, E>(
-    first_error: E,
-    first_removed: bool,
-    rounds: usize,
-    mut publish: impl FnMut() -> bool,
-    mut attempt: impl FnMut() -> Result<T, E>,
-) -> Result<T, E> {
-    let mut changed = first_removed;
-    let mut last = Err(first_error);
-    for _ in 0..rounds {
-        if !changed {
-            // Nothing has been removed since the refusal: publish one tree.
-            changed = publish();
-            if !changed {
-                break;
+/// The bounded exit wait ran out while an evicted idle slot's trash was still
+/// being deleted.
+fn trash_wait_message(seconds: u64) -> String {
+    format!(
+        "oxide: an evicted idle slot's trash is still being deleted after {seconds}s; its durable record stays, and the next oxide command resumes it"
+    )
+}
+
+/// One progress line while the trash of an evicted idle slot is deleted.
+fn trash_progress_message(seconds: u64) -> String {
+    format!(
+        "oxide: still deleting an evicted idle slot's Barge trash outside the pool lock ({seconds}s; the build and every other command are not held)"
+    )
+}
+
+/// One settle pass: Barge evicts each root a command decided to retire and
+/// deletes its trash. A failure is reported; the record stays for a later pass.
+fn report_trash_settle(pool: &Path) {
+    match oxide_storage::lease::managed::settle_pending_evictions(pool) {
+        Ok(messages) => {
+            for message in messages {
+                eprintln!("oxide: {message}");
             }
-            eprintln!("{}", holding_published_message());
         }
-        // A removal has changed the figure, so re-evaluate before demanding
-        // another one.
-        last = attempt();
-        if last.is_ok() {
-            break;
-        }
-        changed = false;
-    }
-    last
-}
-
-// Wording for the holding pass. A holding entry is an idle slot that this
-// command evicted; a held slot is never deleted by this pass, so no message
-// may describe a held slot as deleted.
-
-/// The bounded exit wait ran out while a holding entry was still being deleted.
-fn holding_wait_message(seconds: u64) -> String {
-    format!(
-        "oxide: an evicted idle slot is still being deleted after {seconds}s; it stays recorded in the holding area, and the next oxide command resumes it"
-    )
-}
-
-/// One progress line while the pass deletes an evicted idle slot.
-fn holding_progress_message(seconds: u64) -> String {
-    format!(
-        "oxide: still deleting an evicted idle slot outside the pool lock ({seconds}s; the build and every other command are not held)"
-    )
-}
-
-/// The pass removed an evicted idle slot, which lets admission be decided again.
-fn holding_published_message() -> String {
-    "oxide: deleted an evicted idle slot from the holding area; re-evaluating the admission"
-        .to_owned()
-}
-
-/// The pass removed the named evicted idle slot. A held slot is never touched.
-fn holding_deleted_message(name: &str, entries: u64, size: &str, seconds: f64) -> String {
-    format!(
-        "oxide: deleted the evicted idle slot {name} outside the pool lock ({entries} entries, {size} in {seconds:.2}s); no held slot is deleted by this pass"
-    )
-}
-
-/// The pass kept the named evicted idle slot in the holding area.
-fn holding_kept_message(name: &str, refused: &str) -> String {
-    format!(
-        "oxide: kept the evicted idle slot {name} in the holding area ({refused}); it stays recorded and charged, and a later command reports it again"
-    )
-}
-
-/// The pass could not continue; the entry stays recorded and charged.
-fn holding_failed_message(error: &str) -> String {
-    format!("oxide: the evicted idle slot deletion could not continue: {error}")
-}
-
-/// One pass: claim a pending holding entry and delete it outside the pool
-/// lock. Progress goes to stderr, bounded to one line per pass.
-fn report_holding_pass(
-    pool: &Path,
-    prefer: Option<&str>,
-) -> Option<oxide_storage::lease::HoldingDrain> {
-    let started = Instant::now();
-    match oxide_storage::lease::managed::drain_holding(pool, prefer) {
-        Ok(pass) => {
-            let Some(name) = pass.claimed.clone() else {
-                return None;
-            };
-            if pass.gone {
-                eprintln!(
-                    "{}",
-                    holding_deleted_message(
-                        &name,
-                        pass.entries,
-                        &cargo_home::size(pass.bytes),
-                        started.elapsed().as_secs_f64()
-                    )
-                );
-            } else if !pass.refused.is_empty() {
-                eprintln!("{}", holding_kept_message(&name, &pass.refused.join(", ")));
-            }
-            Some(pass)
-        }
-        // A deletion that cannot continue is reported, never fatal: the tree
-        // stays recorded, charged and visible in `oxide status`.
+        // A deletion that cannot continue is reported, never fatal: the root's
+        // durable record stays and a later command asks Barge again.
         Err(error) => {
-            eprintln!("{}", holding_failed_message(&error.to_string()));
-            None
+            eprintln!("oxide: an evicted idle slot's trash could not be settled: {error}");
         }
     }
 }
@@ -2513,23 +2390,6 @@ fn print_pool(
             pending.join(", ")
         );
     }
-    // Held trees are deleted outside the pool lock by the command that evicted
-    // them or by a later one (oxide#190). This reports the recorded facts and
-    // one presence check each, never a walk; it starts no deletion.
-    for held in &report.holding {
-        let age = process::now_ms().saturating_sub(held.at_ms) / 1000;
-        println!(
-            "  slot {} held for deletion: {} recorded, {}s old, {}",
-            held.slot_id,
-            crate::cargo_home::size(held.recorded_bytes),
-            age,
-            match held.present {
-                Some(true) => "tree still present, deletion pending outside the pool lock",
-                Some(false) => "tree gone, record pending its next locked open",
-                None => "presence not probed",
-            }
-        );
-    }
     if let Some(error) = &report.state_error {
         println!(
             "  control state: unknown ({error}); holders, waits, cleaning and flushes are not reported"
@@ -2875,103 +2735,6 @@ mod tests {
     use std::collections::HashMap;
     use std::ffi::OsStr;
 
-    /// The pre-admission pass runs beside the refused admission, so it can
-    /// remove a tree *after* that refusal was decided. That removal changed the
-    /// charge, so the admission must be re-evaluated even if a later pass finds
-    /// nothing at all — a pass is not the trigger, a removal is.
-    #[test]
-    fn a_pre_admission_removal_re_evaluates_the_refused_admission() {
-        let mut attempts = 0;
-        let mut publishes = 0;
-        let outcome: Result<&'static str, &'static str> = super::reacquire_after_capacity(
-            "full",
-            // The pre-admission pass positively removed a tree.
-            true,
-            4,
-            || {
-                publishes += 1;
-                // Every later pass finds nothing.
-                false
-            },
-            || {
-                attempts += 1;
-                Ok("leased")
-            },
-        );
-        assert_eq!(outcome, Ok("leased"));
-        assert_eq!(attempts, 1, "the changed charge was not re-evaluated");
-        assert_eq!(
-            publishes, 0,
-            "a pass ran although nothing needed publishing"
-        );
-    }
-
-    /// A refused attempt whose pass removes nothing keeps its refusal and never
-    /// invents progress; a pass that removes a tree is re-evaluated once and then
-    /// one more tree is published before the next decision. The bound holds.
-    #[test]
-    fn the_capacity_loop_publishes_one_tree_per_round_and_is_bounded() {
-        // Nothing removed anywhere: no retry at all.
-        let mut attempts = 0;
-        let outcome: Result<(), &'static str> = super::reacquire_after_capacity(
-            "full",
-            false,
-            4,
-            || false,
-            || {
-                attempts += 1;
-                Ok(())
-            },
-        );
-        assert_eq!(outcome, Err("full"));
-        assert_eq!(attempts, 0, "an unchanged figure was retried");
-
-        // One removal, still refused, no further tree: exactly one retry.
-        let mut attempts = 0;
-        let mut publishes = 0;
-        let outcome: Result<(), &'static str> = super::reacquire_after_capacity(
-            "full",
-            false,
-            4,
-            || {
-                publishes += 1;
-                publishes == 1
-            },
-            || {
-                attempts += 1;
-                Err("full")
-            },
-        );
-        assert_eq!(outcome, Err("full"));
-        assert_eq!(attempts, 1);
-        assert_eq!(
-            publishes, 2,
-            "the second round published instead of retrying"
-        );
-
-        // Always over budget, always another tree: the bound stops it.
-        let mut attempts = 0;
-        let mut publishes = 0;
-        let outcome: Result<(), &'static str> = super::reacquire_after_capacity(
-            "full",
-            false,
-            3,
-            || {
-                publishes += 1;
-                true
-            },
-            || {
-                attempts += 1;
-                Err("full")
-            },
-        );
-        assert_eq!(outcome, Err("full"));
-        assert!(
-            attempts <= 3 && publishes <= 3,
-            "the loop exceeded its bound"
-        );
-    }
-
     #[test]
     fn cold_seed_gate_is_off_before_qualification_and_default_on_after() {
         // Before the one-line qualification flip: never active, and an
@@ -3046,7 +2809,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let Ok((cold, _, binding, _pending)) = result else {
+        let Ok((cold, _, binding)) = result else {
             panic!("cold admission stopped")
         };
         assert!(matches!(cold.prior, freshness::Prior::Fresh));
@@ -3531,32 +3294,5 @@ mod tests {
             );
         }
         budget::clear();
-    }
-
-    #[test]
-    fn holding_pass_wording_names_an_evicted_idle_slot_and_never_a_held_one() {
-        assert_eq!(
-            holding_deleted_message("slot-3", 2, "1.0 MiB", 0.5),
-            "oxide: deleted the evicted idle slot slot-3 outside the pool lock (2 entries, 1.0 MiB in 0.50s); no held slot is deleted by this pass"
-        );
-        let messages = [
-            holding_wait_message(60),
-            holding_progress_message(2),
-            holding_published_message(),
-            holding_deleted_message("slot-3", 2, "1.0 MiB", 0.5),
-            holding_kept_message("slot-3", "busy"),
-            holding_failed_message("io"),
-        ];
-        for message in &messages {
-            assert!(message.starts_with("oxide: "), "{message}");
-            assert!(!message.contains("held slot tree"), "{message}");
-            assert!(!message.contains("deleted a held"), "{message}");
-            assert!(!message.contains("deleted the held"), "{message}");
-        }
-        assert!(messages[0].contains("an evicted idle slot is still being deleted"));
-        assert!(messages[1].contains("still deleting an evicted idle slot"));
-        assert!(messages[2].contains("deleted an evicted idle slot"));
-        assert!(messages[4].contains("kept the evicted idle slot slot-3"));
-        assert!(messages[5].contains("the evicted idle slot deletion could not continue"));
     }
 }
