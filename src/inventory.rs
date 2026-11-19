@@ -424,8 +424,6 @@ pub fn inventory_directory(
     root: &Path,
     limits: InventoryLimits,
 ) -> Result<InventoryReport, InventoryError> {
-    #[cfg(debug_assertions)]
-    walk_observer::record(root);
     inventory_with(root, limits, &[], &[])
 }
 
@@ -441,16 +439,13 @@ pub fn inventory_directory(
 /// stray region still counts and a stop that is a symlink or a file is counted
 /// as the ordinary walk counts it (symlinks never contribute bytes).
 ///
-/// This is a *different* entry point from `inventory_directory` on purpose: it
-/// records on the separate [`walk_observer::SCOPE_LOG_ENV`] log, so "no payload
-/// walk happened" stays a checkable claim while the scope pass is observable.
+/// This is a *different* entry point from `inventory_directory` on purpose, so
+/// a caller can tell a shallow scope pass from a payload walk.
 pub fn scope_directory(
     root: &Path,
     stops: &[PathBuf],
     limits: InventoryLimits,
 ) -> Result<InventoryReport, InventoryError> {
-    #[cfg(debug_assertions)]
-    walk_observer::record_scope(root);
     inventory_with(root, limits, stops, &[])
 }
 
@@ -727,7 +722,7 @@ struct Walker<'a> {
     logical_by_name: [u64; 5],
     inodes: HashMap<(u64, u64), InodeRecord>,
     vanished: u64,
-    #[cfg(debug_assertions)]
+    #[cfg(test)]
     test_hook: Option<walk_observer::WalkHook>,
 }
 
@@ -779,8 +774,8 @@ impl<'a> Walker<'a> {
             logical_by_name: [0; 5],
             inodes: HashMap::new(),
             vanished: 0,
-            #[cfg(debug_assertions)]
-            test_hook: walk_observer::WalkHook::from_environment(),
+            #[cfg(test)]
+            test_hook: walk_observer::WalkHook::from_scope(),
         }
     }
 
@@ -863,7 +858,7 @@ impl<'a> Walker<'a> {
                     continue;
                 }
             };
-            #[cfg(debug_assertions)]
+            #[cfg(test)]
             if is_root {
                 self.test_hook_remove_after_open(&directory);
             }
@@ -1137,17 +1132,17 @@ impl<'a> Walker<'a> {
         Ok(())
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(test)]
     fn test_hook_error(&mut self, path: &Path, point: WalkPoint) -> Option<std::io::Error> {
         self.test_hook.as_mut()?.before(path, point)
     }
 
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(test))]
     fn test_hook_error(&mut self, _path: &Path, _point: WalkPoint) -> Option<std::io::Error> {
         None
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(test)]
     fn test_hook_remove_after_open(&mut self, path: &Path) {
         if let Some(hook) = self.test_hook.as_mut() {
             hook.after_root_open(path);
@@ -1602,35 +1597,18 @@ fn bound_utf8(text: String, limit: usize) -> Rendered {
     }
 }
 
-/// Debug builds only, absent from release: walk observation and deterministic
-/// mutation fixtures. Production accounting is unchanged unless a debug
-/// fixture explicitly opts in through its bounded scratch environment.
-#[cfg(debug_assertions)]
-pub mod walk_observer {
+/// Test-only walk mutation fixtures, installed by one test scope. The
+/// environment is never read, so no release or debug process can be steered
+/// by a variable.
+#[cfg(test)]
+mod walk_observer {
     use super::WalkPoint;
     use serde::Deserialize;
     use std::cell::RefCell;
-    use std::fs::OpenOptions;
-    use std::io::Write as _;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
 
-    /// An absolute file path: each walk appends its root as one line.
-    pub const LOG_ENV: &str = "OXIDE_TEST_WALK_LOG";
-    /// An absolute file path: each `scope_directory` call appends its root as
-    /// one line. Separate from [`LOG_ENV`] so a caller can prove that no
-    /// `inventory_directory` walk ran while its shallow scope pass still did.
-    pub const SCOPE_LOG_ENV: &str = "OXIDE_TEST_SCOPE_LOG";
-    #[cfg(not(test))]
-    const MUTATIONS_ENV: &str = "OXIDE_TEST_WALK_MUTATIONS";
-
     thread_local! {
-        static RECORDED: RefCell<Option<Vec<PathBuf>>> = const { RefCell::new(None) };
-        static RECORDED_SCOPE: RefCell<Option<Vec<PathBuf>>> = const { RefCell::new(None) };
-        #[cfg(test)]
         static TEST_MUTATIONS: RefCell<Option<String>> = const { RefCell::new(None) };
-        #[cfg(test)]
         static TEST_SCRATCH_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     }
 
@@ -1670,21 +1648,10 @@ pub mod walk_observer {
     }
 
     impl WalkHook {
-        pub(crate) fn from_environment() -> Option<Self> {
-            #[cfg(test)]
-            let test_value = TEST_MUTATIONS.with(|cell| cell.borrow().clone());
-            #[cfg(not(test))]
-            let test_value: Option<String> = None;
-            #[cfg(test)]
-            let value = test_value.clone()?;
-            #[cfg(not(test))]
-            let value = {
-                std::env::var("OXIDE_PROOF_DEADLINE_NS")
-                    .ok()?
-                    .parse::<u64>()
-                    .ok()?;
-                std::env::var(MUTATIONS_ENV).ok()?
-            };
+        /// The hook the current test scope installed, if its specification is
+        /// valid and every path lies strictly inside the scope's scratch root.
+        pub(crate) fn from_scope() -> Option<Self> {
+            let value = TEST_MUTATIONS.with(|cell| cell.borrow().clone())?;
             if value.len() > 8192 {
                 return None;
             }
@@ -1692,33 +1659,7 @@ pub mod walk_observer {
             if specs.is_empty() || specs.len() > 4 {
                 return None;
             }
-            #[cfg(test)]
-            let scratch = if test_value.is_some() {
-                TEST_SCRATCH_ROOT.with(|cell| cell.borrow().clone())?
-            } else {
-                std::env::var_os("OXIDE_TASK_SCRATCH_ROOT").map(PathBuf::from)?
-            };
-            #[cfg(not(test))]
-            let scratch = {
-                let scratch = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT").map(PathBuf::from)?;
-                let evidence = std::env::var_os("OXIDE_PROOF_EVIDENCE").map(PathBuf::from)?;
-                let scratch = std::fs::canonicalize(scratch).ok()?;
-                let evidence = std::fs::canonicalize(evidence).ok()?;
-                // Adopted runs keep evidence inside caller scratch. The
-                // supervisor-owned layout keeps `scratch/` and `evidence/`
-                // as siblings under its monitored root.
-                let evidence_is_nested = evidence.starts_with(&scratch);
-                let evidence_is_supervisor_sibling = scratch.file_name()
-                    == Some(std::ffi::OsStr::new("scratch"))
-                    && evidence.file_name() == Some(std::ffi::OsStr::new("evidence"))
-                    && scratch.parent() == evidence.parent();
-                if !scratch.starts_with("/private/tmp")
-                    || !(evidence_is_nested || evidence_is_supervisor_sibling)
-                {
-                    return None;
-                }
-                scratch
-            };
+            let scratch = TEST_SCRATCH_ROOT.with(|cell| cell.borrow().clone())?;
             let scratch = std::fs::canonicalize(scratch).ok()?;
             let mut mutations = Vec::with_capacity(specs.len());
             let mut aggregate = 0_u64;
@@ -1740,11 +1681,7 @@ pub mod walk_observer {
                     (_, Some(_)) => return None,
                     (_, None) => {}
                 }
-                let candidate = if test_value.is_some() {
-                    std::fs::canonicalize(&spec.path).ok()?
-                } else {
-                    spec.path
-                };
+                let candidate = std::fs::canonicalize(&spec.path).ok()?;
                 if !candidate.is_absolute() || candidate == scratch {
                     return None;
                 }
@@ -1836,7 +1773,6 @@ pub mod walk_observer {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn with_mutations<T>(
         scratch_root: &Path,
         value: String,
@@ -1863,71 +1799,9 @@ pub mod walk_observer {
         body()
     }
 
-    /// Run `body` and return the roots this thread walked during it.
-    pub fn observe<T>(body: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
-        let outer = RECORDED.with(|cell| cell.replace(Some(Vec::new())));
-        let result = body();
-        let walked = RECORDED
-            .with(|cell| cell.replace(outer))
-            .unwrap_or_default();
-        (result, walked)
-    }
-
-    /// Run `body` and return the roots this thread scope-walked during it.
-    pub fn observe_scopes<T>(body: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
-        let outer = RECORDED_SCOPE.with(|cell| cell.replace(Some(Vec::new())));
-        let result = body();
-        let walked = RECORDED_SCOPE
-            .with(|cell| cell.replace(outer))
-            .unwrap_or_default();
-        (result, walked)
-    }
-
-    /// Test-only: whether the current thread's injection is accepted.
-    #[cfg(test)]
+    /// Whether the current test scope's injection is accepted.
     pub(crate) fn injection_accepted() -> bool {
-        WalkHook::from_environment().is_some()
-    }
-
-    pub(super) fn record(root: &Path) {
-        RECORDED.with(|cell| {
-            if let Some(walked) = cell.borrow_mut().as_mut() {
-                walked.push(root.to_path_buf());
-            }
-        });
-        append_log(LOG_ENV, root);
-    }
-
-    /// Record one shallow scope pass. It is deliberately not pushed onto the
-    /// walk recorder: the walk log answers "did any inventory walk run".
-    pub(super) fn record_scope(root: &Path) {
-        RECORDED_SCOPE.with(|cell| {
-            if let Some(walked) = cell.borrow_mut().as_mut() {
-                walked.push(root.to_path_buf());
-            }
-        });
-        append_log(SCOPE_LOG_ENV, root);
-    }
-
-    /// Append one root to an absolute log file, if one is named.
-    fn append_log(variable: &str, root: &Path) {
-        let Some(log) = std::env::var_os(variable) else {
-            return;
-        };
-        let log = Path::new(&log);
-        let mut line = root.as_os_str().as_bytes().to_vec();
-        line.push(b'\n');
-        let written = log.is_absolute()
-            && OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(log)
-                .and_then(|mut file| file.write_all(&line))
-                .is_ok();
-        if !written {
-            eprintln!("oxide: walk log {} not written", log.display());
-        }
+        WalkHook::from_scope().is_some()
     }
 }
 
@@ -2217,7 +2091,7 @@ mod tests {
             ]),
         ] {
             let accepted =
-                with_walk_mutations(&root, value.clone(), || walk_observer::injection_accepted());
+                with_walk_mutations(&root, value.clone(), walk_observer::injection_accepted);
             assert!(!accepted, "injection was accepted: {value}");
         }
         let accepted = with_walk_mutations(&root, spec(&delayed, 60), || {
@@ -2227,7 +2101,7 @@ mod tests {
 
         // One-shot: the first matching call waits, a second does not.
         let mut hook = with_walk_mutations(&root, spec(&delayed, 60), || {
-            walk_observer::WalkHook::from_environment()
+            walk_observer::WalkHook::from_scope()
         })
         .expect("an accepted hook");
         let first = std::time::Instant::now();

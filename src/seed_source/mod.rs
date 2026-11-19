@@ -13,8 +13,6 @@
 //!   entry by entry;
 //! - [`TreeDigest`] is the canonical digest of that content;
 //! - [`SourceCache`] is the bounded `sources.json` identity cache;
-//! - [`GitVerifier`] proves a locked git dependency with the same sanitized
-//!   bounded process protocol the freshness gate uses.
 //!
 //! Nothing here invokes Cargo, takes a pool or lease lock, reads control state
 //! or writes product state. Every refusal is fail-closed: the caller marks the
@@ -23,7 +21,6 @@
 mod archive;
 mod cache;
 mod digest;
-mod git;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
@@ -31,10 +28,6 @@ mod tree;
 
 pub use cache::{CacheRecord, SourceCache, CACHE_SCHEMA, MAX_CACHE_BYTES, MAX_CACHE_RECORDS};
 pub use digest::{ContentHash, DigestScheme, EntryKind, SourceTree, TreeDigest, MAX_PATH_BYTES};
-pub use git::{
-    GitRefusal, GitSource, GitVerifier, GIT_CALL_TIME, GIT_SETTLE_TIME, GIT_TOTAL_TIME,
-    MAX_GIT_CALLS, MAX_GIT_STDOUT_BYTES,
-};
 
 use std::fmt;
 use std::fs;

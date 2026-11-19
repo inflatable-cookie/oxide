@@ -21,9 +21,6 @@ minimum_effigy_version = "0.14.0"
 # Synthetic fixtures for the installer's link, clobber and identity refusals and
 # the staged canary. Never builds or installs.
 "dogfood:scripts:test" = "python3 -B scripts/test_dogfood_scripts.py"
-# Offline seeder synthetic cases. Writes only fresh fixtures; no network, no
-# Cargo home, no pool.
-"offline-seed:test" = "python3 -B scripts/offline_seed.py --self-test"
 "changelog:check" = "python3 scripts/changelog.py check"
 "changelog:fold" = "python3 scripts/changelog.py fold {args}"
 "changelog:test" = "bash scripts/changelog.test.sh"

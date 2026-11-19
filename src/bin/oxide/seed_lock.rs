@@ -98,22 +98,9 @@ pub(crate) fn skip_reason(reason: &str, analysis: &Analysis) -> String {
     format!("{reason}; {name}: {detail}")
 }
 
-/// A Git package for the dormant v1 Git-hint verifier's own unit tests.
-/// Product eligibility rejects Git before this point; the constructor keeps
-/// that dormant machinery testable without widening v1.
-#[cfg(test)]
-pub(crate) fn test_git_package(name: &str, version: &str, url: &str, rev: &str) -> Package {
-    Package {
-        name: name.to_owned(),
-        version: version.to_owned(),
-        source: Some(format!("git+{url}#{rev}")),
-        checksum: None,
-        dependencies: Vec::new(),
-    }
-}
-
 /// Filter by normalized-name uniqueness across *all* lock entries, leafness,
 /// and supported immutable source identity. The order remains lock order.
+#[cfg(test)]
 pub(crate) fn eligible(bytes: &[u8]) -> Result<Vec<Package>, &'static str> {
     Ok(analyze(bytes)?.eligible)
 }

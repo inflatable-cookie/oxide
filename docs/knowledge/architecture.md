@@ -71,9 +71,6 @@ ownership or eviction authority and never recommends deletion.
   UID trust permits a cooperative caller's explicit writer-closed release;
   TTL or holder loss alone does not establish closure.
 - The inventory CLI reads one explicitly selected target directory.
-- A bounded decoder for Cargo's encoded dep-info (`oxide_storage::dep_info`)
-  is kept. The cross-checkout freshness gate works from Git content and does
-  not call it; decoding alone establishes no freshness.
 - The stable Cargo profile proofs remain opt-in and do not change default
   development or consumer profiles.
 

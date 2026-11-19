@@ -6,7 +6,6 @@
 //! directory. A checkout may take another checkout's idle compatible slot
 //! only through the freshness gate. Plain `cargo` behavior is untouched.
 
-mod admission;
 mod adopt;
 mod budget;
 mod capacity;
@@ -20,7 +19,6 @@ mod describe;
 mod freshness;
 mod guidance;
 mod handoff;
-mod handoff_trace;
 mod identity;
 mod incremental;
 mod launch;
@@ -32,17 +30,11 @@ mod prune;
 mod removable;
 mod scratch_admission;
 mod scratch_io;
-#[allow(dead_code)] // Integrated by the cold-seeding front door.
 mod seed_catalog;
-#[allow(dead_code)] // Integrated by the cold-seeding front door.
 mod seed_context;
-#[allow(dead_code)] // Integrated by the cold-seeding front door.
 mod seed_lock;
-#[allow(dead_code)] // Integrated by the cold-seeding front door.
 mod seed_plan;
-#[allow(dead_code)] // Integrated by the cold-seeding front door.
 mod seed_sources;
-#[allow(dead_code)] // Enabled after the cold-seeding qualification.
 mod seed_summary;
 mod store;
 mod version;
@@ -246,7 +238,6 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
         let (options, _rest) = budget::scan(rest)?;
         budget::install(options)?;
     }
-    budget::refuse_absent_test_hook()?;
     // One pre-effect hand-off check (oxide#122), after help, version, list and
     // toolchain handling and before any arm opens a store. Plain passthrough,
     // usage-only `exec` and `status --launch-check` do no work of their own.
@@ -375,36 +366,6 @@ fn exec_stdin() -> Stdio {
     }
 }
 
-/// Debug-only proof pause (oxide#129): with `OXIDE_TEST_PAUSE=<point>:<gate>`
-/// the command writes `<gate>.<point>-<pid>` at `point` and waits (at most
-/// 120 s) until `<gate>` exists. Absent from release builds.
-fn test_pause(point: &str) {
-    test_pause_with(point, "");
-}
-
-/// [`test_pause`] whose marker file holds `detail` (for `keyed`, the
-/// destination facts the slot key captured, including the root nonce).
-fn test_pause_with(point: &str, detail: &str) {
-    #[cfg(debug_assertions)]
-    if let Some(gate) = std::env::var("OXIDE_TEST_PAUSE")
-        .ok()
-        .and_then(|value| value.strip_prefix(&format!("{point}:")).map(str::to_owned))
-    {
-        // Published atomically: the content is complete before the marker
-        // name (which the proof globs for) exists.
-        let marker = format!("{gate}.{point}-{}", std::process::id());
-        let staged = format!("{gate}.staging-{point}-{}", std::process::id());
-        if std::fs::write(&staged, detail.as_bytes()).is_ok() {
-            let _ = std::fs::rename(&staged, &marker);
-        }
-        let deadline = Instant::now() + std::time::Duration::from_secs(120);
-        while !std::path::Path::new(&gate).exists() && Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
-    let _ = (point, detail);
-}
-
 /// The pinned Cargo layout is qualified (oxide#169). The one-line flip of this
 /// constant is the enablement: seeding is on by default once it is true, and
 /// `OXIDE_COLD_SEED=0` is the opt-out.
@@ -433,7 +394,7 @@ fn cold_seed_notice_when(qualified: bool, value: Option<&std::ffi::OsStr>) -> Op
 
 fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     oxide_storage::lease::admission_cost::start_summary();
-    let outcome = handoff_trace::phase("invocation", || run_invocation_inner(invocation));
+    let outcome = run_invocation_inner(invocation);
     if let Some(summary) = oxide_storage::lease::admission_cost::take_summary() {
         eprintln!("oxide: {summary}");
     }
@@ -471,14 +432,13 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
-    let internal = prep!(handoff_trace::phase("store", Store::open_or_create));
+    let internal = prep!(Store::open_or_create());
     let output_control = internal.control().to_path_buf();
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
-    let checkout = prep!(handoff_trace::phase("workspace", || {
-        identity::locate_workspace(CARGO, invocation.manifest_path.as_deref())
-    }));
+    let checkout =
+        prep!({ identity::locate_workspace(CARGO, invocation.manifest_path.as_deref()) });
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
@@ -490,9 +450,7 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
     // The intermediate pool is selected first: outputs select the external
     // root only when this command's slot comes from the removable pool, whose
     // watchdog supervises the drive's removal.
-    let selected = prep!(handoff_trace::phase("removable", || removable::select(
-        internal
-    )));
+    let selected = prep!(removable::select(internal));
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
@@ -615,7 +573,6 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
             pool_fallback.as_deref(),
         ));
     }
-    test_pause("reserved");
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
@@ -629,17 +586,14 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         guarded,
     ));
     let destination = outputs::destination_facts(planned.as_ref());
-    let incremental_key = prep!(handoff_trace::phase("incremental-key", || {
-        incremental::key_component(&checkout, &invocation)
-    }));
-    let key = prep!(handoff_trace::phase("key", || SlotKey::resolve_in(
+    let incremental_key = prep!({ incremental::key_component(&checkout, &invocation) });
+    let key = prep!(SlotKey::resolve_in(
         &checkout,
         invocation.profile.recipe_key(),
         invocation.target.as_deref(),
         &destination,
         &incremental_key,
-    )));
-    test_pause_with("keyed", &destination);
+    ));
     if budget::admission_expired() {
         return Ok(stop_for_admission());
     }
@@ -654,7 +608,7 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
             eprintln!("oxide: {note}");
         }
     }
-    let started = handoff_trace::phase("summary-clock", Instant::now);
+    let started = Instant::now();
     let mut waits = store::WaitAccounting::default();
     let mut grants = LeaseGrants::new();
     let resolution = cli::resolution(&invocation.cargo_args);
@@ -722,7 +676,6 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
             return Err(reason);
         }
     };
-    test_pause("bound");
     if budget::admission_expired() {
         let origin = held.prior.unchanged();
         store.release(held, origin)?;
@@ -777,12 +730,6 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
             }
             Err(seed_sources::PreparationError::SkipNamed(reason)) => {
                 eprintln!("oxide: seeding skipped: {reason}");
-            }
-            Err(seed_sources::PreparationError::Refuse(reason)) => {
-                drop(binding);
-                let origin = held.prior.unchanged();
-                store.release(held, origin)?;
-                return Err(reason);
             }
         }
     }
@@ -874,11 +821,6 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         store.release(held, origin)?;
         return Ok(stop_for_admission());
     }
-    if let Some(delay) = budget::spawn_delay() {
-        // Debug proof control: hold the last admission check open so the
-        // deadline can pass before the launch attempt (the in-flight case).
-        std::thread::sleep(delay);
-    }
     // oxide#164: a tool's own directory that is not a profile member (the
     // nextest `target/nextest` or llvm-cov analogue) stays a real local
     // directory, and is reported once. This is a bounded observation of ONE
@@ -967,7 +909,7 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
     // Release only after positive closure. A watchdog that cannot confirm
     // the stopped group closed leaves the lease held and the record naming
     // the group, so a later command recovers it once the group is empty.
-    let mut closed = match unrecorded_closed {
+    let closed = match unrecorded_closed {
         Some(true) => Some(Instant::now()),
         Some(false) => None,
         None => oxide_storage::release_trace::phase("cargo group closure", || {
@@ -980,12 +922,6 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
             }
         }),
     };
-    if budget::closure_stuck() {
-        // Debug proof control: report the group and drain as unconfirmed even
-        // though the kernel says otherwise, so the held-custody path is
-        // exercisable without a false custody claim.
-        closed = None;
-    }
     let stopped = watchdog.as_ref().filter(|watchdog| watchdog.stopped());
     if let Some(watchdog) = stopped {
         report_stop(watchdog, group.id, closed, &store.payload);
@@ -1386,7 +1322,7 @@ fn run_owned_program(
         Some(watchdog) => process::wait_leader_watched(&mut group, watchdog, budget_stop)?,
         None => process::wait_leader_budgeted(&mut group, budget_stop)?,
     };
-    let mut closed = oxide_storage::release_trace::phase("run group closure", || {
+    let closed = oxide_storage::release_trace::phase("run group closure", || {
         match (watchdog.as_mut(), status) {
             (Some(_), None) => None,
             (Some(watchdog), Some(_)) => {
@@ -1395,9 +1331,6 @@ fn run_owned_program(
             (None, _) => process::wait_group_empty_budgeted(group.id, budget_stop),
         }
     });
-    if budget::closure_stuck() {
-        closed = None;
-    }
     drop(foreground);
     let stopped = watchdog.as_ref().filter(|watchdog| watchdog.stopped());
     if let Some(watchdog) = stopped {
@@ -1791,7 +1724,7 @@ fn print_summary(
     note: Option<&str>,
     waits: &store::WaitAccounting,
 ) {
-    handoff_trace::phase("summary", || {
+    {
         let strategy = match invocation.command.as_str() {
             "run" | "test" | "exec" => "build+execute",
             _ => "build",
@@ -1819,7 +1752,7 @@ fn print_summary(
         if warm { "warm" } else { "cold" },
         started.elapsed().as_secs_f64()
     );
-    });
+    };
 }
 
 /// An acquisition without a walk has no fresh size, even on warm reuse.
