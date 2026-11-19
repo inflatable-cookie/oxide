@@ -54,7 +54,7 @@ pub(super) struct OpenedFile {
 pub(super) fn open_regular(path: &Path) -> Result<OpenedFile, Refusal> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|_| Refusal::ArchiveUnreadable)?;
     let metadata = file.metadata().map_err(|_| Refusal::ArchiveUnreadable)?;
@@ -276,5 +276,31 @@ pub(super) fn compare(derived: &SourceTree, walked: &SourceTree) -> Result<(), R
         }
         derived_entries.next();
         walked_entries.next();
+    }
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn fifo_is_refused_without_waiting_for_a_writer() {
+        let template = std::env::temp_dir().join("oxide-source-fifo.XXXXXX");
+        let mut name = CString::new(template.as_os_str().as_bytes())
+            .unwrap()
+            .into_bytes_with_nul();
+        // SAFETY: mkdtemp receives a writable, terminated template.
+        assert!(!unsafe { libc::mkdtemp(name.as_mut_ptr().cast()) }.is_null());
+        let directory = PathBuf::from(OsStr::from_bytes(
+            CStr::from_bytes_until_nul(&name).unwrap().to_bytes(),
+        ));
+        let path = directory.join("fifo");
+        let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: cpath is NUL terminated and names a fresh fixture entry.
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        assert!(open_regular(&path).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

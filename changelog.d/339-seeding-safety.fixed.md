@@ -1,1 +1,1 @@
-Refuse Git alternates when preparing offline seed fixtures.
+Harden offline seeding and source verification against unsafe inputs.
