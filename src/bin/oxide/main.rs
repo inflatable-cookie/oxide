@@ -890,6 +890,9 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         cargo.stdout(Stdio::piped());
     }
     waits.print_completion("slot ready");
+    if let (true, Some(queued)) = (budget::has_events(), waits.admission_queue_wait()) {
+        eprintln!("oxide: admission queue wait {} ns", queued.as_nanos());
+    }
     // The last check before the launch attempt: an already-observed expiry
     // forbids starting a primary child.
     if budget::admission_expired() {

@@ -6,6 +6,14 @@ Before a first publication, Tom must approve executable/crate/distribution namin
 
 Release preparation/execution, tags and workflow changes require explicit scoped authority. An approved implementation brief does not grant release authority. Establish the procedure and required validation evidence before any release action.
 
+## Local installation
+
+The planner canaries a staged, pushed-main pin on the live pool before installing
+a storage-affecting build. Install and reinstall accept `--require-canary`
+to enforce a same-pin PASS less than an hour old. See
+[dogfooding in Oxide's repository](workflow.md#dogfooding-in-oxides-repository)
+for the timing limits, receipt rules and compatibility check.
+
 ## Unreleased changes
 
 Each pull request adds one short entry at `changelog.d/<task-or-PR>-<slug>.<type>.md`. The type is `added`, `changed`, `fixed`, `removed` or `security`; keep the body to one entry of a line or two. Keep the `[Unreleased]` section in `CHANGELOG.md` empty. Run `effigy changelog:check` as part of `effigy docs:check`.

@@ -352,6 +352,10 @@ pub fn has_execution() -> bool {
     with(|state| state.is_some_and(|state| state.options.execution.is_some()))
 }
 
+pub(crate) fn has_events() -> bool {
+    with(|state| state.is_some_and(|state| state.events.is_some()))
+}
+
 /// Milliseconds a caller asked for, for the event records (`null` = unbounded).
 fn limits() -> (Option<u64>, Option<u64>) {
     with(|state| {

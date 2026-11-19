@@ -1612,9 +1612,34 @@ or global Cargo configuration is involved.
   the atomic rename, and keeps the old inode until the new receipt is
   published. A receipt write failure restores the original destination
   when the installer still owns the staged inode. Initial installation has
-  no previous binary. `OXIDE_INSTALL_PIN=<commit>` selects a commit on pushed
-  main. Effigy does not forward selector arguments, so the pin travels in the
-  environment.
+  no previous binary. Pass `-- --pin <commit>` or set `OXIDE_INSTALL_PIN`
+  to select a commit on pushed main.
+- **Live canary.** After reviewed merge, the planner runs
+  `effigy oxide:canary -- --pin <commit>` before installing that pin
+  (oxide#318, decision `d9f8839e`). It uses the installer's pin
+  authentication, private build and release artifact probes. The staged
+  binary runs status and pool discovery, then runs two offline Cargo checks
+  in one fresh dependency-free crate. The first must take a new slot and the
+  second must reuse that slot on the selected pool. The crate uses the
+  registered removable volume's existing `scratch` directory, or an
+  existing `scratch` sibling of the internal pool on the same volume
+  (`--scratch-root` can name another eligible internal scratch directory).
+  The crate and its local outputs are cleaned up after writer closure. Its
+  slot remains in the ordinary pool.
+- **Canary timing and receipt.** The canary reports wall time, time to Cargo
+  start excluding measured queue and host-permit polling, and any pool-lock
+  or accounting telemetry emitted by the candidate. Admission lock and
+  retry work count toward the limit. Older pins without exact queue timing
+  get no wait credit. Each check has a 300 s admission budget and a 60 s
+  execution budget. The canary prints FAIL when the new-slot or warm-reuse
+  admission exceeds 10 s or 5 s respectively (override with
+  `--new-seconds` or `--warm-seconds`). Install and reinstall remind the
+  planner to run the canary. With `--require-canary`, both require the
+  owner-only PASS receipt for the same pin, strictly less than one hour old,
+  before the build and again under the install lock before the swap.
+  A new live attempt marks that pin FAIL until both checks and cleanup pass.
+  Candidates with different persisted-state capabilities from the installed
+  receipt need a separate compatibility procedure before live admission.
 - **Rollback.** The planner runs `effigy oxide:rollback` to restore the one
   binary named by the newest receipt's prior record. The current binary, the
   referenced receipt bytes, and the saved binary must all match their
@@ -1686,8 +1711,9 @@ or global Cargo configuration is involved.
 - **Test supervisor.** `test rust`, `rust:test-600` and `rust:pool-scale`
   run under the [shared proof supervisor](#shared-proof-supervisor).
 - **Fixtures.** `effigy dogfood:scripts:test` covers install and rollback
-  refusals, receipt publication failure, the process report and persisted
-  layouts on synthetic fixtures.
+  refusals, receipt publication failure, the process report, persisted layouts
+  and canary timing, receipt gating and cleanup on synthetic fixtures. The
+  planner runs the first live canary after reviewed merge.
 
 ### Writer generation and format versions
 
