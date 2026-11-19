@@ -60,6 +60,11 @@ pub(crate) fn producer(
     use oxide_storage::lease::managed::SeedProducer;
     const PREFIX: &str = "cargo 1.97.1 (c980f4866 ";
     const ADAPTER: &str = "cargo-1.97.1/c980f4866/build-dir-v1";
+    // Layout v2 (Cargo 1.100.0) has no adapter: its per-unit directories are
+    // not the layout section 3 describes, so seeding is skipped, not guessed.
+    if crate::cargo_layout::default_for(facts.cargo_version) == crate::cargo_layout::Layout::V2 {
+        return Err("Cargo build-dir layout v2 has no seeding adapter");
+    }
     if !facts.cargo_version.starts_with(PREFIX) || facts.rustc_version.trim().is_empty() {
         return Err("unsupported Cargo or compiler");
     }
@@ -336,6 +341,21 @@ mod tests {
             cargo_home: Path::new("/fixture/cargo"),
             command: "check",
         }
+    }
+
+    #[test]
+    fn layout_v2_cargo_is_skipped_with_its_own_reason() {
+        // Verified Cargo 1.100.0 has an adapter-less layout: skipped by name, never seeded.
+        let input = ProducerFacts {
+            cargo_version: "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+            ..facts()
+        };
+        assert_eq!(
+            producer(input, test_context()).err(),
+            Some("Cargo build-dir layout v2 has no seeding adapter")
+        );
+        // The adapter for 1.97.1 is unchanged.
+        assert!(producer(facts(), test_context()).is_ok());
     }
 
     #[test]

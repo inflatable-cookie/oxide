@@ -308,8 +308,26 @@ reuse.
 
 The gate, stray detection and dep-info decoder depend on Cargo internals. They run
 only on Cargo releases listed in `VERIFIED_CARGO` (`src/bin/oxide/freshness.rs`):
-1.95.0, 1.96.1, 1.97.1, 1.98.1 and 1.99.1, matched by their `cargo -V` prefix.
-Oxide itself is pinned to 1.97.1 in `rust-toolchain.toml`.
+1.95.0, 1.96.1, 1.97.1, 1.98.1, 1.99.1 and 1.100.0, matched by their `cargo -V`
+prefix. Oxide itself is pinned to 1.97.1 in `rust-toolchain.toml`.
+
+| Cargo | Default build-dir layout | Stray detection reads | Cold-slot seeding |
+| --- | --- | --- | --- |
+| 1.95.0, 1.96.1, 1.97.1, 1.98.1, 1.99.1 | v1: `<profile>/deps`, `.fingerprint`, `incremental` | `deps/`, `incremental/` | adapter `cargo-1.97.1/c980f4866/build-dir-v1` (1.97.1 only) |
+| 1.100.0 (`3acc79c0c`) | v2: `<profile>/build/<pkg>/<meta>/{out,fingerprint,run}`, `incremental/`, `build/` | `deps/`, `incremental/` and, under a profile that holds v2 units, `build/` | skipped with "Cargo build-dir layout v2 has no seeding adapter" |
+
+- Layout is read from the directories Cargo wrote, not from the version alone.
+  Cargo 1.100.0's private opt-out (`__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT`)
+  writes v1 there, and a v1 profile's `build/` keeps its old meaning: build-script
+  output, not counted.
+- The gate reads no slot dep-info or fingerprint. It relies on Cargo's
+  `path_mtime <= reference_mtime` rule, and on 1.100.0 the reference is the v2
+  `build/<pkg>/<meta>/fingerprint/dep-*` file. Fixture runs showed a copied file
+  with an old mtime stays fresh and a refreshed one rebuilds.
+- Cargo 1.100.0 facts rechecked against `3acc79c0c` source and real output: the stale-file
+  rule, the encoded dep-info marker `01 00 00 00 ff` with version 1, workspace-relative
+  local paths, `cargo metadata --format-version 1`, and the `--locked` refusal wording.
+  Its `build.build-dir` setting is stable.
 
 - On any other Cargo, shared reuse is off. A new slot is an affine build reused
   only by its own checkout, and a content slot needing refresh builds cold.

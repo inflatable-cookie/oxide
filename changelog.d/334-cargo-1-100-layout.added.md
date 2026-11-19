@@ -1,0 +1,1 @@
+Cargo 1.100.0 (`3acc79c0c`) is a verified release. Its build-dir layout v2 is read from the directories Cargo wrote, so stray detection reports `build/` intermediates instead of `none`, and cross-checkout slots share through the freshness gate. Cold-slot seeding skips layout v2 with a named reason. Cargo 1.97.1 behaviour is unchanged.

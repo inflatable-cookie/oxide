@@ -11,6 +11,7 @@ mod adopt;
 mod budget;
 mod capacity;
 mod cargo_home;
+mod cargo_layout;
 mod child_temp;
 mod clean;
 mod cli;
@@ -51,7 +52,6 @@ mod wrapper;
 use cli::{Class, Invocation, Profile, LEGACY_PROFILE_ENVIRONMENT};
 use freshness::{Gate, Refusal};
 use identity::{RunPick, SlotKey};
-use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
 use oxide_storage::lease::{AccountingCoverage, PoolStatus, ReuseMeasurement, SlotOccupancy};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
@@ -2662,44 +2662,36 @@ fn slot_use(pool: &PoolStatus) -> String {
     }
 }
 
-/// Plain Cargo leaves `deps/` or `incremental/` in the checkout's `target/`;
-/// Oxide keeps intermediates in its slot. Finding none means none only for a
-/// verified Cargo release, whose layout was checked.
+/// Plain Cargo leaves intermediates in the checkout's `target/`: `deps/` and
+/// `incremental/` under layout v1, and `build/` and `incremental/` under layout
+/// v2 (Cargo 1.100.0). Oxide keeps them in its slot. Finding none means none
+/// only for a verified Cargo release, whose layout was checked.
 fn report_stray(workspace: &Path, remaining_ms: u64) {
     let target = workspace.join("target");
     if !target.is_dir() {
         println!("stray Cargo output: none ({} absent)", target.display());
         return;
     }
-    let limits = InventoryLimits {
-        max_entries: 50_000,
-        max_depth: 24,
-        max_output_bytes: 4096,
-        max_elapsed_ms: remaining_ms.min(2_000),
-    };
-    match inventory_directory(&target, limits) {
-        Ok(report) => {
-            let stray: Vec<_> = report
-                .categories
-                .iter()
-                .filter(|entry| matches!(entry.category, Category::Deps | Category::Incremental))
-                .filter(|entry| entry.accounting.files > 0)
-                .collect();
-            let files: u64 = stray.iter().map(|entry| entry.accounting.files).sum();
-            let bytes: u64 = stray
-                .iter()
-                .map(|entry| entry.accounting.allocated_bytes)
-                .sum();
-            let coverage = if report.coverage.complete {
+    match cargo_layout::scan_stray(&target, remaining_ms) {
+        Ok(stray) => {
+            let coverage = if stray.complete {
                 ""
             } else {
                 " (partial scan)"
             };
-            if files > 0 {
+            if stray.build_files > 0 {
+                let files = stray.files + stray.build_files;
+                let bytes = (stray.bytes + stray.build_bytes) / MIB;
                 println!(
-                    "stray Cargo output: {} holds plain-Cargo deps/ or incremental/ ({files} files, {} MiB){coverage}; `oxide clean` removes it",
+                    "stray Cargo output: {} holds plain-Cargo deps/, incremental/ or layout v2 build/ ({files} files, {bytes} MiB){coverage}; `oxide clean` removes it",
+                    target.display()
+                );
+            } else if stray.files > 0 {
+                println!(
+                    "stray Cargo output: {} holds plain-Cargo deps/ or incremental/ ({} files, {} MiB){coverage}; `oxide clean` removes it",
                     target.display(),
-                    bytes / MIB
+                    stray.files,
+                    stray.bytes / MIB
                 );
             } else if let Err(reason) = freshness::verified_cargo() {
                 // Another layout may keep intermediates elsewhere.
