@@ -99,7 +99,7 @@ pub use join::{
 };
 pub use walk::{WalkGap as SeedWalkGap, WalkLimits as SeedWalkLimits};
 
-use super::pool::{open_seed, open_seed_payload, SeedPoolView, SeedSlotView};
+use super::pool::{open_seed, open_seed_writer, SeedPoolView, SeedSlotView};
 use super::{
     current_uid, ensure_private_dir, io_error, random_hex, LeaseError, MANAGED_NAME,
     MAX_LEASE_ID_BYTES, MAX_PATH_BYTES,
@@ -514,7 +514,7 @@ pub fn write_seed_attempt(pool: &Path, attempt: &SeedAttempt) -> Result<(), Leas
     if !attempt.valid() {
         return Err(LeaseError::InvalidInput("invalid seed attempt"));
     }
-    let opened = open_seed(pool)?;
+    let opened = open_seed_writer(pool, false)?;
     let view = &opened.view;
     let slot = view
         .slot(&attempt.slot_id)
@@ -569,7 +569,7 @@ pub fn write_seed_sources(
     cache: &crate::seed_source::SourceCache,
 ) -> Result<(), LeaseError> {
     validate_recipient(recipient)?;
-    let opened = open_seed(pool)?;
+    let opened = open_seed_writer(pool, false)?;
     let view = &opened.view;
     let slot = view
         .slot(&recipient.slot_id)
@@ -697,7 +697,7 @@ pub fn write_seed_last(pool: &Path, record: &SeedLast) -> Result<(), LeaseError>
     if !record.valid() {
         return Err(LeaseError::InvalidInput("invalid last seed"));
     }
-    let opened = open_seed(pool)?;
+    let opened = open_seed_writer(pool, false)?;
     let view = &opened.view;
     let slot = view
         .slot(&record.slot_id)
@@ -828,7 +828,7 @@ pub fn seed_monitored(
     // deleted or mutated by a seed. This is the payload seam: for a removable
     // pool it verifies the recorded mount and volume UUID under the pool lock
     // before any donor payload is opened.
-    let opened = open_seed_payload(pool)?;
+    let opened = open_seed_writer(pool, true)?;
     let view = &opened.view;
     let payload_root = view
         .payload_root
@@ -1217,7 +1217,7 @@ pub fn seed_monitored(
 /// catalog is not written.
 pub fn publish_seed_catalog(pool: &Path, catalog: &SeedCatalog) -> Result<(), LeaseError> {
     let bytes = catalog.to_bytes().map_err(LeaseError::InvalidInput)?;
-    let opened = open_seed(pool)?;
+    let opened = open_seed_writer(pool, false)?;
     let view = &opened.view;
     let slot = view
         .slot(&catalog.slot_id)
@@ -1717,6 +1717,8 @@ enum DonorControl {
 struct ControlState {
     version: u32,
     #[serde(default)]
+    minimum_writer_generation: Option<u32>,
+    #[serde(default)]
     eviction_accounting: Option<String>,
     #[serde(default)]
     slot_ceiling: Option<String>,
@@ -1797,7 +1799,9 @@ fn donor_control(pool_root: &Path, record_id: u64) -> DonorControl {
         // Version 9 adds the whole-tree holding fence (oxide#190) and changes
         // nothing this donor check reads: a record's phase, holder and lease are
         // still the donor's own durable facts.
-        || (state.version == 9
+        || ((state.version == super::control::HOLDING_STATE_VERSION
+            || (state.version == super::control::WRITER_STATE_VERSION
+                && state.minimum_writer_generation.is_some_and(|generation| generation > 0)))
             && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
             && state.slot_ceiling.as_deref() == Some("oxide.slots/256")
             && state.holding.as_deref() == Some("oxide.holding/1")

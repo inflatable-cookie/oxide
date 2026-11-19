@@ -50,7 +50,11 @@ pub const STATE_VERSION: u32 = super::CONTROL_FENCE_VERSION;
 /// renamed whole into the payload's private holding area under the pool lock
 /// and deleted outside it, so a ledger can carry a `holding` row instead of a
 /// per-entry deletion journal.
-pub const HOLDING_STATE_VERSION: u32 = super::CONTROL_FENCE_VERSION;
+pub const HOLDING_STATE_VERSION: u32 = 9;
+/// First schema that records which generation may write.
+pub const WRITER_STATE_VERSION: u32 = 10;
+/// Advance when an installed successor must exclude earlier writers.
+pub const WRITER_GENERATION: u32 = 1;
 /// Version 7 is the eviction-accounting fence (oxide#175).
 pub const EVICTION_ACCOUNTING_STATE_VERSION: u32 = 7;
 /// Version 8 is the raised-ceiling fence (oxide#177).
@@ -346,6 +350,13 @@ pub struct Clean {
 #[serde(deny_unknown_fields)]
 pub struct State {
     pub version: u32,
+    /// Minimum cooperative writer generation. Passive readers ignore it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "read_writer_generation"
+    )]
+    pub minimum_writer_generation: Option<u32>,
     pub next_id: u64,
     pub next_use: u64,
     pub tickets: Vec<Ticket>,
@@ -402,6 +413,12 @@ pub struct State {
     pub holding: Option<String>,
 }
 
+fn read_writer_generation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    u32::deserialize(deserializer).map(Some)
+}
+
 /// The durable initialization record shared by both pools of a pair.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -431,6 +448,7 @@ impl Default for State {
             // shape; `save` derives the version that document actually
             // carries, so this value is never a claim about a fence.
             version: LEGACY_FIELDS_STATE_VERSION,
+            minimum_writer_generation: None,
             next_id: 1,
             next_use: 1,
             tickets: Vec::new(),
@@ -450,6 +468,13 @@ impl Default for State {
 }
 
 impl State {
+    pub fn check_writer(&self, generation: u32) -> Result<(), super::LeaseError> {
+        if self.minimum_writer_generation.unwrap_or(0) > generation {
+            return Err(super::LeaseError::WriterUpdated);
+        }
+        Ok(())
+    }
+
     pub fn take_id(&mut self) -> Result<u64, String> {
         let id = self.next_id;
         self.next_id = id.checked_add(1).ok_or("Oxide ID sequence exhausted")?;
@@ -572,8 +597,16 @@ pub fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
             | EVICTION_ACCOUNTING_STATE_VERSION
             | SLOT_CEILING_STATE_VERSION
             | HOLDING_STATE_VERSION
+            | WRITER_STATE_VERSION
     ) {
         return Err("Oxide state has an unsupported version".to_owned());
+    }
+    match (state.version, state.minimum_writer_generation) {
+        (WRITER_STATE_VERSION, Some(1..)) => {}
+        (WRITER_STATE_VERSION, _) | (_, Some(_)) => {
+            return Err("Oxide state has an invalid writer generation".to_owned());
+        }
+        _ => {}
     }
     // A document at or above the recorded-accounting version must carry its
     // fence; a fence value this binary does not know refuses rather than being
@@ -932,7 +965,8 @@ pub fn parse_state(bytes: &[u8]) -> Result<State, String> {
         | ONE_USE_STATE_VERSION
         | EVICTION_ACCOUNTING_STATE_VERSION
         | SLOT_CEILING_STATE_VERSION
-        | HOLDING_STATE_VERSION => false,
+        | HOLDING_STATE_VERSION
+        | WRITER_STATE_VERSION => false,
         _ => return Err("Oxide state has an unsupported version or exceeds a limit".to_owned()),
     };
     if legacy && bytes.len() as u64 > LEGACY_MAX_STATE_BYTES {
@@ -951,7 +985,10 @@ pub fn parse_state(bytes: &[u8]) -> Result<State, String> {
 /// insert only a genuinely absent forward field and advance the version, then
 /// validate the result. A corrupt or unsupported document never reaches this
 /// point.
-pub fn fenced_state(mut state: State) -> Result<State, String> {
+pub fn fenced_state(mut state: State, generation: u32) -> Result<State, String> {
+    state
+        .check_writer(generation)
+        .map_err(|error| error.to_string())?;
     if state.recorded_accounting.is_none() {
         state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
     }
@@ -964,6 +1001,7 @@ pub fn fenced_state(mut state: State) -> Result<State, String> {
     if state.holding.is_none() {
         state.holding = Some(HOLDING_FENCE.to_owned());
     }
+    state.minimum_writer_generation = Some(generation);
     state.version = STATE_VERSION;
     validate_state(&state, false)?;
     Ok(state)

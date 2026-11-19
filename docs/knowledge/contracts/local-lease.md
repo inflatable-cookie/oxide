@@ -70,6 +70,20 @@ under the area lock before renaming into Barge trash. Deletion requires the
 matching marker, follows no symlink and crosses no mount. Oxide has no
 per-entry deletion journal, holding-area deleter or descriptor census.
 
+An explicit held eviction checks the writer generation and exact lease under
+the existing pool lock. It writes one private, versioned intent bound to the
+pool, lease, Barge root and parent identity before asking Barge to evict.
+A normal refusal clears the intent and leaves the control and ledger
+unchanged. When the fence must advance, Oxide reserves the existing admission
+lock and publishes the fence after the rename, before saving the revised
+ledger. A settlement failure retains the intent for recovery.
+
+On the next ordinary locked open or exact retry, Oxide clears an intent
+whose original root is still present. It retires the matching ledger row
+when the original parent is verified and both the recorded root ID and
+its path are absent. Recovery leaves unrelated missing roots, substituted
+paths and uncertain custody alone. It never repeats the Barge eviction.
+
 ### Normal warm reuse (oxide#280)
 
 The normal compatible idle path keeps its generation and does not recursively

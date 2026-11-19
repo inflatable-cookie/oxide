@@ -593,6 +593,89 @@ fn tree_snapshot(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
     out
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn a_waiting_writer_refuses_a_newer_generation_without_touching_the_pool() {
+    use oxide_storage::lease::{control::WRITER_GENERATION, LeaseError};
+    use std::os::fd::AsRawFd;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let scratch = Scratch::new();
+    let app = scratch.path().join("app");
+    let manifest = app.join("Cargo.toml");
+    fs::create_dir_all(app.join("src")).unwrap();
+    fs::write(
+        &manifest,
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(app.join("src/lib.rs"), "").unwrap();
+    let (bin, _) = fake_cargo(scratch.path(), &manifest);
+    let pool = scratch.path().join("fixture-pool");
+    created_pool(&scratch, &bin, &manifest, &pool);
+    let gate = scratch.path().join("writer-gate");
+    let mut child = private_env(scratch.path(), &bin, &pool)
+        .current_dir(&app)
+        .env("OXIDE_TASK_SCRATCH_ROOT", scratch.path())
+        .env("OXIDE_TEST_PAUSE", format!("reserved:{}", gate.display()))
+        .arg("check")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let marker = gate.with_extension(format!("reserved-{}", child.id()));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() && child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !marker.exists() {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "the command did not reach its admission wait: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let control = pool.join("oxide-managed");
+    let admission = fs::File::open(control.join("admission.lock")).unwrap();
+    // SAFETY: the descriptor belongs to this fixture only.
+    assert_eq!(
+        unsafe { libc::flock(admission.as_raw_fd(), libc::LOCK_EX) },
+        0
+    );
+    let path = control.join("state.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(state["minimum_writer_generation"], json!(WRITER_GENERATION));
+    state["minimum_writer_generation"] = json!(WRITER_GENERATION + 1);
+    write_private(&path, &serde_json::to_vec(&state).unwrap());
+    let fenced = tree_snapshot(&pool);
+    fs::write(gate, "").unwrap();
+    drop(admission);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(LeaseError::WriterUpdated.exit_code())),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("oxide was updated while this command waited; rerun it"));
+    assert_eq!(tree_snapshot(&pool), fenced);
+    let status = private_env(scratch.path(), &bin, &pool)
+        .current_dir(&app)
+        .env("OXIDE_TASK_SCRATCH_ROOT", scratch.path())
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert_eq!(tree_snapshot(&pool), fenced);
+}
+
 /// oxide#182 item 3, at the CLI boundary: `oxide init` readiness names the
 /// pool a build would select from the recorded registration, consistent with
 /// `status`, and reads no pool state: every recorded pool byte is unchanged.

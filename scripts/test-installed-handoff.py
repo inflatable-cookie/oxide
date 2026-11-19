@@ -114,10 +114,10 @@ RECORDED_ACCOUNTING_STATE_VERSION = 5
 EVICTION_ACCOUNTING_STATE_VERSION = 7
 SLOT_CEILING_STATE_VERSION = 8
 HOLDING_STATE_VERSION = 9
-STATE_VERSION = HOLDING_STATE_VERSION
+STATE_VERSION = 10
 NEWER_STATE_VERSION = STATE_VERSION + 1
 WITNESS_STATE_VERSION = STATE_VERSION
-LEDGER_VERSION = 1
+LEDGER_VERSION = 2
 REGISTRATION_VERSION = 2
 CAPABILITIES_PROBE = "__oxide-build-capabilities"
 SHUTDOWN_MARGIN_S = 20
@@ -686,7 +686,7 @@ def check_source_versions() -> None:
         return int(matches[0])
     expect(STATE_VERSION == literal("src/lease/mod.rs", "CONTROL_FENCE_VERSION"), "control-state fixture version drift")
     expect(SLOT_CEILING_STATE_VERSION == literal("src/lease/control.rs", "SLOT_CEILING_STATE_VERSION"), "slot ceiling fixture version drift")
-    expect(LEDGER_VERSION == literal("src/lease/mod.rs", "LEASE_VERSION"), "ledger fixture version drift")
+    expect(LEDGER_VERSION == literal("src/lease/mod.rs", "LEDGER_VERSION"), "ledger fixture version drift")
 
 
 def current_state(version: int = STATE_VERSION) -> str:
@@ -709,6 +709,8 @@ def current_state(version: int = STATE_VERSION) -> str:
         document["slot_ceiling"] = SLOT_CEILING_FENCE
     if version >= HOLDING_STATE_VERSION:
         document["holding"] = HOLDING_FENCE
+    if version >= STATE_VERSION:
+        document["minimum_writer_generation"] = 1
     return json.dumps(document)
 
 

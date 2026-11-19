@@ -32,8 +32,9 @@ use oxide_storage::lease::managed::{
     prepare_pool, recover, release, snapshot, status as pool_status,
 };
 use oxide_storage::lease::{
-    AccountingScan, AdmissionClass, LeaseError, LeaseRequest, LedgerSlot, LedgerView, MemberPair,
-    MemberSet, OneUseSlice, PoolStatus, Profile as LeaseProfile, RestoreOutcome, ReuseMeasurement,
+    check_control_writer, fence_admission_writer, read_writer_state, AccountingScan,
+    AdmissionClass, LeaseError, LeaseRequest, LedgerSlot, LedgerView, MemberPair, MemberSet,
+    OneUseSlice, PoolStatus, Profile as LeaseProfile, RestoreOutcome, ReuseMeasurement,
     SliceAdmission, SliceReport, SlotLayout, SlotOccupancy, UnmeasuredSlot, VictimPolicy,
     BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, VOLUME_BACKEND_APFS_V1,
 };
@@ -2680,7 +2681,7 @@ impl Store {
                                         );
                                 }
                                 state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
-                                sibling.save(&state)?;
+                                sibling.save_for_writer(&state)?;
                             }
                         }
                         Some(OutputsInit::Ready { .. }) => return Err(
@@ -2699,7 +2700,7 @@ impl Store {
                                 ready_ms: process::now_ms(),
                             });
                             state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
-                            sibling.save(&state)?;
+                            sibling.save_for_writer(&state)?;
                         }
                         None => {
                             // Parity with the `Ready` arm above: the released
@@ -2723,7 +2724,7 @@ impl Store {
                                 ready_ms: process::now_ms(),
                             });
                             state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
-                            sibling.save(&state)?;
+                            sibling.save_for_writer(&state)?;
                         }
                     }
                     if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
@@ -2760,7 +2761,7 @@ impl Store {
         writers_closed(&internal_state, "the internal", own_checkout)?;
         if !fresh && internal_state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
             internal_state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
-            internal.save(&internal_state)?;
+            internal.save_for_writer(&internal_state)?;
         }
         if fresh {
             internal_state.outputs_init = Some(OutputsInit::Initializing {
@@ -2768,8 +2769,9 @@ impl Store {
                 started_ms: process::now_ms(),
             });
             internal_state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
-            internal.save(&internal_state)?;
+            internal.save_for_writer(&internal_state)?;
         }
+        internal.fence_admission_state()?;
         // Internal-first: the paired removable control is fenced only after
         // the internal record is durable.
         if let Some((sibling, _barrier)) = &sibling {
@@ -2797,7 +2799,7 @@ impl Store {
                         started_ms: process::now_ms(),
                     });
                     state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
-                    sibling.save(&state)?;
+                    sibling.save_for_writer(&state)?;
                 }
             }
             if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
@@ -2806,6 +2808,7 @@ impl Store {
                         .to_owned(),
                 );
             }
+            sibling.fence_admission_state()?;
         }
         create(&transaction, true)?;
         if let Some(OutputsInit::Initializing { .. }) = internal_state.outputs_init {
@@ -2813,7 +2816,7 @@ impl Store {
                 transaction: transaction.clone(),
                 ready_ms: process::now_ms(),
             });
-            internal.save(&internal_state)?;
+            internal.save_for_writer(&internal_state)?;
         }
         if let Some((sibling, _barrier)) = &sibling {
             let _admission = sibling.control_admission()?;
@@ -2826,7 +2829,7 @@ impl Store {
                     transaction: transaction.clone(),
                     ready_ms: process::now_ms(),
                 });
-                sibling.save(&state)?;
+                sibling.save_for_writer(&state)?;
             }
         }
         Ok(true)
@@ -2881,7 +2884,7 @@ impl Store {
         let mut sibling_admission = None;
         if let Some((sibling, _barrier)) = &sibling {
             sibling.ensure_control()?;
-            sibling_admission = Some(sibling.admission()?);
+            sibling_admission = Some(sibling.control_admission()?);
             let state = sibling.load()?;
             writers_closed(&state, "the paired", own_checkout)?;
             match state.outputs_init.as_ref() {
@@ -2907,7 +2910,7 @@ impl Store {
             }
         }
         internal_state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
-        internal.save(&internal_state)?;
+        internal.save_for_writer(&internal_state)?;
         if let Some((sibling, _barrier)) = &sibling {
             let _admission = sibling_admission.take();
             let mut state = sibling.load()?;
@@ -2918,7 +2921,7 @@ impl Store {
                     ready_ms: process::now_ms(),
                 });
             }
-            sibling.save(&state)?;
+            sibling.save_for_writer(&state)?;
         }
         Ok(())
     }
@@ -3234,7 +3237,7 @@ impl Store {
     /// before any mark exists**; its error is the guard's own refusal and is
     /// returned unchanged with nothing written. This path never calls
     /// `drop_dead_tickets`, `recover_settled`, `ensure_control` or
-    /// `fence_recorded_accounting`, and it takes every lock it needs
+    /// the writer fence, and it takes every lock it needs
     /// **non-blocking**: a refusal or a retry writes no state, allocates no
     /// id and creates no `waiters/` file, and holding the binding mutex across
     /// this call can never deadlock with a shipped verb that holds the barrier
@@ -3397,6 +3400,10 @@ impl Store {
             BarrierState::Clear => {
                 if state.cleans.len() >= MAX_TICKETS {
                     return Err(format!("too many concurrent oxide cleans ({MAX_TICKETS})"));
+                }
+                if state.minimum_writer_generation != Some(WRITER_GENERATION) {
+                    publish_writer_generation(&self.control)?;
+                    state = self.load()?;
                 }
                 let id = state.take_id()?;
                 let Probe::Free(lock) = probe_lock(&self.ticket_path(id), true)? else {
@@ -4936,23 +4943,8 @@ impl Store {
         self.control.join("waiters").join(format!("{id}.lock"))
     }
 
-    /// The mutating-command gate: fence first (oxide#177; Supervisor ruling
-    /// 4c9984a1). Taking it makes the control fences durable as this command's
-    /// first write, under the admission lock, before any locked pool open
-    /// (which reconciles recorded deletions and can start a recovery journal)
-    /// and before any ledger write.
-    ///
-    /// The gate writes the recorded-accounting fence (oxide#146), the
-    /// eviction-accounting fence (oxide#175) and the version-8 raised-ceiling
-    /// fence (`oxide.slots/256`) in one state document when any is missing.
-    /// Version 8 is what an older installed binary meets before it reads the
-    /// ledger, so it hands off to a receipt-matching successor or refuses
-    /// instead of meeting a `capacity_policy: 4` ledger or a multi-journal
-    /// recovery ledger. An already-version-8 control is not rewritten, and a
-    /// failed fence write refuses the command with no ledger or journal write.
-    /// The one-use fence stays a later step taken only when a class-bearing
-    /// record is written, and passive `status`/snapshot reads never take this
-    /// gate.
+    /// Take admission, then publish the generation before the first
+    /// protected write. Release takes the same gate after Cargo has closed.
     fn admission(&self) -> Result<File, String> {
         let lock = lock_admission(&self.control)?;
         self.fence_admission_state()?;
@@ -4965,69 +4957,31 @@ impl Store {
         Ok(lock)
     }
 
-    /// Output initialization does not mutate the library ledger. Preserve its
-    /// existing recorded-accounting fence without publishing the eviction or
-    /// raised-ceiling fences before its own refusal checks.
+    /// Output initialization decides writer closure before publishing
+    /// anything, including a generation bump.
     fn control_admission(&self) -> Result<File, String> {
         let lock = lock_admission(&self.control)?;
-        self.fence_recorded_accounting()?;
+        check_writer_generation(&self.control)?;
         Ok(lock)
     }
 
-    /// Make the recorded-accounting fence durable. Nothing is written when it
-    /// is already set.
-    fn fence_recorded_accounting(&self) -> Result<(), String> {
-        let mut state = self.load()?;
-        if state.recorded_accounting.as_deref() != Some(RECORDED_ACCOUNTING_FENCE) {
-            state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
-            self.save(&state)?;
+    /// Publish an output transaction and any necessary writer generation in
+    /// the same control replacement, with admission held.
+    fn save_for_writer(&self, state: &State) -> Result<(), String> {
+        if state.minimum_writer_generation == Some(WRITER_GENERATION) {
+            return self.save(state);
         }
-        Ok(())
+        self.save(&fenced_state(state.clone(), WRITER_GENERATION)?)
     }
 
-    /// Make the current control fences durable when they are not already
-    /// there. Returns without writing for an already-fenced control.
     fn fence_admission_state(&self) -> Result<(), String> {
-        let mut state = self.load()?;
-        let mut changed = false;
-        if state.recorded_accounting.as_deref() != Some(RECORDED_ACCOUNTING_FENCE) {
-            state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
-            changed = true;
-        }
-        if state.eviction_accounting.as_deref() != Some(EVICTION_ACCOUNTING_FENCE) {
-            state.eviction_accounting = Some(EVICTION_ACCOUNTING_FENCE.to_owned());
-            changed = true;
-        }
-        if Self::mark_slot_ceiling(&mut state) {
-            changed = true;
-        }
-        if Self::mark_holding(&mut state) {
-            changed = true;
-        }
-        if !changed {
+        let state = read_writer_state(&self.control)
+            .map_err(|error| lease_error("cannot write control state", &error))?
+            .unwrap_or_default();
+        if state.minimum_writer_generation == Some(WRITER_GENERATION) {
             return Ok(());
         }
-        self.save(&state)
-    }
-
-    /// Mark the caller's in-memory state with the whole-tree holding fence
-    /// (oxide#190). Returns whether it changed, so a caller saves once.
-    fn mark_holding(state: &mut State) -> bool {
-        if state.holding.as_deref() == Some(HOLDING_FENCE) {
-            return false;
-        }
-        state.holding = Some(HOLDING_FENCE.to_owned());
-        true
-    }
-
-    /// Mark the caller's in-memory state with the raised-ceiling fence.
-    /// Returns whether it changed, so a caller saves once.
-    fn mark_slot_ceiling(state: &mut State) -> bool {
-        if state.slot_ceiling.as_deref() == Some(SLOT_CEILING_FENCE) {
-            return false;
-        }
-        state.slot_ceiling = Some(SLOT_CEILING_FENCE.to_owned());
-        true
+        self.save(&fenced_state(state, WRITER_GENERATION)?)
     }
 
     /// Make the one-use fence durable **before** the first document that
@@ -5083,7 +5037,9 @@ impl Store {
         let successor = fenced.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE);
         let previous = fenced.outputs_init.is_some()
             || fenced.owned_outputs.as_deref() == Some(LEGACY_OWNED_OUTPUTS_FENCE);
-        fenced.version = if holding {
+        fenced.version = if fenced.minimum_writer_generation.is_some() {
+            WRITER_STATE_VERSION
+        } else if holding {
             // Version 9 is the whole-tree holding fence (oxide#190) and the
             // hand-off trigger that must precede any ledger write recording a
             // holding row.
@@ -5291,6 +5247,7 @@ pub(crate) fn publication_guard(control: &Path) -> Result<PublicationGuard, Stri
         });
     }
     let file = lock_admission(control)?;
+    publish_writer_generation(control)?;
     HELD_PUBLICATION.with(|held| held.borrow_mut().push(control.to_path_buf()));
     Ok(PublicationGuard {
         control: control.to_path_buf(),
@@ -5454,6 +5411,16 @@ pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
     lock_admission_inner(control, None)
 }
 
+pub(crate) fn publish_writer_generation(control: &Path) -> Result<(), String> {
+    fence_admission_writer(control)
+        .map_err(|error| lease_error("cannot fence the Oxide writer", &error))
+}
+
+fn check_writer_generation(control: &Path) -> Result<(), String> {
+    check_control_writer(control)
+        .map_err(|error| lease_error("cannot open the Oxide writer", &error))
+}
+
 fn lock_admission_inner(control: &Path, release_pool: Option<&Path>) -> Result<File, String> {
     // The shipped messages are part of the pre-S1 behaviour this slice must
     // keep byte-identical while it is dormant, so they are produced here
@@ -5566,6 +5533,7 @@ fn acquire_existing_admission(control: &Path) -> Result<Option<File>, String> {
     };
     // SAFETY: the descriptor is open for the duration of the call.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        check_writer_generation(control)?;
         return Ok(Some(file));
     }
     let error = std::io::Error::last_os_error();
@@ -5987,7 +5955,20 @@ fn seed_proof_pause(point: &str) {
 }
 
 fn lease_error(context: &str, error: &LeaseError) -> String {
+    if *error == LeaseError::WriterUpdated {
+        WRITER_UPDATED.set(true);
+    }
     format!("{context}: {} ({error})", error.reason())
+}
+
+thread_local! {
+    // Store callers use String errors and some add context or prefer a budget
+    // result. Preserve the typed lock refusal through those front-door paths.
+    static WRITER_UPDATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn writer_updated() -> bool {
+    WRITER_UPDATED.get()
 }
 
 #[cfg(test)]
@@ -6415,8 +6396,12 @@ pub(crate) mod tests {
         internal.fence_owned_outputs().unwrap();
         internal.fence_owned_outputs().unwrap();
         for control in [&internal.control, &removable.control] {
-            let bytes = fs::read(control.join("state.json")).unwrap();
-            let refused = serde_json::from_slice::<PreFeatureState>(&bytes)
+            let text = fs::read_to_string(control.join("state.json")).unwrap();
+            assert!(serde_json::from_str::<PreFeatureState>(&text).is_err());
+            // Isolate the owned-outputs check from the earlier writer field.
+            let writer = format!("\"minimum_writer_generation\":{WRITER_GENERATION},");
+            let owned_only = text.replacen(&writer, "", 1);
+            let refused = serde_json::from_str::<PreFeatureState>(&owned_only)
                 .err()
                 .expect("a pre-feature parser accepted the fenced state");
             assert!(refused.to_string().contains("owned_outputs"), "{refused}");
@@ -6495,7 +6480,8 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(created.get(), 1);
         let state = internal.load().unwrap();
-        assert_eq!(state.version, RECORDED_ACCOUNTING_STATE_VERSION);
+        assert_eq!(state.version, WRITER_STATE_VERSION);
+        assert_eq!(state.minimum_writer_generation, Some(WRITER_GENERATION));
         assert!(matches!(
             state.outputs_init,
             Some(OutputsInit::Ready { .. })
@@ -6856,10 +6842,8 @@ pub(crate) mod tests {
     #[test]
     fn an_unknown_paired_fence_and_an_open_writer_still_refuse() {
         let transaction = "d".repeat(32);
-        // Both fixtures already carry the recorded-accounting fence, because a
-        // control's own admission publishes it before this path reads either
-        // state; that durability step is not part of what a refused migration
-        // may change.
+        // Both fixtures model older writable controls. A refused migration
+        // leaves both checks and both documents unchanged.
         let ready_internal = |internal: &Store| {
             internal
                 .save(&State {
@@ -9905,7 +9889,7 @@ pub(crate) mod tests {
         state.recorded_accounting = Some(RECORDED_ACCOUNTING_FENCE.to_owned());
         state.eviction_accounting = Some(EVICTION_ACCOUNTING_FENCE.to_owned());
 
-        state.version = STATE_VERSION;
+        state.version = HOLDING_STATE_VERSION;
         assert!(
             validate_state(&state, false).is_err(),
             "the current version without the raised fence was accepted"
@@ -9935,7 +9919,7 @@ pub(crate) mod tests {
             "the holding fence at version 8 was accepted"
         );
         state.holding = Some(HOLDING_FENCE.to_owned());
-        state.version = STATE_VERSION;
+        state.version = HOLDING_STATE_VERSION;
         state.slot_ceiling = None;
         assert!(
             validate_state(&state, false).is_err(),
@@ -9976,7 +9960,7 @@ pub(crate) mod tests {
 
         // An unknown raised-ceiling fence, or a version-8 document without
         // it, is a state no writer produces.
-        state.version = STATE_VERSION;
+        state.version = HOLDING_STATE_VERSION;
         state.eviction_accounting = Some(EVICTION_ACCOUNTING_FENCE.to_owned());
         state.slot_ceiling = Some("oxide.slots/128".to_owned());
         assert!(

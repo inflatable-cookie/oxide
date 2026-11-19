@@ -1,15 +1,17 @@
 //! Exclusive pool: short-lived flock, durable JSON ledger, idle-only eviction.
 
+mod held_eviction;
+
 use super::backing::BackingPaths;
 use super::slice::{AdmissionClass, OneUseSlice, RestoreOutcome, SliceReport, VictimPolicy};
 use super::{
     canonical_existing_dir, current_uid, ensure_private_dir, io_error, is_finder_metadata,
     is_tolerated_metadata_file, persist_private_file, random_hex, read_private_file,
-    unexpected_entry, AccountingCoverage, AccountingScan, HeldEvictionFailure, LeaseEnvironment,
-    LeaseError, LeaseGrant, Leased, LedgerSlot, LedgerView, MeasuredPool, PassiveSnapshot,
-    PoolStatus, Profile, RecordedFact, RecordedVolume, ReleaseReceipt, SlotOccupancy, SlotStatus,
-    UnmeasuredSlot, ACCOUNTING_MAX_ELAPSED_MS, CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION,
-    LEDGER_NAME, LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME, MANAGED_NAME,
+    unexpected_entry, AccountingCoverage, AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant,
+    Leased, LedgerSlot, LedgerView, MeasuredPool, PassiveSnapshot, PoolStatus, Profile,
+    RecordedFact, RecordedVolume, ReleaseReceipt, SlotOccupancy, SlotStatus, UnmeasuredSlot,
+    ACCOUNTING_MAX_ELAPSED_MS, CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
+    LEDGER_VERSION, LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME, MANAGED_NAME,
     MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS,
     PREVIOUS_CAPACITY_POLICY_VERSION, RAISED_CAPACITY_POLICY_VERSION, SLOTS_NAME,
 };
@@ -231,6 +233,8 @@ struct VolumeConfig {
     volume_uuid: String,
     payload_dir: String,
 }
+
+const LEGACY_LEDGER_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -481,7 +485,7 @@ pub(super) struct SeedPoolView {
     pub(super) pool_root: PathBuf,
     /// The payload root. Call 1 and the sidecar writers need no payload, so
     /// their seam leaves this `None` and opens no volume; call 2 uses
-    /// [`open_seed_payload`] and gets the verified root for both backends.
+    /// [`open_seed_writer`] and gets the verified root for both backends.
     pub(super) payload_root: Option<PathBuf>,
     pub(super) slots: Vec<SeedSlotView>,
 }
@@ -495,7 +499,7 @@ impl SeedPoolView {
 /// The seeding custody seam (`oxide#137` §6.3 calls 1 and 2 and
 /// `publish_seed_catalog`): the pool lock held for the whole transaction plus
 /// the immutable facts those calls read. It takes no reconciliation and writes
-/// nothing. [`open_seed`] opens no payload; [`open_seed_payload`] additionally
+/// nothing. [`open_seed`] opens no payload; [`open_seed_writer`] additionally
 /// opens the verified payload call 2 clones from, including a removable
 /// `apfs-volume-v1` volume's mount and volume-UID binding (§7, §8.3).
 pub(super) struct SeedPoolOpen {
@@ -587,28 +591,40 @@ impl SeedPoolOpen {
 /// finished here. No payload is opened: the sidecar writers and call 1 read
 /// control state only.
 pub(super) fn open_seed(root: &Path) -> Result<SeedPoolOpen, LeaseError> {
-    open_seed_inner(root, false)
+    open_seed_inner(root, false, false)
 }
 
 /// The same seam, additionally opening the payload call 2 clones from. For a
 /// removable `apfs-volume-v1` pool this verifies the recorded mount and volume
 /// UUID through [`Binding::open`] and the recorded owner-only payload
 /// directory, under the pool lock and before any donor payload is read.
-pub(super) fn open_seed_payload(root: &Path) -> Result<SeedPoolOpen, LeaseError> {
-    open_seed_inner(root, true)
+pub(super) fn open_seed_writer(
+    root: &Path,
+    with_payload: bool,
+) -> Result<SeedPoolOpen, LeaseError> {
+    open_seed_inner(root, with_payload, true)
 }
 
-fn open_seed_inner(root: &Path, with_payload: bool) -> Result<SeedPoolOpen, LeaseError> {
+fn open_seed_inner(
+    root: &Path,
+    with_payload: bool,
+    writer: bool,
+) -> Result<SeedPoolOpen, LeaseError> {
     let root = canonical_existing_dir(root, true)?;
     refuse_foreign_pool_entries(&root)?;
     refuse_retired_image_pool(&root)?;
     let lock = lock_pool(&root)?;
+    if writer {
+        // The front-door admission holder publishes the generation. Recheck
+        // it here without upgrading the donor's legacy custody document.
+        super::check_control_writer(&root.join(MANAGED_NAME))?;
+        if held_eviction::HeldEvictionIntent::read(&root)?.is_some() {
+            return Err(LeaseError::UnknownAccounting);
+        }
+    }
     let config = read_config(&root)?;
     let ledger = read_ledger(&root)?;
-    if ledger.version != LEASE_VERSION
-        || ledger.store_id != config.store_id
-        || ledger.cap_bytes != config.cap_bytes
-    {
+    if ledger.store_id != config.store_id || ledger.cap_bytes != config.cap_bytes {
         return Err(LeaseError::BackingMismatch);
     }
     if ledger.slots.len() > MAX_SLOTS {
@@ -722,7 +738,7 @@ pub mod managed {
         canonical_existing_dir, ensure_private_dir, io_error, LeaseError, Leased, LedgerView,
         MeasuredPool, PassiveSnapshot, PoolInfo, PoolStatus, ReleaseReceipt, VolumeDescription,
         ACCOUNTING_MAX_ELAPSED_MS, BUDGET_BACKEND_DIRECTORY_V1, CONFIG_NAME, LEASE_VERSION,
-        LEDGER_NAME, MAX_SLOTS, PAYLOAD_NAME, SLOTS_NAME, VOLUME_BACKEND_APFS_V1,
+        LEDGER_NAME, LEDGER_VERSION, MAX_SLOTS, PAYLOAD_NAME, SLOTS_NAME, VOLUME_BACKEND_APFS_V1,
     };
     use super::LeaseRequest;
     use super::{
@@ -795,7 +811,7 @@ pub mod managed {
             }),
         };
         let ledger = Ledger {
-            version: LEASE_VERSION,
+            version: LEDGER_VERSION,
             store_id: store_id.clone(),
             cap_bytes: budget_bytes,
             next_slot: 1,
@@ -972,7 +988,7 @@ pub mod managed {
             volume: None,
         };
         let ledger = Ledger {
-            version: LEASE_VERSION,
+            version: LEDGER_VERSION,
             store_id: store_id.clone(),
             cap_bytes: budget_bytes,
             next_slot: 1,
@@ -1124,8 +1140,7 @@ pub mod managed {
         }
         let volume = config.volume.ok_or(LeaseError::BackingMismatch)?;
         let ledger = read_ledger(&root)?;
-        if ledger.version != LEASE_VERSION
-            || ledger.store_id != config.store_id
+        if ledger.store_id != config.store_id
             || ledger.cap_bytes != config.cap_bytes
             || ledger.slots.len() > MAX_SLOTS
         {
@@ -1239,11 +1254,6 @@ impl Pool {
         Self::open_inner(root, true, lease_id, true)
     }
 
-    /// The held eviction's locked open (oxide#196): the pool lock is taken, but
-    /// no control fence is written and nothing is reconciled before the
-    /// caller's held-row validation and its durable hold intent. A pre-commit
-    /// failure therefore leaves the pool bytes and identity unchanged. A pool
-    /// with pending recorded reconciliation refuses in the caller.
     fn open_held_eviction(root: &Path) -> Result<Self, LeaseError> {
         Self::open_inner(root, false, None, false)
     }
@@ -1252,22 +1262,31 @@ impl Pool {
         root: &Path,
         trace_release: bool,
         releasing: Option<&str>,
-        fence_control: bool,
+        reconcile: bool,
     ) -> Result<Self, LeaseError> {
         let root = canonical_existing_dir(root, true)?;
         refuse_foreign_pool_entries(&root)?;
         refuse_retired_image_pool(&root)?;
         let lock = if trace_release {
             crate::release_trace::phase("pool lock", || lock_pool_inner(&root, true, true))?
-        } else {
+        } else if reconcile {
             lock_pool(&root)?
+        } else {
+            lock_pool_inner(&root, false, false)?
+        };
+        let pending = if reconcile {
+            held_eviction::HeldEvictionIntent::read(&root)?
+        } else {
+            None
         };
         // Fence first (oxide#177, ruling 4c9984a1): a managed pool's control
         // state reaches the current fence version before this open can start a
         // recovery journal or finish a recorded deletion. A library fixture
         // has no control state and nothing to fence.
-        if fence_control {
+        if reconcile {
             super::fence_managed_control(&root)?;
+        } else {
+            super::check_control_writer(&root.join(MANAGED_NAME))?;
         }
         let config = read_config(&root)?;
         let paths = BackingPaths::under(&root);
@@ -1277,10 +1296,7 @@ impl Pool {
             _ => return Err(LeaseError::BackingMismatch),
         };
         let ledger = read_ledger(&root)?;
-        if ledger.version != LEASE_VERSION
-            || ledger.store_id != config.store_id
-            || ledger.cap_bytes != config.cap_bytes
-        {
+        if ledger.store_id != config.store_id || ledger.cap_bytes != config.cap_bytes {
             return Err(LeaseError::BackingMismatch);
         }
         if ledger.slots.len() > MAX_SLOTS {
@@ -1291,22 +1307,27 @@ impl Pool {
                 split_slot_dir(dir, slot.id).ok_or(LeaseError::UnknownAccounting)?;
             }
         }
-        let storage = pool_storage(&root, &config)?;
         let mut pool = Self {
             _lock: Some(lock),
             root,
             config,
             backing,
-            storage,
+            storage: None,
             pending_hold: None,
             deadline: None,
             budget: ledger.cap_bytes,
             ledger,
             admission_note: None,
         };
-        pool.recover_abandoned_holds(releasing)?;
-        pool.retire_missing_idle_roots()?;
-        pool.sweep_trash()?;
+        if reconcile {
+            if let Some(intent) = pending {
+                pool.recover_held_eviction(&intent, false)?;
+            }
+            pool.storage = pool_storage(&pool.root, &pool.config)?;
+            pool.recover_abandoned_holds(releasing)?;
+            pool.retire_missing_idle_roots()?;
+            pool.sweep_trash()?;
+        }
         Ok(pool)
     }
 
@@ -1363,7 +1384,8 @@ impl Pool {
         )
     }
 
-    fn persist(&self) -> Result<(), LeaseError> {
+    fn persist(&mut self) -> Result<(), LeaseError> {
+        self.ledger.version = LEDGER_VERSION;
         write_ledger(&self.root, &self.ledger)?;
         Ok(())
     }
@@ -1374,10 +1396,14 @@ impl Pool {
     /// raised caps, then replace the ledger atomically. Legacy representation
     /// is never migrated by a read-only observer or by reconciliation alone.
     fn persist_revised(&mut self) -> Result<(), LeaseError> {
+        self.validate_revised_ledger()?;
+        self.persist()
+    }
+
+    fn validate_revised_ledger(&mut self) -> Result<(), LeaseError> {
         self.ensure_capacity_policy()?;
         self.raise_capacity_policy_if_needed();
-        validate_ledger_write(&self.ledger)?;
-        self.persist()
+        validate_ledger_write(&self.ledger)
     }
 
     /// The raised-ceiling fence (oxide#177) is written forward-only, in the
@@ -2088,48 +2114,6 @@ impl Pool {
         Ok(Vec::new())
     }
 
-    /// Retire one held slot by its exact lease.
-    fn evict_held(
-        &mut self,
-        slot_id: &str,
-        lease_id: &str,
-    ) -> Result<Vec<String>, HeldEvictionFailure> {
-        let pre = HeldEvictionFailure::PreCommit;
-        let id = slot_id
-            .parse::<u64>()
-            .ok()
-            .filter(|id| *id != 0)
-            .ok_or(LeaseError::InvalidInput(
-                "slot ID must be a positive integer",
-            ))
-            .map_err(pre)?;
-        let Some(slot) = self.slot(id) else {
-            return Err(pre(LeaseError::Busy));
-        };
-        if slot.state != SlotPersistState::Held || slot.lease_id.as_deref() != Some(lease_id) {
-            return Err(pre(LeaseError::Busy));
-        }
-        let root = slot
-            .root
-            .clone()
-            .ok_or(pre(LeaseError::UnknownAccounting))?;
-        let project = slot
-            .dir
-            .as_deref()
-            .and_then(|dir| dir.split_once('/'))
-            .map(|(f, _)| f.to_owned());
-        let storage = self
-            .storage
-            .as_ref()
-            .ok_or(pre(LeaseError::UnknownAccounting))?;
-        storage
-            .evict_in(project.as_deref(), &root)
-            .map_err(|_| pre(LeaseError::UnknownAccounting))?;
-        self.ledger.slots.retain(|slot| slot.id != id);
-        self.persist_revised().map_err(pre)?;
-        Ok(Vec::new())
-    }
-
     fn volume_space(&self) -> Result<barge::Space, LeaseError> {
         self.storage
             .as_ref()
@@ -2369,8 +2353,7 @@ fn read_consistent_pair_before(
         if let Some(deadline) = deadline {
             measurement_remaining(deadline)?;
         }
-        if ledger.version == LEASE_VERSION
-            && ledger.store_id == config.store_id
+        if ledger.store_id == config.store_id
             && ledger.cap_bytes == config.cap_bytes
             && ledger.slots.len() <= MAX_SLOTS
         {
@@ -2504,9 +2487,17 @@ fn pool_storage(
     root: &Path,
     config: &PoolConfig,
 ) -> Result<Option<crate::storage::PoolStorage>, LeaseError> {
+    crate::storage::PoolStorage::open(&root.join(MANAGED_NAME), &pool_backing(root, config)?)
+        .map(Some)
+        .map_err(|_| LeaseError::BackingMismatch)
+}
+
+fn pool_backing(
+    root: &Path,
+    config: &PoolConfig,
+) -> Result<crate::storage::PoolBacking, LeaseError> {
     use crate::storage::PoolBacking;
-    let control = root.join(MANAGED_NAME);
-    let backing = match config.backend.as_str() {
+    Ok(match config.backend.as_str() {
         BUDGET_BACKEND_DIRECTORY_V1 => PoolBacking::budget(root, config.cap_bytes),
         VOLUME_BACKEND_APFS_V1 => {
             let volume = config.volume.as_ref().ok_or(LeaseError::BackingMismatch)?;
@@ -2520,10 +2511,7 @@ fn pool_storage(
             )
         }
         _ => return Err(LeaseError::BackingMismatch),
-    };
-    crate::storage::PoolStorage::open(&control, &backing)
-        .map(Some)
-        .map_err(|_| LeaseError::BackingMismatch)
+    })
 }
 
 fn open_budget_payload(
@@ -3039,6 +3027,9 @@ fn read_ledger(pool: &Path) -> Result<Ledger, LeaseError> {
     let bytes = read_private_file(&pool.join(LEDGER_NAME))?;
     let ledger: Ledger =
         serde_json::from_slice(&bytes).map_err(|_| LeaseError::UnknownAccounting)?;
+    if !matches!(ledger.version, LEGACY_LEDGER_VERSION | LEDGER_VERSION) {
+        return Err(LeaseError::BackingMismatch);
+    }
     validate_ledger_read(&ledger)?;
     Ok(ledger)
 }
