@@ -630,10 +630,25 @@ fn the_first_writer_waits_for_admission_before_upgrading_v9() {
     let lock = fs::File::open(control.join("admission.lock")).unwrap();
     // SAFETY: the descriptor belongs to this fixture only.
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
-    let before = tree_snapshot(&pool);
+    // A refused open records a timing observation. Every other byte and path
+    // must stay unchanged while the predecessor holds admission.
+    let history = "oxide-managed/admission-cost.json";
+    let sample_count = || {
+        serde_json::from_slice::<Vec<Value>>(&fs::read(pool.join(history)).unwrap())
+            .unwrap()
+            .len()
+    };
+    let pool_without_history = || {
+        tree_snapshot(&pool)
+            .into_iter()
+            .filter(|(path, _)| path != history)
+            .collect::<Vec<_>>()
+    };
+    let before = pool_without_history();
+    let samples_before = sample_count();
     let waiting = private_env(scratch.path(), &bin, &pool)
         .current_dir(&app)
-        .args(["check", "--admission-budget=500ms"])
+        .args(["check", "--admission-budget=2s"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&waiting.stderr);
@@ -642,7 +657,8 @@ fn the_first_writer_waits_for_admission_before_upgrading_v9() {
         stderr.contains("stopped by the admission budget"),
         "{stderr}"
     );
-    assert_eq!(tree_snapshot(&pool), before);
+    assert_eq!(sample_count(), samples_before + 1);
+    assert_eq!(pool_without_history(), before);
     drop(lock);
 
     let upgraded = private_env(scratch.path(), &bin, &pool)
