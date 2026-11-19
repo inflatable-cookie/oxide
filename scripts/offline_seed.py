@@ -3,7 +3,7 @@
 
 One shared helper for proof fixtures that need a private, offline CARGO_HOME
 without a download. It starts from the #112 bounded seed (`seed_from_lock`,
-`seed_git`, `copy_bounded` in `scripts/test-pool-describe.py`) and corrects two
+`seed_git`, `copy_bounded` in the retired native proof suite) and corrects two
 defects that proof disclosed rather than closed:
 
 - **Anchored reads.** Every source path is opened descriptor-relative with

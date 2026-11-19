@@ -1,7 +1,6 @@
 //! Opt-in stable-Cargo profile probe (oxide#068).
 //!
-//! This focused probe is run by `rust:profile-light` and
-//! `rust:profile-full-debug`. It asserts, in the profile that actually
+//! This focused probe runs under `cargo test` in whichever profile compiled it. It asserts, in the profile that actually
 //! compiled this test target:
 //!
 //! 1. a panic inside a workspace helper still unwinds and is delivered to

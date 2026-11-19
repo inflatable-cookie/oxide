@@ -233,7 +233,7 @@ operator instruction; the general lean reset is not deletion authority.
   conversion on build, others by explicit adoption. Existing whole-target
   links migrate only by explicit adoption. It never moves existing output,
   and ephemeral mode is unchanged
-  ([workflow](contracts/workflow.md#final-outputs-on-the-permanent-drive-oxide117)).
+  ([workflow](contracts/workflow.md)).
 - **Profile layout becomes the default** (built by oxide#160 for S1 and S4b; migration of existing checkouts still gated): automatic first conversion creates profile member links, keeping `target` a real directory so container tools that mount it (Effigy's isolated `target` mounts) keep working, instead of the legacy whole-target link. `oxide exec` now derives a tool's output members from the checkout's committed placement, so no route needs `--output` ([design](contracts/exec-output-inference.md), which records that a member the checkout's committed placement does not cover stays a real local directory and is reported, never guessed); `--output` remains an optional complete override. Existing whole-target checkouts are untouched and migrate only by explicit `oxide outputs adopt`, Acowtancy's primary checkout first — that migration, the design's S2/S3/S5 follow-ons and a real Tauri dogfood are not part of oxide#160.
 - **Owned links at profile directories** (v1, operator accepted): a converted
   checkout keeps `target` itself a real directory and owns only the positively
@@ -249,7 +249,7 @@ operator instruction; the general lean reset is not deletion authority.
   malformed link still refuses with nothing changed. Corrected native
   coverage of detach, clean and prune is still unactivated. The as-is
   acceptance, contract, formats and evidence limits are owned by the
-  [workflow](contracts/workflow.md#owned-output-members-at-profile-directories-oxide133).
+  [workflow](contracts/workflow.md).
 - **Machine pool from the account:** Oxide resolves its config, pool and
   drive from the account home, not `$HOME`, so a harness that overrides
   HOME still uses them; private pools need an explicit setting. Its proof
@@ -262,7 +262,7 @@ operator instruction; the general lean reset is not deletion authority.
   writes to or removes one. Otherwise Oxide owns one short per-command
   directory inside the slot, removed at release after writer closure; a `run`
   program that uses one keeps the lease until its own group closes
-  ([workflow](contracts/workflow.md#child-temporary-files-oxide136)). The
+  ([workflow](contracts/workflow.md)). The
   [proposed idle-session design](contracts/idle-exec-sessions.md) weighs the
   successor custody alternatives and keeps this guarantee; it selects none of
   them. It is
@@ -272,7 +272,7 @@ operator instruction; the general lean reset is not deletion authority.
   default is implemented and qualified by oxide#145 (merged at `0520fc04`,
   guard `a6d73326`), which places and monitors proof scratch on the selected
   pool's own volume with a warned `/private/tmp` fallback
-  ([placement](contracts/workflow.md#temporary-scratch-placement)). Internal-
+  ([placement](contracts/workflow.md)). Internal-
   placement proofs may declare an explicit internal root as the owner-accepted
   narrow exception, with their fixtures beside the pool, never inside it. Both
   cover Oxide-owned scratch only: CI, Nucleus worktrees, containers and host
@@ -303,7 +303,7 @@ operator instruction; the general lean reset is not deletion authority.
   donor on the same volume, removable pools included, with Cargo still judging
   freshness; default-on, with natives held. The
   [design](contracts/cold-slot-seeding.md) owns the protocol and
-  `effigy rust:cold-slot-seeding` its 24-case proof.
+  its retired 24-case native proof (removed in oxide#322).
 - **Implemented, native held** (Tom, 2026-10-25): recorded per-slot accounting
   replaces whole-payload admission walks. Closed-slot records are bound to
   generation/incarnation; missing or invalid records require bounded slot
@@ -314,7 +314,7 @@ operator instruction; the general lean reset is not deletion authority.
   eligible idle whole slots, and a fixed 10 GiB hard floor decides once nothing
   is left to prune. Source and unit regressions are in;
   the focused proof and its elevated natives are held for separate owner
-  activations. The [accounting contract](contracts/local-lease.md#recorded-per-slot-accounting-oxide146-implemented-native-held)
+  activations. The [accounting contract](contracts/local-lease.md)
   owns the design, the implementation record and its trust limits. This supersedes the earlier cached
   accounting decline for this scope; its negative reviews remain history.
 
@@ -481,7 +481,7 @@ the operating rules.
     Do not invent fixture repair or presume a reaped child proves closure.
     If no safe diagnostic can fit these constraints, return the concrete
     design issue to the owner before a counted run.
-  - Every brief also applies the fixed [proof-authoring premise checklist](contracts/workflow.md#proof-authoring-premise-checklist)
+  - Every brief also applies the fixed [proof-authoring premise checklist](contracts/workflow.md)
     to the executable case bodies and helpers, recording each disposition or
     reason it does not apply. This source sweep complements the execution;
     it does not replace it.
@@ -506,7 +506,7 @@ the operating rules.
   recorded as operator acceptance, never as a review pass. A direct GitHub
   merge needs explicit scoped authorisation.
 - **Native-proof harness:** native proofs run under the shared proof
-  supervisor, `scripts/bounded-test.py`. It qualified as #109 (PR #99) on
+  supervisor (retired under oxide#322). It qualified as #109 (PR #99) on
   2026-10-21, under the pinned-leader cooperative-closure contract (Tom,
   "Yes, (2)"), with independent author and reviewer native passes at
   `018f6e1`.
@@ -565,7 +565,7 @@ the operating rules.
   diagnostics; the trial embeds no compiler, changes no
   quick/test/debug/release default, installs nothing and keeps the Barge
   integration independent. Owning research record:
-  [landscape](rust-dx-landscape.md#relax-quick-run-trial-2026-11-11-prepared).
+  [landscape](rust-dx-landscape.md).
 - **Relax compatibility recheck** (Tom, 2026-11-12, decision
   `7b5a88ce-96cb-4fab-a584-2e5deffa28ce` v2, "Go for it"): a focused,
   independently reviewed recheck of a NEWER pinned Relax engine on actual
@@ -584,7 +584,7 @@ the operating rules.
   justified. No product
   integration, engine fork, installation, default change or consumer adoption
   is authorized by a pass. Owning research record:
-  [landscape](rust-dx-landscape.md#relax-compatibility-recheck-2026-11-12).
+  [landscape](rust-dx-landscape.md).
 - **Still need Tom's scoped approval:**
   - host installs beyond the planner's receipt-matched `oxide` reinstall;
   - releases, tags and workflow changes;
