@@ -255,10 +255,9 @@ pub enum LeaseError {
     Io(String),
 }
 
-/// A held eviction's failure class (oxide#196). The durable hold intent is
-/// the commit point: a pre-commit failure leaves the pool bytes and identity
-/// unchanged, while a post-commit failure names the recorded partial state
-/// that the next locked open resumes or rolls back.
+/// A held eviction's failure class. Before Barge commits the root rename,
+/// Oxide leaves the control and ledger unchanged and runs no reconciliation.
+/// A failure settling control or the ledger after the rename is post-commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeldEvictionFailure {
     PreCommit(LeaseError),
@@ -1047,7 +1046,7 @@ pub(crate) fn fence_managed_control(pool: &Path) -> Result<(), LeaseError> {
     if state.minimum_writer_generation == Some(control::WRITER_GENERATION) {
         return Ok(());
     }
-    let _admission = open_control_admission(&control)?;
+    let _admission = open_control_admission(&control, true)?;
     // Re-read after taking both locks. Only the admission holder publishes
     // the minimum, and a newer writer may have published while we waited.
     fence_admission_writer(&control)
@@ -1124,13 +1123,30 @@ pub fn fence_admission_writer(control: &Path) -> Result<(), LeaseError> {
     persist_control_state(&control.join("state.json"), &bytes)
 }
 
-fn open_control_admission(control: &Path) -> Result<File, LeaseError> {
+/// Reserve an existing admission lock for a held eviction that needs to
+/// raise the fence. The pool lock is already held. Validate again once both
+/// locks are held, without publishing the generation or creating a lock.
+fn reserve_eviction_fence(control: &Path) -> Result<Option<File>, LeaseError> {
+    let Some(state) = read_writer_state(control)? else {
+        return Ok(None);
+    };
+    if state.minimum_writer_generation == Some(control::WRITER_GENERATION) {
+        return Ok(None);
+    }
+    let admission = open_control_admission(control, false)?;
+    let state = read_writer_state(control)?.ok_or(LeaseError::UnknownAccounting)?;
+    control::fenced_state(state, control::WRITER_GENERATION)
+        .map_err(|_| LeaseError::UnknownAccounting)?;
+    Ok(Some(admission))
+}
+
+fn open_control_admission(control: &Path, create: bool) -> Result<File, LeaseError> {
     let path = control.join("admission.lock");
     let mut options = OpenOptions::new();
     options
         .read(true)
         .write(true)
-        .create(true)
+        .create(create)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW);
     let file = options.open(&path).map_err(io_error)?;

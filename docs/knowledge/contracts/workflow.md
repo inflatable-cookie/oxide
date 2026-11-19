@@ -1701,6 +1701,7 @@ lock without blocking and rereads state there. A stale writer exits 76 with
 `oxide was updated while this command waited; rerun it`. A command that
 already held a lock can finish that critical section. It checks again on
 the next acquisition. Passive readers of the same schema ignore the minimum.
+Held eviction follows its [pre-commit refusal contract](local-lease.md#capacity-and-eviction).
 Already-running children and executables predating the generation check
 remain subject to the install compatibility window and existing recovery rules.
 

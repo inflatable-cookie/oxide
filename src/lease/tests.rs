@@ -15,6 +15,91 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
 #[test]
+fn held_eviction_publishes_the_writer_fence_only_after_commit() {
+    use super::control::{
+        fenced_state, parse_state, State, HOLDING_STATE_VERSION, WRITER_GENERATION,
+    };
+    use super::HeldEvictionFailure;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let fixture = Fixture::new("held-eviction-fence");
+    let pool = fixture.pool();
+    let leased = managed::lease_measured(request(
+        &pool,
+        &fixture.dir("project"),
+        &fixture.dir("workspace"),
+        "held-eviction",
+    ))
+    .unwrap();
+    fill(&leased, 4);
+    let slot = leased.grant.slot_id.clone();
+    let lease = leased.grant.lease_id.clone();
+    let root = leased
+        .grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let control = pool.join(super::MANAGED_NAME);
+    let state_path = control.join("state.json");
+    let admission = control.join("admission.lock");
+    let ledger = pool.join("ledger.json");
+    let marker = root.join(".barge-root.json");
+    let artifact = root.join("build/artifact");
+    let mut old_state = fenced_state(State::default(), WRITER_GENERATION).unwrap();
+    old_state.version = HOLDING_STATE_VERSION;
+    old_state.minimum_writer_generation = None;
+    let write_state = |state: &State| {
+        fs::write(&state_path, serde_json::to_vec(state).unwrap()).unwrap();
+        fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    write_state(&old_state);
+    fs::write(&admission, []).unwrap();
+    fs::set_permissions(&admission, fs::Permissions::from_mode(0o600)).unwrap();
+    let snapshot = || {
+        [&state_path, &admission, &ledger, &marker, &artifact].map(|path| {
+            let metadata = fs::metadata(path).unwrap();
+            (metadata.ino(), fs::read(path).unwrap())
+        })
+    };
+    let before = snapshot();
+    assert!(matches!(
+        managed::evict_held_slot(&pool, "invalid", &lease),
+        Err(HeldEvictionFailure::PreCommit(LeaseError::InvalidInput(_)))
+    ));
+    assert_eq!(
+        managed::evict_held_slot(&pool, &slot, "wrong lease"),
+        Err(HeldEvictionFailure::PreCommit(LeaseError::Busy))
+    );
+    assert_eq!(
+        managed::evict_held_slot(&pool, &slot, &lease),
+        Err(HeldEvictionFailure::PreCommit(
+            LeaseError::UnknownAccounting
+        )),
+        "Barge must refuse the exact lease's still-live hold"
+    );
+    assert_eq!(snapshot(), before);
+
+    let newer = fenced_state(old_state.clone(), WRITER_GENERATION + 1).unwrap();
+    write_state(&newer);
+    let before = snapshot();
+    assert_eq!(
+        managed::evict_held_slot(&pool, &slot, &lease),
+        Err(HeldEvictionFailure::PreCommit(LeaseError::WriterUpdated))
+    );
+    assert_eq!(snapshot(), before);
+
+    write_state(&old_state);
+    drop(leased);
+    managed::evict_held_slot(&pool, &slot, &lease).unwrap();
+    assert!(!root.exists());
+    assert!(managed::snapshot(&pool).unwrap().slots.is_empty());
+    let committed = parse_state(&fs::read(state_path).unwrap()).unwrap();
+    assert_eq!(committed.minimum_writer_generation, Some(WRITER_GENERATION));
+}
+
+#[test]
 fn writer_generation_is_checked_on_pool_open_before_adoption_or_reconciliation() {
     use super::control::{fenced_state, parse_state, State, WRITER_GENERATION};
     use std::os::unix::fs::PermissionsExt;

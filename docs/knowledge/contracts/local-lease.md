@@ -70,6 +70,13 @@ under the area lock before renaming into Barge trash. Deletion requires the
 matching marker, follows no symlink and crosses no mount. Oxide has no
 per-entry deletion journal, holding-area deleter or descriptor census.
 
+An explicit held eviction checks the writer generation and exact lease under
+the existing pool lock. It opens only the recorded Barge area and leaves
+Oxide's control and ledger as they were on a pre-commit refusal. When it must
+raise the writer generation, it reserves the existing admission lock before
+eviction and publishes the fence after Barge renames the root, before saving
+the revised ledger. A settlement failure after the rename is post-commit.
+
 ### Normal warm reuse (oxide#280)
 
 The normal compatible idle path keeps its generation and does not recursively

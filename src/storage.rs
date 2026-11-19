@@ -630,6 +630,48 @@ impl PoolBacking {
             removable: true,
         }
     }
+
+    fn area_config(&self) -> AreaConfig {
+        AreaConfig::new("pool", self.mount.clone(), POOL_AREA)
+            .uuid(self.uuid.clone())
+            .folder(self.folder.clone())
+            .soft_cap_bytes(self.soft_cap_bytes)
+            .reserve_bytes(self.reserve_bytes)
+            .floor_bytes(if self.reserve_bytes == 0 {
+                self.floor_bytes
+            } else {
+                self.floor_bytes.min(self.reserve_bytes)
+            })
+    }
+
+    /// Evict from an area already bound to this pool. Never declare or repair
+    /// storage while attempting to retire a held ledger row.
+    pub(crate) fn evict_existing(
+        &self,
+        control: &Path,
+        project_folder: Option<&str>,
+        id: &str,
+    ) -> Result<(), String> {
+        let mut config = self.area_config();
+        if let Some(folder) = project_folder {
+            config.area = format!("{}-{}", config.area, slug(folder));
+            config.folder = format!("{}/{folder}", config.folder);
+        }
+        let existing = |storage: Storage| {
+            storage
+                .existing_area(&config)?
+                .ok_or_else(|| format!("pool area {} is missing", config.key()))
+        };
+        // A known area proves the account exists. The writable open then
+        // uses the same declaration without creating a volume or area.
+        existing(Storage::open_read_only(control)?)?
+            .resolve(id)
+            .map_err(|error| format!("cannot resolve held slot root {id}: {error}"))?;
+        existing(Storage::open(control)?)?
+            .evict(id)
+            .map_err(|error| format!("cannot evict slot root {id}: {error}"))?;
+        Ok(())
+    }
 }
 
 impl PoolStorage {
@@ -653,16 +695,7 @@ impl PoolStorage {
     /// Build a pool storage over an already-open account (Oxide's tests use a
     /// fake platform seam).
     pub fn from_storage(storage: Storage, backing: &PoolBacking) -> Result<Self, String> {
-        let config = AreaConfig::new("pool", backing.mount.clone(), POOL_AREA)
-            .uuid(backing.uuid.clone())
-            .folder(backing.folder.clone())
-            .soft_cap_bytes(backing.soft_cap_bytes)
-            .reserve_bytes(backing.reserve_bytes)
-            .floor_bytes(if backing.reserve_bytes == 0 {
-                backing.floor_bytes
-            } else {
-                backing.floor_bytes.min(backing.reserve_bytes)
-            });
+        let config = backing.area_config();
         let area = storage.declare(&config)?;
         let location = area
             .location()

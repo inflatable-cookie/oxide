@@ -838,7 +838,7 @@ pub mod managed {
         slot_id: &str,
         lease_id: &str,
     ) -> Result<Vec<String>, HeldEvictionFailure> {
-        Pool::open(pool)
+        Pool::open_held_eviction(pool)
             .map_err(HeldEvictionFailure::PreCommit)?
             .evict_held(slot_id, lease_id)
     }
@@ -1242,31 +1242,42 @@ impl Pool {
     /// recorded backend, including the retired `apfs-sparse-image-v1`,
     /// refuses before anything under the pool is touched.
     pub(super) fn open(root: &Path) -> Result<Self, LeaseError> {
-        Self::open_inner(root, false, None)
+        Self::open_inner(root, false, None, true)
     }
 
     fn open_for_release(root: &Path, lease_id: Option<&str>) -> Result<Self, LeaseError> {
-        Self::open_inner(root, true, lease_id)
+        Self::open_inner(root, true, lease_id, true)
+    }
+
+    fn open_held_eviction(root: &Path) -> Result<Self, LeaseError> {
+        Self::open_inner(root, false, None, false)
     }
 
     fn open_inner(
         root: &Path,
         trace_release: bool,
         releasing: Option<&str>,
+        reconcile: bool,
     ) -> Result<Self, LeaseError> {
         let root = canonical_existing_dir(root, true)?;
         refuse_foreign_pool_entries(&root)?;
         refuse_retired_image_pool(&root)?;
         let lock = if trace_release {
             crate::release_trace::phase("pool lock", || lock_pool_inner(&root, true, true))?
-        } else {
+        } else if reconcile {
             lock_pool(&root)?
+        } else {
+            lock_pool_inner(&root, false, false)?
         };
         // Fence first (oxide#177, ruling 4c9984a1): a managed pool's control
         // state reaches the current fence version before this open can start a
         // recovery journal or finish a recorded deletion. A library fixture
         // has no control state and nothing to fence.
-        super::fence_managed_control(&root)?;
+        if reconcile {
+            super::fence_managed_control(&root)?;
+        } else {
+            super::check_control_writer(&root.join(MANAGED_NAME))?;
+        }
         let config = read_config(&root)?;
         let paths = BackingPaths::under(&root);
         let backing = match config.backend.as_str() {
@@ -1286,7 +1297,11 @@ impl Pool {
                 split_slot_dir(dir, slot.id).ok_or(LeaseError::UnknownAccounting)?;
             }
         }
-        let storage = pool_storage(&root, &config)?;
+        let storage = if reconcile {
+            pool_storage(&root, &config)?
+        } else {
+            None
+        };
         let mut pool = Self {
             _lock: Some(lock),
             root,
@@ -1299,9 +1314,11 @@ impl Pool {
             ledger,
             admission_note: None,
         };
-        pool.recover_abandoned_holds(releasing)?;
-        pool.retire_missing_idle_roots()?;
-        pool.sweep_trash()?;
+        if reconcile {
+            pool.recover_abandoned_holds(releasing)?;
+            pool.retire_missing_idle_roots()?;
+            pool.sweep_trash()?;
+        }
         Ok(pool)
     }
 
@@ -1370,10 +1387,14 @@ impl Pool {
     /// raised caps, then replace the ledger atomically. Legacy representation
     /// is never migrated by a read-only observer or by reconciliation alone.
     fn persist_revised(&mut self) -> Result<(), LeaseError> {
+        self.validate_revised_ledger()?;
+        self.persist()
+    }
+
+    fn validate_revised_ledger(&mut self) -> Result<(), LeaseError> {
         self.ensure_capacity_policy()?;
         self.raise_capacity_policy_if_needed();
-        validate_ledger_write(&self.ledger)?;
-        self.persist()
+        validate_ledger_write(&self.ledger)
     }
 
     /// The raised-ceiling fence (oxide#177) is written forward-only, in the
@@ -2114,15 +2135,25 @@ impl Pool {
             .as_deref()
             .and_then(|dir| dir.split_once('/'))
             .map(|(f, _)| f.to_owned());
-        let storage = self
-            .storage
-            .as_ref()
-            .ok_or(pre(LeaseError::UnknownAccounting))?;
-        storage
-            .evict_in(project.as_deref(), &root)
-            .map_err(|_| pre(LeaseError::UnknownAccounting))?;
+        let control = self.root.join(MANAGED_NAME);
+        let admission = super::reserve_eviction_fence(&control).map_err(pre)?;
         self.ledger.slots.retain(|slot| slot.id != id);
-        self.persist_revised().map_err(pre)?;
+        self.validate_revised_ledger().map_err(pre)?;
+        pool_backing(&self.root, &self.config)
+            .map_err(pre)?
+            .evict_existing(&control, project.as_deref(), &root)
+            .map_err(|_| pre(LeaseError::UnknownAccounting))?;
+        // Barge has renamed the root. From here an error cannot be reported
+        // as a refusal that left the original pool intact.
+        let post = |error| {
+            HeldEvictionFailure::PostCommit(format!(
+                "slot {id} was evicted but settlement failed: {error}"
+            ))
+        };
+        if admission.is_some() {
+            super::fence_admission_writer(&control).map_err(post)?;
+        }
+        self.persist().map_err(post)?;
         Ok(Vec::new())
     }
 
@@ -2499,9 +2530,17 @@ fn pool_storage(
     root: &Path,
     config: &PoolConfig,
 ) -> Result<Option<crate::storage::PoolStorage>, LeaseError> {
+    crate::storage::PoolStorage::open(&root.join(MANAGED_NAME), &pool_backing(root, config)?)
+        .map(Some)
+        .map_err(|_| LeaseError::BackingMismatch)
+}
+
+fn pool_backing(
+    root: &Path,
+    config: &PoolConfig,
+) -> Result<crate::storage::PoolBacking, LeaseError> {
     use crate::storage::PoolBacking;
-    let control = root.join(MANAGED_NAME);
-    let backing = match config.backend.as_str() {
+    Ok(match config.backend.as_str() {
         BUDGET_BACKEND_DIRECTORY_V1 => PoolBacking::budget(root, config.cap_bytes),
         VOLUME_BACKEND_APFS_V1 => {
             let volume = config.volume.as_ref().ok_or(LeaseError::BackingMismatch)?;
@@ -2515,10 +2554,7 @@ fn pool_storage(
             )
         }
         _ => return Err(LeaseError::BackingMismatch),
-    };
-    crate::storage::PoolStorage::open(&control, &backing)
-        .map(Some)
-        .map_err(|_| LeaseError::BackingMismatch)
+    })
 }
 
 fn open_budget_payload(
