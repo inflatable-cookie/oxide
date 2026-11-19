@@ -1107,7 +1107,7 @@ pub(crate) fn eviction_protected(error: &barge::Error) -> bool {
 
 /// The pinned Barge API reports a post-rename deletion error as source-less
 /// I/O with this trash diagnosis. Ordinary path I/O still has its source kind.
-pub(crate) fn eviction_moved(error: &barge::Error) -> bool {
+pub fn eviction_moved(error: &barge::Error) -> bool {
     error.kind() == barge::ErrorKind::Io
         && error.io_kind().is_none()
         && error

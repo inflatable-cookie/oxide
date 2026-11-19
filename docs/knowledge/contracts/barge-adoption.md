@@ -86,6 +86,8 @@ reserve, so the floor never exceeds the prune target.
 - The rename into trash is the commit point. A post-rename deletion failure
   retires workflow membership and surfaces the trash failure. A workflow failure
   after the rename reports that the root moved. Neither gives freed-space credit.
+  Output prune settles such a root in its registry, reports it as moved to trash
+  with deletion failed, and counts it as not freed.
 - Deletion never follows a symlink, never descends into another filesystem, and
   removes a trash entry only when its marker still names the area. A crash after
   rename leaves owned trash, which the next prune or sweep removes. A later root

@@ -514,11 +514,17 @@ paths. The summary says `temp: inherited <path>` or `temp: oxide <path>`.
   (mount, UUID, mode, reserve, budget). It is imported into the pool's Barge
   account. A different UUID or path refuses.
 - **Selection:** when a build starts, the drive is selected only if it is mounted,
-  its registered UUID matches, it is writable, it is not in the boot container, and
-  free space is above the reserve. Positive absence falls back to the internal pool
-  with a warning. An unknown or different identity refuses. Low space keeps the
-  volume selected, and Barge's reserve pruning and floor apply. A running command
+  its registered UUID matches and it is writable. Selection does not repeat the
+  boot-container or APFS-role checks; registration and `describe` run those, and
+  the registered UUID pins the volume. Positive absence falls back to the internal
+  pool with a warning. An unknown or different identity refuses. Free space below
+  the reserve starts Barge's reserve pruning and never refuses selection; the floor
+  refuses admission only when that space cannot be recovered. A running command
   never switches volumes.
+- **Registration failure:** a registration that fails after the drive's pool is
+  created removes that pool directory and the drive folders it created, so the
+  next attempt is not refused as already registered. Folders that existed before
+  the attempt are left alone.
 - **Modes:** both modes use the same checks. `ephemeral` keeps final outputs local.
   `permanent` places them on the drive (see [final outputs](#final-outputs)). A
   permanent drive that cannot be used produces a warning before admission, with the
@@ -612,8 +618,12 @@ to the registered drive, and Oxide owns the links that point there.
   durable. `oxide outputs prune --dry-run` previews the candidates and prints a
   SHA-256. `oxide outputs prune --plan <file> --plan-sha256 <hex>` applies that
   exact plan, and Barge rechecks holds and pins before moving a root to
-  marker-checked trash. Unknown legacy roots and unfinished historical prune
-  intents are retained. `resolve-intent` does not replay them.
+  marker-checked trash. Unknown legacy roots are retained. A root named by an
+  unfinished historical prune intent is kept and reported; the rest of the plan
+  still runs. Nothing replays or settles those intents, so an operator recovers
+  such a root by hand with writers stopped. A root whose trash copy could not be
+  deleted is settled in the registry, frees no space, and makes `--plan` exit 1
+  with a count of roots not freed. So does a root Barge keeps.
 
 ## Clean
 
@@ -716,8 +726,8 @@ Privacy & Security, Developer Tools. It states that the cause is inferred.
     `pending_reconciliation_slot_ids` describe a registered one.
   - `available` is passive eligibility. It needs the mount to hold the registered
     volume's root, the UUID to match, the volume to be writable and outside the
-    boot container, free space above the reserve, the payload to exist, and the
-    config and ledger to read cleanly. Each `diskutil` or `plutil` call is bounded
+    boot container, the payload to exist, and the config and ledger to read
+    cleanly. Free space is not part of `available`; the reserve is a prune trigger. Each `diskutil` or `plutil` call is bounded
     by 5 seconds.
   - `unavailable_reason` is `absent`, `identity_mismatch`, `volume_unusable`,
     `metadata_unknown`, `control_missing` or `payload_missing`, or `null` when
@@ -726,7 +736,8 @@ Privacy & Security, Developer Tools. It states that the cause is inferred.
     write grant.
   - Exit code is 0 whenever a description is produced. Before writing, a consumer
     must recheck the UUID, the mount root and that the device differs from both `/`
-    and `/System/Volumes/Data`, and check free space above `reserve_bytes`.
+    and `/System/Volumes/Data`, and read free space against `reserve_bytes` only as
+    a prune trigger, never as a refusal.
 
 ## Adoption: `oxide init` and `oxide new`
 

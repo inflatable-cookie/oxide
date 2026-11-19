@@ -1542,13 +1542,57 @@ fn output_id(selected: &Selected) -> String {
 /// Re-pin an already owned Barge identity without using mutable Oxide marker
 /// fields as new storage authority. A first import requires the Oxide marker
 /// and selection to agree; a retired ID can never re-import its former path.
+/// An imported output root. `pinned` is true only when Barge already protects
+/// the root: its inventory showed a pin, or its pin record is present. The
+/// caller then skips the pin write; every other case reports `false` and pins.
+struct Imported {
+    area: barge::Area,
+    id: String,
+    pinned: bool,
+}
+
+/// Whether Barge protects a root with its durable pin record, at
+/// `<root parent>/.barge/pins/<id>.json`. This mirrors Barge's own `pin_state`:
+/// only `NotFound` means unpinned, and any other inspection error counts as
+/// pinned, because Barge treats that state as unknown and protected. The
+/// layout is Barge-private, so a test pins through Barge and checks this
+/// reader against it. A root without a parent answers `false`, so the caller
+/// pins and surfaces the error.
+fn pin_record_exists(root: &Path, id: &str) -> bool {
+    let Some(parent) = root.parent() else {
+        return false;
+    };
+    let record = parent
+        .join(".barge")
+        .join("pins")
+        .join(format!("{id}.json"));
+    match fs::symlink_metadata(record) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Pin a selected root unless Barge already protects it. A second pin only
+/// rewrites the pin record and its timestamp.
+fn pin_selected(imported: &Imported) -> Result<(), String> {
+    if imported.pinned {
+        return Ok(());
+    }
+    imported
+        .area
+        .pin(&imported.id, "selected by an Oxide output receipt")
+        .map_err(|error| error.to_string())
+}
+
+/// `registry` is the caller's single read of the registry for this command.
 fn import_output(
     control: &Path,
+    registry: Option<&Registry>,
     checkout: &Path,
     checkout_id: &str,
     selected: &Selected,
-) -> Result<(barge::Area, String), String> {
-    if read_registry(control)?.is_some_and(|registry| {
+) -> Result<Imported, String> {
+    if registry.is_some_and(|registry| {
         registry.rows.iter().any(|row| {
             row.root == selected.root()
                 && row.nonce.as_deref() == selected.nonce()
@@ -1558,12 +1602,12 @@ fn import_output(
         return Err("a retired output generation cannot adopt its old path".to_owned());
     }
     let area = output_area(control, selected)?;
-    if let Some(id) = read_registry(control)?.and_then(|registry| {
+    if let Some(id) = registry.and_then(|registry| {
         registry
             .rows
-            .into_iter()
+            .iter()
             .find(|row| row.root == selected.root() && row.barge_id.is_some())
-            .and_then(|row| row.barge_id)
+            .and_then(|row| row.barge_id.clone())
     }) {
         let root = area.resolve(&id).map_err(|error| {
             format!("the recorded Barge output generation is unavailable: {error}")
@@ -1571,7 +1615,10 @@ fn import_output(
         if root.path != selected.root() {
             return Err("the recorded Barge output ID moved".to_owned());
         }
-        return Ok((area, id));
+        // This path reads no inventory. Its pin state comes from the pin
+        // record's presence alone, which is cheap and never a listing.
+        let pinned = pin_record_exists(&root.path, &id);
+        return Ok(Imported { area, id, pinned });
     }
     // The Barge marker and account can already own this path even before
     // its first Oxide index row is committed. Re-pinning it is conservative;
@@ -1580,7 +1627,11 @@ fn import_output(
         .into_iter()
         .find(|root| root.path == selected.root());
     if let Some(root) = existing {
-        return Ok((area, root.id));
+        return Ok(Imported {
+            area,
+            id: root.id,
+            pinned: root.pinned,
+        });
     }
     let marker = outputs::read_marker_for_prune(selected.root())?;
     if !marker.is_owned_by(checkout, checkout_id)
@@ -1613,10 +1664,15 @@ fn import_output(
         }
         Err(error) => return Err(error.to_string()),
     }
-    Ok((area, id))
+    Ok(Imported {
+        area,
+        id,
+        pinned: false,
+    })
 }
 
 fn pin_references(control: &Path, receipt: &Receipt) -> Result<(), String> {
+    let registry = read_registry(control)?;
     for placement in receipt.links() {
         for (selected, pending) in placement
             .selected_ref()
@@ -1644,10 +1700,14 @@ fn pin_references(control: &Path, receipt: &Receipt) -> Result<(), String> {
             {
                 continue;
             }
-            let (area, id) =
-                import_output(control, receipt.checkout(), receipt.checkout_id(), selected)?;
-            area.pin(&id, "selected by an Oxide output receipt")
-                .map_err(|error| error.to_string())?;
+            let imported = import_output(
+                control,
+                registry.as_ref(),
+                receipt.checkout(),
+                receipt.checkout_id(),
+                selected,
+            )?;
+            pin_selected(&imported)?;
         }
     }
     Ok(())
@@ -1660,10 +1720,10 @@ pub(crate) fn pin_output(
     checkout_id: &str,
     selected: &Selected,
 ) -> Result<(), String> {
-    let (area, id) = import_output(control, checkout, checkout_id, selected)?;
-    area.pin(&id, "selected by an Oxide output receipt")
-        .map_err(|error| error.to_string())?;
-    record_import(control, selected.root(), &id)
+    let registry = read_registry(control)?;
+    let imported = import_output(control, registry.as_ref(), checkout, checkout_id, selected)?;
+    pin_selected(&imported)?;
+    record_import(control, selected.root(), &imported.id)
 }
 
 /// Release old selections only after their replacement receipt is durable.
@@ -1713,6 +1773,7 @@ pub(crate) fn hold_outputs(
 ) -> Result<Vec<barge::Hold>, String> {
     let mut held = Vec::new();
     let mut ids = std::collections::HashSet::new();
+    let registry = read_registry(control)?;
     for selected in receipt
         .links()
         .iter()
@@ -1722,12 +1783,17 @@ pub(crate) fn hold_outputs(
         if !receipt.holds_selection() || !ids.insert(selected.root().to_path_buf()) {
             continue;
         }
-        let (area, id) =
-            import_output(control, receipt.checkout(), receipt.checkout_id(), selected)?;
-        area.pin(&id, "selected by an Oxide output receipt")
-            .map_err(|error| error.to_string())?;
-        let hold = area
-            .try_hold(&id, barge::Mode::Shared)
+        let imported = import_output(
+            control,
+            registry.as_ref(),
+            receipt.checkout(),
+            receipt.checkout_id(),
+            selected,
+        )?;
+        pin_selected(&imported)?;
+        let hold = imported
+            .area
+            .try_hold(&imported.id, barge::Mode::Shared)
             .map_err(|error| error.to_string())?
             .ok_or("the output root is held exclusively")?;
         held.push(hold.into_inheritable().map_err(|error| error.to_string())?);
@@ -1751,9 +1817,21 @@ struct Preview {
     roots: Vec<PlannedRoot>,
 }
 
+/// The reason a root is kept while a historical prune intent names it. Barge
+/// never replays or settles old deletion journals, so there is no automatic
+/// path: an operator with writers stopped recovers the bytes by hand. This is
+/// the one wording the outputs refusals reuse.
+pub(crate) const RETAINED_BY_INTENT: &str = "a historical prune intent names this root, so it is retained. Barge does not replay or settle old deletion journals; with writers stopped, inspect the paths recorded for the intent in outputs/registry.json and recover them by hand";
+
 fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
     let mut roots = Vec::new();
     let mut locations = std::collections::HashSet::new();
+    // Only the roots an unfinished intent names are kept; the rest of the
+    // registry still previews and executes.
+    let retained: std::collections::HashSet<&Path> = registry
+        .unfinished_intents()
+        .map(|intent| intent.identity.root.as_path())
+        .collect();
     for row in &registry.rows {
         if row.pruned_ms.is_some() || row.barge_id.is_none() {
             continue;
@@ -1775,6 +1853,9 @@ fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
             continue;
         };
         for root in output_roots(&area)? {
+            if retained.contains(root.path.as_path()) {
+                continue;
+            }
             let recorded = registry
                 .rows
                 .iter()
@@ -1812,11 +1893,20 @@ fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
     })
 }
 
+/// What Barge did with one planned root.
+enum Disposition {
+    /// The root and its trash copy are gone.
+    Removed,
+    /// The root left its path, but its trash copy could not be deleted. Its
+    /// bytes still exist and free no space; the registry settles it anyway.
+    MovedToTrash(String),
+}
+
 fn evict_planned_root(
     control: &Path,
     registry: &Registry,
     planned: &PlannedRoot,
-) -> Result<barge::area::Eviction, String> {
+) -> Result<Disposition, String> {
     let row = registry
         .rows
         .iter()
@@ -1845,7 +1935,20 @@ fn evict_planned_root(
     }
     // The supplier must validate this ID's current marker under its locks
     // through rename; an outer path check cannot supply that authority.
-    area.evict(&planned.id).map_err(|error| error.to_string())
+    match area.evict(&planned.id) {
+        Ok(evicted) if evicted.deleted => Ok(Disposition::Removed),
+        Ok(evicted) => Ok(Disposition::MovedToTrash(
+            evicted
+                .kept_reason
+                .unwrap_or_else(|| "reason unknown".to_owned()),
+        )),
+        // The same post-rename failure the pool settles: the root has left its
+        // path, so the registry must not keep referencing it.
+        Err(error) if oxide_storage::storage::eviction_moved(&error) => {
+            Ok(Disposition::MovedToTrash(error.to_string()))
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 #[derive(Debug)]
@@ -1858,8 +1961,9 @@ fn evict_planned(
     control: &Path,
     registry: &mut Registry,
     planned: &PlannedRoot,
-) -> Result<bool, EvictError> {
-    let result = evict_planned_root(control, registry, planned).map_err(EvictError::Retained)?;
+) -> Result<Disposition, EvictError> {
+    let disposition =
+        evict_planned_root(control, registry, planned).map_err(EvictError::Retained)?;
     for row in registry
         .rows
         .iter_mut()
@@ -1877,28 +1981,52 @@ fn evict_planned(
                 planned.id
             ))
         })?;
-    Ok(result.deleted)
+    Ok(disposition)
 }
 
-fn execute_plan(control: &Path, registry: &mut Registry, planned: &Preview) -> Result<(), String> {
+/// Evict each planned root and return how many were not freed: kept by Barge,
+/// or moved to trash with its deletion failed.
+fn execute_plan(
+    control: &Path,
+    registry: &mut Registry,
+    planned: &Preview,
+) -> Result<usize, String> {
+    let mut not_freed = 0;
     for root in &planned.roots {
         match evict_planned(control, registry, root) {
-            Ok(deleted) => println!(
-                "{}: {}",
-                root.path.display(),
-                if deleted {
-                    "removed"
-                } else {
-                    "kept in Barge trash"
-                }
-            ),
+            Ok(Disposition::Removed) => println!("{}: removed", root.path.display()),
+            Ok(Disposition::MovedToTrash(reason)) => {
+                not_freed += 1;
+                println!(
+                    "{}: moved to trash; deletion failed: {reason}",
+                    root.path.display()
+                )
+            }
             Err(EvictError::Retained(error)) => {
+                not_freed += 1;
                 eprintln!("oxide: kept {}: {error}", root.path.display())
             }
             Err(EvictError::Publication(error)) => return Err(error),
         }
     }
-    Ok(())
+    Ok(not_freed)
+}
+
+/// One accepted command shape. Parsing happens before any store is opened, so
+/// a malformed invocation changes nothing.
+enum Command<'a> {
+    DryRun,
+    Apply { path: &'a str, sha256: &'a str },
+}
+
+const USAGE: &str = "usage: oxide outputs prune --dry-run | --plan FILE --plan-sha256 HEX";
+
+fn parse_command<'a>(words: &[&'a str]) -> Result<Command<'a>, String> {
+    match words {
+        ["prune", "--dry-run"] => Ok(Command::DryRun),
+        ["prune", "--plan", path, "--plan-sha256", sha256] => Ok(Command::Apply { path, sha256 }),
+        _ => Err(USAGE.to_owned()),
+    }
 }
 
 pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
@@ -1910,7 +2038,8 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
         println!("usage: oxide outputs prune --dry-run\n       oxide outputs prune --plan FILE --plan-sha256 HEX\n\nBarge prunes idle unpinned output roots; selected member roots stay pinned.");
         return Ok(0);
     }
-    let dry_run = matches!(words.as_slice(), ["prune", "--dry-run"]);
+    let command = parse_command(&words)?;
+    let dry_run = matches!(command, Command::DryRun);
     let internal = if dry_run {
         Store::open_recorded(&store::settings()?)?
             .ok_or("no internal pool exists; run a building oxide command first")?
@@ -1924,19 +2053,22 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
         Some(store::publication_guard(control)?)
     };
     let mut registry = require_ready(&internal, control)?;
-    if registry.unfinished_intents().next().is_some() {
-        return Err(
-            "historical output prune intents remain unsettled; their roots are retained".to_owned(),
+    // Only the roots an unfinished intent names are refused, below in preview.
+    for intent in registry.unfinished_intents() {
+        eprintln!(
+            "oxide: kept {}: {RETAINED_BY_INTENT}",
+            intent.identity.root.display()
         );
     }
     let planned = preview(control, &registry)?;
     let bytes = serde_json::to_vec_pretty(&planned).map_err(|error| error.to_string())?;
-    match words.as_slice() {
-        ["prune", "--dry-run"] => {
+    match command {
+        Command::DryRun => {
             println!("{}", String::from_utf8_lossy(&bytes));
             eprintln!("plan-sha256: {}", sha256_hex(&bytes));
+            Ok(0)
         }
-        ["prune", "--plan", path, "--plan-sha256", hash] => {
+        Command::Apply { path, sha256 } => {
             let mut given = Vec::new();
             File::open(path)
                 .and_then(|file| file.take(MAX_REGISTRY_BYTES + 1).read_to_end(&mut given))
@@ -1945,15 +2077,17 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
                 return Err("the output prune plan exceeds its byte limit".to_owned());
             }
             let given = given.strip_suffix(b"\n").unwrap_or(&given);
-            if sha256_hex(given) != *hash || given != bytes {
+            if sha256_hex(given) != sha256 || given != bytes {
                 return Err("the output prune plan changed; take a new preview".to_owned());
             }
-            execute_plan(control, &mut registry, &planned)?;
+            let not_freed = execute_plan(control, &mut registry, &planned)?;
+            if not_freed == 0 {
+                return Ok(0);
+            }
+            eprintln!("oxide: {not_freed} planned root(s) were not freed");
+            Ok(1)
         }
-        ["resolve-intent", _] => return Err("historical prune intents are retained; the Barge replacement does not replay old deletion journals".to_owned()),
-        _ => return Err("usage: oxide outputs prune --dry-run | --plan FILE --plan-sha256 HEX".to_owned()),
     }
-    Ok(0)
 }
 
 pub fn status_lines(control: &Path) -> Vec<String> {
@@ -2111,6 +2245,7 @@ fn record_import(control: &Path, root: &Path, id: &str) -> Result<(), String> {
 #[cfg(test)]
 mod plan_identity_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     struct Fixture {
         _temp: barge::testing::TempDir,
@@ -2229,5 +2364,235 @@ mod plan_identity_tests {
         assert!(preview(&control, &registry)
             .unwrap_err()
             .contains("recorded Barge root"));
+    }
+
+    /// Restore owner write access under `path` so a fixture can be removed
+    /// after a test deliberately made a tree undeletable.
+    fn make_writable(path: &Path) {
+        if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            for entry in fs::read_dir(path).unwrap() {
+                make_writable(&entry.unwrap().path());
+            }
+        }
+    }
+
+    /// Barge moves the root out of its path before a deletion can fail. The
+    /// registry must settle that root like any eviction, and the plan must not
+    /// count the still-present trash copy as freed.
+    #[test]
+    fn a_root_moved_to_trash_is_settled_and_not_counted_as_freed() {
+        // SAFETY: geteuid has no preconditions and cannot fail. Root deletes
+        // through an unwritable directory, so the failure cannot be forced.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let Fixture {
+            _temp,
+            control,
+            area,
+            original,
+            mut registry,
+            plan,
+        } = fixture();
+        let protected = original.path.join("protected");
+        fs::create_dir(&protected).unwrap();
+        fs::write(protected.join("file"), b"kept after failed unlink").unwrap();
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let not_freed = execute_plan(&control, &mut registry, &plan).unwrap();
+
+        assert_eq!(not_freed, 1);
+        assert!(!original.path.exists());
+        assert!(area.resolve(&original.id).is_err());
+        let settled = ready_registry(&control)
+            .unwrap()
+            .rows
+            .into_iter()
+            .find(|row| row.root == original.path)
+            .unwrap();
+        assert!(settled.pruned_ms.is_some());
+        make_writable(_temp.path());
+    }
+
+    /// A root Barge keeps (here: held) is not freed, and the plan says so.
+    #[test]
+    fn a_kept_root_is_counted_as_not_freed() {
+        let Fixture {
+            _temp,
+            control,
+            area,
+            original,
+            mut registry,
+            plan,
+        } = fixture();
+        let _hold = area
+            .try_hold(&original.id, barge::Mode::Shared)
+            .unwrap()
+            .expect("the root is free to hold");
+
+        let not_freed = execute_plan(&control, &mut registry, &plan).unwrap();
+
+        assert_eq!(not_freed, 1);
+        assert!(original.path.is_dir());
+        let row = ready_registry(&control)
+            .unwrap()
+            .rows
+            .into_iter()
+            .find(|row| row.root == original.path)
+            .unwrap();
+        assert!(row.pruned_ms.is_none());
+    }
+
+    /// An unsettled legacy intent keeps its own root out of the plan, and no
+    /// other root is refused with it.
+    #[test]
+    fn an_unsettled_intent_retains_only_the_root_it_names() {
+        let Fixture {
+            _temp,
+            control,
+            area,
+            original,
+            ..
+        } = fixture();
+        let neighbor = area.create_root("neighbor").unwrap();
+        let mut registry = ready_registry(&control).unwrap();
+        let mut row = registry.rows[0].clone();
+        row.root = neighbor.path.clone();
+        row.barge_id = Some(neighbor.id.clone());
+        registry.rows.push(row);
+        write_registry(&control, &registry).unwrap();
+        seed_test_intent(&control, &"a".repeat(64), false);
+        let mut registry = ready_registry(&control).unwrap();
+        registry.intents[0].identity.root = original.path.clone();
+        registry.bump().unwrap();
+        write_registry(&control, &registry).unwrap();
+
+        let plan = preview(&control, &ready_registry(&control).unwrap()).unwrap();
+
+        let planned: Vec<&str> = plan.roots.iter().map(|root| root.id.as_str()).collect();
+        assert_eq!(planned, [neighbor.id.as_str()]);
+    }
+
+    #[test]
+    fn malformed_invocations_fail_before_any_store_is_touched() {
+        for words in [
+            vec!["prune"],
+            vec!["prune", "--plan", "plan.json"],
+            vec!["resolve-intent", "0123"],
+        ] {
+            let error = parse_command(&words).err().unwrap();
+            assert_eq!(error, USAGE);
+        }
+        assert!(matches!(
+            parse_command(&["prune", "--dry-run"]),
+            Ok(Command::DryRun)
+        ));
+        assert!(!USAGE.contains("resolve-intent"));
+    }
+
+    /// Importing an unrecorded root reads the inventory that identifies it,
+    /// and that read reports whether a pin already protects the root. A pinned
+    /// root is reported as such, so its pin write is skipped; an unpinned root
+    /// is not, so it is pinned.
+    #[test]
+    fn import_reports_the_pin_its_inventory_already_shows() {
+        let Fixture {
+            _temp,
+            control,
+            area,
+            ..
+        } = fixture();
+        let pinned = area.create_root("already-pinned").unwrap();
+        area.pin(&pinned.id, "earlier pin").unwrap();
+        let plain = area.create_root("unpinned").unwrap();
+        let checkout = _temp.path().join("checkout");
+        let checkout_id = "a".repeat(64);
+        let import = |root: &barge::Root| {
+            let selected = Selected {
+                kind: RootKind::Local,
+                root: root.path.clone(),
+                volume_uuid: None,
+                nonce: None,
+                generation: 1,
+            };
+            import_output(&control, None, &checkout, &checkout_id, &selected).unwrap()
+        };
+
+        let already = import(&pinned);
+        assert_eq!(already.id, pinned.id);
+        assert!(already.pinned);
+        let fresh = import(&plain);
+        assert_eq!(fresh.id, plain.id);
+        assert!(!fresh.pinned);
+    }
+
+    /// The pin-record reader follows Barge's own pin and unpin. If Barge moves
+    /// its record, this fails before a skip could trust a stale answer.
+    #[test]
+    fn the_pin_record_reader_agrees_with_barge_pins() {
+        let Fixture { _temp, area, .. } = fixture();
+        let root = area.create_root("reader").unwrap();
+        assert!(!pin_record_exists(&root.path, &root.id));
+        area.pin(&root.id, "reader pin").unwrap();
+        assert!(pin_record_exists(&root.path, &root.id));
+        area.unpin(&root.id).unwrap();
+        assert!(!pin_record_exists(&root.path, &root.id));
+    }
+
+    /// Only `NotFound` reads as unpinned, as in Barge. A record path that cannot
+    /// be inspected for another reason counts as protected, so the skip never
+    /// reaches a pin write on an unknown state.
+    #[test]
+    fn the_pin_record_reader_treats_only_not_found_as_unpinned() {
+        let temp = barge::testing::TempDir::new("oxide-pin-reader-errors").unwrap();
+        let absent = temp.path().join("absent").join("root");
+        assert!(!pin_record_exists(&absent, "any-id"));
+        // A regular file in the parent position makes the record path fail
+        // with NotADirectory, which is not NotFound.
+        let file = temp.path().join("file");
+        fs::write(&file, b"not a folder").unwrap();
+        assert!(pin_record_exists(&file.join("root"), "any-id"));
+    }
+
+    /// A recorded root reads no inventory, so its pin state must come from its
+    /// pin record: an existing pin is skipped, and an unpinned root is pinned.
+    #[test]
+    fn a_recorded_import_reports_the_pin_its_record_shows() {
+        let Fixture {
+            _temp,
+            control,
+            area,
+            original,
+            registry,
+            ..
+        } = fixture();
+        let checkout = _temp.path().join("checkout");
+        let checkout_id = "a".repeat(64);
+        let selected = Selected {
+            kind: RootKind::Local,
+            root: original.path.clone(),
+            volume_uuid: None,
+            nonce: None,
+            generation: 1,
+        };
+        let import = || {
+            import_output(
+                &control,
+                Some(&registry),
+                &checkout,
+                &checkout_id,
+                &selected,
+            )
+            .unwrap()
+        };
+
+        assert!(!import().pinned);
+        area.pin(&original.id, "recorded pin").unwrap();
+        let recorded = import();
+        assert_eq!(recorded.id, original.id);
+        assert!(recorded.pinned);
+        area.unpin(&original.id).unwrap();
+        assert!(!import().pinned);
     }
 }
