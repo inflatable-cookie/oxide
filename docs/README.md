@@ -1,6 +1,6 @@
 # Oxide documentation
 
-Oxide aims to make Rust development easy and light: predictable storage, less build churn and a fast, understandable feedback loop. Bounded reusable build storage is its first foothold. Queue and Nucleus should consume the same reusable facility; a daemon is one candidate architecture.
+Oxide aims to make Rust development easy and light: predictable storage, less build churn and a fast, understandable feedback loop. Bounded reusable build storage is its first foothold. Nucleus should consume the same reusable facility; a daemon is one candidate architecture.
 
 - [Vision and operator ruling](knowledge/vision.md)
 - [Oxide workflow (foundation core, adoption, freshness gate, budget-only directory backend, Cargo home hygiene, removable-volume modes and surprise-removal handling implemented; dogfooded in this repository)](knowledge/contracts/workflow.md)
@@ -28,4 +28,4 @@ Oxide aims to make Rust development easy and light: predictable storage, less bu
 - [Knowledge map](knowledge/README.md)
 - [Release contract](knowledge/contracts/release.md)
 
-The project plan and proposed briefs live in Queue project `oxide`. Repository knowledge records current truth, not work status.
+The project plan and proposed briefs live in Nucleus project `oxide`. Repository knowledge records current truth, not work status.

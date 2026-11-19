@@ -1160,7 +1160,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # separately, distinguishes outer from nested custody, is bounded to 64 KiB
 # with 32/32/64 row caps and totals/omissions, and never concludes the
 # hosting root (it stays hosting, unconcluded and retained even on success).
-# Native execution is gated on the retained Queue reviewer's exact-head
+# Native execution is gated on the retained Nucleus reviewer's exact-head
 # source/premise approval; the one counted-path diagnostic then runs through
 # the task's proof route. Fit is unmeasured; this declaration activates
 # nothing.
@@ -1405,7 +1405,7 @@ run = 'python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 4096 -- 
 # Rust/Cargo 1.100 foundation qualification (oxide#083). `:plan` and `:test`
 # read repository source only (the test writes removed temp dirs under
 # TMPDIR) and start no child, compiler, Cargo, toolchain, pool or image.
-# `:diagnostic` is the planned single Queue proof: one fixed capture producer
+# `:diagnostic` is the planned single Nucleus proof: one fixed capture producer
 # (`--compose`) that refuses until the planner issues FOUNDATION_083_BINDING
 # (+_SHA256) for the exact head and both toolchains are installed, then runs
 # two ordinary-guard phases (1.97.1, then 1.100.0; 300 s each; guard budget
