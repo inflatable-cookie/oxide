@@ -136,7 +136,10 @@ digest and the receipt digest are reported under separate labels.
   search path — the program's directory, its `deps`, the toolchain's
   `target-libdir` and `sysroot/lib`, then the caller's own
   `DYLD_FALLBACK_LIBRARY_PATH` or `LD_LIBRARY_PATH`, or the loader's default. A
-  failure to read the package facts is one warning and the program still runs.
+  Each post-build metadata and toolchain query has a separate ten-second
+  limit with bounded stop and cleanup. If package facts cannot be read, Oxide
+  warns and runs the program with the other environment fields it could set.
+  If the toolchain query fails, the search path omits its library directories.
 - `run` needs Cargo's JSON to find the program, so `--message-format` takes a
   json variant (`json`, `json-render-diagnostics`, `json-diagnostic-short`,
   `json-diagnostic-rendered-ansi`): the caller's variant is forwarded as given

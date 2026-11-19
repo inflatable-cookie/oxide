@@ -420,7 +420,7 @@ impl PackageFacts {
         command.args(["metadata", "--no-deps", "--format-version", "1"]);
         command.arg("--manifest-path").arg(manifest);
         crate::wrapper::apply(&mut command);
-        let output = crate::budget::output(&mut command)
+        let output = run_environment_query(&mut command)
             .map_err(|error| format!("could not ask Cargo for the package facts: {error}"))?;
         if !output.status.success() {
             return Err(format!(
@@ -526,16 +526,12 @@ pub fn apply_run_environment(
     program: &Path,
     manifest: &Path,
 ) -> Result<(), String> {
-    let facts = PackageFacts::read(crate::CARGO, manifest)?;
     command.env("CARGO", cargo_program());
     command.env(
         "CARGO_MANIFEST_DIR",
         manifest.parent().unwrap_or(Path::new("")),
     );
     command.env("CARGO_MANIFEST_PATH", manifest);
-    for (name, value) in facts.variables() {
-        command.env(name, value);
-    }
     let search = dylib_search_path(
         program,
         &toolchain_libraries(),
@@ -545,6 +541,10 @@ pub fn apply_run_environment(
     let joined = std::env::join_paths(&search)
         .map_err(|error| format!("the program's library search path cannot be written: {error}"))?;
     command.env(dylib_path_variable(), joined);
+    let facts = PackageFacts::read(crate::CARGO, manifest)?;
+    for (name, value) in facts.variables() {
+        command.env(name, value);
+    }
     Ok(())
 }
 
@@ -615,6 +615,33 @@ fn dylib_search_path(
     paths
 }
 
+// Post-build queries cannot reuse the admission deadline: admission ended when
+// Cargo started. Give each query its own ten-second bound in a fresh thread,
+// whose budget state and lease deadline are thread-local. The existing bounded
+// output runner owns the child group and its TERM/KILL closeout.
+fn run_environment_query(command: &mut Command) -> std::io::Result<crate::budget::Output> {
+    run_environment_query_with_limit(command, std::time::Duration::from_secs(10))
+}
+
+fn run_environment_query_with_limit(
+    command: &mut Command,
+    limit: std::time::Duration,
+) -> std::io::Result<crate::budget::Output> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                crate::budget::install(crate::budget::Options {
+                    admission: Some(limit),
+                    ..Default::default()
+                })
+                .map_err(std::io::Error::other)?;
+                crate::budget::output(command)
+            })
+            .join()
+            .map_err(|_| std::io::Error::other("run environment query thread panicked"))?
+    })
+}
+
 /// The rustc's two library directories, so a dynamically linked `std` loads:
 /// the target's own `--print target-libdir` and the sysroot's `lib`, in the
 /// order `cargo run` writes them. Empty when rustc cannot answer; the program
@@ -625,7 +652,7 @@ fn toolchain_libraries() -> Vec<PathBuf> {
         .unwrap_or_else(|| OsString::from("rustc"));
     let mut command = Command::new(rustc);
     command.args(["--print", "sysroot", "--print", "target-libdir"]);
-    let Ok(output) = crate::budget::output(&mut command) else {
+    let Ok(output) = run_environment_query(&mut command) else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -646,6 +673,17 @@ fn toolchain_libraries() -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn run_environment_query_stops_a_hung_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 5"]);
+        let started = std::time::Instant::now();
+        let result =
+            run_environment_query_with_limit(&mut command, std::time::Duration::from_millis(100));
+        assert!(result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+    }
 
     #[test]
     fn labels_are_sanitized_plain_names() {

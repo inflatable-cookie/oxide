@@ -305,8 +305,9 @@ fn fake_run_cargo(scratch: &Path, manifest: &Path) -> (PathBuf, PathBuf) {
 printf '%s\n' "$*" >> "{log}"
 case "$1" in
   locate-project) echo "{manifest}"; exit 0 ;;
-  metadata) cat "{metadata}"; exit 0 ;;
+  metadata) if [ -n "$FAKE_CARGO_METADATA_FAIL" ]; then exit 1; fi; cat "{metadata}"; exit 0 ;;
 esac
+if [ -n "$FAKE_CARGO_BUILD_SLEEP" ]; then sleep "$FAKE_CARGO_BUILD_SLEEP"; fi
 if [ -n "$FAKE_CARGO_SIGNAL_PARENT" ]; then kill -INT "$PPID"; fi
 printf '{{"reason":"compiler-artifact","target":{{"name":"demo","kind":["bin"]}},"executable":"%s","manifest_path":"{manifest}"}}\n' "$FAKE_CARGO_PROGRAM"
 exit 0
@@ -382,14 +383,62 @@ fn bounded_run_gives_the_program_cargos_run_environment() {
     assert_run_environment(&["run", "--execution-budget", "30s", "--bin", "demo"]);
 }
 
+#[test]
+fn run_environment_survives_an_expired_admission_window() {
+    assert_run_environment_with_delay(
+        &[
+            "run",
+            "--admission-budget",
+            "5s",
+            "--execution-budget",
+            "30s",
+            "--bin",
+            "demo",
+        ],
+        Some("6"),
+    );
+}
+
+#[test]
+fn run_keeps_independent_environment_when_package_facts_fail() {
+    let scratch = Scratch::new();
+    let (manifest, program, bin, _) = run_fixture(&scratch);
+    let pool = scratch.path().join("fixture-pool");
+    let output = run_command(&scratch, &bin, &pool, &manifest, &program)
+        .env("FAKE_CARGO_METADATA_FAIL", "1")
+        .args(["run", "--bin", "demo"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("could not read the package facts"));
+    let environment = environment_file(&scratch.path().join("program.env"));
+    assert_eq!(
+        environment.get("CARGO_MANIFEST_PATH"),
+        Some(&manifest.display().to_string())
+    );
+    assert_eq!(
+        environment.get("CARGO"),
+        Some(&bin.join("cargo").display().to_string())
+    );
+}
+
 fn assert_run_environment(args: &[&str]) {
+    assert_run_environment_with_delay(args, None);
+}
+
+fn assert_run_environment_with_delay(args: &[&str], delay: Option<&str>) {
     let scratch = Scratch::new();
     let (manifest, program, bin, _log) = run_fixture(&scratch);
     let pool = scratch.path().join("fixture-pool");
-    let output = run_command(&scratch, &bin, &pool, &manifest, &program)
-        .args(args)
-        .output()
-        .unwrap();
+    let mut command = run_command(&scratch, &bin, &pool, &manifest, &program);
+    if let Some(delay) = delay {
+        command.env("FAKE_CARGO_BUILD_SLEEP", delay);
+    }
+    let output = command.args(args).output().unwrap();
     assert!(
         output.status.success(),
         "oxide run: {}\n{}",
