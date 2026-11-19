@@ -108,6 +108,12 @@ A sweep failure is reported and does not prevent settlement of other recorded
 roots. A record whose root is still present stays for a later pass; recovery
 never deletes it directly.
 
+The deciding command settles before it prints its summary, with the pool and
+admission locks released, inside a bounded exit wait that reports progress as it
+runs. A worker still deleting when that bound is reached, or when a signal has
+already ended the command, is detached: the durable record and the trash stay,
+and the next command resumes them. A signal never waits out the bound.
+
 A held eviction checks the writer generation and exact lease under the pool lock.
 It first writes a private, versioned intent bound to the pool, lease, Barge root
 and parent identity. A normal refusal clears the intent and leaves the control

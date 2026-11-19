@@ -1,14 +1,19 @@
 //! Cargo as leader of its own process group, with Ctrl-C and termination
 //! forwarded to the whole group.
+//!
+//! A group Oxide runs in the background never reads this terminal: only a
+//! group it hands the terminal's foreground to may, and a stop of that group
+//! (Ctrl-Z) hands the terminal back and stops this command with it, as a shell
+//! does for a stopped job.
 
 use crate::watchdog::Watchdog;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const FORWARDED: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+const FORWARDED: [libc::c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 /// The budget stop reuses the space watchdog's escalation allowances.
 const STOP_GRACE: Duration = crate::budget::GRACE;
 const STOP_CLOSE_BOUND: Duration = crate::budget::CLOSE_BOUND;
@@ -82,7 +87,7 @@ extern "C" fn record_signal(signal: libc::c_int) {
     RECEIVED.store(signal, Ordering::SeqCst);
 }
 
-/// Catch SIGINT/SIGTERM/SIGHUP so Oxide can forward them and release.
+/// Catch SIGINT/SIGTERM/SIGHUP/SIGQUIT so Oxide can forward them and release.
 pub fn install_signal_handlers() -> Result<(), String> {
     for signal in FORWARDED {
         // SAFETY: `record_signal` is an `extern "C"` process-lifetime function
@@ -162,6 +167,9 @@ impl Stop {
 pub struct Group {
     pub child: Child,
     pub id: i32,
+    /// This group owns the terminal's foreground while it runs, so its stops
+    /// are this command's business.
+    foreground: bool,
 }
 
 /// Start `command` as the leader of a new process group.
@@ -171,6 +179,16 @@ pub fn spawn_group(command: &mut Command) -> Result<Group, String> {
 
 /// [`spawn_group`] keeping the start error, for `exec`'s exit code.
 pub fn start_group(command: &mut Command) -> std::io::Result<Group> {
+    start_group_with(command, false)
+}
+
+fn start_group_with(command: &mut Command, owns_terminal: bool) -> std::io::Result<Group> {
+    if detaches_stdin(owns_terminal, stdin_is_terminal()) {
+        // A background group must not read this terminal: a read there raises
+        // SIGTTIN and stops the job, which is a hang when nobody owns the
+        // terminal to carry on. It reads end-of-file instead.
+        command.stdin(Stdio::null());
+    }
     let child = command.process_group(0).spawn()?;
     let id = i32::try_from(child.id()).map_err(|_| {
         std::io::Error::new(
@@ -178,19 +196,106 @@ pub fn start_group(command: &mut Command) -> std::io::Result<Group> {
             "process ID is out of range",
         )
     })?;
-    Ok(Group { child, id })
+    Ok(Group {
+        child,
+        id,
+        foreground: owns_terminal,
+    })
 }
 
-/// Forward any newly received signal to the group.
+/// Whether a group must read end-of-file instead of the terminal: only a group
+/// that is not given the terminal's foreground, and only when standard input is
+/// that terminal.
+fn detaches_stdin(owns_terminal: bool, stdin_is_terminal: bool) -> bool {
+    !owns_terminal && stdin_is_terminal
+}
+
+fn stdin_is_terminal() -> bool {
+    // SAFETY: isatty only inspects descriptor 0.
+    unsafe { libc::isatty(0) == 1 }
+}
+
+/// Forward any newly received signal to the group, then continue it: a member
+/// stopped by a job-control signal must run again to act on what it was sent.
 pub fn forward_pending(group: i32) {
     let signal = PENDING.swap(0, Ordering::SeqCst);
-    if signal != 0 && group > 1 {
-        // SAFETY: a negative PID addresses the process group this command
-        // created; `signal` is one of the forwarded termination signals.
-        unsafe {
-            libc::kill(-group, signal);
-        }
+    if signal == 0 || group <= 1 {
+        return;
     }
+    signal_group(group, signal);
+    signal_group(group, libc::SIGCONT);
+}
+
+/// What one non-blocking wait on the leader found.
+enum Harvest {
+    Running,
+    Exited(ExitStatus),
+    /// Stopped by a job-control signal, and not yet reaped.
+    Stopped,
+}
+
+/// Harvest the leader without blocking or losing it.
+///
+/// A background group is harvested with `try_wait`: its stops are its own
+/// business. A group that owns the terminal is harvested with `WUNTRACED`, so a
+/// Ctrl-Z is observed instead of looking like a child that never exits.
+fn harvest(group: &mut Group) -> Result<Harvest, String> {
+    if !group.foreground {
+        return group
+            .child
+            .try_wait()
+            .map(|status| status.map_or(Harvest::Running, Harvest::Exited))
+            .map_err(|error| format!("could not wait for Cargo: {error}"));
+    }
+    let mut status = 0;
+    // SAFETY: `status` is writable and `group.id` is the child this command
+    // started, which nothing else in this process waits on.
+    let waited = unsafe { libc::waitpid(group.id, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+    match waited {
+        0 => Ok(Harvest::Running),
+        -1 => Err(format!(
+            "could not wait for Cargo: {}",
+            std::io::Error::last_os_error()
+        )),
+        _ if libc::WIFSTOPPED(status) => Ok(Harvest::Stopped),
+        _ if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) => {
+            Ok(Harvest::Exited(ExitStatus::from_raw(status)))
+        }
+        _ => Ok(Harvest::Running),
+    }
+}
+
+/// Hand the terminal's foreground to `group`.
+fn hand_terminal_to(group: i32) {
+    // SAFETY: SIGTTOU is ignored only around tcsetpgrp on descriptor 0, then
+    // the previous disposition is restored.
+    unsafe {
+        let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::tcsetpgrp(0, group);
+        libc::signal(libc::SIGTTOU, previous);
+    }
+}
+
+/// A foreground group was stopped, as a shell's job is on Ctrl-Z: hand the
+/// terminal back, stop with the job, and — once this command is resumed — give
+/// the job the terminal again and continue it. Without this the caller's shell
+/// never learns the job stopped and the terminal stays owned by a group that
+/// cannot use it.
+fn suspend_with_stopped_group(group: i32) {
+    // SAFETY: getpgrp has no preconditions.
+    hand_terminal_to(unsafe { libc::getpgrp() });
+    // SAFETY: SIGSTOP cannot be caught or ignored, so the stop always lands;
+    // whatever started this command resumes it with SIGCONT.
+    unsafe {
+        libc::raise(libc::SIGSTOP);
+    }
+    // Resumed: a `fg` gave this command the terminal back; a `bg` did not, and
+    // then the shell keeps it and only the group continues.
+    // SAFETY: tcgetpgrp and getpgrp only inspect this process and descriptor 0.
+    if unsafe { libc::tcgetpgrp(0) } == unsafe { libc::getpgrp() } {
+        hand_terminal_to(group);
+    }
+    signal_group(group, libc::SIGCONT);
 }
 
 /// Wait for the leader, forwarding signals.
@@ -214,12 +319,10 @@ pub fn wait_leader_budgeted(
     stop: &mut Stop,
 ) -> Result<Option<ExitStatus>, String> {
     loop {
-        if let Some(status) = group
-            .child
-            .try_wait()
-            .map_err(|error| format!("could not wait for Cargo: {error}"))?
-        {
-            return Ok(Some(status));
+        match harvest(group)? {
+            Harvest::Exited(status) => return Ok(Some(status)),
+            Harvest::Stopped => suspend_with_stopped_group(group.id),
+            Harvest::Running => {}
         }
         forward_pending(group.id);
         if stop.poll(group.id) {
@@ -238,12 +341,10 @@ pub fn wait_leader_watched(
 ) -> Result<Option<ExitStatus>, String> {
     loop {
         // Same order as the unwatched wait: harvest, forward, then deadline.
-        if let Some(status) = group
-            .child
-            .try_wait()
-            .map_err(|error| format!("could not wait for Cargo: {error}"))?
-        {
-            return Ok(Some(status));
+        match harvest(group)? {
+            Harvest::Exited(status) => return Ok(Some(status)),
+            Harvest::Stopped => suspend_with_stopped_group(group.id),
+            Harvest::Running => {}
         }
         forward_pending(group.id);
         if stop.poll(group.id) {
@@ -334,7 +435,7 @@ pub fn start_foreground_group(
     // this process.
     let foreground = unsafe { libc::isatty(0) == 1 && libc::tcgetpgrp(0) == libc::getpgrp() };
     if !foreground {
-        return Ok((start_group(command)?, None));
+        return Ok((start_group_with(command, false)?, None));
     }
     // SAFETY: the closure runs in the child between fork and exec and only
     // calls async-signal-safe functions: the child takes the foreground for
@@ -349,7 +450,7 @@ pub fn start_foreground_group(
     }
     // SAFETY: getpgrp has no preconditions.
     let previous = unsafe { libc::getpgrp() };
-    let group = start_group(command)?;
+    let group = start_group_with(command, true)?;
     let guard = Foreground { previous };
     // The parent hands the foreground over too, so whichever runs first wins
     // the race and the program never reads the terminal from the background.
@@ -364,13 +465,7 @@ pub struct Foreground {
 
 impl Foreground {
     fn give(&self, group: i32) {
-        // SAFETY: SIGTTOU is ignored only around tcsetpgrp on descriptor 0,
-        // then the previous disposition is restored.
-        unsafe {
-            let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
-            libc::tcsetpgrp(0, group);
-            libc::signal(libc::SIGTTOU, previous);
-        }
+        hand_terminal_to(group);
     }
 }
 
@@ -521,6 +616,96 @@ mod tests {
             "a natural exit must not latch a stop"
         );
         budget::clear();
+    }
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("process-{label}-{:x}", std::process::id()));
+        std::fs::create_dir(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// A job-control stop is observed, not mistaken for a child that never
+    /// exits, and the leader is left for the ordinary reap. Counterfactual:
+    /// harvesting with `try_wait` alone (no WUNTRACED) reports nothing until
+    /// the child is continued, which is the terminal hang Ctrl-Z caused.
+    #[test]
+    fn a_stopped_foreground_leader_is_observed_without_being_reaped() {
+        let mut group = OwnedGroup::spawn(Command::new("/bin/sh").args(["-c", "kill -STOP $$"]));
+        // As `start_foreground_group` marks a group that owns the terminal.
+        group.foreground = true;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stopped = loop {
+            match harvest(&mut group).expect("a wait") {
+                Harvest::Stopped => break true,
+                Harvest::Exited(_) => break false,
+                Harvest::Running if Instant::now() >= deadline => break false,
+                Harvest::Running => std::thread::sleep(POLL),
+            }
+        };
+        assert!(stopped, "the stopped leader was never observed");
+        signal_group(group.id, libc::SIGCONT);
+        let status = group
+            .child
+            .wait()
+            .expect("the leader is still this process's child to reap");
+        assert!(status.success(), "the resumed leader exited {status}");
+    }
+
+    /// Forwarding a signal to a stopped group continues it, so the group acts
+    /// on the signal instead of staying stopped forever.
+    #[test]
+    fn a_forwarded_signal_continues_a_stopped_group() {
+        let dir = scratch("forward-cont");
+        let report = dir.join("term");
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            &format!(
+                "trap 'echo term > {}; exit 0' TERM; while :; do sleep 0.05; done",
+                report.display()
+            ),
+        ]);
+        let mut group = OwnedGroup::spawn(&mut command);
+        group.foreground = true;
+        // Let the shell install its trap, then stop the whole group.
+        std::thread::sleep(Duration::from_millis(200));
+        signal_group(group.id, libc::SIGSTOP);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match harvest(&mut group).expect("a wait") {
+                Harvest::Stopped => break,
+                Harvest::Exited(_) => panic!("the group exited before it was stopped"),
+                Harvest::Running if Instant::now() >= deadline => {
+                    panic!("the group did not stop")
+                }
+                Harvest::Running => std::thread::sleep(POLL),
+            }
+        }
+        PENDING.store(libc::SIGTERM, Ordering::SeqCst);
+        forward_pending(group.id);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !report.exists() && Instant::now() < deadline {
+            std::thread::sleep(POLL);
+        }
+        assert!(
+            report.exists(),
+            "the stopped group never acted on the forwarded signal"
+        );
+        let _ = group.child.wait();
+        std::fs::remove_dir_all(&dir).expect("remove scratch");
+    }
+
+    /// Only a group that is not given the terminal, and only when standard
+    /// input is that terminal, reads end-of-file instead.
+    #[test]
+    fn only_a_background_group_on_a_terminal_detaches_its_stdin() {
+        assert!(detaches_stdin(false, true));
+        assert!(!detaches_stdin(true, true));
+        assert!(!detaches_stdin(false, false));
+        assert!(!detaches_stdin(true, false));
     }
 
     #[test]

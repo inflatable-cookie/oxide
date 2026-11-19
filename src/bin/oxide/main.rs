@@ -208,14 +208,26 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
     // runs exactly `cargo <cmd> --help`. `clean`, `init` and `new` forward
     // too, so neither clean's own planning and workspace discovery nor the
     // hand-off check that reads pool control state can run for a help
-    // request. Help after `--` belongs to the program and keeps the owned
+    // request. The whole request is forwarded unchanged: an external
+    // subcommand such as `oxide nextest run --help` takes its own arguments
+    // before `--help`, and dropping them asks Cargo for a different help page
+    // (or none). Help after `--` belongs to the program and keeps the owned
     // path.
     if matches!(
         class,
         Class::Modelled | Class::Building | Class::Clean | Class::Init | Class::New
     ) && cli::cargo_help(rest)
     {
-        return Err(exec_cargo(&[first.clone(), OsString::from("--help")]));
+        // Oxide's leading budget options are Oxide's, not Cargo's, so a help
+        // request drops them. Malformed ones keep the old answer: Cargo's help.
+        let kept = match budget::scan(rest) {
+            Ok((_, kept)) => kept,
+            Err(_) => rest.to_vec(),
+        };
+        let mut forwarded = Vec::with_capacity(kept.len() + 1);
+        forwarded.push(first.clone());
+        forwarded.extend(kept);
+        return Err(exec_cargo(&forwarded));
     }
     // The budget prefix is Oxide's on leased commands only (oxide#140). Any
     // other class refuses a reserved name by name instead of forwarding it.
@@ -1046,7 +1058,7 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
     // unbudgeted path keeps today's release-then-exec hand-off.
     let bounded_run = run && budget::has_execution();
     let owned_program = match (&outcome, &output_root) {
-        (Ok((Some(status), Some(Ok((program, manifest_dir))), _drained)), root)
+        (Ok((Some(status), Some(Ok(target)), _drained)), root)
             if run
                 && status.success()
                 && stopped.is_none()
@@ -1060,17 +1072,20 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
             let program = match root {
                 Some(root) => {
                     oxide_storage::release_trace::phase("program target resolution", || {
-                        outputs::program_target(&key.checkout, root, &program)
+                        outputs::program_target(&key.checkout, root, &target.program)
                     })
-                    .unwrap_or_else(|| program.clone())
+                    .unwrap_or_else(|| target.program.clone())
                 }
-                None => program.clone(),
+                None => target.program.clone(),
             };
-            Some((program, manifest_dir.clone()))
+            Some(RunProgram {
+                program,
+                manifest: target.manifest.clone(),
+            })
         }
         _ => None,
     };
-    if let Some((program, manifest_dir)) = owned_program {
+    if let Some(program) = owned_program {
         print_summary(
             &store,
             &invocation,
@@ -1088,8 +1103,8 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
             &store,
             held,
             origin,
-            &program,
-            &manifest_dir,
+            &program.program,
+            &program.manifest,
             &invocation.program_args,
             execution_started,
             &mut budget_stop,
@@ -1108,14 +1123,14 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
     // the group is observed empty. A program with no owned directory to
     // protect keeps the plain release-then-exec path.
     let fenced_program = match (&outcome, chosen_temp.owned()) {
-        (Ok((Some(status), Some(Ok((program, manifest_dir))), _drained)), Some(_))
+        (Ok((Some(status), Some(Ok(target)), _drained)), Some(_))
             if run && status.success() && stopped.is_none() =>
         {
-            Some((program.clone(), manifest_dir.clone()))
+            Some(target.clone())
         }
         _ => None,
     };
-    if let Some((program, manifest_dir)) = fenced_program {
+    if let Some(program) = fenced_program {
         print_summary(
             &store,
             &invocation,
@@ -1130,8 +1145,8 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
             &store,
             held,
             origin,
-            &program,
-            &manifest_dir,
+            &program.program,
+            &program.manifest,
             &invocation.program_args,
             execution_started,
             &mut budget_stop,
@@ -1186,6 +1201,22 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
     if let Some(origin) = budget::origin() {
         budget::report_stop(origin);
     }
+    // The code this command returns is settled before the budget event is
+    // reported, so the event and the exit status always agree. `stopped` is a
+    // reserve stop: an ordinary failed command, never a success.
+    let mut code = process::exit_code(status);
+    if stopped.is_some() {
+        code = code.max(1);
+    }
+    // A signal that arrived while Cargo ran ends this command, and a `run`
+    // never launches its program afterwards.
+    let interrupted = (run && status.success())
+        .then(process::received_signal)
+        .flatten();
+    if let Some(signal) = interrupted {
+        code = process::signal_exit_code(signal);
+    }
+    let code = budget::exit_code(code);
     budget::finished(
         if budget::origin() == Some(budget::Origin::Admission) {
             budget::Outcome::AdmissionDeadline
@@ -1210,14 +1241,13 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         } else {
             budget::Lease::Released
         },
-        budget::exit_code(process::exit_code(status)),
+        code,
     );
-    if stopped.is_some() {
-        // A reserve stop is an ordinary failed command, never a success.
-        return Ok(process::exit_code(status).max(1));
+    if stopped.is_some() || interrupted.is_some() {
+        return Ok(code);
     }
     if !run || !status.success() {
-        return Ok(budget::exit_code(process::exit_code(status)));
+        return Ok(code);
     }
     if budget::has_execution() && budget::origin().is_none() {
         // A bounded `run` never reaches the release-then-exec hand-off.
@@ -1225,17 +1255,35 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         return Ok(101);
     }
     match executable.unwrap_or_else(|| Err("no run target was recorded".to_owned())) {
-        Ok((program, manifest_dir)) => {
+        Ok(target) => {
+            // A signal that arrived after Cargo's status was reported still
+            // ends the command instead of launching a program nobody asked
+            // for any more.
+            if let Some(signal) = process::received_signal() {
+                return Ok(process::signal_exit_code(signal));
+            }
             // Lease released and this command owns no temporary directory,
             // so the program runs from the private target dir with the kept
-            // inherited directory.
-            let mut command = Command::new(&program);
-            command
-                .args(&invocation.program_args)
-                .env("CARGO_MANIFEST_DIR", manifest_dir);
+            // inherited directory, in the environment `cargo run` gives it.
+            let mut command = Command::new(&target.program);
+            command.args(&invocation.program_args);
             chosen_temp.apply(&mut command);
+            if let Err(error) =
+                identity::apply_run_environment(&mut command, &target.program, &target.manifest)
+            {
+                eprintln!(
+                    "oxide: warning: {error}; the program runs without Cargo's full run environment"
+                );
+            }
+            // A signal can arrive while the post-build environment queries run.
+            if let Some(signal) = process::received_signal() {
+                return Ok(process::signal_exit_code(signal));
+            }
             let error = command.exec();
-            Err(format!("could not execute {}: {error}", program.display()))
+            Err(format!(
+                "could not execute {}: {error}",
+                target.program.display()
+            ))
         }
         Err(message) => {
             eprintln!("oxide: error: {message}");
@@ -1256,7 +1304,7 @@ fn run_owned_program(
     held: store::Lease,
     origin: Option<freshness::Built>,
     program: &Path,
-    manifest_dir: &Path,
+    manifest: &Path,
     args: &[OsString],
     execution_started: Option<Instant>,
     budget_stop: &mut process::Stop,
@@ -1265,8 +1313,14 @@ fn run_owned_program(
     seed_profile: &str,
 ) -> Result<u8, String> {
     let mut command = Command::new(program);
-    command.args(args).env("CARGO_MANIFEST_DIR", manifest_dir);
+    command.args(args).env(
+        "CARGO_MANIFEST_DIR",
+        manifest.parent().unwrap_or(Path::new("")),
+    );
     child_temp.apply(&mut command);
+    if let Err(error) = identity::apply_run_environment(&mut command, program, manifest) {
+        eprintln!("oxide: warning: {error}; the program runs without Cargo's full run environment");
+    }
     if let Err(error) = store.mark_spawning(&held) {
         store.release(held, origin)?;
         return Err(error);
@@ -1566,7 +1620,14 @@ fn lease_with_gate(
     Err("the freshness gate kept refusing slots".to_owned())
 }
 
-type RunTarget = Result<(PathBuf, PathBuf), String>;
+/// The program `run` built and the package manifest it belongs to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RunProgram {
+    program: PathBuf,
+    manifest: PathBuf,
+}
+
+type RunTarget = Result<RunProgram, String>;
 
 /// `run`: wait for the build while reading Cargo's JSON for the executable.
 fn collect_run(
@@ -1593,6 +1654,10 @@ fn collect_run(
     let mut found: Vec<(String, PathBuf, PathBuf)> = Vec::new();
     let mut status = None;
     let mut closed = false;
+    // A closed stdout (a caller that went away, a full pipe) must not panic
+    // while this command holds the lease: stop forwarding and keep draining,
+    // so Cargo still gets its stdout read and its group still closes.
+    let mut forwarding = invocation.json_messages;
     while status.is_none() || !closed {
         // Freeze A2 item 6 order, with the drain slice first: the line read is
         // the only wait here, and the leader is harvested immediately after it
@@ -1603,8 +1668,8 @@ fn collect_run(
         // can still be stopped.
         match receiver.recv_timeout(Duration::from_millis(20)) {
             Ok(line) => {
-                if invocation.json_messages {
-                    println!("{line}");
+                if forwarding && writeln!(std::io::stdout().lock(), "{line}").is_err() {
+                    forwarding = false;
                 }
                 if let Some(artifact) = run_artifact(&line, selection.as_deref()) {
                     if !found.iter().any(|known| known.1 == artifact.1) {
@@ -1644,8 +1709,8 @@ fn collect_run(
     let _ = std::io::stdout().flush();
     let target = match found.len() {
         1 => {
-            let (_, program, manifest_dir) = found.remove(0);
-            Ok((program, manifest_dir))
+            let (_, program, manifest) = found.remove(0);
+            Ok(RunProgram { program, manifest })
         }
         0 => Err("the build produced no binary to run; pass --bin or --example".to_owned()),
         _ => {
@@ -1674,12 +1739,8 @@ fn run_artifact(line: &str, selection: Option<&str>) -> Option<(String, PathBuf,
     if !runnable || selection.is_some_and(|selected| selected != name) {
         return None;
     }
-    let manifest_dir = Path::new(message["manifest_path"].as_str()?).parent()?;
-    Some((
-        name.to_owned(),
-        PathBuf::from(executable),
-        manifest_dir.to_path_buf(),
-    ))
+    let manifest = PathBuf::from(message["manifest_path"].as_str()?);
+    Some((name.to_owned(), PathBuf::from(executable), manifest))
 }
 
 /// One line: profile, strategy, slot warmth, elapsed time, the slot's size
@@ -1812,6 +1873,14 @@ impl TrashSettler {
     /// worker still running at the bound is detached: its durable record stays,
     /// and the next command resumes it.
     fn finish(&mut self) {
+        self.finish_while(|| process::received_signal().is_some());
+    }
+
+    /// [`Self::finish`] giving up as soon as `interrupted` reports that this
+    /// command is already ending. A signal has asked it to stop, so it never
+    /// waits out the settle bound: the deletion's durable record stays and the
+    /// next command resumes it.
+    fn finish_while(&mut self, interrupted: impl Fn() -> bool) {
         // Ending the channel lets the worker leave its loop after the pass it
         // is running.
         self.kick.take();
@@ -1829,6 +1898,11 @@ impl TrashSettler {
                 if let Some(worker) = self.worker.take() {
                     let _ = worker.join();
                 }
+                return;
+            }
+            if interrupted() {
+                self.worker = None;
+                eprintln!("{}", trash_interrupted_message(started.elapsed()));
                 return;
             }
             let elapsed = started.elapsed();
@@ -1859,6 +1933,15 @@ impl Drop for TrashSettler {
 fn trash_wait_message(seconds: u64) -> String {
     format!(
         "oxide: an evicted idle slot's trash is still being deleted after {seconds}s; its durable record stays, and the next oxide command resumes it"
+    )
+}
+
+/// A signal ended this command while an evicted idle slot's trash was still
+/// being deleted: the same durable record resumes it.
+fn trash_interrupted_message(elapsed: Duration) -> String {
+    format!(
+        "oxide: an evicted idle slot's trash is still being deleted ({}s); the signal ends this command, its durable record stays, and the next oxide command resumes it",
+        elapsed.as_secs()
     )
 }
 
@@ -3234,6 +3317,33 @@ mod tests {
                 assert_eq!(profile.get(name), set(value).as_ref(), "{name}");
             }
         }
+    }
+
+    /// A signal that already ends this command never waits out the settle
+    /// bound for an evicted slot's deletion: the worker is detached and its
+    /// durable record resumes on the next command. Counterfactual: the wait
+    /// polled only the worker and the bound.
+    #[test]
+    fn a_signal_stops_waiting_for_an_evicted_slots_deletion() {
+        let mut settler = TrashSettler {
+            worker: Some(
+                std::thread::Builder::new()
+                    .name("oxide-test-trash".to_owned())
+                    .spawn(|| std::thread::sleep(Duration::from_secs(3)))
+                    .expect("a worker"),
+            ),
+            kick: None,
+        };
+        let started = Instant::now();
+        settler.finish_while(|| true);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the settle wait did not stop for the ending command"
+        );
+        assert!(
+            settler.worker.is_none(),
+            "the still-running worker stays detached"
+        );
     }
 
     fn budget_invocation() -> Invocation {

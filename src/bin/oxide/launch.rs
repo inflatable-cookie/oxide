@@ -295,17 +295,24 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The standard plan. `OXIDE_TEST_LAUNCH_LIMIT_MS`,
-    /// `OXIDE_TEST_LAUNCH_DELAY` (`copy:<ms>`, `start:<ms>` or
-    /// `remove:<ms>`) and `OXIDE_TEST_LAUNCH_SOURCE` exist for the
-    /// integration tests.
+    /// The standard plan. In a debug build, `OXIDE_TEST_LAUNCH_LIMIT_MS`,
+    /// `OXIDE_TEST_LAUNCH_DELAY` (`copy:<ms>`, `start:<ms>` or `remove:<ms>`)
+    /// and `OXIDE_TEST_LAUNCH_SOURCE` exist for the integration tests.
     fn from_environment(oxide: PathBuf) -> Result<Self, String> {
-        let mut plan = Self {
+        let plan = Self {
             limit: DEADLINE,
             work: WORK_DEADLINE,
             delays: Delays::default(),
             source: oxide,
         };
+        Self::with_test_hooks(plan)
+    }
+
+    /// The test hooks, in a debug build only: an installer's release binary
+    /// carries the `test_controls` capability as `false` and must not be able
+    /// to copy and execute a file named in the environment.
+    #[cfg(debug_assertions)]
+    fn with_test_hooks(mut plan: Self) -> Result<Self, String> {
         let millis = |text: &str| text.parse::<u64>().ok().map(Duration::from_millis);
         if let Ok(text) = std::env::var("OXIDE_TEST_LAUNCH_LIMIT_MS") {
             plan.limit = millis(&text).ok_or("OXIDE_TEST_LAUNCH_LIMIT_MS must be milliseconds")?;
@@ -325,6 +332,13 @@ impl Plan {
         if let Some(source) = std::env::var_os("OXIDE_TEST_LAUNCH_SOURCE") {
             plan.source = PathBuf::from(source);
         }
+        Ok(plan)
+    }
+
+    /// A release build answers the same plan with no hook: the environment
+    /// names nothing it will copy or run.
+    #[cfg(not(debug_assertions))]
+    fn with_test_hooks(plan: Self) -> Result<Self, String> {
         Ok(plan)
     }
 }
