@@ -256,6 +256,7 @@ fn register(mount: &Path, reserve: u64, cap: u64, mode: DriveMode) -> Result<u8,
     let internal = Store::open_or_create()?;
     let control = internal.control().to_path_buf();
     let _admission = store::lock_admission(&control)?;
+    store::publish_writer_generation(&control)?;
     if let Some(previous) = previous_registration(&internal) {
         return Err(previous_registration_refusal(&previous));
     }
@@ -309,6 +310,7 @@ fn set_mode(mode: DriveMode) -> Result<u8, String> {
 
 fn set_mode_in_control(control: &Path, mode: DriveMode) -> Result<(), String> {
     let _admission = store::lock_admission(control)?;
+    store::publish_writer_generation(control)?;
     let mut registration =
         read_registration(control)?.ok_or_else(|| "no removable pool is registered".to_owned())?;
     registration.version = REGISTRATION_VERSION;
@@ -791,7 +793,16 @@ pub fn select(internal: Store) -> Result<Selected, String> {
         .control()
         .join(POOL_DIR)
         .join(oxide_storage::lease::MANAGED_NAME);
-    let area = registered_area(&control, &registration)?;
+    let area = {
+        // Declaration can import or update Barge state before pool open.
+        let _internal = store::publication_guard(internal.control())?;
+        let _removable = if store::open_control_directory(&control)?.is_some() {
+            Some(store::publication_guard(&control)?)
+        } else {
+            None
+        };
+        registered_area(&control, &registration)?
+    };
     let absent = match &area {
         None => true,
         Some(area) => match area.volume().state().map_err(|error| error.to_string())? {
@@ -817,8 +828,7 @@ pub fn select(internal: Store) -> Result<Selected, String> {
         });
     }
     let area = area.ok_or("the removable storage area is unavailable")?;
-    require_location(&area)?;
-    verified_registration(&control, &registration)?;
+    verify_location(&area, &registration)?;
     let store = Store::open_removable(
         &internal.control().join(POOL_DIR),
         registration.mount_point.join(PAYLOAD_DIR),
@@ -915,7 +925,11 @@ pub(crate) fn verified_registration(
             registration.mount_point.display()
         )
     })?;
-    require_location(&area)?;
+    verify_location(&area, registration)
+}
+
+fn verify_location(area: &barge::Area, registration: &Registration) -> Result<(), String> {
+    require_location(area)?;
     if !volume::writable(&registration.mount_point)? {
         return Err("the volume is not writable".to_owned());
     }

@@ -11,17 +11,22 @@ inside one fresh mktemp directory. Aggregate budget is 60 seconds.
 from __future__ import annotations
 
 import datetime
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
+import re
 import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 signal.alarm(60)
 
@@ -62,8 +67,16 @@ class InstallerTests(unittest.TestCase):
         os.environ["PATH"] = self.path
 
     def receipt(self, data):
+        # The first replacement may be of a binary from the old installer.
         installer.RECEIPTS.mkdir(parents=True)
-        (installer.RECEIPTS / "1.json").write_text(json.dumps({"installed": {"sha256": sha256(data)}}))
+        path = installer.RECEIPTS / "20260101T000000Z-aaaaaaaaaaaa.json"
+        path.write_text(json.dumps({
+            "pin": "a" * 40, "build_instance": "b" * 32,
+            "control_state_version": 9, "registration_version": 2,
+            "installed": {"path": str(installer.DESTINATION), "sha256": sha256(data)},
+        }))
+        path.chmod(0o600)
+        return path
 
     def test_initial_install_is_a_regular_staged_file(self):
         previous, expected = installer.preflight(False)
@@ -204,10 +217,149 @@ class InstallerTests(unittest.TestCase):
         path = installer.write_receipt(receipt, started, "a" * 40)
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
         self.assertEqual(json.loads(path.read_text())["build_instance"], "b" * 32)
-        self.assertEqual(path.name, "20260101T000000Z-aaaaaaaaaaaa.json")
+        self.assertEqual(path.name, "20260101T000000Z_000000-aaaaaaaaaaaa.json")
         # An existing receipt is never overwritten.
         with self.assertRaises(FileExistsError):
             installer.write_receipt(receipt, started, "a" * 40)
+        # A clock rollback must not publish a receipt readers will overlook.
+        with self.assertRaisesRegex(installer.Refusal, "timestamp"):
+            installer.write_receipt(receipt, started - datetime.timedelta(seconds=1), "a" * 40)
+
+    def upgrade(self):
+        installer.DESTINATION.write_bytes(b"old oxide")
+        prior = self.receipt(b"old oxide")
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            mock.patch.object(sys, "argv", ["oxide-install.py", "--replace"]),
+            mock.patch.object(installer, "authenticate_pin", return_value=("c" * 40, "d" * 40, "e" * 40)),
+            mock.patch.object(installer, "build", return_value=(self.built, {"cargo": "fixture"})),
+            mock.patch.object(installer, "build_identity"),
+            mock.patch.object(installer, "state_capabilities", return_value={
+                "control_state_version": 10, "registration_version": 2,
+                "ledger_version": 2, "writer_generation": 1,
+            }),
+            mock.patch.object(installer, "report_old_processes") as report,
+        ):
+            self.assertEqual(installer.main(), 0)
+        report.assert_called_once()
+        return prior, Path(str(prior) + ".binary")
+
+    def invoke_rollback(self):
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+            mock.patch.object(sys, "argv", ["oxide-install.py", "--rollback"]),
+            mock.patch.object(installer, "authenticate_pin", side_effect=AssertionError("git access")),
+            mock.patch.object(installer, "build", side_effect=AssertionError("build")),
+            mock.patch.object(installer, "report_old_processes"),
+        ):
+            code = installer.main()
+        return code, output.getvalue(), errors.getvalue()
+
+    def test_rollback_restores_a_private_hash_matching_copy_and_records_its_identity(self):
+        prior, backup = self.upgrade()
+        self.assertEqual(backup.read_bytes(), b"old oxide")
+        self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o700)
+        self.assertNotEqual(backup.stat().st_ino, installer.DESTINATION.stat().st_ino)
+        before_rollback = installer.newest_receipt()
+        self.assertEqual(before_rollback[1]["version"], 2)
+        self.assertEqual(set(before_rollback[1]), {
+            "version", "mode", "started", "finished", "pin", "tree", "origin_main", "build",
+            "toolchain", "built_sha256", "build_instance", "control_state_version",
+            "registration_version", "ledger_version", "writer_generation", "installed", "prior",
+        }, "install receipt layout changed. Bump its version and document downgrade compatibility.")
+        self.assertEqual(set(before_rollback[1]["installed"]),
+                         {"path", "owner_uid", "mode", "size", "mtime", "sha256"})
+        self.assertEqual(set(before_rollback[1]["prior"]), {"receipt", "receipt_sha256", "sha256"})
+        code, output, errors = self.invoke_rollback()
+        self.assertEqual(code, 0, errors)
+        self.assertIn("Downgrading persisted state", output)
+        self.assertEqual(installer.DESTINATION.read_bytes(), b"old oxide")
+        newest = installer.newest_receipt()[1]
+        self.assertEqual(newest["version"], installer.RECEIPT_VERSION)
+        self.assertEqual(newest["mode"], "rollback")
+        self.assertEqual(newest["pin"], "a" * 40)
+        self.assertEqual(newest["build_instance"], "b" * 32)
+        self.assertEqual(newest["installed"]["sha256"], sha256(b"old oxide"))
+        self.assertEqual(newest["prior"]["receipt"], before_rollback[0].name)
+        self.assertTrue(prior.is_file())
+        self.assertEqual(self.invoke_rollback()[0], 0)
+        self.assertEqual(installer.DESTINATION.read_bytes(), b"new oxide")
+
+    def test_rollback_refuses_mismatches_without_changing_the_install(self):
+        prior, backup = self.upgrade()
+        receipt_bytes = prior.read_bytes()
+        for problem in ("missing", "hash", "mode", "link", "receipt", "installed"):
+            with self.subTest(problem=problem):
+                if problem == "missing":
+                    backup.unlink()
+                elif problem == "hash":
+                    backup.write_bytes(b"changed")
+                elif problem == "mode":
+                    backup.chmod(0o755)
+                elif problem == "link":
+                    backup.unlink()
+                    backup.symlink_to(self.built)
+                elif problem == "receipt":
+                    prior.write_bytes(receipt_bytes + b"\n")
+                else:
+                    installer.DESTINATION.write_bytes(b"changed")
+                receipts = sorted(installer.RECEIPTS.glob("*.json"))
+                installed = installer.DESTINATION.read_bytes()
+                code, _, errors = self.invoke_rollback()
+                self.assertEqual(code, 1, errors)
+                self.assertIn("oxide:rollback refused", errors)
+                self.assertEqual(installer.DESTINATION.read_bytes(), installed)
+                self.assertEqual(sorted(installer.RECEIPTS.glob("*.json")), receipts)
+                if backup.is_symlink():
+                    backup.unlink()
+                backup.write_bytes(b"old oxide")
+                backup.chmod(0o700)
+                prior.write_bytes(receipt_bytes)
+                installer.DESTINATION.write_bytes(b"new oxide")
+
+    def test_receipt_write_failure_restores_the_previous_inode(self):
+        installer.DESTINATION.write_bytes(b"old oxide")
+        prior = self.receipt(b"old oxide")
+        old_inode = installer.DESTINATION.stat().st_ino
+        with installer.receipt_lock() as directory:
+            previous, expected = installer.preflight(True)
+            with mock.patch.object(installer, "write_receipt", side_effect=OSError("write failed")):
+                with self.assertRaisesRegex(OSError, "write failed"):
+                    installer.commit_install(self.built, sha256(b"new oxide"), {
+                        "pin": "c" * 40,
+                    }, previous, expected, directory)
+        self.assertEqual(installer.DESTINATION.read_bytes(), b"old oxide")
+        self.assertEqual(installer.DESTINATION.stat().st_ino, old_inode)
+        self.assertEqual(installer.newest_receipt()[0], prior)
+
+    def test_old_process_report_only_reads_ps_and_keeps_pid_start_and_argv(self):
+        uid = os.getuid()
+        old = f"  71 {uid} Thu Jan  1 00:00:08 2026 "
+        recent = f"  72 {uid} Thu Jan  1 00:00:10 2026 "
+        other = f"  73 {uid} Thu Jan  1 00:00:07 2026 "
+        exited = f"  74 {uid} Thu Jan  1 00:00:06 2026 "
+        tables = [
+            old + "/dir with spaces/oxide\n" + recent + "oxide\n" + other + "cargo\n" + exited + "oxide\n",
+            old + "oxide check --profile 'my profile'\n" + recent + "oxide test\n" + other + "cargo oxide\n",
+        ]
+        output = io.StringIO()
+        cutoff = datetime.datetime(2026, 1, 1, 0, 0, 9, tzinfo=datetime.timezone.utc)
+        with (
+            contextlib.redirect_stdout(output),
+            mock.patch.object(os, "kill", side_effect=AssertionError("signalled a process")),
+            mock.patch.object(subprocess, "run", side_effect=[
+                subprocess.CompletedProcess(["ps"], 0, table) for table in tables
+            ]) as read,
+        ):
+            installer.report_old_processes(cutoff)
+        self.assertEqual([(call.args[0][0], call.args[0][-1]) for call in read.call_args_list],
+                         [("ps", "comm="), ("ps", "args=")])
+        self.assertIn("PID 71  2026-01-01T00:00:08+00:00", output.getvalue())
+        self.assertIn("oxide check --profile", output.getvalue())
+        for pid in (72, 73, 74):
+            self.assertNotIn(f"PID {pid}", output.getvalue())
 
     def test_replace_refuses_an_unmatched_or_linked_destination(self):
         self.receipt(b"old oxide")
@@ -573,6 +725,50 @@ class AccountHomeCustodyTests(unittest.TestCase):
         self.custody.record("attached", stderr="x" * 200_000)
         self.assertLessEqual((self.directory / "custody.json").stat().st_size, account_home.CUSTODY_MAX_BYTES)
         self.assertTrue(self.persisted()["truncated"])
+
+class PersistedFormatTests(unittest.TestCase):
+    # Version-specific wire declarations, including nested records and serde
+    # attributes. This catches even optional fields omitted by empty fixtures.
+    # Add a case for a new version after providing its compatibility path.
+    def test_versioned_wire_shapes(self):
+        cases = (
+            ("ledger", "src/lease/mod.rs", "LEDGER_VERSION", "2", "src/lease/pool.rs",
+             ("Ledger", "SlotRecord", "SlotPersistState"),
+             "45f102db3b3bbc47ac7425695cd077a9d1f132f24ba8dd4bea9ab80c3d2245b0"),
+            ("control", "src/lease/mod.rs", "CONTROL_FENCE_VERSION", "10", "src/lease/control.rs",
+             ("State", "Record", "Phase", "WorkspaceClass", "Holder", "Lost", "Recovery",
+              "Ticket", "Clean", "Flush", "OutputsInit"),
+             "c4c1fb1f512a37ef9af9391b3c5e07c73e1019383e324d0a8e7b17c1e97f4f2a"),
+            ("registry", "src/bin/oxide/prune.rs", "REGISTRY_VERSION", '"oxide.outputs.registry/2"',
+             "src/bin/oxide/prune.rs", ("Registry", "Row", "Incomplete", "Intent", "RootIdentity",
+                                       "GroupRow", "IntentPhase"),
+             "77cee06380b26869e27c0d3c51845b40a59e685deb80711241f04d882ea883fa"),
+            ("output receipt", "src/bin/oxide/outputs.rs", "PROFILE_RECEIPT_VERSION",
+             '"oxide.outputs.transition/3"', "src/bin/oxide/outputs.rs",
+             ("Doc", "PlacementDoc", "Selected", "Prepared", "Reservation", "RootKind",
+              "LayoutKind", "ReceiptState", "Migration", "MigrationPhase", "OverflowTag", "PruneRecord"),
+             "d8b1a506dd5a21cfc2bb846eb0a70c3a6e2d3c69e6c9d5f3abe240dd4fd03a3c"),
+        )
+        for label, version_path, constant, version, path, names, digest in cases:
+            with self.subTest(format=label):
+                version_source = (SCRIPTS.parent / version_path).read_text()
+                declared = re.search(rf"\bconst {constant}: [^=]+? = ([^;]+);", version_source)
+                self.assertIsNotNone(declared)
+                self.assertEqual(declared[1], version, "Record the new format's compatibility path.")
+                source = (SCRIPTS.parent / path).read_text()
+                declarations = []
+                for name in names:
+                    matches = list(re.finditer(
+                        rf"^( *)(?:#\[[^\n]+\]\n\1)*(?:pub(?:\(crate\))? )?"
+                        rf"(?:struct|enum) {name}\b[^{{]*\{{.*?^\1\}}",
+                        source, re.S | re.M,
+                    ))
+                    self.assertEqual(len(matches), 2 if name in ("Doc", "PlacementDoc") else 1, name)
+                    declarations.extend(match[0] for match in matches)
+                normalized = re.sub(r"\s+", "", re.sub(r"(?m)//.*$", "", "\n".join(declarations)))
+                self.assertEqual(sha256(normalized.encode()), digest,
+                                 "Persisted fields changed. Bump the format and cover the previous reader or downgrade.")
+
 
 class HandoffSelectorTests(unittest.TestCase):
     """Pin both selected-volume commands and their unchanged bounds."""

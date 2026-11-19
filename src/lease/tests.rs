@@ -14,6 +14,55 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
+#[test]
+fn writer_generation_is_checked_on_pool_open_before_adoption_or_reconciliation() {
+    use super::control::{fenced_state, parse_state, State, WRITER_GENERATION};
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new("writer-generation");
+    let pool = fixture.pool();
+    let control = pool.join(super::MANAGED_NAME);
+    if !control.exists() {
+        fs::DirBuilder::new().create(&control).unwrap();
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = control.join("state.json");
+    let legacy = serde_json::to_vec(&State::default()).unwrap();
+    fs::write(&path, legacy).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    managed::prepare_pool(&pool).unwrap();
+    let raised = fs::read(&path).unwrap();
+    let state = parse_state(&raised).unwrap();
+    assert_eq!(state.minimum_writer_generation, Some(WRITER_GENERATION));
+    assert_eq!(state.check_writer(WRITER_GENERATION + 1), Ok(()));
+    managed::prepare_pool(&pool).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), raised);
+
+    let newer = serde_json::to_vec(&fenced_state(state, WRITER_GENERATION + 1).unwrap()).unwrap();
+    fs::write(&path, &newer).unwrap();
+    let ledger = fs::read(pool.join("ledger.json")).unwrap();
+    assert!(matches!(
+        managed::prepare_pool(&pool),
+        Err(LeaseError::WriterUpdated)
+    ));
+    managed::snapshot(&pool).unwrap();
+    assert_eq!(fs::read(path).unwrap(), newer);
+    assert_eq!(fs::read(pool.join("ledger.json")).unwrap(), ledger);
+
+    let mut successor: serde_json::Value = serde_json::from_slice(&newer).unwrap();
+    successor["version"] = serde_json::json!(super::control::STATE_VERSION + 1);
+    successor["successor_field"] = serde_json::json!(true);
+    fs::write(
+        control.join("state.json"),
+        serde_json::to_vec(&successor).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        managed::prepare_pool(&pool),
+        Err(LeaseError::WriterUpdated)
+    ));
+}
+
 pub(super) struct Fixture {
     path: PathBuf,
 }

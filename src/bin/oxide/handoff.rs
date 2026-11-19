@@ -61,8 +61,9 @@ pub fn hidden() -> Option<u8> {
     }
     // `test_controls`: whether this artifact honours the debug-only proof
     // controls (`OXIDE_TEST_*`). The installer refuses an artifact that does.
+    use oxide_storage::lease::{control::WRITER_GENERATION, LEDGER_VERSION};
     println!(
-        "{{\"control_state_version\":{STATE_VERSION},\"registration_version\":{REGISTRATION_VERSION},\"test_controls\":{}}}",
+        "{{\"control_state_version\":{STATE_VERSION},\"registration_version\":{REGISTRATION_VERSION},\"ledger_version\":{LEDGER_VERSION},\"writer_generation\":{WRITER_GENERATION},\"test_controls\":{}}}",
         cfg!(debug_assertions)
     );
     Some(0)

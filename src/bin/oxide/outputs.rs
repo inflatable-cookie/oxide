@@ -1603,8 +1603,7 @@ impl Context {
     fn open() -> Result<Self, String> {
         let settings = store::settings()?;
         let workspace = identity::locate_workspace(CARGO, None)?;
-        let control =
-            Store::open_existing_with(&settings)?.map(|store| store.control().to_path_buf());
+        let control = Store::open_recorded(&settings)?.map(|store| store.control().to_path_buf());
         Ok(Self::new(control, workspace))
     }
 

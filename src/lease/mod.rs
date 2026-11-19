@@ -33,8 +33,10 @@ pub use slice::{
     SliceAdmission, SliceReport, VictimPolicy, ONE_USE_MAX_BYTES, ONE_USE_MAX_SLOTS,
 };
 
-/// Version of the lease JSON, receipts, pool config and ledger.
+/// Version of the lease JSON, lease receipts and pool config.
 pub const LEASE_VERSION: u32 = 1;
+/// Version 2 identifies the Barge slot fields previously written as version 1.
+pub const LEDGER_VERSION: u32 = 2;
 /// Budget-only directory backend for the `oxide` front door: admission and
 /// whole-idle-slot eviction against a soft budget, with no OS ceiling.
 pub const BUDGET_BACKEND_DIRECTORY_V1: &str = "directory-budget-v1";
@@ -207,6 +209,7 @@ pub enum LeaseError {
     Usage(&'static str),
     InvalidInput(&'static str),
     Busy,
+    WriterUpdated,
     Full,
     UnknownAccounting,
     /// An entry the pool's shape does not allow, named by its place and an
@@ -279,6 +282,7 @@ impl LeaseError {
         match self {
             Self::Usage(_) | Self::InvalidInput(_) | Self::Io(_) | Self::Unsupported(_) => 1,
             Self::Busy | Self::HolderConflict => 2,
+            Self::WriterUpdated => 76,
             Self::Full
             | Self::UnknownAccounting
             | Self::UnexpectedEntry { .. }
@@ -296,6 +300,7 @@ impl LeaseError {
             Self::Usage(_) => "usage",
             Self::InvalidInput(_) => "invalid_input",
             Self::Busy => "busy",
+            Self::WriterUpdated => "writer_updated",
             Self::Full => "full",
             Self::UnknownAccounting
             | Self::UnexpectedEntry { .. }
@@ -320,6 +325,8 @@ impl std::fmt::Display for LeaseError {
                 formatter.write_str(message)
             }
             Self::Busy => formatter.write_str("compatible slot is held"),
+            Self::WriterUpdated => formatter
+                .write_str("oxide was updated while this command waited; rerun it"),
             Self::Full => formatter.write_str("pool cap cannot admit a new slot"),
             Self::UnknownAccounting => {
                 formatter.write_str("owned accounting is unknown or a foreign entry is present")
@@ -1003,7 +1010,7 @@ fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseErro
 /// owns the same values; its constants alias these so the two writers cannot
 /// drift. A document at version 6 or later carries `CONTROL_ONE_USE_FENCE`;
 /// a document at [`CONTROL_FENCE_VERSION`] takes every fence.
-pub const CONTROL_FENCE_VERSION: u32 = 9;
+pub const CONTROL_FENCE_VERSION: u32 = 10;
 pub const CONTROL_RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
 pub const CONTROL_EVICTION_ACCOUNTING_FENCE: &str = "oxide.eviction-accounting/1";
 pub const CONTROL_SLOT_CEILING_FENCE: &str = "oxide.slots/256";
@@ -1034,43 +1041,79 @@ pub const CONTROL_HOLDING_FENCE: &str = "oxide.holding/1";
 /// unfenced control. Passive snapshots never call this.
 pub(crate) fn fence_managed_control(pool: &Path) -> Result<(), LeaseError> {
     let control = pool.join(MANAGED_NAME);
-    let path = control.join("state.json");
-    // Only an absent control state means "a library fixture with nothing to
-    // fence". Any other metadata failure is a refusal: a state this binary
-    // cannot inspect must never let recovery run unfenced.
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+    let Some(state) = read_writer_state(&control)? else {
+        return Ok(());
+    };
+    if state.minimum_writer_generation == Some(control::WRITER_GENERATION) {
+        return Ok(());
+    }
+    let _admission = open_control_admission(&control)?;
+    // Re-read after taking both locks. Only the admission holder publishes
+    // the minimum, and a newer writer may have published while we waited.
+    fence_admission_writer(&control)
+}
+
+/// Read control as a prospective writer. The versioned generation header
+/// stays recognizable even when a future schema cannot be deserialized.
+pub fn read_writer_state(control: &Path) -> Result<Option<control::State>, LeaseError> {
+    writer_state_bytes(control)?
+        .map(|bytes| control::parse_state(&bytes).map_err(|_| LeaseError::UnknownAccounting))
+        .transpose()
+}
+
+/// Compare generations under a lock without interpreting the owner's other
+/// control fields. The caller still validates those fields before writing.
+pub fn check_control_writer(control: &Path) -> Result<(), LeaseError> {
+    writer_state_bytes(control).map(|_| ())
+}
+
+fn writer_state_bytes(control: &Path) -> Result<Option<Vec<u8>>, LeaseError> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(control.join("state.json"))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io_error(error)),
     };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.is_file()
         || metadata.uid() != current_uid()
-        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.mode() & 0o077 != 0
         || metadata.len() > control::MAX_STATE_BYTES
     {
-        return Err(LeaseError::UnsafePath(
-            "control state must be a private regular file",
-        ));
+        return Err(LeaseError::UnknownAccounting);
     }
-    let bytes = read_private_file_bounded(&path, control::MAX_STATE_BYTES)?;
-    // The acceptance test is the front door's own parse-and-validate function:
-    // a document this refuses is exactly a document `Store::load` refuses, and
-    // a corrupt or unsupported one is never upgraded.
-    let state = control::parse_state(&bytes).map_err(|_| LeaseError::UnknownAccounting)?;
-    if state.version == control::STATE_VERSION {
+    let mut bytes = Vec::new();
+    file.take(control::MAX_STATE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    #[derive(Deserialize)]
+    struct WriterHeader {
+        version: u32,
+        minimum_writer_generation: u32,
+    }
+    if bytes.len() as u64 > control::MAX_STATE_BYTES {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    if serde_json::from_slice::<WriterHeader>(&bytes).is_ok_and(|header| {
+        header.version >= control::WRITER_STATE_VERSION
+            && header.minimum_writer_generation > control::WRITER_GENERATION
+    }) {
+        return Err(LeaseError::WriterUpdated);
+    }
+    Ok(Some(bytes))
+}
+
+/// With the admission lock held, publish this generation as the first write.
+pub fn fence_admission_writer(control: &Path) -> Result<(), LeaseError> {
+    let state = read_writer_state(control)?.unwrap_or_default();
+    if state.minimum_writer_generation == Some(control::WRITER_GENERATION) {
         return Ok(());
     }
-    let admission = open_control_admission(&control)?;
-    // Re-read under the writer lock: another command may have fenced while
-    // this one waited for the pool lock.
-    let bytes = read_private_file_bounded(&path, control::MAX_STATE_BYTES)?;
-    let state = control::parse_state(&bytes).map_err(|_| LeaseError::UnknownAccounting)?;
-    if state.version == control::STATE_VERSION {
-        drop(admission);
-        return Ok(());
-    }
-    let fenced = control::fenced_state(state).map_err(|_| LeaseError::UnknownAccounting)?;
+    let fenced = control::fenced_state(state, control::WRITER_GENERATION)
+        .map_err(|_| LeaseError::UnknownAccounting)?;
     let bytes = serde_json::to_vec(&fenced).map_err(|error| LeaseError::Io(error.to_string()))?;
     if bytes.len() as u64 > control::MAX_STATE_BYTES {
         return Err(LeaseError::LedgerExhausted);
@@ -1078,9 +1121,7 @@ pub(crate) fn fence_managed_control(pool: &Path) -> Result<(), LeaseError> {
     // Prove the bytes the front door will read back are accepted by the same
     // parser before replacing the durable document.
     control::parse_state(&bytes).map_err(|_| LeaseError::UnknownAccounting)?;
-    persist_control_state(&path, &bytes)?;
-    drop(admission);
-    Ok(())
+    persist_control_state(&control.join("state.json"), &bytes)
 }
 
 fn open_control_admission(control: &Path) -> Result<File, LeaseError> {

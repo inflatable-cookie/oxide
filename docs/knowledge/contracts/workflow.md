@@ -1591,7 +1591,7 @@ or global Cargo configuration is involved.
   between advertisement and fetch — or a tip that is not a commit — is a
   clean refusal the install can simply retry (oxide#302). It builds the pin
   from `git archive` in
-  a private `/private/tmp/oxide-install.*` staging directory, installs through
+  a private `oxide-install.*` directory under the caller's temporary root, installs through
   a sibling temporary file and `link` (no clobber), and writes a JSON receipt
   under `~/.local/state/oxide/install/`. The receipt records pin, tree,
   toolchain, build command, path, owner, mode, size, time and SHA-256, plus
@@ -1605,13 +1605,29 @@ or global Cargo configuration is involved.
   the opened directory, with no-follow opens.
 - **Updating.** After a reviewed or explicitly operator-accepted merge, the
   planner runs `effigy oxide:reinstall`. It replaces only a regular,
-  user-owned binary whose hash matches the newest receipt. Directly before
-  the atomic rename it rechecks that the destination is still that file
-  (type, owner, inode and hash) and refuses otherwise. Earlier receipts are
-  kept. `OXIDE_INSTALL_PIN=<commit>` selects a commit on pushed main; it does
-  not roll back ledger or control state, and an older binary may refuse
-  forward-only fields. Effigy does not forward selector arguments, so the
-  pin travels in the environment.
+  user-owned binary whose hash matches the newest receipt. It copies that
+  binary beside its receipt as `<receipt>.binary` with mode `0700` and
+  verifies its SHA-256 before replacing it. The installer serializes swaps
+  under the private install lock, rechecks the destination immediately before
+  the atomic rename, and keeps the old inode until the new receipt is
+  published. A receipt write failure restores the original destination
+  when the installer still owns the staged inode. Initial installation has
+  no previous binary. `OXIDE_INSTALL_PIN=<commit>` selects a commit on pushed
+  main. Effigy does not forward selector arguments, so the pin travels in the
+  environment.
+- **Rollback.** The planner runs `effigy oxide:rollback` to restore the one
+  binary named by the newest receipt's prior record. The current binary, the
+  referenced receipt bytes, and the saved binary must all match their
+  recorded hashes. Missing, linked, substituted or non-private backups
+  refuse. The selector restores those bytes with a new owner-only rollback
+  receipt carrying the restored build's original identity and capabilities.
+  It saves the displaced binary under the same rules. Rollback builds
+  nothing and names the [persisted-state downgrade step](#downgrading-persisted-state).
+- **Process report.** After the swap and receipt publication, the installer
+  reports any same-user `oxide` processes it observes from before the swap,
+  with PID, UTC start time, and command line. The process table's start time
+  has one-second precision, so processes started in the swap's second may
+  also appear. The report observes the process table without sending signals.
 - **Install compatibility window.** Before an update, classify whether its
   ledger or control-state format adds a forward-only fence that older
   binaries refuse. For such updates, the planner obtains a fresh supported
@@ -1636,6 +1652,10 @@ or global Cargo configuration is involved.
   [installed-binary hand-off](#installed-binary-hand-off-oxide122) adds a
   bounded recovery for commands that do run under an older binary, but it
   cannot repair a binary built without it, so this window policy stands.
+  The first writer-generation rollout also requires every pre-fence Oxide
+  writer to be closed. Those executables cannot apply a check their source
+  never shipped. Process reporting is a point-in-time observation and
+  supplies no writer-closure proof.
 - **Default pool.** The first leased command created
   `~/Library/Caches/oxide/pool` under the then-shipped rules: a 24 GiB
   `apfs-sparse-image-v1` image, refused below the 20 GiB host reserve. That
@@ -1665,10 +1685,70 @@ or global Cargo configuration is involved.
   `force = true` while `oxide` is broken, or `cargo` by hand.
 - **Test supervisor.** `test rust`, `rust:test-600` and `rust:pool-scale`
   run under the [shared proof supervisor](#shared-proof-supervisor).
-- **Fixtures.** `effigy dogfood:scripts:test` proves the installer's refusals
-  (linked or foreign directories, an existing destination, a destination
-  swapped during the build) on synthetic fixtures. It never builds or
-  installs.
+- **Fixtures.** `effigy dogfood:scripts:test` covers install and rollback
+  refusals, receipt publication failure, the process report and persisted
+  layouts on synthetic fixtures.
+
+### Writer generation and format versions
+
+The control document for each managed pool records
+`minimum_writer_generation` in schema 10. The first mutating open publishes
+the binary's generation under that pool's admission lock. Admission,
+registry publication, removable registration and the mutating library paths
+check the minimum after taking their lock, before any protected write.
+If a pool-only caller has to raise the minimum, it also takes the admission
+lock without blocking and rereads state there. A stale writer exits 76 with
+`oxide was updated while this command waited; rerun it`. A command that
+already held a lock can finish that critical section. It checks again on
+the next acquisition. Passive readers of the same schema ignore the minimum.
+Already-running children and executables predating the generation check
+remain subject to the install compatibility window and existing recovery rules.
+
+Advance the binary's source-controlled writer generation whenever an update
+must exclude writers from the prior generation. Rebuilds of the same
+generation can still cooperate. A generation advance can reuse control
+schema 10 when the wire format stays the same. Future control schemas keep
+the numeric generation header readable so stale writers can refuse before
+interpreting the rest of the document.
+
+Bump the owning format version for changes to persisted Oxide layouts,
+including optional fields and nested data in the ledger, control, registry
+and receipts. Either demonstrate that the previous released reader can read
+the new bytes, or document the downgrade and have `oxide:rollback` name it.
+Update the version-specific shape tests in `dogfood:scripts:test` and add
+coverage for both the old and the new data when changing a format. The
+current ledger writes version 2 for the Barge slot layout and still accepts
+historical version 1. Pool configuration and lease identifiers retain their
+own versions. The install receipt is now version 2. Its fields used by
+older hand-off and identity readers retain their names and meaning.
+
+### Downgrading persisted state
+
+Rollback restores the executable. Before resuming with a writer from an
+older generation or format, the planner positively closes Oxide writers
+and keeps launches paused for the downgrade window. Include the internal
+pool, any registered removable pool's control files, and any separately
+configured pool touched by the upgraded binary. Keep owner-only copies of
+the original control and ledger documents before editing. Preserve every
+lease, slot, output link, Barge root and pin.
+
+For the first generation's rollback to a predecessor containing oxide#315
+(merge `6f8d8f2c`) and declaring control version 9, the format conversion is:
+
+1. For each `<pool>/ledger.json` at version 2, set `version` to `1`. The
+   predecessor already understands the Barge slot fields this writer uses.
+2. For each `<pool>/oxide-managed/state.json` at version 10 with
+   `minimum_writer_generation: 1`, remove that field and set `version` to
+   `9`. Keep the other fences. Write the control file last.
+
+For each file, validate the expected version and schema before replacing it
+through an owner-only sibling and atomic rename. Files already in the
+predecessor's format need no rewrite. Leave registries and output receipts
+as they are for this pair. If no generation or format changed, both builds
+can use the same state. If the saved binary predates oxide#315 or state
+shows a later generation or an unfamiliar version, stop before editing
+and use a downgrade documented for that exact pair. Resume launches only
+after the restored binary can read the converted pool.
 
 ### Installed-binary hand-off (oxide#122)
 
