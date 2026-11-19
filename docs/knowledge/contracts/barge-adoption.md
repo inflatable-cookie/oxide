@@ -17,8 +17,9 @@ and Queue history; no evidence, credit or fixture from them is migrated.
 
 `barge` is a Git dependency pinned by full 40-hex revision in `Cargo.toml` and
 `Cargo.lock`; never a branch or tag. The current pin is merged Barge main
-`9336617a87ef182460bdccc4a419f3f8d497b245`. The library uses caret dependency
-requirements. Only test builds request Barge's `testing` feature.
+`3320dd276856356c5a9e59bafa6f091c0df71ac3` (barge#088: mount-identity checks,
+no-replace renames, eviction and lock-open corrections). The library uses caret
+dependency requirements. Only test builds request Barge's `testing` feature.
 `scripts/offline_seed.py` derives the exact Git revision from `Cargo.lock`;
 a missing revision is an offline failure.
 
@@ -55,11 +56,13 @@ compilation is not Linux runtime evidence.
 
 On macOS, a
 `/Volumes/<name>` path that is a directory left on the boot disk by an unclean
-detach is *absent*, not a different volume. `src/storage.rs` implements
-`barge::Os` with that rule; every other path answers its containing
-filesystem's identity, which is the fact Barge wants. A drive that comes back
-under a different identity is a `Mismatch` and is refused, never used and never
-silently re-registered.
+detach is *absent*, not a different volume. Barge's own seam now answers a UUID
+only for a mount root (barge#088 reads the mount table and asks for
+`ATTR_VOL_INFO`), so `src/storage.rs` supplies both halves: the drive rule for
+`/Volumes/<name>` paths, and the containing APFS volume's UUID for every other
+path, which keeps an internal or budget pool's recorded identity unchanged. A
+drive that comes back under a different identity is a `Mismatch` and is
+refused, never used and never silently re-registered.
 
 ## Declarations
 

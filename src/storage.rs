@@ -142,54 +142,103 @@ impl AreaConfig {
 /// A stale `/Volumes/<name>` directory on macOS's boot disk is absent; Linux
 /// directory pools use the kernel filesystem identity through `DirectoryOs`.
 ///
-/// Barge's own `volume_identity` answers the UUID of the filesystem that holds
-/// any path, so on a directory left behind by an unclean detach it would report
-/// the boot volume's UUID and Barge would call that a different volume at the
-/// registered mount (a refusal). Oxide's absence protocol already distinguishes
-/// the two: a registered drive is present only when the path is that volume's
-/// mounted root. This seam applies exactly that rule to drive mount points and
-/// leaves every other path to Barge: an internal pool, one-use pool or outputs
-/// directory is a plain directory whose containing filesystem identity is the
-/// wanted fact.
+/// Barge's own macOS `volume_identity` answers a UUID only for a mount root
+/// (barge#088 reads the mount table and asks for `ATTR_VOL_INFO`), so on a
+/// directory left behind by an unclean detach it answers `None` rather than the
+/// boot volume's UUID. Oxide's absence protocol needs both halves of that rule:
+/// a registered drive is present only when the path is that volume's mounted
+/// root, and every other path (an internal pool, a one-use pool or an outputs
+/// directory) is a plain directory whose containing filesystem identity is the
+/// fact Barge wants. This seam applies the first rule to drive mount points and
+/// supplies the second itself, so an internal pool keeps the same recorded
+/// identity Barge's platform seam answered before barge#088.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OxideOs;
 
 impl barge::Os for OxideOs {
     fn volume_identity(&self, mount: &Path) -> barge::Result<Option<String>> {
-        if cfg!(target_os = "macos") && is_drive_mount_point(mount) {
-            // A path that does not exist is positively absent; a stale
-            // directory (a positive observation that this is not the volume's
-            // mount root) is absent too; any observation failure is unknown
-            // and refuses rather than falling back.
-            if std::fs::symlink_metadata(mount)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-            {
-                return Ok(None);
-            }
-            return match crate::volume::observe_path(mount) {
-                Ok(facts) => judge_mount_identity(mount, &facts).map_err(|reason| {
-                    barge::Error::unknown_state(format!(
-                        "cannot read the volume identity at {}: {reason}",
-                        mount.display()
-                    ))
-                }),
-                Err(reason) => Err(barge::Error::unknown_state(format!(
-                    "cannot read the volume identity at {}: {reason}",
-                    mount.display()
-                ))),
-            };
-        }
-        #[cfg(target_os = "linux")]
-        {
-            barge::Os::volume_identity(&DirectoryOs, mount)
-        }
-        #[cfg(not(target_os = "linux"))]
-        barge::os::platform().volume_identity(mount)
+        identity(mount)
     }
 
     fn free_bytes(&self, path: &Path) -> barge::Result<u64> {
         barge::os::platform().free_bytes(path)
     }
+}
+
+/// A drive mount is present only at its own mounted root; every other path
+/// answers its containing filesystem's identity.
+#[cfg(target_os = "macos")]
+fn identity(mount: &Path) -> barge::Result<Option<String>> {
+    if !is_drive_mount_point(mount) {
+        return containing_volume_identity(mount);
+    }
+    // A path that does not exist is positively absent; a stale directory (a
+    // positive observation that this is not the volume's mount root) is absent
+    // too; any observation failure is unknown and refuses rather than falling
+    // back.
+    if std::fs::symlink_metadata(mount)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(None);
+    }
+    match crate::volume::observe_path(mount) {
+        Ok(facts) => judge_mount_identity(mount, &facts).map_err(|reason| {
+            barge::Error::unknown_state(format!(
+                "cannot read the volume identity at {}: {reason}",
+                mount.display()
+            ))
+        }),
+        Err(reason) => Err(barge::Error::unknown_state(format!(
+            "cannot read the volume identity at {}: {reason}",
+            mount.display()
+        ))),
+    }
+}
+
+/// Linux directory storage answers the kernel filesystem identity.
+#[cfg(target_os = "linux")]
+fn identity(mount: &Path) -> barge::Result<Option<String>> {
+    barge::Os::volume_identity(&DirectoryOs, mount)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn identity(mount: &Path) -> barge::Result<Option<String>> {
+    barge::os::platform().volume_identity(mount)
+}
+
+/// The APFS volume UUID of the filesystem that holds `path`, read through a
+/// descriptor on that directory.
+///
+/// This is the identity Barge's own seam answered for a directory before
+/// barge#088 restricted itself to mount roots, so an existing internal pool or
+/// outputs registration keeps matching. A path that does not exist is absent;
+/// any other observation failure is unknown and refuses.
+#[cfg(target_os = "macos")]
+fn containing_volume_identity(path: &Path) -> barge::Result<Option<String>> {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let directory = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(barge::Error::unknown_state(format!(
+                "cannot open the directory at {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let facts = crate::volume::observe_held(directory.as_fd()).map_err(|reason| {
+        barge::Error::unknown_state(format!(
+            "cannot read the volume identity at {}: {reason}",
+            path.display()
+        ))
+    })?;
+    Ok(facts.uuid)
 }
 
 /// Directory backends on Linux use the kernel filesystem ID, not an APFS UUID.
@@ -1762,6 +1811,77 @@ mod tests {
         // and accounts for it.
         assert!(area.bytes().expect("bytes") > 0);
     }
+
+    /// The real seam (no injected facts) still registers an internal pool: a
+    /// plain directory answers its containing filesystem's identity, which is
+    /// what Barge's own platform seam answered before barge#088 restricted
+    /// itself to mount roots. Without this, `declare` would refuse every
+    /// internal, one-use and budget pool on macOS.
+    #[test]
+    fn an_internal_pool_directory_registers_through_the_real_seam() {
+        let temp = TempDir::new("storage-real-directory").unwrap();
+        let control = temp.path().join("control");
+        std::fs::create_dir(&control).unwrap();
+        let pool_dir = temp.path().join("pool");
+        std::fs::create_dir(&pool_dir).unwrap();
+        let storage = Storage::open(&control).expect("storage");
+        let config = AreaConfig::new("internal", pool_dir.clone(), POOL_AREA)
+            .folder(PAYLOAD_FOLDER.to_owned() + "/" + POOL_FOLDER)
+            .soft_cap_bytes(Some(1 << 30));
+        let area = storage.declare(&config).expect("area");
+        let volume = storage.volume("internal").expect("volume");
+        let registered = &volume.spec().uuid;
+        assert!(
+            barge::os::canonical_uuid(registered).is_ok(),
+            "a containing volume identity is a canonical UUID: {registered}"
+        );
+        assert_eq!(
+            volume_state(&volume).expect("state"),
+            VolumeState::Present,
+            "the pool's own directory is a present volume"
+        );
+        let root = area.create_root("quick").expect("root");
+        assert!(root
+            .path
+            .starts_with(pool_dir.join(PAYLOAD_FOLDER).join(POOL_FOLDER)));
+    }
+
+    /// Barge refuses a registration whose seam answers absent, so a removable
+    /// path that is a plain directory (the stale-directory answer) can never be
+    /// recorded against the internal volume: nothing is registered and there is
+    /// no path to route external data onto the internal drive.
+    #[test]
+    fn a_volume_whose_seam_answers_absent_is_never_registered() {
+        let temp = TempDir::new("storage-stale-drive").unwrap();
+        let internal_dir = temp.path().join("internal-pool");
+        std::fs::create_dir(&internal_dir).unwrap();
+        let stale = temp.path().join("Volumes/Builds");
+        std::fs::create_dir_all(&stale).unwrap();
+        // Only the internal directory has a readable identity; the stale drive
+        // path answers absent, exactly as `OxideOs` judges it.
+        let os = FakeOs::with_volume(internal_dir, UUID, 100 << 30);
+        let storage = Storage::open_with(
+            temp.path().join("state"),
+            Arc::new(os),
+            Arc::new(ManualClock::new(1_000)),
+        )
+        .expect("storage");
+        let error = storage
+            .register_volume(
+                "pool",
+                &stale,
+                Some("11111111-2222-4333-8444-555555555555"),
+                "",
+                0,
+                reserve_floor(0),
+            )
+            .expect_err("a stale drive path is not a volume");
+        assert!(error.contains("cannot read a volume identity"), "{error}");
+        assert!(
+            storage.volume("pool").is_err(),
+            "nothing was registered for the stale path"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1886,6 +2006,7 @@ mod revision_tests {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+    use barge::Os;
 
     fn facts(mounted_on: &Path, uuid: Option<&str>) -> crate::volume::Facts {
         crate::volume::Facts {
@@ -1920,6 +2041,51 @@ mod identity_tests {
         assert_eq!(
             judge_mount_identity(mount, &facts(Path::new("/"), Some("boot"))).unwrap(),
             None
+        );
+    }
+
+    /// barge#088 registers and identifies a volume only at a mount root. The
+    /// kernel still reports the containing volume's UUID for a plain
+    /// `/Volumes/<name>` directory left by an unclean detach, so the UUID alone
+    /// must never become that path's identity: it would register the internal
+    /// volume as a removable one, or refuse the drive's own registration as a
+    /// mismatch.
+    #[test]
+    fn a_plain_directory_at_a_removable_mount_is_absent_never_the_internal_volume() {
+        let stale = Path::new("/Volumes/Builds");
+        assert!(is_drive_mount_point(stale));
+        let internal = "7C1D9A00-1111-4222-8333-444455556666";
+        let drive = "8E4A5C1D-0000-4000-8000-00000000BEEF";
+        // The stale directory sits on the boot volume: `fstatfs` names `/` as
+        // its mount and `ATTR_VOL_UUID` still reports the internal UUID.
+        let plain = facts(Path::new("/"), Some(internal));
+        assert_eq!(
+            judge_mount_identity(stale, &plain).unwrap(),
+            None,
+            "the containing volume's UUID is never the drive's identity"
+        );
+        assert!(
+            crate::volume::judge(stale, &plain, Some(internal)).is_err(),
+            "the apfs binding refuses a stale directory even for its own UUID"
+        );
+        // The same path mounted as the drive itself is that drive, present.
+        assert_eq!(
+            judge_mount_identity(stale, &facts(stale, Some(drive))).unwrap(),
+            Some(drive.to_owned())
+        );
+    }
+
+    /// The warned absent-drive fallback keys on positive absence. A missing
+    /// `/Volumes/<name>` (the ordinary detached drive) must keep answering
+    /// absent, never unknown, so the internal pool fallback still applies.
+    #[test]
+    fn a_missing_removable_mount_is_absent_so_the_warned_fallback_still_applies() {
+        let absent = Path::new("/Volumes/oxide-storage-seam-absent-drive-probe");
+        assert!(!absent.exists(), "the probe path must not exist");
+        assert_eq!(
+            OxideOs.volume_identity(absent).expect("identity"),
+            None,
+            "a detached drive is absent, not unknown"
         );
     }
 }
