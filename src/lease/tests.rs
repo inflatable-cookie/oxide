@@ -782,7 +782,144 @@ fn an_unfinished_legacy_transition_preserves_existing_barge_pins() {
 }
 
 #[test]
-fn a_pool_at_its_slot_ceiling_evicts_the_oldest_adopted_idle_row() {
+fn held_eviction_distinguishes_a_held_root_from_a_failed_trash_delete() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new("held-eviction-failure");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let leased = managed::lease(request(&pool, &project, &project, "held")).unwrap();
+    let slot = leased.grant.slot_id.clone();
+    let lease_id = leased.grant.lease_id.clone();
+    let path = leased
+        .grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .unwrap()
+        .to_owned();
+
+    let before = fs::read(pool.join("ledger.json")).unwrap();
+    let refusal = managed::evict_held_slot(&pool, &slot, &lease_id).unwrap_err();
+    assert!(matches!(refusal, super::HeldEvictionFailure::PreCommit(_)));
+    assert_eq!(fs::read(pool.join("ledger.json")).unwrap(), before);
+    assert!(path.is_dir());
+    drop(leased);
+
+    // Unlinking a file from a non-writable directory fails for the pool's
+    // ordinary owner. Privileged users bypass this permission on both hosts.
+    if super::current_uid() == 0 {
+        return;
+    }
+    let protected = path.join("protected");
+    fs::create_dir(&protected).unwrap();
+    fs::write(protected.join("file"), b"kept after failed unlink").unwrap();
+    fs::set_permissions(&protected, fs::Permissions::from_mode(0o500)).unwrap();
+    let failure = managed::evict_held_slot(&pool, &slot, &lease_id);
+    let retained_path = if path.exists() {
+        path.clone()
+    } else {
+        let trash = path.parent().unwrap().join(".trash");
+        fs::read_dir(trash).unwrap().next().unwrap().unwrap().path()
+    };
+    fs::set_permissions(
+        retained_path.join("protected"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+
+    let error = failure.unwrap_err();
+    assert!(
+        matches!(error, super::HeldEvictionFailure::PostCommit(_)),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("evicted root remains in trash at"),
+        "{error}"
+    );
+    assert!(!path.exists());
+    assert!(retained_path.join("protected/file").is_file());
+    assert!(managed::snapshot(&pool).unwrap().slots.is_empty());
+}
+
+#[test]
+fn an_eviction_counts_its_byte_walk_even_if_rename_cannot_start() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if super::current_uid() == 0 {
+        return; // The superuser can create trash in a non-writable directory.
+    }
+    let fixture = Fixture::new("eviction-walk-before-rename");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let leased = managed::lease(request(&pool, &project, &project, "first")).unwrap();
+    let victim = leased.grant.slot_id.parse().unwrap();
+    managed::release(&pool, &leased.grant.lease_id).unwrap();
+    let path = leased
+        .grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .unwrap()
+        .to_owned();
+    drop(leased);
+
+    let slots = path.parent().unwrap();
+    assert!(!slots.join(".trash").exists());
+    let other = fixture.dir("other");
+    let mut replacement = request(&pool, &other, &other, "replacement");
+    replacement.replace_slot = Some(victim);
+    fs::set_permissions(slots, fs::Permissions::from_mode(0o500)).unwrap();
+    let (attempt, walks) = count_pool_walks(|| managed::lease(replacement));
+    fs::set_permissions(slots, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let error = attempt
+        .err()
+        .expect("trash creation refuses while the parent is read-only");
+    assert!(
+        error.to_string().contains("cannot create the trash at"),
+        "{error}"
+    );
+    assert!(matches!(walks.as_slice(), [PoolWalk::Evict(_)]));
+    let (_, walked, listed, opaque) = super::admission_cost::latest(&pool);
+    assert_eq!((walked, listed, opaque), (1, 0, true));
+    assert!(path.is_dir());
+}
+
+#[test]
+fn sweeping_owned_trash_does_not_resample_the_roots_bytes() {
+    let fixture = Fixture::new("trash-byte-walks");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let leased = managed::lease(request(&pool, &project, &project, "first")).unwrap();
+    fill(&leased, 8192);
+    managed::release(&pool, &leased.grant.lease_id).unwrap();
+    let path = leased
+        .grant
+        .env
+        .cargo_build_build_dir
+        .parent()
+        .unwrap()
+        .to_owned();
+    drop(leased);
+    // Reproduce the state left after Barge renames an owned root into trash.
+    let trash = path.parent().unwrap().join(".trash");
+    fs::create_dir(&trash).unwrap();
+    let evicted = trash.join(path.file_name().unwrap());
+    fs::rename(path, &evicted).unwrap();
+
+    managed::prepare_pool(&pool).unwrap();
+    let (_, walked, listed, opaque) = super::admission_cost::latest(&pool);
+    assert_eq!((walked, listed, opaque), (0, 1, false));
+    assert!(!evicted.exists());
+}
+
+#[test]
+fn admission_cost_and_protection_at_the_256_slot_ceiling() {
+    use super::admission_cost;
+    use std::io::Write;
     let fixture = Fixture::new("legacy-ceiling");
     let pool = fixture.pool();
     let project = fixture.dir("project");
@@ -806,7 +943,9 @@ fn a_pool_at_its_slot_ceiling_evicts_the_oldest_adopted_idle_row() {
                     "entries": 1,
                     "at_ms": 1,
                 });
-                slot_dir(&pool, &id.to_string());
+                let root = slot_dir(&pool, &id.to_string());
+                fs::create_dir(root.join("build")).unwrap();
+                fs::write(root.join("build/artifact"), b"tiny").unwrap();
                 row
             })
             .collect();
@@ -815,18 +954,143 @@ fn a_pool_at_its_slot_ceiling_evicts_the_oldest_adopted_idle_row() {
         ledger["next_slot"] = (count + 1).into();
         ledger["next_rank"] = (count + 1).into();
     });
-    let (prepared, walks) = count_pool_walks(|| managed::prepare_pool(&pool));
-    assert_eq!(prepared.unwrap().slots.len(), super::MAX_SLOTS);
-    assert_eq!(walks.len(), super::MAX_SLOTS);
-    assert!(walks.iter().all(|walk| matches!(walk, PoolWalk::Adopt(_))));
+    let mut max_prepare_us = 0;
+    let mut migrated = 0;
+    while migrated < super::MAX_SLOTS {
+        let (prepared, walks) = count_pool_walks(|| managed::prepare_pool(&pool));
+        assert_eq!(prepared.unwrap().slots.len(), super::MAX_SLOTS);
+        assert_eq!(walks.len(), 8);
+        assert!(walks.iter().all(|walk| matches!(walk, PoolWalk::Adopt(_))));
+        let (micros, walked, listed, opaque) = admission_cost::latest(&pool);
+        assert_eq!((walked, listed, opaque), (0, 0, true));
+        max_prepare_us = max_prepare_us.max(micros);
+        migrated += walks.len();
+    }
+    assert_eq!(count_pool_walks(|| managed::prepare_pool(&pool)).1, []);
+    assert_eq!(
+        managed::pinned_roots(&pool).unwrap(),
+        "pinned roots by reason: none"
+    );
 
+    admission_cost::start_summary();
+    let (warm, walks) =
+        count_pool_walks(|| managed::lease(request(&pool, &project, &workspace, "warm")));
+    let warm = warm.unwrap();
+    assert!(warm.grant.reused_slot);
+    assert!(walks.is_empty(), "warm admission does not walk the payload");
+    let (warm_us, walked, listed, opaque) = admission_cost::latest(&pool);
+    assert_eq!(
+        (walked, listed, opaque),
+        (0, 0, true),
+        "Barge hold resolves by enumerating markers"
+    );
+    let summary = admission_cost::take_summary()
+        .expect("unavailable listing count triggers the build summary");
+    assert!(
+        summary.contains("Barge listing count unavailable"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("accounting") && summary.contains("byte walks 0"),
+        "{summary}"
+    );
+    managed::release(&pool, &warm.grant.lease_id).unwrap();
+    drop(warm);
+
+    admission_cost::start_summary();
+    let (reserve, walks) = count_pool_walks(|| {
+        super::pool::check_ample_reserve(&pool, &fixture.dir("reserve-account"))
+    });
+    reserve.unwrap();
+    assert!(walks.is_empty());
+    let (reserve_us, walked, listed, opaque) = admission_cost::latest(&pool);
+    assert_eq!((walked, listed, opaque), (0, 0, false));
+
+    let ample_summary = admission_cost::take_summary();
+    if reserve_us <= 2_000_000 {
+        assert_eq!(ample_summary, None);
+    }
+
+    admission_cost::start_summary();
     let other = fixture.dir("other");
     let (admitted, walks) =
         count_pool_walks(|| managed::lease(request(&pool, &other, &workspace, "new")));
-    assert_eq!(admitted.unwrap().grant.slot_id, (count + 1).to_string());
+    let admitted = admitted.unwrap();
+    assert_eq!(admitted.grant.slot_id, (count + 1).to_string());
     assert!(matches!(walks.as_slice(), [PoolWalk::Evict(_)]));
+    let (eviction_us, walked, listed, opaque) = admission_cost::latest(&pool);
+    assert_eq!(
+        (walked, listed, opaque),
+        (1, 0, true),
+        "Barge eviction also enumerates markers"
+    );
+    let summary = admission_cost::take_summary()
+        .expect("unavailable listing count triggers the build summary");
+    assert!(
+        summary.contains("Barge listing count unavailable"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("eviction") && summary.contains("byte walks 1"),
+        "{summary}"
+    );
     assert!(!pool.join("payload/slots").join(count.to_string()).exists());
     assert!(pool.join("payload/slots/1").is_dir());
+
+    let storage = fixture_storage(&pool);
+    let roots = storage.area().list_without_bytes().unwrap().roots;
+    for (index, root) in roots.iter().filter(|root| !root.held).enumerate() {
+        let reason = if index < 100 {
+            "keep build"
+        } else {
+            "keep evidence"
+        };
+        storage.pin_in(None, &root.id, reason).unwrap();
+    }
+
+    let (refused, walks) = count_pool_walks(|| {
+        managed::lease(request(&pool, &fixture.dir("third"), &workspace, "refused"))
+    });
+    let error = refused.err().expect("ceiling refusal");
+    assert_eq!(error.reason(), "ledger_exhausted");
+    let diagnosis = error.to_string();
+    assert!(
+        diagnosis.contains("1 held, 255 pinned, 0 other unavailable"),
+        "{diagnosis}"
+    );
+    assert!(
+        diagnosis.contains(r#"100 "keep build", 155 "keep evidence""#),
+        "{diagnosis}"
+    );
+    assert_eq!(walks, [PoolWalk::Inventory]);
+    let (refused_us, walked, listed, opaque) = admission_cost::latest(&pool);
+    assert_eq!((walked, listed, opaque), (0, 256, true));
+
+    let ((), walks) = count_pool_walks(|| {
+        assert_eq!(managed::status(&pool).unwrap().slots.len(), 256);
+        assert_eq!(
+            managed::pinned_roots(&pool).unwrap(),
+            r#"pinned roots by reason: 100 "keep build", 155 "keep evidence""#
+        );
+        let history = admission_cost::recorded(&pool).unwrap().unwrap();
+        assert!(
+            history.contains("explicit inventory entries 256"),
+            "{history}"
+        );
+        assert!(
+            history.contains("Barge listing count unavailable"),
+            "{history}"
+        );
+    });
+    assert!(walks.is_empty(), "default status walks and lists no roots");
+    let durations = [max_prepare_us, warm_us, reserve_us, eviction_us, refused_us];
+    assert!(
+        durations.into_iter().all(|micros| micros < 10_000_000),
+        "{durations:?}"
+    );
+    writeln!(std::io::stderr().lock(),
+        "256 slots, lock µs and root counts: adoption max {max_prepare_us} (8 rows per batch, 0 walks, marker count unavailable), warm {warm_us} (0 walks, marker count unavailable), reserve {reserve_us} (0 roots), eviction {eviction_us} (1 walk, marker count unavailable), refusal {refused_us} (0 walks, 256 explicit inventory entries, marker count unavailable), status 0 roots, warm and eviction summaries disclosed the unavailable listing count"
+    ).unwrap();
 }
 
 #[test]

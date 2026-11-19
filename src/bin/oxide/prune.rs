@@ -780,7 +780,8 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
     for row in &mut registry.rows {
         if !row.live()
             || !row.root.is_dir()
-            || (row.barge_id.is_none() && !row.root.join(barge::root::MARKER_NAME).exists())
+            || (row.barge_id.is_none()
+                && !row.root.join(oxide_storage::storage::ROOT_MARKER).exists())
         {
             continue;
         }
@@ -793,7 +794,7 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
         };
         let area = output_area(control, &selected)?;
         if let Some(root) = area
-            .list()
+            .list_without_bytes()
             .map_err(|error| error.to_string())?
             .roots
             .into_iter()
@@ -1526,7 +1527,7 @@ fn import_output(
     // its first Oxide index row is committed. Re-pinning it is conservative;
     // the caller still validates every Oxide link and marker before use.
     let existing = area
-        .list()
+        .list_without_bytes()
         .map_err(|error| error.to_string())?
         .roots
         .into_iter()
@@ -1549,13 +1550,7 @@ fn import_output(
     }
     let mut identity = selected.clone();
     identity.generation = marker.generation();
-    let listing = area.list().map_err(|error| error.to_string())?;
-    let id = listing
-        .roots
-        .iter()
-        .find(|root| root.path == selected.root())
-        .map(|root| root.id.clone())
-        .unwrap_or_else(|| output_id(&identity));
+    let id = output_id(&identity);
     let folder = selected
         .root()
         .file_name()
@@ -1592,7 +1587,11 @@ fn pin_references(control: &Path, receipt: &Receipt) -> Result<(), String> {
                 Err(error) => return Err(error.to_string()),
                 Ok(_) => {}
             }
-            if (pending || !selected.root().join(barge::root::MARKER_NAME).exists())
+            if (pending
+                || !selected
+                    .root()
+                    .join(oxide_storage::storage::ROOT_MARKER)
+                    .exists())
                 && fs::symlink_metadata(selected.root().join(outputs::MARKER))
                     .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
             {
@@ -1723,7 +1722,11 @@ fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
         let Some(area) = existing_output_area(control, &selected)? else {
             continue;
         };
-        for root in area.list().map_err(|error| error.to_string())?.roots {
+        for root in area
+            .list_without_bytes()
+            .map_err(|error| error.to_string())?
+            .roots
+        {
             let recorded = registry
                 .rows
                 .iter()

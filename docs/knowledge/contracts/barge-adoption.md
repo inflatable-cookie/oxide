@@ -16,13 +16,11 @@ and Queue history; no evidence, credit or fixture from them is migrated.
 ## The pinned library
 
 `barge` is a Git dependency pinned by full 40-hex revision in `Cargo.toml` and
-`Cargo.lock`; never a branch or tag. The current pin is the merged lean core
-with its adopted-root seam, atomic identity revalidation and read-only account
-opener, `26caf67e9cf7715b9945d625ac110610aa54e791` (Barge PRs 66, 68 and 67).
-Offline
-builds seed that locked Git source through
-`scripts/offline_seed.py`; a missing candidate is an offline failure, not
-permission to resolve a moving ref.
+`Cargo.lock`; never a branch or tag. The current pin is merged Barge main
+`9336617a87ef182460bdccc4a419f3f8d497b245`. The library uses caret dependency
+requirements. Only test builds request Barge's `testing` feature.
+`scripts/offline_seed.py` derives the exact Git revision from `Cargo.lock`;
+a missing revision is an offline failure.
 
 Barge reads no Oxide format and knows nothing about Oxide. Oxide forges no
 Barge marker and writes no Barge document except through the library.
@@ -112,9 +110,12 @@ selected prune target. A zero reserve retains Barge's default floor.
   exclusive lock without waiting, then rechecks the pin under the area lock
   before renaming the root into `.trash/`. An earlier "idle and unpinned"
   reading never authorises an eviction by itself.
-- A workflow publication failure after Barge eviction fails the command and
-  reports that eviction occurred. It is never described as a retained root,
-  and the dispatcher stops before attempting another planned root.
+- Barge's rename into trash is the held eviction's commit point. A reported
+  post-rename deletion failure retires workflow membership and surfaces the
+  trash failure. A workflow publication failure after the rename reports
+  that the root moved. Neither failure gives freed-space credit.
+- If output-prune workflow publication fails after Barge evicts a root, the
+  dispatcher reports the eviction and stops before attempting another root.
 - Deletion never follows a symlink and never descends into another filesystem;
   a trash entry is removed only when its marker still names the area.
   Eviction renames first, so a crash leaves owned trash, which the next prune
@@ -126,18 +127,15 @@ Oxide's existing roots are not Barge roots: they predate the marker, and Barge
 records any folder without a matching marker as a straggler it will not reuse,
 evict or delete.
 
-Barge offers one generic `Area::adopt_root(folder, label, id)`: it validates a
-caller-owned directory inside a declared area, records the folder in a
-`barge.root/2` marker, refuses a symlink, a group- or other-writable folder, a
-foreign or mismatched marker and a duplicate id, and repeats a matching
-adoption idempotently. Oxide supplies the layout and identity facts; Barge never
-learns an Oxide format. Front-door pool preparation is the one-time
-transition. It resolves a published or interrupted adoption by its recorded
-path and deterministic ID before asking Barge to adopt. It records each
-completed or definitively refused row before moving on. Barge's
-`adopt_root` currently sizes existing roots in the area to check for a
-duplicate ID. Importing many old rows into one area can therefore take
-quadratic work. Lease admission, release and status never call adoption.
+Barge's `Area::adopt_root(folder, label, id)` validates a caller-owned
+directory inside a declared area, records its folder in a `barge.root/2`
+marker and refuses a symlink, an unsafe directory or a conflicting marker or
+ID. Adoption and resolution inspect markers without walking payloads. The
+duplicate-ID check still enumerates the area. Preparation processes at most
+eight eligible rows per command. It resolves interrupted adoption by
+deterministic ID and recorded path, and publishes each completed or refused
+row before visiting the next one. Later commands continue from that ledger.
+Lease admission, release and status never call adoption.
 
 Preparation adopts idle legacy rows in place when the kernel reports their
 recorded Oxide holder PID absent. It creates no durable pin. Opaque or
@@ -152,10 +150,16 @@ New-slot admission reads the Oxide ledger's logical-byte observations and
 walks only rows missing a current observation. Count, byte and reserve
 pressure can choose a ranked idle slot and call Barge eviction for that
 root alone. Barge rechecks the actual hold, pin and marker and handles
-trash. Removable admission checks free space through Barge. It only starts
-reserve eviction below the reserve and rereads free space after each eviction.
-Warm reuse above the reserve needs no other root. Explicit inventory and output
-pruning can still use Barge listings.
+trash. Removable admission checks free space through Barge. It only starts reserve
+eviction below the reserve and rereads free space after each completed
+eviction. An eviction left in trash surfaces an error and earns no freed
+space. Warm reuse above the reserve walks no other payload. Barge's own
+soft caps use its release size records, with measurements of vanished roots
+reported as approximate. Identity and protection views use bytes-free Barge
+listings. Oxide counts byte walks separately and reports the unavailable
+count for Barge's internal marker enumeration. The
+[admission observations](local-lease.md#admission-observations-oxide317)
+own the measurement rules.
 
 Selecting a volume, refusing a mismatch, falling back while the drive is away
 and reporting the fallback in status are ordinary behaviour and do not wait on
