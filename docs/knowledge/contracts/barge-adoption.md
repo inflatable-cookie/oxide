@@ -122,6 +122,25 @@ selected prune target. A zero reserve retains Barge's default floor.
 
 ## Transition from Oxide's existing roots
 
+### Proposed bounded preparation (oxide#317)
+
+Advance at most eight eligible legacy rows per front-door preparation. The
+durable row state already records completed and definitively refused imports.
+Resume from those records on the next preparation, keeping the writer, path
+and marker checks and the deterministic root IDs. Live or unverifiable legacy
+writers remain unavailable. The transition creates no pin. At a full ledger
+with pending migration, report that fact alongside any capacity diagnosis.
+
+Use the merged Barge main observed at task start
+(`9336617a87ef182460bdccc4a419f3f8d497b245`). It provides marker-only adoption
+and resolution and a bytes-free inventory. Reserve admission checks space
+before looking for victims. The Rust workflow retains its generation-bound
+observations and ranked slot selection. Barge's own soft-cap accounting uses
+its recorded release sizes and treats a vanished root's size as approximate.
+An eviction that leaves trash behind must surface the failure and cannot be
+credited as freed space. Linux directory identity continues through Oxide's
+kernel-observed directory seam. Enable Barge's `testing` feature for tests.
+
 Oxide's existing roots are not Barge roots: they predate the marker, and Barge
 records any folder without a matching marker as a straggler it will not reuse,
 evict or delete.

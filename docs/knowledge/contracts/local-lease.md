@@ -58,6 +58,29 @@ after recipient writes, failure cannot publish a trusted origin.
 
 ## Capacity and eviction
 
+### Proposed admission observations (oxide#317)
+
+Time each admission lock hold from successful acquisition through release,
+including refusals and front-door preparation. Keep a fixed recent history in
+private pool control state. Publish it after releasing the pool lock and let
+status read it passively. The build summary reports a hold over two seconds
+or more than one root visited, with the cost attributed to adoption, eviction,
+accounting or reserve. A refusal can report its own cost without a build.
+
+A root visit is a payload traversal or a root returned by an explicit Barge
+inventory. Count one eviction's measurement and deletion as one root visit.
+Barge's internal marker scans during lookup and adoption have no public root
+counter. Their elapsed time is included in the phase. Keep that distinction
+visible in the diagnostic and in the counting regression.
+
+At the slot ceiling, try the ranked candidate through Barge. After a hold or
+pin refusal, a bytes-free listing can identify other protected candidates
+without repeatedly resolving them for eviction. Barge still checks the hold,
+pin and marker before each eviction. Report held and pinned counts (which can
+overlap), other unavailable rows, and pin reasons when no slot can be freed.
+Status reads this pool's recorded pin paths for a current reason tally without
+listing roots. Pin reads are diagnostic and an unreadable reason is unknown.
+
 Budgets remain soft admission figures. New-slot admission uses recorded
 logical bytes against the pool budget. Both new-slot and warm admission read
 removable free space against Barge's reserve and floor. Below reserve, they can
