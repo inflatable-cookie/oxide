@@ -1,6 +1,6 @@
 //! Cross-checkout freshness gate (W-8).
 //!
-//! Cargo 1.97.1 keys workspace units by relative path and treats an input as
+//! Cargo 1.97.1 and 1.100.0 key workspace units by relative path and treat an input as
 //! fresh when its mtime is not newer than the unit's dep-info. A slot shared
 //! by two checkouts therefore needs the second checkout's differing files to
 //! look newer than the slot's last build. Each slot records its last compile
@@ -71,13 +71,16 @@ const LOCK_REFUSAL: &str = "was passed to prevent this";
 /// the `path_mtime <= reference_mtime` freshness rule, workspace-relative
 /// unit paths, `cargo metadata` format 1, the lock and unknown `-Z` refusal
 /// wording, stable `build.build-dir` and the legacy `deps/` / `incremental/`
-/// layout. Any other release, older, newer or unknown, never shares a slot.
-pub(crate) const VERIFIED_CARGO: [&str; 5] = [
+/// layout. Cargo 1.100.0 (oxide#334) was checked the same way, with the
+/// build-dir layout v2 that it defaults to (see `cargo_layout`). Any other
+/// release, older, newer or unknown, never shares a slot.
+pub(crate) const VERIFIED_CARGO: [&str; 6] = [
     "cargo 1.95.0 (f2d3ce0bd ",
     "cargo 1.96.1 (356927216 ",
     "cargo 1.97.1 (c980f4866 ",
     "cargo 1.98.1 (797e8a9bc ",
     "cargo 1.99.1 (5f94df478 ",
+    "cargo 1.100.0 (3acc79c0c ",
 ];
 
 /// Why the gate did not vouch for a slot.
@@ -2113,6 +2116,7 @@ mod tests {
             "cargo 1.97.1 (c980f4866 2026-06-30)",
             "cargo 1.98.1 (797e8a9bc 2026-08-05)",
             "cargo 1.99.1 (5f94df478 2026-08-27)",
+            "cargo 1.100.0 (3acc79c0c 2026-11-05)",
         ] {
             assert!(is_verified(version), "{version}");
         }
@@ -2122,6 +2126,7 @@ mod tests {
             "cargo 1.97.0 (c980f4866 2026-06-30)",
             "cargo 1.99.1 (0123456789 2026-08-27)",
             "cargo 1.100.0 (5f94df478 2026-08-27)",
+            "cargo 1.100.1 (3acc79c0c 2026-11-05)",
             "cargo 1.97.1",
             "",
         ] {
@@ -2454,5 +2459,167 @@ mod tests {
         // Any other directory keeps the old refusal.
         assert!(refresh(&dir, &["plain".to_owned()], anchor, &states).is_err());
         fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// Real Cargo 1.100.0, the second checkout of one slot. A file copied
+    /// with an old mtime is fresh to Cargo and keeps the first checkout's
+    /// output (the control). The gate's own refresh makes it stale, so the
+    /// unit rebuilds and prints the second checkout's value.
+    #[test]
+    fn cross_checkout_reuse_refreshes_and_rebuilds_on_1_100() {
+        use crate::cargo_layout::support::{cargo_1_100, toolchain_installed, Fixture};
+        if !toolchain_installed() {
+            eprintln!("skipped: Cargo 1.100.0 is not installed");
+            return;
+        }
+        let root = Fixture::new("gate-1-100");
+        let first = root.0.join("first");
+        let second = root.0.join("second");
+        let slot = root.0.join("slot/build");
+        for checkout in [&first, &second] {
+            fs::create_dir_all(checkout.join("src")).expect("checkout");
+            fs::write(
+                checkout.join("Cargo.toml"),
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .expect("manifest");
+        }
+        fs::write(first.join("src/lib.rs"), "pub fn f() -> u32 { 1 }\n").expect("lib");
+        fs::write(
+            first.join("src/main.rs"),
+            "fn main() { println!(\"{}\", probe::f()); }\n",
+        )
+        .expect("main");
+        fs::write(
+            second.join("src/main.rs"),
+            fs::read(first.join("src/main.rs")).expect("main"),
+        )
+        .expect("second main");
+        // The second checkout's library differs and carries an old mtime, as a copy might.
+        fs::write(second.join("src/lib.rs"), "pub fn f() -> u32 { 2 }\n").expect("second lib");
+        let old = std::process::Command::new("touch")
+            .args(["-t", "202001010000"])
+            .arg(second.join("src/lib.rs"))
+            .status()
+            .expect("touch");
+        assert!(old.success());
+
+        let run = |checkout: &Path| {
+            let output = cargo_1_100(checkout)
+                .args(["run", "-q"])
+                .env("CARGO_BUILD_BUILD_DIR", &slot)
+                .output()
+                .expect("cargo run");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        assert_eq!(run(&first), "1");
+        assert!(crate::cargo_layout::holds_v2_build(&slot.join("debug")));
+        // Check Cargo's actual v2 fingerprint and dep-info, which Cargo itself
+        // uses when the gate refreshes checkout files.
+        let package = slot.join("debug/build/probe");
+        let mut decoded_units = 0;
+        for entry in fs::read_dir(package).expect("unit directories") {
+            let fingerprint = entry.expect("unit").path().join("fingerprint");
+            for entry in fs::read_dir(&fingerprint).expect("fingerprint directory") {
+                let entry = entry.expect("fingerprint entry");
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(unit) = name.strip_prefix("dep-") else {
+                    continue;
+                };
+                let bytes = fs::read(entry.path()).expect("encoded dep-info");
+                let info = oxide_storage::dep_info::decode(&bytes).expect("Cargo v1 encoding");
+                assert!(info.files.iter().any(|file| {
+                    file.reference.tag == oxide_storage::dep_info::PathTag::PackageRootRelative
+                        && file.reference.path.starts_with("src/")
+                }));
+                let json = fs::read(fingerprint.join(format!("{unit}.json")))
+                    .expect("unit fingerprint JSON");
+                let json: serde_json::Value = serde_json::from_slice(&json).expect("JSON");
+                assert_eq!(json["local"][0]["CheckDepInfo"]["fingerprint"], "mtime");
+                assert!(fingerprint.join(unit).is_file(), "unit fingerprint hash");
+                decoded_units += 1;
+            }
+        }
+        assert!(decoded_units >= 2, "library and binary dep-info");
+        let anchor_ns = now_ns();
+
+        // Control: without the gate's refresh, Cargo 1.100.0 keeps the stale unit.
+        assert_eq!(
+            run(&second),
+            "1",
+            "the mtime rule must make the old copy fresh"
+        );
+
+        let refreshed = refresh(
+            &second,
+            &["src/lib.rs".to_owned()],
+            anchor_ns,
+            &BTreeMap::new(),
+        )
+        .expect("refresh");
+        assert_eq!(refreshed, 1);
+        assert_eq!(
+            run(&second),
+            "2",
+            "the refreshed file must rebuild the unit"
+        );
+        let warm = cargo_1_100(&second)
+            .args(["run", "-v"])
+            .env("CARGO_BUILD_BUILD_DIR", &slot)
+            .output()
+            .expect("warm cargo run");
+        assert!(warm.status.success());
+        let stderr = String::from_utf8_lossy(&warm.stderr);
+        assert!(stderr.contains("Fresh probe"), "{stderr}");
+        assert!(!stderr.contains("Compiling probe"), "{stderr}");
+
+        // A tracked input redirecting outside this checkout must refuse
+        // rather than touch the other checkout's file.
+        let outside = first.join("src/lib.rs");
+        let before = mtime_ns(&fs::metadata(&outside).expect("outside file"));
+        std::os::unix::fs::symlink(&outside, second.join("src/outside.rs"))
+            .expect("outside symlink");
+        let refusal = refresh(
+            &second,
+            &["src/outside.rs".to_owned()],
+            anchor_ns,
+            &BTreeMap::new(),
+        )
+        .expect_err("outside symlink must refuse");
+        assert!(refusal.contains("links outside the checkout"), "{refusal}");
+        assert_eq!(
+            mtime_ns(&fs::metadata(outside).expect("outside file")),
+            before
+        );
+    }
+
+    /// Real Cargo 1.100.0 refuses to create a lock file under `--locked`,
+    /// with the wording the gate's refusal detection matches.
+    #[test]
+    fn locked_refusal_wording_matches_1_100() {
+        use crate::cargo_layout::support::{cargo_1_100, toolchain_installed, Fixture};
+        if !toolchain_installed() {
+            eprintln!("skipped: Cargo 1.100.0 is not installed");
+            return;
+        }
+        let root = Fixture::new("lock-1-100");
+        fs::create_dir_all(root.0.join("src")).expect("src");
+        fs::write(
+            root.0.join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        fs::write(root.0.join("src/lib.rs"), "").expect("lib");
+        let output = cargo_1_100(&root.0)
+            .args(["build", "--locked"])
+            .output()
+            .expect("cargo build");
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(LOCK_REFUSAL));
     }
 }

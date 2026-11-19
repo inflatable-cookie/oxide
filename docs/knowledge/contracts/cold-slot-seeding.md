@@ -418,6 +418,15 @@ Any other Cargo version, a build-dir v2 layout, an unverified or rebuilt Cargo,
 or a release without this adapter's qualification means no seeding. Normal Cargo
 is never altered. A new Cargo release needs its own adapter id and qualification.
 
+Cargo 1.100.0 is a verified release whose default layout is v2 (oxide#334). It has
+no adapter: the producer refuses it before any catalog or planner work, with the
+named reason "Cargo build-dir layout v2 has no seeding adapter", and the command
+builds cold. Seeding does not clone per-unit directories, because the section 3
+identities (the `.fingerprint` triple, `deps/` artifacts and the `.d` join) do not
+carry over to `build/<pkg>/<meta>/`. A v2 adapter needs its own design and
+qualification. A v1 profile reached under the 1.100.0 opt-out is never seeded either,
+because the producer identity is keyed by version.
+
 ## 11. Interfaces with other contracts
 
 - **Child temporary files** ([workflow](workflow.md)).
