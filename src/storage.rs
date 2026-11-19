@@ -1369,17 +1369,44 @@ mod tests {
         fixture.clock.advance(1_000);
         let newer = area.create_root("quick").expect("root");
         fixture.clock.advance(1_000);
+        // Barge samples the filesystem again after deleting a root. The
+        // fake mount gains space only after the older root has disappeared.
+        #[derive(Debug)]
+        struct FreeAfterEviction {
+            volume: FakeOs,
+            older: PathBuf,
+            reserve: u64,
+        }
+
+        impl Os for FreeAfterEviction {
+            fn volume_identity(&self, mount: &Path) -> barge::Result<Option<String>> {
+                self.volume.volume_identity(mount)
+            }
+
+            fn free_bytes(&self, mount: &Path) -> barge::Result<u64> {
+                let before = self.volume.free_bytes(mount)?;
+                Ok(if self.older.exists() {
+                    before
+                } else {
+                    self.reserve
+                })
+            }
+        }
+
         let reserve = 20_u64 << 30;
-        let older_bytes = area
-            .list()
-            .expect("list")
-            .get(&older.id)
-            .map(|root| root.bytes)
-            .expect("older");
-        assert!(older_bytes > 0);
-        // Just below the reserve: evicting the older root alone returns above it.
-        fixture.os.set_free(&fixture.mount, reserve - older_bytes);
-        let report = fixture.storage.prune("Builds", false).expect("prune");
+        fixture.os.set_free(&fixture.mount, reserve - 1);
+        let storage = Storage::open_with(
+            fixture.storage.state_dir().to_path_buf(),
+            Arc::new(FreeAfterEviction {
+                volume: fixture.os.clone(),
+                older: older.path.clone(),
+                reserve,
+            }),
+            fixture.clock.clone(),
+        )
+        .expect("storage");
+        let report = storage.prune("Builds", false).expect("prune");
+        assert_eq!(report.free_after_bytes, reserve);
         assert_eq!(report.evicted.len(), 1, "{report:?}");
         assert_eq!(report.evicted[0].id, older.id);
         assert!(!older.path.exists());
