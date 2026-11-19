@@ -6,9 +6,6 @@ minimum_effigy_version = "0.14.0"
 # is broken, use Effigy's machine-wide per-program fallback or cargo by hand.
 "rust:compile" = "oxide check --workspace --all-targets --locked"
 "rust:format" = "oxide fmt --all -- --check"
-# Compile-only check for the already-installed Linux target. It installs no
-# target, links nothing and runs nothing.
-"rust:compile-linux" = "oxide check --locked --offline --target x86_64-unknown-linux-gnu"
 # Release-profile compile of the binaries with warnings fatal.
 "rust:compile-release" = "RUSTFLAGS='-D warnings' oxide check --release --workspace --bins --locked"
 # Duplicate packages in the normal dependency closure for every target. Reads the

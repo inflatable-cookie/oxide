@@ -19,7 +19,7 @@ The unpublished root package uses Rust edition 2021 and declares
 names remain subject to [Q-005](questions.md#q-005--what-names-are-safe-to-publish).
 It contains a Unix-only local storage library, the unpublished `oxide` and
 `oxide-storage-inventory` binaries (the standalone lease binary was retired in
-oxide#102), and pins `sha2` 0.10.9 for
+oxide#102), and pins `sha2` 0.11.0 for
 persisted lease-token hashes. It pins `basic-toml` `=0.1.10` (oxide#095), the
 strict-profile exception in Tom's
 [2026-10-19 ruling](vision.md#product-workflow-direction), only to parse Cargo

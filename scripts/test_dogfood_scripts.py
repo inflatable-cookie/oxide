@@ -7,6 +7,7 @@ inside one fresh mktemp directory. Aggregate budget is 60 seconds.
 """
 from __future__ import annotations
 
+import atexit
 import datetime
 import contextlib
 import hashlib
@@ -21,15 +22,31 @@ import stat
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
-signal.alarm(60)
-
 SCRIPTS = Path(__file__).resolve().parent
 _SCRATCH_DIR = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
 SCRATCH = Path(tempfile.mkdtemp(prefix="oxide-dogfood-", dir=_SCRATCH_DIR or None)).resolve()
+
+
+def _remove_scratch():
+    # Only this run's own fixture root; never raises, so it is safe in a handler.
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+
+
+def _expire(signum, frame):
+    # The alarm's default action would end the process without removing SCRATCH.
+    _remove_scratch()
+    print("dogfood scripts: the 60 s budget expired", file=sys.stderr)
+    os._exit(128 + signum)
+
+
+atexit.register(_remove_scratch)
+signal.signal(signal.SIGALRM, _expire)
+signal.alarm(60)
 
 
 def load(name):
@@ -878,6 +895,48 @@ class PersistedFormatTests(unittest.TestCase):
                 normalized = re.sub(r"\s+", "", re.sub(r"(?m)//.*$", "", "\n".join(declarations)))
                 self.assertEqual(sha256(normalized.encode()), digest,
                                  "Persisted fields changed. Bump the format and cover the previous reader or downgrade.")
+
+
+class StagingCleanupTests(unittest.TestCase):
+    def test_a_failed_build_removes_its_staging_directory(self):
+        seen = []
+
+        def failing_build(pin, instance, staging):
+            seen.append(staging)
+            raise installer.Refusal("synthetic build failure")
+
+        with mock.patch.object(sys, "argv", ["oxide-install"]), \
+                mock.patch.object(installer, "authenticate_pin", return_value=("a" * 40, "tree", "tip")), \
+                mock.patch.object(installer, "preflight", return_value=(None, None)), \
+                mock.patch.object(installer, "build", side_effect=failing_build), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            status = installer.main()
+        self.assertEqual(status, 1)
+        self.assertEqual(len(seen), 1, "the build ran once")
+        self.assertFalse(seen[0].exists(), f"staging left behind: {seen[0]}")
+
+
+class CanaryCleanupTests(unittest.TestCase):
+    def test_a_refused_cleanup_does_not_mask_the_original_error(self):
+        scratch = Path(tempfile.mkdtemp(dir=SCRATCH)).resolve()
+        scratch_id = installer.directory_identity(scratch)
+
+        def replace_crate(built, crate, environment):
+            # A new directory at the same path makes the cleanup identity check refuse.
+            crate.rename(crate.with_name(crate.name + ".moved"))
+            crate.mkdir()
+            return None, 0.0, [{"v": 1, "event": "finished", "lease": "released", "drain": "complete"}]
+
+        def failing_assessment(*args, **kwargs):
+            raise RuntimeError("original failure")
+
+        arguments = types.SimpleNamespace(new_seconds=10, warm_seconds=5)
+        with mock.patch.object(installer, "canary_check", side_effect=replace_crate), \
+                mock.patch.object(installer, "assess_canary", side_effect=failing_assessment), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "original failure"):
+                installer.exercise(Path("/unused"), {}, scratch, scratch_id, None, arguments,
+                                   {"safe": True})
 
 
 if __name__ == "__main__":

@@ -23,8 +23,16 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).expect("remove owned test scratch");
+        // A panic here would replace the test's own failure during unwinding.
+        let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn scratch_drop_tolerates_a_directory_already_removed() {
+    let scratch = Scratch::new();
+    fs::remove_dir_all(&scratch.0).expect("remove the fixture early");
+    drop(scratch);
 }
 
 #[test]

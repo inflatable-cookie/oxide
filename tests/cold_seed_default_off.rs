@@ -37,8 +37,16 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).unwrap();
+        // A panic here would replace the test's own failure during unwinding.
+        let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn scratch_drop_tolerates_a_directory_already_removed() {
+    let scratch = Scratch::new();
+    std::fs::remove_dir_all(&scratch.0).expect("remove the fixture early");
+    drop(scratch);
 }
 
 /// The oxide binary staged from the merge-base source. Set `OXIDE_SEED_BASELINE_BINARY`
