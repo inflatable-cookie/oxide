@@ -22,7 +22,7 @@ Tom's 2026-10-10 blanket approval in [vision](docs/knowledge/vision.md#authority
 
 Tom's 2026-11-17 lean reset ([vision](docs/knowledge/vision.md#validation-policy)) applies to all Oxide work: ordinary tests and one independent exact-head review, with no native-proof ladders.
 
-- Every product brief names its covering Effigy selectors, wall-clock limit and scratch-disk budget.
+- Every product brief names its covering Effigy selectors, wall-clock limit and scratch-disk budget. When a brief names none, the defaults are 600 s per selector run, 8 GiB of task scratch for build staging, and 512 MiB per test fixture. Report observed figures as observations.
 - The author runs `rust:compile`, `rust:compile-release`, `rust:format`, `docs:check` when docs change, and the ordinary unit/integration suite (`rust:barge-adoption`) on fresh fixtures below the task's TMPDIR. Crash recovery, deletion and removable-media behaviour are covered by ordinary regression tests there.
 - The ordinary selectors run through the installed `oxide` on the live pool (dogfooding). Their normal pool effects, such as leasing a slot or evicting an idle one at the ceiling, are expected. "No live pool access" in a brief means: don't hand-edit pool files or state, don't point fixtures at the live pool, and don't install. Cargo using the invoking `CARGO_HOME` (`~/.cargo`) cache is normal, so don't isolate it.
 - Oxide has no `test:affected` selector, and its Nucleus repository record sets no affected-test command. The whole-suite `rust:barge-adoption` run at the head covers every affected test and satisfies a generic "run the affected tests" instruction. Don't block on the missing selector.
