@@ -9524,7 +9524,7 @@ pub(crate) mod tests {
             slots.push(serde_json::json!({
                 "id": id, "incarnation": 1, "state": "idle",
                 "project": key.checkout, "workspace": key.checkout, "profile": "dev",
-                "holder": "", "lease_id": null, "last_lease_id": format!("v1.{store_id}.{id}.1.1"),
+                "holder": format!("oxide-{}-{id}", std::process::id()), "lease_id": null, "last_lease_id": format!("v1.{store_id}.{id}.1.1"),
                 "rank": id, "root": pinned.id, "dir": pinned.folder, "owned": true,
             }));
         }
@@ -9550,7 +9550,15 @@ pub(crate) mod tests {
             "the first diagnosis bypasses generic wait suppression"
         );
 
+        let held_slot = held.slot_id.clone();
         store.release(held, None).unwrap();
+        let reused = match lease_as(&store, &key, WorkspaceAdmission::NORMAL, false) {
+            Ok(reused) => reused,
+            Err(wait) => panic!("the released slot makes progress at the ceiling: {wait:?}"),
+        };
+        assert!(reused.reused);
+        assert_eq!(reused.slot_id, held_slot);
+        store.release(reused, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

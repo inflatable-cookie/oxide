@@ -114,6 +114,8 @@ selected prune target. A zero reserve retains Barge's default floor.
   post-rename deletion failure retires workflow membership and surfaces the
   trash failure. A workflow publication failure after the rename reports
   that the root moved. Neither failure gives freed-space credit.
+- If output-prune workflow publication fails after Barge evicts a root, the
+  dispatcher reports the eviction and stops before attempting another root.
 - Deletion never follows a symlink and never descends into another filesystem;
   a trash entry is removed only when its marker still names the area.
   Eviction renames first, so a crash leaves owned trash, which the next prune
