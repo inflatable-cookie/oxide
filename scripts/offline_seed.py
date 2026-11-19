@@ -787,7 +787,7 @@ def _walk_git(
                 continue
             child = parts + (name,)
             child_rel = rel + (name,)
-            if parts == ("objects", "info") and name in ("alternates", "http-alternates"):
+            if rel == ("objects", "info") and name in ("alternates", "http-alternates"):
                 raise SeedRefusal(
                     f"Git database alternates entry refused: {'/'.join(child)}",
                     _failure(parts, None, "alternates check", None, component=name),
@@ -1590,6 +1590,21 @@ def self_test(root: Path | str) -> list[dict]:
         assert not (directory / "two-revisions" / "git").exists(), "a repeated repository copied before refusing"
         return outcomes[0]["refusal"]
 
+    def git_alternates_refused(directory: Path) -> str:
+        host, rev, checksum = _fixture_host(directory)
+        info = host / "git" / "db" / "seedrepo-0123456789abcdef" / "objects" / "info"
+        for name in ("alternates", "http-alternates"):
+            entry = info / name
+            entry.write_text("/untrusted/object/store\n")
+            expect_refusal(
+                lambda: seed_cargo_home(host, directory / ("cargo-" + name),
+                                        _lock_text(rev, checksum).encode(), deadline_ns=deadline),
+                "alternates entry refused",
+            )
+            entry.unlink()
+        return "both Git alternates entries refused"
+
+    case("git-alternates-refused", git_alternates_refused)
     case("registry-git-positive", positive)
     case("two-git-sources-positive", two_sources_positive)
     case("second-source-wrong-commit", second_wrong_commit)
