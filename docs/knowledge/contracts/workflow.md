@@ -5216,7 +5216,11 @@ migration and consumer adoption remain separate gates.
   absent (no file, directory or link, dangling links included). It runs the
   adopt barrier, downgrade fence, admission lock, roots, marker and receipt,
   with a missing-target-only transition, and releases the barrier before the
-  slot is taken. Every fact is rechecked under the admission lock. A concurrent
+  slot is taken. Output identity, holds and pins use Barge markers and
+  bytes-free listings. Auto-adopt, adopt and detach do not measure neighboring
+  output payloads while holding admission. See the
+  [Barge adoption contract](barge-adoption.md) for registry ID backfill.
+  Every fact is rechecked under the admission lock. A concurrent
   receipt, creator, mode or volume change makes it a no-op, and the existing
   path decides. The conversion creates the PROFILE layout (oxide#160, S4b):
   it runs the same creator an explicit `oxide outputs adopt` runs for a fresh
@@ -5485,6 +5489,14 @@ author and reviewer native remain unactivated.
   foreign link refuses. Every first link also checks the actual Git
   ignore/tracked state of `target/<member>`; a winning parent `target/` ignore
   is allowed, unknown answers refuse.
+
+  In ephemeral mode a converted checkout keys a missing member as a real
+  local directory. Cargo or the tool can create it under a real or missing
+  `target` and triple directory. Existing links keep their receipt-recorded
+  roots after verification. A foreign link, non-directory ancestor or
+  unverified linked destination still refuses by name. The local placement
+  leaves the receipt and its durable pins intact.
+
   For a receiptless, nonempty real target, `oxide outputs plan` reports the
   explicit profile adoption member by member: nonempty real directories stay
   local, missing or empty members convert, and a foreign member refuses by

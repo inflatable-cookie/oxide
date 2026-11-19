@@ -4136,6 +4136,22 @@ pub fn auto_adopt(
     if !auto_adopts(&facts) {
         return Ok(());
     }
+    auto_adopt_fresh(store, &context, &captured, || {
+        Ok(external_choice(&context)?
+            .ok()
+            .map(|registration| external_spec(&registration, checkout)))
+    })
+}
+
+/// Convert a fresh checkout, consulting the current placement again while
+/// admission is held. The placement lookup is separate from publication so
+/// the same transition can run on a private directory fixture.
+fn auto_adopt_fresh(
+    store: &Store,
+    context: &Context,
+    captured: &Selected,
+    current: impl FnOnce() -> Result<Option<RootSpec>, String>,
+) -> Result<(), String> {
     // Expected automatic-adoption ineligibility must leave the build usable
     // (oxide#154). The prerequisite is asked before the barrier, the
     // downgrade fence or the admission lock, so an ineligible checkout gets
@@ -4144,10 +4160,11 @@ pub fn auto_adopt(
     // publish (oxide#160), the same set `adopt_profile_from` checks before it
     // creates the real target directory.
     for member in AUTO_ADOPT_MEMBERS {
-        if first_link_git_answer(&context, Some(member)).verdict != LinkGitVerdict::Eligible {
+        if first_link_git_answer(context, Some(member)).verdict != LinkGitVerdict::Eligible {
             return Ok(());
         }
     }
+    let checkout = &context.workspace;
     let mut waits = WaitAccounting::default();
     let guard = barrier(store, checkout, &mut waits)?;
     let outcome: Result<Option<Selected>, String> = (|| {
@@ -4164,11 +4181,10 @@ pub fn auto_adopt(
         if context.receipt()?.is_some() || context.target()? != TargetState::Missing {
             return Ok(None);
         }
-        let Ok(registration) = external_choice(&context)? else {
+        let Some(spec) = current()? else {
             return Ok(None);
         };
-        let spec = external_spec(&registration, checkout);
-        if !selection_matches(&captured, &spec.selected(0)) {
+        if !selection_matches(captured, &spec.selected(0)) {
             return Ok(None);
         }
         // The first conversion creates the profile layout through the SAME
@@ -4179,7 +4195,7 @@ pub fn auto_adopt(
         // identical in form to a fresh explicit adoption.
         let receipt = Receipt::first_with(checkout, &context.checkout_id, LayoutKind::Profile);
         let (_committed, selected, _converted) =
-            adopt_profile_from(&context, receipt, Start::MissingOnly, Some(&spec))?;
+            adopt_profile_from(context, receipt, Start::MissingOnly, Some(&spec))?;
         Ok(Some(selected))
     })();
     release_barrier(store, guard)?;
@@ -4405,6 +4421,7 @@ pub struct OutputBinding {
     pub outcome: Outcome,
     _lock: Option<File>,
     _holds: Vec<barge::Hold>,
+    ephemeral: bool,
 }
 
 impl OutputBinding {
@@ -4413,6 +4430,7 @@ impl OutputBinding {
             outcome,
             _lock: None,
             _holds: Vec::new(),
+            ephemeral: false,
         }
     }
 }
@@ -4465,7 +4483,14 @@ pub fn bind_for_command(
     } else {
         None
     } {
-        binding._holds = crate::prune::hold_outputs(store.owner_control(), &receipt)?;
+        binding._holds = crate::prune::hold_outputs(store.owner_control(), &receipt, |member| {
+            // Keep the receipt's durable pin. A member that the command can
+            // only reach locally needs no running hold on its former root.
+            !binding.ephemeral
+                || receipt.layout() != LayoutKind::Profile
+                || !ephemeral_member_state(checkout, &id, member)
+                    .is_ok_and(|state| is_local_member(&state))
+        })?;
     }
     Ok(binding)
 }
@@ -4513,6 +4538,7 @@ fn bind_for_command_inner(
             outcome,
             _lock: Some(lock),
             _holds: Vec::new(),
+            ephemeral: mode == Some(DriveMode::Ephemeral),
         });
     }
     if context.receipt()?.is_none() {
@@ -4535,6 +4561,7 @@ fn bind_for_command_inner(
                 outcome: unconverted_outcome(),
                 _lock: Some(lock),
                 _holds: Vec::new(),
+                ephemeral: false,
             });
         };
         keyed_state_matches(Some(&receipt), expected)?;
@@ -4565,6 +4592,7 @@ fn bind_for_command_inner(
                     outcome,
                     _lock: Some(lock),
                     _holds: Vec::new(),
+                    ephemeral: false,
                 })
             }
             Bind::Refuse(reason) => return Err(reason),
@@ -4684,8 +4712,8 @@ fn bind_ephemeral(context: &Context, expected: Option<&Plan>) -> Result<Outcome,
             if receipt.layout() == LayoutKind::Profile {
                 // Ephemeral mode never relinks a converted checkout. The
                 // profile layout is validated exactly as keyed: each owned
-                // member link selects the receipt's root and each real member
-                // stays real.
+                // member link selects the receipt's root and real or missing
+                // members are used locally.
                 return bind_profile_sealed(context, &receipt, expected);
             }
             let wanted = match expected_selected {
@@ -4724,8 +4752,9 @@ fn bind_ephemeral(context: &Context, expected: Option<&Plan>) -> Result<Outcome,
     }
 }
 
-/// Ephemeral-mode binding for a converted profile checkout: no member is
-/// created or relinked, so every keyed placement must already be live.
+/// Ephemeral-mode binding for a converted profile checkout. Cargo can create
+/// a missing local directory after binding. Existing links must still be live
+/// and match their keyed, receipt-recorded roots.
 fn bind_profile_sealed(
     context: &Context,
     receipt: &Receipt,
@@ -4743,19 +4772,46 @@ fn bind_profile_sealed(
                 .to_owned(),
         );
     }
+    let ephemeral = context.mode()? == Some(DriveMode::Ephemeral);
     let mut outcome = Outcome::default();
     let mut real = Vec::new();
     for planned in &plan.members {
         let link = link_path(&context.workspace, &planned.member);
-        let state = link_state(&link, &context.workspace, &context.checkout_id)?;
+        let state = if ephemeral {
+            ephemeral_member_state(&context.workspace, &context.checkout_id, &planned.member)?
+        } else {
+            link_state(&link, &context.workspace, &context.checkout_id)?
+        };
         match (&planned.selected, &state) {
             (Some(wanted), TargetState::OwnedLink(root))
-                if root == &member_destination(&wanted.root, &planned.member) =>
+                if (!ephemeral || receipt.selected_for(&planned.member) == Some(wanted))
+                    && root == &member_destination(&wanted.root, &planned.member) =>
             {
-                check_bound_root(context, receipt.generation, wanted)?;
+                if let Some(reason) = context.pool_fallback.as_deref().filter(|_| wanted.kind == RootKind::External) {
+                    return Err(format!(
+                        "outputs: {} selects the external root {}, but this command's intermediate slot fell back to the internal pool ({reason}) and the drive's removal would not be supervised. Restore the drive or run `oxide outputs detach`",
+                        link.display(),
+                        wanted.root.display()
+                    ));
+                }
+                check_bound_root(context, receipt.generation, wanted).map_err(|reason| format!(
+                    "outputs: {} selects an unverified root: {reason}. Run `oxide outputs adopt` or `oxide outputs detach`",
+                    link.display()
+                ))?;
+                if ephemeral && (!profile_member_parent_exists(&wanted.root, &planned.member)?
+                    || !profile_directory_exists(root)?)
+                {
+                    return Err(format!(
+                        "outputs: {} selects {}, which is unavailable. Run `oxide outputs adopt` or `oxide outputs detach`",
+                        link.display(), root.display()
+                    ));
+                }
                 outcome.root.get_or_insert_with(|| wanted.root.clone());
             }
             (None, TargetState::RealEmpty | TargetState::RealNonEmpty) => {
+                real.push(planned.member.clone());
+            }
+            (None, TargetState::Missing) if ephemeral => {
                 real.push(planned.member.clone());
             }
             _ => {
@@ -4776,13 +4832,56 @@ fn bind_profile_sealed(
     if !real.is_empty() {
         let list = real.join(", ");
         outcome.warnings.push(format!(
-            "profile outputs: {list} stay real directories and are used locally; only an explicit `oxide outputs adopt` converts an empty one"
+            "profile outputs: {list} use local directories; only an explicit `oxide outputs adopt` converts an empty one"
         ));
         if outcome.note.is_none() {
-            outcome.note = Some(format!("real profile directories kept ({list})"));
+            outcome.note = Some(format!("local profile directories ({list})"));
         }
     }
     Ok(outcome)
+}
+
+fn is_local_member(state: &TargetState) -> bool {
+    matches!(
+        state,
+        TargetState::Missing | TargetState::RealEmpty | TargetState::RealNonEmpty
+    )
+}
+
+/// Check ancestors before inspecting a member. A missing ancestor means the
+/// member is absent. A link or file there cannot make a safe local placement.
+fn ephemeral_member_state(
+    checkout: &Path,
+    checkout_id: &str,
+    member: &str,
+) -> Result<TargetState, String> {
+    let target = checkout.join("target");
+    if !profile_member_parent_exists(&target, member)? {
+        return Ok(TargetState::Missing);
+    }
+    link_state(&target.join(member), checkout, checkout_id)
+}
+
+fn profile_member_parent_exists(base: &Path, member: &str) -> Result<bool, String> {
+    if !profile_directory_exists(base)? {
+        return Ok(false);
+    }
+    match member.split_once('/') {
+        Some((triple, _)) => profile_directory_exists(&base.join(triple)),
+        None => Ok(true),
+    }
+}
+
+fn profile_directory_exists(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(format!(
+            "outputs: {} is not a real profile directory; Oxide never follows or replaces it. Run `oxide outputs adopt` or `oxide outputs detach`",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("outputs: cannot inspect {}: {error}", path.display())),
+    }
 }
 
 /// The result of one binding attempt under the mutex.
@@ -5613,31 +5712,35 @@ pub fn planned_destination(
                 return Err("outputs: this checkout places outputs at profile members, but this command declares none; declare its outputs with `oxide exec --output <member>` or run `oxide outputs detach`"
                     .to_owned());
             }
-            let desired = desired_selection(&context, &receipt)?;
+            let ephemeral = context.mode()? == Some(DriveMode::Ephemeral);
+            let desired = if ephemeral {
+                None
+            } else {
+                desired_selection(&context, &receipt)?
+            };
             let mut members = Vec::with_capacity(declaration.members().len());
             for member in declaration.members() {
-                let state = link_state(
-                    &link_path(&context.workspace, member.name()),
-                    &context.workspace,
-                    &context.checkout_id,
-                )?;
-                let keeps_real =
-                    matches!(state, TargetState::RealEmpty | TargetState::RealNonEmpty);
-                if !keeps_real && !matches!(state, TargetState::Missing) {
-                    // An owned or foreign link: the owned root (or the desired
-                    // one) is planned; a foreign link refuses here, before the
-                    // slot is keyed or any Cargo call runs.
-                    if !matches!(state, TargetState::OwnedLink(_) | TargetState::Dangling(_)) {
-                        return Err(format!(
-                            "outputs: {} is {}; Oxide never follows or replaces it. Remove it or restore the owned link, then run the command again",
-                            link_path(&context.workspace, member.name()).display(),
-                            state.label()
-                        ));
+                let link = link_path(&context.workspace, member.name());
+                let state = if ephemeral {
+                    ephemeral_member_state(&context.workspace, &context.checkout_id, member.name())?
+                } else {
+                    link_state(&link, &context.workspace, &context.checkout_id)?
+                };
+                let selected = match state {
+                    TargetState::RealEmpty | TargetState::RealNonEmpty => None,
+                    TargetState::Missing if ephemeral => None,
+                    TargetState::OwnedLink(_) | TargetState::Dangling(_) if ephemeral => {
+                        receipt.selected_for(member.name()).cloned()
                     }
-                }
+                    TargetState::Missing | TargetState::OwnedLink(_) | TargetState::Dangling(_) => desired.clone(),
+                    TargetState::Foreign => return Err(format!(
+                        "outputs: {} is {}; Oxide never follows or replaces it. Remove it or restore the owned link, then run the command again",
+                        link.display(), state.label()
+                    )),
+                };
                 members.push(PlannedMember {
                     member: member.name().to_owned(),
-                    selected: if keeps_real { None } else { desired.clone() },
+                    selected,
                 });
             }
             Ok(Some(Plan {
@@ -5810,12 +5913,7 @@ pub fn exec_declaration(
             return Err("outputs: this checkout's owned output root was pruned; run `oxide outputs adopt` to convert it again".to_owned())
         }
     }
-    // The destination the plan will use, computed exactly as
-    // `planned_destination` computes it: a receipt-selected member must already
-    // be this checkout's owned link AT THAT destination, so a derived `exec`
-    // never relinks, not even between two roots the receipt knows.
-    let desired = desired_selection(&context, &receipt)?;
-    let members = exec_members(&context, &receipt, desired.as_ref())?;
+    let members = exec_members(&context, &receipt)?;
     if receipt.state == ReceiptState::Detached {
         // A detached checkout owns no destination: its command runs locally
         // through real directories, so the derived set is empty and the key
@@ -5842,14 +5940,9 @@ pub fn exec_declaration(
 /// committed destinations are accepted, plus the two absent-link shapes the
 /// permanent-mode binding repairs (an absent member directory beneath a
 /// verified root, oxide#162, and an absent member link of a verified root whose
-/// real `target` directory went with it, oxide#165); a real member the receipt
-/// keeps local is planned `real`; everything else that occupies a member-shaped
-/// path refuses before Cargo, with the link, receipt and root unchanged.
-fn exec_members(
-    context: &Context,
-    receipt: &Receipt,
-    desired: Option<&Selected>,
-) -> Result<Vec<String>, String> {
+/// real `target` directory went with it, oxide#165). In ephemeral mode a
+/// recorded member that is real or missing is local. Foreign paths refuse.
+fn exec_members(context: &Context, receipt: &Receipt) -> Result<Vec<String>, String> {
     let live_target = target_state(&context.workspace, &context.checkout_id)?;
     let mut candidates: Vec<String> = Vec::new();
     match &live_target {
@@ -5878,17 +5971,33 @@ fn exec_members(
     }
     candidates.sort();
     candidates.dedup();
-    // The absent-destination repair belongs to the permanent-mode binding's
-    // custody; every other mode keeps exactly today's refusal.
-    let permanent = context.mode()? == Some(DriveMode::Permanent);
+    // Permanent-mode repair runs under writer custody. Ephemeral-mode tools
+    // can use a missing member locally without touching its recorded root.
+    let mode = context.mode()?;
+    let permanent = mode == Some(DriveMode::Permanent);
+    let ephemeral = mode == Some(DriveMode::Ephemeral);
+    let desired = if ephemeral {
+        None
+    } else {
+        desired_selection(context, receipt)?
+    };
     let mut members = Vec::new();
     for name in &candidates {
         let link = link_path(&context.workspace, name);
-        let state = link_state(&link, &context.workspace, &context.checkout_id)?;
+        let state = if ephemeral {
+            ephemeral_member_state(&context.workspace, &context.checkout_id, name)?
+        } else {
+            link_state(&link, &context.workspace, &context.checkout_id)?
+        };
+        if ephemeral && receipt.placement(name).is_some() && is_local_member(&state) {
+            members.push(name.clone());
+            continue;
+        }
         match receipt.placement(name) {
             Some(placement) => match placement.selected_ref() {
-                Some(_) => {
-                    let Some(desired) = desired else {
+                Some(committed) => {
+                    let wanted = if ephemeral { Some(committed) } else { desired.as_ref() };
+                    let Some(desired) = wanted else {
                         return Err(format!(
                             "outputs: this checkout's receipt places the profile member {name} at a root this command would no longer select; an exec command never relinks it. Nothing was changed. Run `oxide outputs adopt` to recheck this checkout's owned outputs"
                         ));
@@ -6286,7 +6395,10 @@ pub fn reserve(
             &context.checkout_id,
             receipt.reserved().map(|reserved| reserved.id.as_str()),
         )?;
-        if receipt.state != ReceiptState::Committed {
+        if receipt.state != ReceiptState::Committed
+            || (receipt.layout() == LayoutKind::Profile
+                && context.mode()? == Some(DriveMode::Ephemeral))
+        {
             return Ok(());
         }
         let Some(wanted) = desired_selection(&context, &receipt)? else {
@@ -6801,6 +6913,7 @@ fn bind_local_outputs(
         outcome: local_outcome(local.reason),
         _lock: Some(lock),
         _holds: Vec::new(),
+        ephemeral: false,
     })
 }
 
@@ -14449,6 +14562,104 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_mode_uses_a_missing_converted_member_locally() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let store = pool_store(&fixture.root.join("pool"));
+        let control = store.owner_control();
+        let context = Context::new(Some(control.to_path_buf()), fixture.checkout.clone());
+        let receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        let (receipt, selected, _) = adopt_profile(&context, receipt).unwrap();
+        register_at(&fixture, control, DriveMode::Ephemeral);
+        let debug = context.link().join("debug");
+        let release = context.link().join("release");
+        let old_debug = member_destination(selected.root(), "debug");
+        fs::write(old_debug.join("retained"), b"old outputs").unwrap();
+        fs::remove_file(&debug).unwrap();
+
+        let declaration = declared(&["debug", "release"]);
+        let plan = |members: &crate::layout::Declaration| {
+            planned_destination(Some(control), &fixture.checkout, members, None, false)
+                .unwrap()
+                .unwrap()
+        };
+        let keyed = plan(&declaration);
+        assert_eq!(keyed.members[0].member, "debug");
+        assert!(keyed.members[0].selected.is_none());
+        assert_eq!(
+            keyed.members[1].selected.as_ref(),
+            receipt.selected_for("release")
+        );
+        assert!(destination_facts(Some(&keyed))
+            .lines()
+            .any(|line| line == "real debug"));
+        let derived = exec_declaration(Some(control), &fixture.checkout, None).unwrap();
+        assert_eq!(
+            destination_facts(Some(&plan(&derived))),
+            destination_facts(Some(&keyed))
+        );
+
+        let bind = |keyed: &Plan| {
+            bind_for_command(&store, &fixture.checkout, 0, Some(keyed), None, false, None)
+        };
+        let binding = bind(&keyed).unwrap();
+        assert_eq!(
+            binding._holds.len(),
+            1,
+            "the surviving release link still holds its root"
+        );
+        // Cargo's creation after binding stays on the checkout side.
+        fs::create_dir(&debug).unwrap();
+        fs::write(debug.join("new-output"), b"local output").unwrap();
+        drop(binding);
+        let derived = exec_declaration(Some(control), &fixture.checkout, None).unwrap();
+        assert!(plan(&derived).members[0].selected.is_none());
+        assert_eq!(context.receipt().unwrap(), Some(receipt.clone()));
+        assert_eq!(
+            fs::read(old_debug.join("retained")).unwrap(),
+            b"old outputs"
+        );
+        assert!(!old_debug.join("new-output").exists());
+        assert_eq!(
+            fs::read_link(&release).unwrap(),
+            member_destination(selected.root(), "release")
+        );
+
+        // A foreign link appearing after planning is refused under binding.
+        fs::remove_dir_all(&debug).unwrap();
+        let foreign = fixture.root.join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        symlink(&foreign, &debug).unwrap();
+        let Err(reason) = bind(&keyed) else {
+            panic!("bound a foreign member link")
+        };
+        assert!(
+            reason.contains("target/debug") && reason.contains("oxide outputs adopt"),
+            "{reason}"
+        );
+        assert_eq!(fs::read_link(&debug).unwrap(), foreign);
+
+        fs::remove_file(&debug).unwrap();
+        fs::rename(selected.root(), fixture.root.join("retained-root")).unwrap();
+        let Err(reason) = bind(&keyed) else {
+            panic!("bound a link to the unavailable root")
+        };
+        assert!(
+            reason.contains("target/release") && reason.contains("oxide outputs adopt"),
+            "{reason}"
+        );
+
+        // When every link is gone, build locally even if the old root is
+        // unavailable. A historical placement cannot require a running hold.
+        fs::remove_dir_all(context.link()).unwrap();
+        let debug_only = declared(&["debug"]);
+        reserve(&store, Some(control), &fixture.checkout, &debug_only, None).unwrap();
+        let binding = bind(&plan(&debug_only)).unwrap();
+        assert!(binding._holds.is_empty());
+        assert_eq!(context.receipt().unwrap(), Some(receipt));
+    }
+
+    #[test]
     fn a_profile_receipt_refuses_unsorted_overlapping_or_foreign_members() {
         let fixture = Fixture::new();
         let id = identity::digest(&fixture.checkout.to_string_lossy());
@@ -17378,6 +17589,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fresh_auto_adoption_does_not_measure_neighboring_outputs() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let store = Store::for_tests(&fixture.root.join("pool"));
+        let control = store.owner_control();
+        let context = Context::new(Some(control.to_path_buf()), fixture.checkout.clone());
+        crate::prune::ensure_ready(&store, &fixture.checkout).unwrap();
+        let spec = fixture.local();
+        let neighbors = crate::prune::seed_output_neighbors(control, &spec.selected(1), 708);
+        assert!(context.receipt().unwrap().is_none());
+        assert_eq!(context.target().unwrap(), TargetState::Missing);
+
+        let started = Instant::now();
+        let (result, (listings, measured)) = crate::prune::count_output_listings(|| {
+            auto_adopt_fresh(&store, &context, &spec.selected(0), || {
+                Ok(Some(spec.clone()))
+            })
+        });
+        let elapsed = started.elapsed();
+        result.unwrap();
+        assert_eq!(measured, 0, "auto-adoption measured output payloads");
+        assert!(
+            listings <= 8,
+            "auto-adoption listed the area {listings} times"
+        );
+        // A generous upper bound for the whole conversion, which includes
+        // every admission-lock hold as well as work outside the lock.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "auto-adoption took {elapsed:?}"
+        );
+
+        let receipt = context.receipt().unwrap().unwrap();
+        assert_eq!(receipt.state, ReceiptState::Committed);
+        for member in AUTO_ADOPT_MEMBERS {
+            assert_eq!(
+                fs::read_link(context.link().join(member)).unwrap(),
+                spec.root().join(member),
+            );
+        }
+        crate::prune::assert_output_neighbors(control, &neighbors);
+        println!(
+            "auto-adoption beside {} roots: {measured} measured, {listings} metadata listings, {elapsed:?} including admission-lock holds",
+            neighbors.len()
+        );
+    }
+
     /// A command whose slot came from the internal pool, or from a registration
     /// that was ephemeral when it selected, never converts, even when the drive
     /// is permanent by the time it checks. The all-true facts are the control.
@@ -18780,7 +19038,7 @@ mod tests {
             .is_symlink());
         let (area, id) = crate::prune::test_output_storage(&fixture.control, &selected);
         assert!(area
-            .list()
+            .list_without_bytes()
             .unwrap()
             .roots
             .iter()

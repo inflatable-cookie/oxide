@@ -20,6 +20,7 @@ and Queue history; no evidence, credit or fixture from them is migrated.
 `3320dd276856356c5a9e59bafa6f091c0df71ac3` (barge#088: mount-identity checks,
 no-replace renames, eviction and lock-open corrections). The library uses caret
 dependency requirements. Only test builds request Barge's `testing` feature.
+The offline seeder derives its Git revision from `Cargo.lock`.
 `scripts/offline_seed.py` derives the exact Git revision from `Cargo.lock`;
 a missing revision is an offline failure.
 
@@ -104,7 +105,9 @@ selected prune target. A zero reserve retains Barge's default floor.
   roots use shared holds to preserve concurrent command behavior; their durable
   selection pins remain independent of running commands. The hold's descriptor is made inheritable before the real child
   launch, so the root stays held until the child that keeps the descriptor
-  exits.
+  exits. In ephemeral mode a profile member that is missing or a real local
+  directory needs no running hold on its receipt's root. Live owned links
+  still take their holds and the durable receipt pins remain in force.
 - Holds are cooperative: a child that closes the descriptor, and a process
   that writes into a root without holding it, are outside this guarantee. The
   docs say so; no process or descriptor census is restored to widen it.
@@ -159,7 +162,10 @@ eviction. An eviction left in trash surfaces an error and earns no freed
 space. Warm reuse above the reserve walks no other payload. Barge's own
 soft caps use its release size records, with measurements of vanished roots
 reported as approximate. Identity and protection views use bytes-free Barge
-listings. Oxide counts byte walks separately and reports the unavailable
+listings or marker-only resolution. Owned-output receipt publication keeps
+recorded Barge IDs and backfills missing IDs with at most one metadata listing
+per area. It never measures output payloads under the admission lock. Oxide
+counts byte walks separately and reports the unavailable
 count for Barge's internal marker enumeration. The
 [admission observations](local-lease.md#admission-observations-oxide317)
 own the measurement rules.

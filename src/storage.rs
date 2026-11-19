@@ -956,7 +956,8 @@ impl PoolStorage {
         Err(last)
     }
 
-    /// The bytes every area of this pool holds.
+    /// Explicitly measure the bytes every area of this pool holds. Recursively
+    /// walks root contents, for maintenance outside admission.
     pub fn total_bytes(&self) -> Result<u64, String> {
         #[cfg(test)]
         observe_pool_walk(PoolWalk::Inventory);
@@ -970,8 +971,8 @@ impl PoolStorage {
         Ok(total)
     }
 
-    /// Every owned root of this pool with its area's project folder (the first
-    /// component of `folder` is the area, so a root's area is recoverable).
+    /// Every owned root with its area's project folder, without walking root
+    /// contents or returning sizes.
     pub fn all_roots(&self) -> Result<Vec<(Option<String>, barge::RootInfo)>, String> {
         #[cfg(test)]
         observe_pool_walk(PoolWalk::Inventory);
@@ -980,7 +981,7 @@ impl PoolStorage {
             let area_folder = area.record().effective_folder();
             let project = project_folder(self.folder.as_str(), &area_folder);
             let listing = area
-                .list()
+                .list_without_bytes()
                 .map_err(|error| format!("cannot list the pool area: {error}"))?;
             for info in listing.roots {
                 roots.push((project.clone(), info));
@@ -1032,12 +1033,12 @@ impl PoolStorage {
             .map_err(|error| format!("cannot test slot root {id}: {error}"))
     }
 
-    /// Every owned root, with held/pinned/bytes facts.
+    /// Every owned root, with hold and pin facts, without measuring sizes.
     pub fn list(&self) -> Result<barge::Listing, String> {
         #[cfg(test)]
         observe_pool_walk(PoolWalk::Inventory);
         self.area
-            .list()
+            .list_without_bytes()
             .map_err(|error| format!("cannot list the pool area: {error}"))
     }
 
@@ -1049,7 +1050,8 @@ impl PoolStorage {
             .map_err(|error| format!("cannot evict slot root {id}: {error}"))
     }
 
-    /// The bytes the area's owned roots hold.
+    /// Explicitly measure the bytes the area's owned roots hold. Recursively
+    /// walks root contents, for maintenance outside admission.
     pub fn bytes(&self) -> Result<u64, String> {
         #[cfg(test)]
         observe_pool_walk(PoolWalk::Inventory);
@@ -1579,6 +1581,7 @@ mod tests {
         assert!(root.path.join(".barge-root.json").is_file());
         let listing = pool.list().expect("list");
         assert_eq!(listing.roots.len(), 1);
+        assert_eq!(listing.bytes(), 0);
         assert!(pool.bytes().expect("bytes") > 0);
     }
 
