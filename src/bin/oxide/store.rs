@@ -1966,8 +1966,7 @@ impl Store {
     ) -> Result<Self, String> {
         let pool = fs::canonicalize(root)
             .map_err(|error| format!("cannot open the removable pool: {error}"))?;
-        let view = prepare_pool(&pool)
-            .map_err(|error| lease_error("cannot open the removable pool", &error))?;
+        let view = prepare_front_door_pool(&pool, "cannot open the removable pool")?;
         if Backend::recorded(&view.backend)? != Backend::ApfsVolume {
             return Err("the removable pool records another backend".to_owned());
         }
@@ -2129,8 +2128,7 @@ impl Store {
     fn open_at(path: &Path, settings: &Settings) -> Result<Self, String> {
         let pool =
             fs::canonicalize(path).map_err(|error| format!("cannot open the pool: {error}"))?;
-        let view =
-            prepare_pool(&pool).map_err(|error| lease_error("cannot open the pool", &error))?;
+        let view = prepare_front_door_pool(&pool, "cannot open the pool")?;
         let backend = Backend::recorded(&view.backend)?;
         if backend != Backend::DirectoryBudget {
             return Err(format!(
@@ -5409,6 +5407,22 @@ fn open_admission_file(control: &Path, create: bool) -> Result<Option<File>, Str
 
 pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
     lock_admission_inner(control, None)
+}
+
+fn prepare_front_door_pool(pool: &Path, context: &str) -> Result<LedgerView, String> {
+    let result = prepare_pool(pool);
+    if result != Err(LeaseError::WriterFenceBusy) {
+        return result.map_err(|error| lease_error(context, &error));
+    }
+    // The pool-first open has dropped the pool lock. Wait for admission in
+    // the normal order, under the command's budget, and reread the state
+    // before publishing. Subsequent pool opens see the durable generation.
+    let control = pool.join(MANAGED_NAME);
+    {
+        let _admission = lock_admission(&control)?;
+        publish_writer_generation(&control)?;
+    }
+    prepare_pool(pool).map_err(|error| lease_error(context, &error))
 }
 
 pub(crate) fn publish_writer_generation(control: &Path) -> Result<(), String> {

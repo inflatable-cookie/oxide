@@ -212,6 +212,10 @@ pub enum LeaseError {
     WriterUpdated,
     Full,
     UnknownAccounting,
+    /// A writer cannot read or publish the pool's control state.
+    ControlState(String),
+    /// A pool-first caller cannot wait on admission without reversing lock order.
+    WriterFenceBusy,
     /// An entry the pool's shape does not allow, named by its place and an
     /// escaped name. Same `unknown_accounting` category and exit code.
     UnexpectedEntry {
@@ -285,6 +289,8 @@ impl LeaseError {
             Self::WriterUpdated => 76,
             Self::Full
             | Self::UnknownAccounting
+            | Self::ControlState(_)
+            | Self::WriterFenceBusy
             | Self::UnexpectedEntry { .. }
             | Self::AccountingIncomplete(..)
             | Self::CapacityCharged { .. }
@@ -305,6 +311,8 @@ impl LeaseError {
             Self::UnknownAccounting
             | Self::UnexpectedEntry { .. }
             | Self::AccountingIncomplete(..) => "unknown_accounting",
+            Self::ControlState(_) => "control_state",
+            Self::WriterFenceBusy => "writer_fence_busy",
             Self::CapacityCharged { .. } => "full",
             Self::OneUseBudget { .. } => "one_use_budget",
             Self::UnsafePath(_) => "unsafe_path",
@@ -330,6 +338,10 @@ impl std::fmt::Display for LeaseError {
             Self::Full => formatter.write_str("pool cap cannot admit a new slot"),
             Self::UnknownAccounting => {
                 formatter.write_str("owned accounting is unknown or a foreign entry is present")
+            }
+            Self::ControlState(message) => formatter.write_str(message),
+            Self::WriterFenceBusy => {
+                formatter.write_str("the admission lock is held during the writer generation upgrade")
             }
             Self::UnexpectedEntry { place, entry } => {
                 write!(
@@ -1057,7 +1069,7 @@ pub(crate) fn fence_managed_control(pool: &Path) -> Result<(), LeaseError> {
 /// stays recognizable even when a future schema cannot be deserialized.
 pub fn read_writer_state(control: &Path) -> Result<Option<control::State>, LeaseError> {
     writer_state_bytes(control)?
-        .map(|bytes| control::parse_state(&bytes).map_err(|_| LeaseError::UnknownAccounting))
+        .map(|bytes| control::parse_state(&bytes).map_err(LeaseError::ControlState))
         .transpose()
 }
 
@@ -1078,12 +1090,14 @@ fn writer_state_bytes(control: &Path) -> Result<Option<Vec<u8>>, LeaseError> {
         Err(error) => return Err(io_error(error)),
     };
     let metadata = file.metadata().map_err(io_error)?;
-    if !metadata.is_file()
-        || metadata.uid() != current_uid()
-        || metadata.mode() & 0o077 != 0
-        || metadata.len() > control::MAX_STATE_BYTES
-    {
-        return Err(LeaseError::UnknownAccounting);
+    if !metadata.is_file() || metadata.uid() != current_uid() || metadata.mode() & 0o077 != 0 {
+        return Err(LeaseError::UnsafePath(
+            "state.json must be a private regular file owned by the current user",
+        ));
+    }
+    let byte_limit = || LeaseError::ControlState("Oxide state exceeds its byte limit".to_owned());
+    if metadata.len() > control::MAX_STATE_BYTES {
+        return Err(byte_limit());
     }
     let mut bytes = Vec::new();
     file.take(control::MAX_STATE_BYTES + 1)
@@ -1095,7 +1109,7 @@ fn writer_state_bytes(control: &Path) -> Result<Option<Vec<u8>>, LeaseError> {
         minimum_writer_generation: u32,
     }
     if bytes.len() as u64 > control::MAX_STATE_BYTES {
-        return Err(LeaseError::UnknownAccounting);
+        return Err(byte_limit());
     }
     if serde_json::from_slice::<WriterHeader>(&bytes).is_ok_and(|header| {
         header.version >= control::WRITER_STATE_VERSION
@@ -1113,14 +1127,16 @@ pub fn fence_admission_writer(control: &Path) -> Result<(), LeaseError> {
         return Ok(());
     }
     let fenced = control::fenced_state(state, control::WRITER_GENERATION)
-        .map_err(|_| LeaseError::UnknownAccounting)?;
+        .map_err(LeaseError::ControlState)?;
     let bytes = serde_json::to_vec(&fenced).map_err(|error| LeaseError::Io(error.to_string()))?;
     if bytes.len() as u64 > control::MAX_STATE_BYTES {
-        return Err(LeaseError::LedgerExhausted);
+        return Err(LeaseError::ControlState(
+            "Oxide state exceeds its byte limit after fencing".to_owned(),
+        ));
     }
     // Prove the bytes the front door will read back are accepted by the same
     // parser before replacing the durable document.
-    control::parse_state(&bytes).map_err(|_| LeaseError::UnknownAccounting)?;
+    control::parse_state(&bytes).map_err(LeaseError::ControlState)?;
     persist_control_state(&control.join("state.json"), &bytes)
 }
 
@@ -1135,9 +1151,12 @@ fn reserve_eviction_fence(control: &Path) -> Result<Option<File>, LeaseError> {
         return Ok(None);
     }
     let admission = open_control_admission(control, false)?;
-    let state = read_writer_state(control)?.ok_or(LeaseError::UnknownAccounting)?;
-    control::fenced_state(state, control::WRITER_GENERATION)
-        .map_err(|_| LeaseError::UnknownAccounting)?;
+    let state = read_writer_state(control)?.ok_or_else(|| {
+        LeaseError::ControlState(
+            "state.json disappeared while taking the admission lock".to_owned(),
+        )
+    })?;
+    control::fenced_state(state, control::WRITER_GENERATION).map_err(LeaseError::ControlState)?;
     Ok(Some(admission))
 }
 
@@ -1163,7 +1182,7 @@ fn open_control_admission(control: &Path, create: bool) -> Result<File, LeaseErr
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::WouldBlock {
-            return Err(LeaseError::UnknownAccounting);
+            return Err(LeaseError::WriterFenceBusy);
         }
         return Err(io_error(error));
     }
