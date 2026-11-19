@@ -1539,19 +1539,6 @@ fn output_id(selected: &Selected) -> String {
     sha256_hex(format!("{}:{}", selected.root().display(), selected.generation()).as_bytes())
 }
 
-/// Pin one root unless Barge already reports it pinned. A second pin only
-/// rewrites the pin record and its timestamp, so the check skips that write.
-fn pin_root(area: &barge::Area, id: &str) -> Result<(), String> {
-    if output_roots(area)?
-        .iter()
-        .any(|root| root.id == id && root.pinned)
-    {
-        return Ok(());
-    }
-    area.pin(id, "selected by an Oxide output receipt")
-        .map_err(|error| error.to_string())
-}
-
 /// Re-pin an already owned Barge identity without using mutable Oxide marker
 /// fields as new storage authority. A first import requires the Oxide marker
 /// and selection to agree; a retired ID can never re-import its former path.
@@ -1667,7 +1654,8 @@ fn pin_references(control: &Path, receipt: &Receipt) -> Result<(), String> {
                 receipt.checkout_id(),
                 selected,
             )?;
-            pin_root(&area, &id)?;
+            area.pin(&id, "selected by an Oxide output receipt")
+                .map_err(|error| error.to_string())?;
         }
     }
     Ok(())
@@ -1682,7 +1670,8 @@ pub(crate) fn pin_output(
 ) -> Result<(), String> {
     let registry = read_registry(control)?;
     let (area, id) = import_output(control, registry.as_ref(), checkout, checkout_id, selected)?;
-    pin_root(&area, &id)?;
+    area.pin(&id, "selected by an Oxide output receipt")
+        .map_err(|error| error.to_string())?;
     record_import(control, selected.root(), &id)
 }
 
@@ -1750,7 +1739,8 @@ pub(crate) fn hold_outputs(
             receipt.checkout_id(),
             selected,
         )?;
-        pin_root(&area, &id)?;
+        area.pin(&id, "selected by an Oxide output receipt")
+            .map_err(|error| error.to_string())?;
         let hold = area
             .try_hold(&id, barge::Mode::Shared)
             .map_err(|error| error.to_string())?
@@ -2448,23 +2438,5 @@ mod plan_identity_tests {
             Ok(Command::DryRun)
         ));
         assert!(!USAGE.contains("resolve-intent"));
-    }
-
-    #[test]
-    fn pinning_an_already_pinned_root_leaves_it_pinned() {
-        let Fixture {
-            _temp,
-            area,
-            original,
-            ..
-        } = fixture();
-        area.pin(&original.id, "first pin").unwrap();
-
-        pin_root(&area, &original.id).unwrap();
-
-        assert!(output_roots(&area)
-            .unwrap()
-            .iter()
-            .any(|root| root.id == original.id && root.pinned));
     }
 }
