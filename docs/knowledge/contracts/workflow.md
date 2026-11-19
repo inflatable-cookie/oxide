@@ -1063,6 +1063,11 @@ leases taken by `oxide` commands only:
   and Cargo's process-group ID. Separately, the lease carries its Barge root
   hold through the actual child exec; the control-record lock is not storage
   ownership. Recovery also respects the root hold and uncertain legacy state.
+- Every wait on the pool lock or an admission-class lock is bounded (oxide#325).
+  It ends at the command's admission window when one is set, otherwise after
+  120 s, and refuses with a message naming what it waited on: the slot recorded
+  as being deleted, or an unknown holder. It prints one progress line after
+  5 s. No such wait is unbounded.
 - Ctrl-C and termination signals are forwarded to the group. Oxide waits for
   the group to empty, then releases normally. A clean exit or Ctrl-C is
   never logged as a recovery.
@@ -1614,6 +1619,23 @@ or global Cargo configuration is involved.
   when the installer still owns the staged inode. Initial installation has
   no previous binary. Pass `-- --pin <commit>` or set `OXIDE_INSTALL_PIN`
   to select a commit on pushed main.
+- **Canary modes.** Three modes share one receipt per pin (oxide#323):
+  - *Live* (default): the staged binary runs status, pool describe and two
+    checks on the live pool. It refuses when the staged control-state version
+    differs from the installed receipt's.
+  - *`--scratch-root DIR`*: a fresh pool under `DIR`, created at an explicit
+    path with `OXIDE_POOL_CREATE=1`. No live pool is read or written and no
+    live-version check applies. Use it to exercise a candidate's control state
+    from creation onward.
+  - *`--format-change`* (with optional `--scratch-root DIR`): for a build that
+    changes the persisted format. Oxide reads the live `config.json`,
+    `ledger.json` and `oxide-managed/state.json` read-only, copies them into a
+    scratch pool layout, and runs the staged binary against that copy only:
+    status, then a new-slot check (which performs the upgrade), then a warm
+    rerun. It prints the control-state version before and after the upgrade and
+    refuses if the upgraded version is not the staged one, if the live state is
+    newer than the staged build, or if any live document's bytes or file identity
+    changed during the run. Its PASS satisfies `--require-canary` for the pin.
 - **Live canary.** After reviewed merge, the planner runs
   `effigy oxide:canary -- --pin <commit>` before installing that pin
   (oxide#318, decision `d9f8839e`). It uses the installer's pin
@@ -1711,9 +1733,11 @@ or global Cargo configuration is involved.
 - **Test supervisor.** `test rust`, `rust:test-600` and `rust:pool-scale`
   run under the [shared proof supervisor](#shared-proof-supervisor).
 - **Fixtures.** `effigy dogfood:scripts:test` covers install and rollback
-  refusals, receipt publication failure, the process report, persisted layouts
-  and canary timing, receipt gating and cleanup on synthetic fixtures. The
-  planner runs the first live canary after reviewed merge.
+  refusals, receipt publication failure, the process report, persisted layouts,
+  canary timing, the three canary modes (including that the format-change run
+  never names or writes the live documents), receipt gating and cleanup on
+  synthetic fixtures with a fake staged binary. The planner runs the first live
+  canary after reviewed merge.
 
 ### Writer generation and format versions
 

@@ -1869,17 +1869,11 @@ impl HoldingSweep {
                 // Detach the worker: the process is about to exit, and the
                 // entry keeps its record and charge for the next command.
                 self.worker = None;
-                eprintln!(
-                    "oxide: a held slot tree is still being deleted after {}s; it stays recorded in the holding area, and the next oxide command resumes it",
-                    elapsed.as_secs()
-                );
+                eprintln!("{}", holding_wait_message(elapsed.as_secs()));
                 return None;
             }
             if elapsed >= next_report {
-                eprintln!(
-                    "oxide: still deleting a held slot tree outside the pool lock ({}s; the build and every other command are not held)",
-                    elapsed.as_secs()
-                );
+                eprintln!("{}", holding_progress_message(elapsed.as_secs()));
                 next_report += HOLDING_SWEEP_REPORT;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -1923,9 +1917,7 @@ fn reacquire_after_capacity<T, E>(
             if !changed {
                 break;
             }
-            eprintln!(
-                "oxide: deleted a held slot tree in the holding area; re-evaluating the admission"
-            );
+            eprintln!("{}", holding_published_message());
         }
         // A removal has changed the figure, so re-evaluate before demanding
         // another one.
@@ -1936,6 +1928,49 @@ fn reacquire_after_capacity<T, E>(
         changed = false;
     }
     last
+}
+
+// Wording for the holding pass. A holding entry is an idle slot that this
+// command evicted; a held slot is never deleted by this pass, so no message
+// may describe a held slot as deleted.
+
+/// The bounded exit wait ran out while a holding entry was still being deleted.
+fn holding_wait_message(seconds: u64) -> String {
+    format!(
+        "oxide: an evicted idle slot is still being deleted after {seconds}s; it stays recorded in the holding area, and the next oxide command resumes it"
+    )
+}
+
+/// One progress line while the pass deletes an evicted idle slot.
+fn holding_progress_message(seconds: u64) -> String {
+    format!(
+        "oxide: still deleting an evicted idle slot outside the pool lock ({seconds}s; the build and every other command are not held)"
+    )
+}
+
+/// The pass removed an evicted idle slot, which lets admission be decided again.
+fn holding_published_message() -> String {
+    "oxide: deleted an evicted idle slot from the holding area; re-evaluating the admission"
+        .to_owned()
+}
+
+/// The pass removed the named evicted idle slot. A held slot is never touched.
+fn holding_deleted_message(name: &str, entries: u64, size: &str, seconds: f64) -> String {
+    format!(
+        "oxide: deleted the evicted idle slot {name} outside the pool lock ({entries} entries, {size} in {seconds:.2}s); no held slot is deleted by this pass"
+    )
+}
+
+/// The pass kept the named evicted idle slot in the holding area.
+fn holding_kept_message(name: &str, refused: &str) -> String {
+    format!(
+        "oxide: kept the evicted idle slot {name} in the holding area ({refused}); it stays recorded and charged, and a later command reports it again"
+    )
+}
+
+/// The pass could not continue; the entry stays recorded and charged.
+fn holding_failed_message(error: &str) -> String {
+    format!("oxide: the evicted idle slot deletion could not continue: {error}")
 }
 
 /// One pass: claim a pending holding entry and delete it outside the pool
@@ -1952,23 +1987,23 @@ fn report_holding_pass(
             };
             if pass.gone {
                 eprintln!(
-                    "oxide: deleted the held slot tree {name} outside the pool lock ({} entries, {} in {:.2}s)",
-                    pass.entries,
-                    cargo_home::size(pass.bytes),
-                    started.elapsed().as_secs_f64()
+                    "{}",
+                    holding_deleted_message(
+                        &name,
+                        pass.entries,
+                        &cargo_home::size(pass.bytes),
+                        started.elapsed().as_secs_f64()
+                    )
                 );
             } else if !pass.refused.is_empty() {
-                eprintln!(
-                    "oxide: kept the held slot tree {name} in the holding area ({}); it stays recorded and charged, and a later command reports it again",
-                    pass.refused.join(", ")
-                );
+                eprintln!("{}", holding_kept_message(&name, &pass.refused.join(", ")));
             }
             Some(pass)
         }
         // A deletion that cannot continue is reported, never fatal: the tree
         // stays recorded, charged and visible in `oxide status`.
         Err(error) => {
-            eprintln!("oxide: the held slot deletion could not continue: {error}");
+            eprintln!("{}", holding_failed_message(&error.to_string()));
             None
         }
     }
@@ -3496,5 +3531,32 @@ mod tests {
             );
         }
         budget::clear();
+    }
+
+    #[test]
+    fn holding_pass_wording_names_an_evicted_idle_slot_and_never_a_held_one() {
+        assert_eq!(
+            holding_deleted_message("slot-3", 2, "1.0 MiB", 0.5),
+            "oxide: deleted the evicted idle slot slot-3 outside the pool lock (2 entries, 1.0 MiB in 0.50s); no held slot is deleted by this pass"
+        );
+        let messages = [
+            holding_wait_message(60),
+            holding_progress_message(2),
+            holding_published_message(),
+            holding_deleted_message("slot-3", 2, "1.0 MiB", 0.5),
+            holding_kept_message("slot-3", "busy"),
+            holding_failed_message("io"),
+        ];
+        for message in &messages {
+            assert!(message.starts_with("oxide: "), "{message}");
+            assert!(!message.contains("held slot tree"), "{message}");
+            assert!(!message.contains("deleted a held"), "{message}");
+            assert!(!message.contains("deleted the held"), "{message}");
+        }
+        assert!(messages[0].contains("an evicted idle slot is still being deleted"));
+        assert!(messages[1].contains("still deleting an evicted idle slot"));
+        assert!(messages[2].contains("deleted an evicted idle slot"));
+        assert!(messages[4].contains("kept the evicted idle slot slot-3"));
+        assert!(messages[5].contains("the evicted idle slot deletion could not continue"));
     }
 }

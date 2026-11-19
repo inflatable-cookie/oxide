@@ -2547,7 +2547,7 @@ impl Store {
                 }
                 evict_idle_slot(&self.pool, &slot.slot_id)
                     .map_err(|error| lease_error("cannot delete a lost slot", &error))?;
-                eprintln!("oxide: deleted slot {} {reported}", slot.slot_id);
+                eprintln!("{}", idle_slot_evicted_message(&slot.slot_id, &reported));
             }
             self.forget_record(state, id);
             self.save(state)?;
@@ -5476,6 +5476,7 @@ fn lock_admission_inner(control: &Path, release_pool: Option<&Path>) -> Result<F
         wait_release_admission(
             &file,
             Duration::from_secs(5),
+            crate::budget::UNBUDGETED_LOCK_BOUND,
             || crate::budget::admission_deadline().is_some(),
             crate::budget::admission_expired,
             || {
@@ -5491,6 +5492,12 @@ fn lock_admission_inner(control: &Path, release_pool: Option<&Path>) -> Result<F
     Ok(file)
 }
 
+/// A lost slot is recovered to idle and then evicted; the message says so and
+/// names the record it was in, instead of calling a held slot deleted.
+fn idle_slot_evicted_message(slot_id: &str, record: &str) -> String {
+    format!("oxide: evicted idle slot {slot_id}; the slot was {record}")
+}
+
 fn admission_wait_message(slot: Option<&str>) -> String {
     match slot {
         Some(id) => format!("oxide: waiting for the admission lock (slot {id} is recorded as being deleted; its current writer is unknown)"),
@@ -5501,6 +5508,7 @@ fn admission_wait_message(slot: Option<&str>) -> String {
 fn wait_release_admission(
     file: &File,
     notice_delay: Duration,
+    bound: Duration,
     budgeted: impl Fn() -> bool,
     expired: impl Fn() -> bool,
     notice: impl FnOnce(),
@@ -5516,12 +5524,19 @@ fn wait_release_admission(
                 "the admission budget expired while waiting for the admission lock".to_owned(),
             );
         }
-        if notice.is_some() && started.elapsed() >= notice_delay {
+        // Without an admission budget the wait still ends: a holder that
+        // outlives the bound is a refusal, never an unbounded flock (oxide#325).
+        let waited = started.elapsed();
+        if !budgeted() && waited >= bound {
+            return Err(format!(
+                "gave up waiting for the admission lock after {:.1}s (the {:.0}s bound was reached; the notice above names its holder)",
+                waited.as_secs_f64(),
+                bound.as_secs_f64()
+            ));
+        }
+        if notice.is_some() && waited >= notice_delay {
             if let Some(notice) = notice.take() {
                 notice();
-            }
-            if !budgeted() {
-                return flock_blocking(file);
             }
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -5920,8 +5935,8 @@ fn probe_lock(path: &Path, create: bool) -> Result<Probe, String> {
     }
 }
 
-/// The existing blocking exclusive `flock`, unchanged for unbudgeted
-/// commands.
+/// A blocking exclusive `flock` for test fixtures only: product waits are bounded.
+#[cfg(test)]
 pub(crate) fn flock_blocking(file: &File) -> Result<(), String> {
     flock(file, libc::LOCK_EX)
 }
@@ -5940,6 +5955,7 @@ pub(crate) fn flock_nonblocking(file: &File) -> Result<bool, String> {
     }
 }
 
+#[cfg(test)]
 fn flock(file: &File, operation: libc::c_int) -> Result<(), String> {
     loop {
         // SAFETY: the descriptor is open for the duration of the call.
@@ -6024,6 +6040,7 @@ pub(crate) mod tests {
         wait_release_admission(
             &waiter,
             Duration::ZERO,
+            Duration::from_secs(120),
             || false,
             || false,
             || {
@@ -6039,6 +6056,7 @@ pub(crate) mod tests {
         wait_release_admission(
             &waiter,
             Duration::from_secs(5),
+            Duration::from_secs(120),
             || false,
             || false,
             || panic!("uncontended notice"),
@@ -6051,6 +6069,7 @@ pub(crate) mod tests {
             wait_release_admission(
                 &waiter,
                 Duration::ZERO,
+                Duration::from_secs(120),
                 || true,
                 || true,
                 || panic!("expired notice")
@@ -6058,11 +6077,59 @@ pub(crate) mod tests {
             .unwrap_err(),
             "the admission budget expired while waiting for the admission lock"
         );
+        // An unbudgeted wait on a held lock ends at its bound, naming what it waited on.
+        let started = Instant::now();
+        let refusal = wait_release_admission(
+            &waiter,
+            Duration::ZERO,
+            Duration::from_millis(60),
+            || false,
+            || false,
+            || {},
+        )
+        .unwrap_err();
+        assert!(
+            refusal.starts_with("gave up waiting for the admission lock after "),
+            "{refusal}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            idle_slot_evicted_message("3", "held when the removable volume was lost (Cargo group 4 empty)"),
+            "oxide: evicted idle slot 3; the slot was held when the removable volume was lost (Cargo group 4 empty)"
+        );
         assert_eq!(admission_wait_message(Some("17")), "oxide: waiting for the admission lock (slot 17 is recorded as being deleted; its current writer is unknown)");
         assert_eq!(
             admission_wait_message(None),
             "oxide: waiting for the admission lock (holder unknown)"
         );
+        drop(holder);
+        drop(waiter);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn release_admission_wait_is_bounded_when_the_holder_never_lets_go() {
+        let (root, _store, _key) = class_fixture("release-admission-bound");
+        let path = root.join("bound-lock");
+        let holder = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let waiter = OpenOptions::new().write(true).open(&path).unwrap();
+        flock_blocking(&holder).unwrap();
+        let started = Instant::now();
+        let refusal = wait_release_admission(
+            &waiter,
+            Duration::from_millis(10),
+            Duration::from_millis(80),
+            || false,
+            || false,
+            || {},
+        )
+        .unwrap_err();
+        assert!(refusal.contains("the admission lock"), "{refusal}");
+        assert!(started.elapsed() < Duration::from_secs(10));
         drop(holder);
         drop(waiter);
         fs::remove_dir_all(root).unwrap();

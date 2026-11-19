@@ -112,6 +112,24 @@ const SLOTS_NAME: &str = "slots";
 /// tolerates it as a real directory and never reads or writes it.
 pub const MANAGED_NAME: &str = "oxide-managed";
 
+thread_local! {
+    /// The end of this command's admission window, set by the front door on the
+    /// thread that runs the command. Waits on the pool lock stop no later.
+    static ADMISSION_DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Record (or clear) the admission window that bounds this thread's waits on
+/// the pool lock (oxide#325). The front door calls this once per command.
+pub fn set_admission_deadline(deadline: Option<std::time::Instant>) {
+    ADMISSION_DEADLINE.with(|cell| cell.set(deadline));
+}
+
+/// The admission window's end on this thread, when the command has one.
+pub fn admission_deadline() -> Option<std::time::Instant> {
+    ADMISSION_DEADLINE.with(std::cell::Cell::get)
+}
+
 /// Caller-selected Cargo profile label. The CLI records it and returns it; it
 /// does not force incremental, debug or feature flags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

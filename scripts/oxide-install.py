@@ -6,8 +6,13 @@ the newest install receipt. A replacement saves that binary beside its
 receipt. `--rollback` restores the verified prior binary without building.
 `--check` stops after the preflight and builds nothing.
 `--canary` builds the same way and tests the staged binary on the live pool.
-`--require-canary` requires a fresh PASS for the same pin. `OXIDE_INSTALL_PIN`
-also names the pin.
+It refuses when the staged control-state version differs from the installed
+one. `--canary --scratch-root DIR` instead runs against a fresh pool under DIR
+with no live-version check and no live contact. `--canary --format-change`
+upgrades a read-only copy of the live control and ledger documents, for a
+format-changing build, and never writes the live pool.
+`--require-canary` requires a fresh PASS for the same pin, whatever the mode.
+`OXIDE_INSTALL_PIN` also names the pin.
 
 The receipt records the pinned build's own `control_state_version` and
 `registration_version` capabilities, read by an effect-free probe of the
@@ -423,11 +428,11 @@ def write_private(directory, name, mode, write):
         os.fsync(output.fileno())
 
 
-def write_canary_receipt(pin, result):
+def write_canary_receipt(pin, result, mode="live"):
     directory = open_owned_directory(RECEIPTS / "canary", create=True)
     temporary = temporary_name()
     try:
-        receipt = {"pin": pin, "result": result,
+        receipt = {"pin": pin, "result": result, "mode": mode,
                    "finished": datetime.datetime.now(datetime.timezone.utc).isoformat()}
         write_private(directory, temporary, 0o600,
                       lambda output: output.write((json.dumps(receipt) + "\n").encode()))
@@ -590,7 +595,11 @@ def assess_canary(label, result, wall, events, expected, payload, limit):
     return slot[1], admission
 
 
-def run_canary(built, arguments):
+LIVE_DOCUMENTS = ("config.json", "ledger.json", "oxide-managed/state.json")
+DOCUMENT_BYTES = 64 * 1024 * 1024
+
+
+def canary_environment():
     # Prevent the staged binary's normal older-binary hand-off and keep
     # caller-supplied scratch/test settings from routing the canary elsewhere.
     excluded = {"OXIDE_POOL_CREATE", "OXIDE_TASK_SCRATCH_ROOT", "OXIDE_SCRATCH_ROOT",
@@ -598,20 +607,17 @@ def run_canary(built, arguments):
     environment = {key: value for key, value in os.environ.items()
                    if key not in excluded and not key.startswith(("OXIDE_TEST_", "OXIDE_PROOF_"))}
     environment["OXIDE_INTERNAL_HANDED_OFF"] = "1"
-    print("Staged oxide status:", flush=True)
-    started = time.monotonic()
-    subprocess.run([str(built), "status"], env=environment, check=True, timeout=60)
-    print(f"status: wall {time.monotonic() - started:.3f}s")
-    described = subprocess.run([str(built), "pool", "describe", "--json"], env=environment,
-                               check=True, stdout=subprocess.PIPE, text=True, timeout=60)
-    pool, payload, scratch, scratch_id = canary_scratch(json.loads(described.stdout), arguments.scratch_root)
-    # A disappearing pool cannot authorize creation at the explicit path.
-    environment.update(OXIDE_POOL=str(pool), GIT_CEILING_DIRECTORIES=str(scratch))
-    if directory_identity(scratch) != scratch_id:
-        raise Refusal("the selected scratch directory changed")
+    return environment
+
+
+def exercise(built, environment, scratch, scratch_id, payload, arguments, closure, after_new=None):
+    """Run the new-slot and warm-reuse checks in one fresh crate under scratch.
+
+    `closure["safe"]` records whether writer closure is confirmed, so a caller
+    can decide whether its own directories may be removed.
+    """
     crate = Path(tempfile.mkdtemp(prefix="oxide-canary.", dir=scratch))
     created = directory_identity(crate)
-    safe_to_remove = True
     missed_limits = []
     try:
         (crate / "src").mkdir()
@@ -626,21 +632,23 @@ def run_canary(built, arguments):
             if (directory_identity(scratch) != scratch_id or directory_identity(crate) != created
                     or created[0] != scratch_id[0]):
                 raise Refusal("the canary crate or selected volume changed")
-            safe_to_remove = False
+            closure["safe"] = False
             result, wall, events = canary_check(built, crate, environment)
             terminal = events[-1] if events and isinstance(events[-1], dict) else {}
-            safe_to_remove = (terminal.get("v") == 1 and terminal.get("event") == "finished"
-                              and terminal.get("lease") == "released"
-                              and terminal.get("drain") in ("complete", "not_reached"))
+            closure["safe"] = (terminal.get("v") == 1 and terminal.get("event") == "finished"
+                               and terminal.get("lease") == "released"
+                               and terminal.get("drain") in ("complete", "not_reached"))
             slot, admission = assess_canary(label, result, wall, events, expected, payload, limit)
             if admission > limit:
                 missed_limits.append(f"{label} admission exceeded {limit:g}s")
             if expected == "cold":
                 cold_slot = slot
+                if after_new is not None:
+                    after_new()
             elif slot != cold_slot:
                 raise Refusal("warm check used a different slot")
     finally:
-        if safe_to_remove:
+        if closure["safe"]:
             if directory_identity(scratch) != scratch_id or directory_identity(crate) != created:
                 raise Refusal(f"the canary crate or its scratch directory changed; skipped cleanup of {crate}")
             shutil.rmtree(crate)
@@ -651,6 +659,172 @@ def run_canary(built, arguments):
         raise Refusal(", ".join(missed_limits))
 
 
+def run_canary(built, arguments):
+    """The live canary: the selected live pool, refused unless versions match."""
+    environment = canary_environment()
+    print("Staged oxide status:", flush=True)
+    started = time.monotonic()
+    subprocess.run([str(built), "status"], env=environment, check=True, timeout=60)
+    print(f"status: wall {time.monotonic() - started:.3f}s")
+    described = subprocess.run([str(built), "pool", "describe", "--json"], env=environment,
+                               check=True, stdout=subprocess.PIPE, text=True, timeout=60)
+    pool, payload, scratch, scratch_id = canary_scratch(json.loads(described.stdout), arguments.scratch_root)
+    # A disappearing pool cannot authorize creation at the explicit path.
+    environment.update(OXIDE_POOL=str(pool), GIT_CEILING_DIRECTORIES=str(scratch))
+    if directory_identity(scratch) != scratch_id:
+        raise Refusal("the selected scratch directory changed")
+    exercise(built, environment, scratch, scratch_id, payload, arguments, {"safe": True})
+
+
+def run_scratch_canary(built, arguments):
+    """`--scratch-root` alone: a fresh pool under that directory.
+
+    No live pool is read or written and no live-version check applies, so the
+    staged binary's own control state is exercised from creation onward.
+    """
+    scratch = arguments.scratch_root
+    if (not scratch.is_absolute() or scratch.resolve(strict=True) != scratch
+            or scratch == scratch.parent or not stat.S_ISDIR(scratch.stat().st_mode)
+            or scratch.stat().st_mode & 0o022):
+        raise Refusal(f"scratch must be an existing canonical, privately writable directory: {scratch}")
+    scratch_id = directory_identity(scratch)
+    root = Path(tempfile.mkdtemp(prefix="oxide-canary-pool.", dir=scratch))
+    root_id = directory_identity(root)
+    pool = root / "pool"  # Created by the staged binary at this explicit path.
+    environment = canary_environment()
+    environment.update(OXIDE_POOL=str(pool), OXIDE_POOL_CREATE="1", GIT_CEILING_DIRECTORIES=str(scratch))
+    print(f"fresh scratch pool: {pool}", flush=True)
+    closure = {"safe": True}
+    try:
+        exercise(built, environment, scratch, scratch_id, None, arguments, closure)
+    finally:
+        if closure["safe"] and directory_identity(scratch) == scratch_id and directory_identity(root) == root_id:
+            shutil.rmtree(root)
+        else:
+            print(f"Fresh scratch pool cleanup skipped because writer closure is unconfirmed: {root}",
+                  file=sys.stderr)
+
+
+def state_version(data):
+    """The control-state version a serialized state document declares, if any."""
+    try:
+        value = json.loads(data).get("version")
+    except (ValueError, AttributeError):
+        return None
+    return value if type(value) is int else None
+
+
+def read_live_documents(pool):
+    """Read the live control and ledger documents without writing or following links.
+
+    Config and ledger are required. The control state is optional: a pool the
+    front door has never used has none. Each document keeps its bytes and file
+    identity, so the same read can prove afterwards that nothing changed.
+    """
+    documents = {}
+    for name in LIVE_DOCUMENTS:
+        path = pool / name
+        optional = name == "oxide-managed/state.json"
+        if optional:
+            try:
+                if not stat.S_ISDIR(os.lstat(pool / "oxide-managed").st_mode):
+                    raise Refusal("the live control directory is not a real directory")
+            except FileNotFoundError:
+                continue
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            if optional:
+                continue
+            raise Refusal(f"the live pool has no {name}")
+        except OSError as error:
+            raise Refusal(f"the live pool's {name} cannot be read without following links: {error}")
+        with os.fdopen(descriptor, "rb") as file:
+            info = os.fstat(file.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise Refusal(f"the live pool's {name} is not a regular file")
+            data = file.read(DOCUMENT_BYTES + 1)
+        if len(data) > DOCUMENT_BYTES:
+            raise Refusal(f"the live pool's {name} exceeds the byte limit")
+        identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        documents[name] = (data, identity)
+    return documents
+
+
+def verify_live_documents(pool, before):
+    """Refuse when any live document changed since `read_live_documents`."""
+    if read_live_documents(pool) != before:
+        raise Refusal("live pool documents changed during the format-change canary; no PASS")
+
+
+def write_document_copy(root, documents):
+    """Write the copied documents into a scratch pool layout, owner-only."""
+    copy = root / "pool"
+    copy.mkdir(mode=0o700)
+    (copy / "payload").mkdir(mode=0o700)
+    if "oxide-managed/state.json" in documents:
+        (copy / "oxide-managed").mkdir(mode=0o700)
+    for name, (data, _) in documents.items():
+        descriptor = os.open(copy / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(data)
+    return copy
+
+
+def run_format_canary(built, arguments, capabilities):
+    """`--format-change`: the staged binary upgrades a read-only copy of the live documents.
+
+    The live pool is never a `status`, admission or upgrade target. The only
+    contact is one `pool describe` to find its documents and one read-only
+    copy; the staged binary runs against the copy alone, and the live documents
+    must match their first read byte for byte afterwards.
+    """
+    environment = canary_environment()
+    described = subprocess.run([str(built), "pool", "describe", "--json"], env=environment,
+                               check=True, stdout=subprocess.PIPE, text=True, timeout=60)
+    pool, _, scratch, scratch_id = canary_scratch(json.loads(described.stdout), arguments.scratch_root)
+    before = read_live_documents(pool)
+    staged = capabilities["control_state_version"]
+    live_version = state_version(before["oxide-managed/state.json"][0]) if "oxide-managed/state.json" in before else None
+    if live_version is not None and live_version > staged:
+        raise Refusal(f"the live control state (version {live_version}) is newer than the staged build ({staged})")
+    print(f"format-change: read {len(before)} live documents read-only: {', '.join(before)}", flush=True)
+    root = Path(tempfile.mkdtemp(prefix="oxide-format-canary.", dir=scratch))
+    root_id = directory_identity(root)
+    closure = {"safe": True}
+    try:
+        copy = write_document_copy(root, before)
+        environment.update(OXIDE_POOL=str(copy), GIT_CEILING_DIRECTORIES=str(scratch))
+        if directory_identity(scratch) != scratch_id:
+            raise Refusal("the selected scratch directory changed")
+        print("Staged oxide status on the copy:", flush=True)
+        started = time.monotonic()
+        subprocess.run([str(built), "status"], env=environment, check=True, timeout=60)
+        print(f"format-change status: wall {time.monotonic() - started:.3f}s")
+
+        def after_new_slot():
+            # The first mutating admission on the copy is the upgrade. The copy
+            # is an explicit internal pool, so its slots name no removable volume.
+            state = copy / "oxide-managed" / "state.json"
+            upgraded = state_version(state.read_bytes()) if state.exists() else None
+            if live_version is not None and upgraded != staged:
+                raise Refusal(f"format-change: the upgrade reached control state {upgraded}, not the staged {staged}")
+            print(f"format-change: control state {live_version if live_version is not None else 'absent'}"
+                  f" -> {upgraded if upgraded is not None else 'absent'} (staged {staged})")
+
+        exercise(built, environment, scratch, scratch_id, None, arguments, closure, after_new=after_new_slot)
+    finally:
+        try:
+            verify_live_documents(pool, before)
+        finally:
+            if closure["safe"] and directory_identity(scratch) == scratch_id and directory_identity(root) == root_id:
+                shutil.rmtree(root)
+            else:
+                print(f"Format-change copy cleanup skipped because writer closure is unconfirmed: {root}",
+                      file=sys.stderr)
+    print("format-change: live documents unchanged")
+
+
 def positive_seconds(value):
     seconds = float(value)
     if not math.isfinite(seconds) or seconds <= 0:
@@ -658,8 +832,15 @@ def positive_seconds(value):
     return seconds
 
 
+def canary_mode(arguments):
+    if arguments.format_change:
+        return "format-change"
+    return "scratch-root" if arguments.scratch_root is not None else "live"
+
+
 def canary(pin, arguments):
     # Hold the install lock across the live exercise and its receipt.
+    mode = canary_mode(arguments)
     with ExitStack() as lock:
         with tempfile.TemporaryDirectory(prefix="oxide-canary-build.") as staging:
             print(f"staging {staging}", flush=True)
@@ -668,11 +849,16 @@ def canary(pin, arguments):
             capabilities = state_capabilities(built)
             build_identity(built, pin, instance)
             lock.enter_context(receipt_lock())
-            write_canary_receipt(pin, "FAIL")
-            canary_compatibility(capabilities)
-            run_canary(built, arguments)
-        write_canary_receipt(pin, "PASS")
-    print(f"oxide:canary PASS for {pin}")
+            write_canary_receipt(pin, "FAIL", mode)
+            if mode == "live":
+                canary_compatibility(capabilities)
+                run_canary(built, arguments)
+            elif mode == "scratch-root":
+                run_scratch_canary(built, arguments)
+            else:
+                run_format_canary(built, arguments, capabilities)
+        write_canary_receipt(pin, "PASS", mode)
+    print(f"oxide:canary PASS for {pin} ({mode})")
 
 
 def write_receipt(receipt, finished, pin, directory=None):
@@ -909,14 +1095,18 @@ def main():
     parser.add_argument("--require-canary", action="store_true", help="require a same-pin PASS from the last hour")
     parser.add_argument("--new-seconds", type=positive_seconds, help="canary new-slot limit (default: 10)")
     parser.add_argument("--warm-seconds", type=positive_seconds, help="canary warm-reuse limit (default: 5)")
-    parser.add_argument("--scratch-root", type=Path, help="existing scratch directory for an internal-pool canary")
+    parser.add_argument("--scratch-root", type=Path,
+                        help="existing scratch directory: a fresh scratch pool with no live-version check; "
+                             "with --format-change, where the copied documents live")
+    parser.add_argument("--format-change", action="store_true",
+                        help="canary a format-changing build: upgrade a read-only copy of the live documents")
     arguments = parser.parse_args()
     if arguments.canary and (arguments.check or arguments.require_canary):
         parser.error("--canary cannot be combined with --check or --require-canary")
     if not arguments.canary and any(value is not None for value in (
         arguments.new_seconds, arguments.warm_seconds, arguments.scratch_root,
-    )):
-        parser.error("--new-seconds, --warm-seconds and --scratch-root require --canary")
+    )) or (not arguments.canary and arguments.format_change):
+        parser.error("--new-seconds, --warm-seconds, --scratch-root and --format-change require --canary")
     started = datetime.datetime.now(datetime.timezone.utc)
     try:
         if arguments.rollback:
