@@ -45,8 +45,7 @@ pub const SEED_MAX_RULES: usize = 4096;
 pub const SEED_MAX_UNIT_INPUTS: usize = 4096;
 /// Rule inputs across one plan (§8.1: 32,768 total).
 pub const SEED_MAX_PLAN_INPUTS: usize = 32768;
-/// Files recorded for one unit: the fingerprint triple, the artifacts and
-/// their `.d`, with bounded headroom for role variants.
+/// Files recorded for one unit, including its fingerprint, outputs and `.d`.
 pub const SEED_MAX_UNIT_FILES: usize = 16;
 /// One relative path or name component.
 pub const SEED_MAX_NAME_BYTES: usize = 255;
@@ -235,10 +234,12 @@ pub struct SeedFile {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeedFileKind {
-    /// One of Cargo's fingerprint triple: unit state, never a rustc output.
+    /// Cargo's fingerprint state for the unit.
     Fingerprint,
     /// A rustc output the unit's `.d` must join.
     Artifact,
+    /// A layout-v2 rustc codegen object retained for split debuginfo.
+    DebugObject,
     /// Cargo's unhashed build-script uplift: a copy of the hashed output, not
     /// a `.d` output rule.
     Uplift,
@@ -540,6 +541,17 @@ impl SeedUnit {
                         return Err("cold-seed artifact is outside its unit's output directory");
                     }
                 }
+                SeedFileKind::DebugObject => {
+                    let prefix = format!("{}-{hex}.", self.target);
+                    if layout != SeedLayout::V2
+                        || !file
+                            .path
+                            .strip_prefix(&outputs_prefix)
+                            .is_some_and(|name| is_v2_debug_object(name, &prefix))
+                    {
+                        return Err("cold-seed debug object is outside its layout v2 unit");
+                    }
+                }
                 SeedFileKind::Uplift => {
                     let build_prefix = format!("{}/build/", profile);
                     if self.role != SeedRole::BuildScriptCompile
@@ -606,6 +618,24 @@ impl SeedUnit {
         }
         Ok(())
     }
+}
+
+/// A layout-v2 rustc split-debuginfo object with the unit's `<target>-<hex>.`
+/// prefix and a codegen-unit suffix such as `itoa.ff0ef7f4e00ba40c-cgu.0.rcgu.o`.
+pub fn is_v2_debug_object(name: &str, unit_prefix: &str) -> bool {
+    let Some((codegen_unit, index)) = name
+        .strip_prefix(unit_prefix)
+        .and_then(|name| name.strip_suffix(".rcgu.o"))
+        .and_then(|stem| stem.rsplit_once("-cgu."))
+    else {
+        return false;
+    };
+    !codegen_unit.is_empty()
+        && codegen_unit
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+        && !index.is_empty()
+        && index.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 impl SeedJoin {
@@ -767,6 +797,7 @@ mod layout_tests {
 
     const HEX: &str = "0123456789abcdef";
     const DIR: &str = "debug/build/cfg-if/0123456789abcdef";
+    const OBJECT: &str = "cfg_if-0123456789abcdef.cfg_if.aaaa-cgu.0.rcgu.o";
 
     fn digest() -> String {
         "a".repeat(64)
@@ -783,7 +814,7 @@ mod layout_tests {
     }
 
     /// A layout v2 library unit as the producer offers it: the fingerprint
-    /// triple, its `invoked.timestamp`, the artifact and the joining `.d`.
+    /// triple, its `invoked.timestamp`, the artifacts and the joining `.d`.
     fn v2_unit() -> SeedUnit {
         let dep = format!("{DIR}/out/cfg_if-{HEX}.d");
         SeedUnit {
@@ -818,6 +849,7 @@ mod layout_tests {
                     SeedFileKind::Artifact,
                 ),
                 file(&dep, SeedFileKind::DepInfo),
+                file(&format!("{DIR}/out/{OBJECT}"), SeedFileKind::DebugObject),
             ],
         }
     }
@@ -894,6 +926,28 @@ mod layout_tests {
         let mut stray_artifact = v2_unit();
         stray_artifact.files[4].path = format!("debug/deps/libcfg_if-{HEX}.rmeta");
         assert!(catalog(ADAPTER_V2, stray_artifact).validate().is_err());
+    }
+
+    #[test]
+    fn layout_v2_debug_objects_must_belong_to_the_unit_and_cannot_replace_library_artifacts() {
+        for name in [
+            "cfg_if-ffffffffffffffff.cfg_if.aaaa-cgu.0.rcgu.o",
+            "cfg_if-0123456789abcdef.stray.o",
+        ] {
+            let mut misplaced = v2_unit();
+            let object = misplaced
+                .files
+                .iter_mut()
+                .find(|file| file.kind == SeedFileKind::DebugObject)
+                .unwrap();
+            object.path = format!("{DIR}/out/{name}");
+            assert!(catalog(ADAPTER_V2, misplaced).validate().is_err(), "{name}");
+        }
+        let mut object_only = v2_unit();
+        object_only
+            .files
+            .retain(|file| file.kind != SeedFileKind::Artifact);
+        assert!(catalog(ADAPTER_V2, object_only).validate().is_err());
     }
 
     #[test]

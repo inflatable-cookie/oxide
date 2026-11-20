@@ -41,7 +41,7 @@ mod status;
 mod launch_hold_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod scratch_internal_tests;
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod seed_layout_v2_tests;
 #[cfg(test)]
 pub(crate) mod tests;

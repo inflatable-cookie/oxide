@@ -132,14 +132,16 @@ when it holds exactly the entries `fingerprint/` and `out/`, and:
   `dep-lib-<target>`, and may hold `output-lib-<target>` and `invoked.timestamp`.
   Any other entry makes the unit unusable.
 - `out/` holds the joining `<target>-<hex>.d`, at least one of
-  `lib<target>-<hex>.rmeta` and `.rlib`, and any rustc debuginfo objects
-  (`<target>-<hex>.<…>.o`). The objects are not offered: Cargo never reads them
-  for freshness or linking, and layout v1 never copied them either. Any other
-  entry makes the unit unusable.
+  `lib<target>-<hex>.rmeta` and `.rlib`, and any rustc split-debuginfo objects
+  (`<target>-<hex>.<codegen-unit>-cgu.<index>.rcgu.o`). Any other entry or a
+  file that cannot be verified makes the unit unusable.
 
-Layout v2 offers library units only. Each offered file is cloned with its own
-digest check and the same join rules as layout v1. A profile that also holds
-layout v1 output (`deps/` or `.fingerprint/`) is refused, not read.
+Layout v2 clones every file in an eligible library unit with its own digest
+check. The `.d`, `.rmeta` and `.rlib` must satisfy the same join rules as
+layout v1. Rustc leaves the split-debuginfo objects out of its dep-info rules,
+so Oxide checks their names against the unit and verifies them by digest. The
+existing file and byte caps apply to the complete unit. A profile that also
+holds layout v1 output (`deps/` or `.fingerprint/`) is refused.
 
 Several fingerprint directories for one package are per-unit variants. A
 run-only directory is ignored and never copied. A directory that mixes units or
@@ -477,8 +479,6 @@ Oxide always sets.
 - Reading a held slot as a donor.
 - Per-unit pruning of unused copies, and any Cargo package-id or unit hash
   computation.
-- Copying rustc debuginfo objects (`*.rcgu.o`) under layout v2. The seeded unit
-  is verified to link and run; its debuginfo objects are not carried over.
 - A config key, flag or environment toggle beyond the `OXIDE_COLD_SEED=0`
   opt-out.
 - A unified start gate for commands that seed nothing.
@@ -496,14 +496,14 @@ ordinary tests are:
   `src/bin/oxide/seed_plan.rs`, the adapter and opt-out tests in
   `src/bin/oxide/seed_context.rs`, and the seed tests in
   `src/bin/oxide/store/tests.rs`;
-- end to end, `src/bin/oxide/store/seed_layout_v2_tests.rs`: a real Cargo 1.100.0
-  donor publishes a catalog and is released idle, and a cold recipient seeds the
-  registry library. Cargo reports it `Fresh`, the binary links and runs, and
-  Cargo rebuilds it when the profile changes or the copied artifact is missing
-  or altered. The test runs against a fresh Cargo home under its root holding one
-  registry archive and index entry, copied read only from the invoking cache,
-  because seeding refuses a registry archive held in two index directories. It
-  skips with a named reason when Cargo 1.100.0 or those cache entries are absent;
+- end to end on macOS, `src/bin/oxide/store/seed_layout_v2_tests.rs`: a real
+  Cargo 1.100.0 donor publishes a catalog and is released idle. The cold
+  recipient receives every file in the registry library unit, including its
+  split-debuginfo objects. Cargo reports it `Fresh`, the binary links and runs,
+  and Cargo rebuilds the unit when the profile changes, an artifact is missing
+  or the fingerprint is altered. The offline test uses an unambiguous registry
+  source in the invoking Cargo cache. It skips when the pinned Cargo or an
+  eligible cached test package is unavailable;
 - default-on and opt-out behaviour (`src/bin/oxide/main.rs`).
   `tests/cold_seed_default_off.rs` compares `status` against a staged baseline
   binary. It is `#[ignore]` by default and needs `OXIDE_SEED_BASELINE_BINARY`.

@@ -20,8 +20,9 @@ listed in the [Cargo version matrix](contracts/workflow.md#cargo-version-matrix)
 Moving the pin changed only Oxide's own build. Oxide still reads other projects'
 Cargo releases independently. Cold-slot seeding has one adapter per layout: Cargo
 1.97.1 (layout v1) and Cargo 1.100.0 (layout v2), each chosen from the consumer's
-own Cargo and never mixed. A consumer that sets Cargo's layout opt-out is refused
-and builds cold ([cold-slot contract](contracts/cold-slot-seeding.md#10-cargo-layout-adapters)).
+own Cargo. The layout v2 adapter clones complete eligible library units,
+including rustc's split-debuginfo objects. A consumer that sets Cargo's layout
+opt-out builds cold ([cold-slot contract](contracts/cold-slot-seeding.md#10-cargo-layout-adapters)).
 `clean --cargo-cache` still runs only under Cargo 1.97.1 until that release is
 qualified.
 

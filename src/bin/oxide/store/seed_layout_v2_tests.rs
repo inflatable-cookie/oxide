@@ -1,14 +1,10 @@
 //! Layout v2 cold-slot seeding against real Cargo 1.100.0 output. A donor
 //! slot is built by Cargo, published as a catalog and released idle. A cold
 //! recipient slot then seeds the registry library unit, and Cargo must report
-//! it fresh instead of compiling it again. Cargo still judges every copy: an
-//! aged dep-info or a changed profile makes it rebuild.
+//! it fresh instead of compiling it again. A changed profile, a missing
+//! artifact or an altered fingerprint makes Cargo rebuild.
 //!
-//! The Cargo home is a fresh fixture under the test root. The invoking home
-//! holds the one archive this test locks in two index directories, and seeding
-//! refuses an ambiguous registry index, so the fixture copies that archive and
-//! its index entry (read only) into a home that has exactly one. The test
-//! skips with a message when Cargo 1.100.0 or those cache entries are absent.
+//! The fixture uses an unambiguous registry package in the invoking Cargo home.
 
 use super::seeding::SeedRun;
 use super::tests::{lease, seed_fixture};
@@ -22,57 +18,16 @@ use crate::seed_context::{self, ProducerFacts};
 use crate::seed_plan::VerifiedSource;
 use oxide_storage::lease::managed::{SeedCatalog, SeedFileKind, SeedProducer};
 use oxide_storage::lease::seed::ADAPTER_V2;
-use oxide_storage::seed_source::SourceCache;
+use oxide_storage::seed_source::{RegistrySource, SourceCache};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::SystemTime;
 
-const MANIFEST: &str = "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nitoa = \"=1.0.18\"\n";
 const LIB: &str =
     "pub fn f() -> String { let mut b = itoa::Buffer::new(); b.format(7u32).to_string() }\n";
 const MAIN: &str = "fn main() { println!(\"{}\", probe::f()); }\n";
-/// The one registry package this project locks, in the index directory Cargo
-/// uses for crates.io.
-const INDEX: &str = "index.crates.io-1949cf8c6b5b557f";
-const ARCHIVE: &str = "itoa-1.0.18.crate";
-const INDEX_ENTRY: &str = ".cache/it/oa/itoa";
-
-fn invoking_cargo_home() -> PathBuf {
-    std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cargo"))
-}
-
-/// A fresh Cargo home under `root` holding exactly one registry archive and its
-/// index entry, copied from `invoking`. Nothing under `invoking` is written.
-fn fixture_cargo_home(root: &Path, invoking: &Path) -> PathBuf {
-    let home = root.join("cargo-home");
-    let cache = home.join("registry/cache").join(INDEX);
-    let index = home.join("registry/index").join(INDEX);
-    fs::create_dir_all(&cache).unwrap();
-    fs::create_dir_all(index.join(".cache/it/oa")).unwrap();
-    fs::copy(
-        invoking.join("registry/cache").join(INDEX).join(ARCHIVE),
-        cache.join(ARCHIVE),
-    )
-    .unwrap();
-    for name in ["config.json", ".last-updated"] {
-        let from = invoking.join("registry/index").join(INDEX).join(name);
-        if from.is_file() {
-            fs::copy(from, index.join(name)).unwrap();
-        }
-    }
-    fs::copy(
-        invoking
-            .join("registry/index")
-            .join(INDEX)
-            .join(INDEX_ENTRY),
-        index.join(INDEX_ENTRY),
-    )
-    .unwrap();
-    home
-}
 
 /// A change to a seeded copy that Cargo must notice.
 enum Damage {
@@ -80,24 +35,34 @@ enum Damage {
     AlteredFingerprint,
 }
 
-fn write_project(dir: &Path) {
+fn write_project(dir: &Path, manifest: &str) {
     fs::create_dir_all(dir.join("src")).unwrap();
-    fs::write(dir.join("Cargo.toml"), MANIFEST).unwrap();
+    fs::write(dir.join("Cargo.toml"), manifest).unwrap();
     fs::write(dir.join("src/lib.rs"), LIB).unwrap();
     fs::write(dir.join("src/main.rs"), MAIN).unwrap();
 }
 
 /// One offline `cargo build` in `checkout`, with the slot's build directory as
-/// the front door sets it, the target directory in the checkout and the test
-/// Cargo home.
-fn cargo_build(checkout: &Path, build: &Path, home: &Path) -> Output {
+/// the front door sets it and the target directory in the checkout.
+fn cargo_build(checkout: &Path, build: &Path) -> Output {
     cargo_1_100(checkout)
         .args(["build", "-v", "--offline"])
-        .env("CARGO_HOME", home)
         .env("CARGO_BUILD_BUILD_DIR", build)
         .env("CARGO_TARGET_DIR", checkout.join("target"))
         .output()
         .expect("cargo 1.100.0")
+}
+
+fn unit_files(unit: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    ["fingerprint", "out"]
+        .into_iter()
+        .flat_map(|subdir| fs::read_dir(unit.join(subdir)).unwrap())
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let relative = path.strip_prefix(unit).unwrap().to_owned();
+            (relative, fs::read(path).unwrap())
+        })
+        .collect()
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -151,9 +116,15 @@ fn verified(
 }
 
 /// A cold recipient in its own checkout, with the same lock as the donor.
-fn recipient(root: &Path, name: &str, store: &Store, lock_bytes: &[u8]) -> (SlotKey, Lease) {
+fn recipient(
+    root: &Path,
+    name: &str,
+    store: &Store,
+    manifest: &str,
+    lock_bytes: &[u8],
+) -> (SlotKey, Lease) {
     let checkout = root.join(name);
-    write_project(&checkout);
+    write_project(&checkout, manifest);
     fs::write(checkout.join("Cargo.lock"), lock_bytes).unwrap();
     let key = SlotKey {
         checkout,
@@ -170,27 +141,32 @@ fn a_cold_1_100_slot_seeds_from_an_idle_donor_and_cargo_reuses_the_unit() {
         eprintln!("skipped: Cargo {TOOLCHAIN} is not installed");
         return;
     }
-    let invoking = invoking_cargo_home();
-    let index = invoking.join("registry/index").join(INDEX);
-    if !index.join(INDEX_ENTRY).is_file()
-        || !invoking
-            .join("registry/cache")
-            .join(INDEX)
-            .join(ARCHIVE)
-            .is_file()
-    {
-        eprintln!("skipped: {ARCHIVE} is not in the invoking Cargo registry cache");
+    let home = crate::cargo_home::resolve()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    // Prefer the workspace's locked version. The alternate is available on
+    // hosts whose legacy index cache makes that version ambiguous.
+    let Some(version) = ["1.0.18", "1.0.17"]
+        .into_iter()
+        .find(|version| RegistrySource::locate(&home, &format!("itoa-{version}")).is_ok())
+    else {
+        eprintln!("skipped: neither pinned itoa version has an unambiguous cached registry source");
         return;
-    }
+    };
+    let manifest = format!(
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [dependencies]\nitoa = \"={version}\"\n\n\
+         [profile.dev]\ndebug = 2\nsplit-debuginfo = \"unpacked\"\n"
+    );
     let (root, store, donor_key) = seed_fixture();
-    let home = fixture_cargo_home(&root, &invoking);
     let started = SystemTime::now();
     let started_ms = process::now_ms();
 
     // The donor: one real Cargo 1.100.0 build, catalogued and released idle.
     let donor = lease(&store, &donor_key, None).expect("donor lease");
-    write_project(&donor_key.checkout);
-    let built = cargo_build(&donor_key.checkout, &donor.build_dir, &home);
+    write_project(&donor_key.checkout, &manifest);
+    let built = cargo_build(&donor_key.checkout, &donor.build_dir);
     assert!(built.status.success(), "{}", text(&built.stderr));
     let lock_bytes = fs::read(donor_key.checkout.join("Cargo.lock")).unwrap();
     let lock = crate::seed_lock::analyze(&lock_bytes).unwrap();
@@ -236,10 +212,14 @@ fn a_cold_1_100_slot_seeds_from_an_idle_donor_and_cargo_reuses_the_unit() {
         .path
         .clone();
     assert!(unit_dir.starts_with("debug/build/itoa/"), "{unit_dir}");
+    let expected = unit_files(&donor.build_dir.join(&unit_dir));
+    assert!(expected
+        .keys()
+        .any(|path| path.extension().is_some_and(|ext| ext == "o")));
     store.release(donor, Some(origin)).expect("donor release");
 
     // A cold recipient seeds the unit, and Cargo reuses it.
-    let (fresh_key, fresh) = recipient(&root, "fresh", &store, &lock_bytes);
+    let (fresh_key, fresh) = recipient(&root, "fresh", &store, &manifest, &lock_bytes);
     let mut fresh_cache = SourceCache::new(&fresh.store_id).unwrap();
     let seeded = store
         .seed(&fresh, &producer, &lock, |_| {
@@ -251,15 +231,17 @@ fn a_cold_1_100_slot_seeds_from_an_idle_donor_and_cargo_reuses_the_unit() {
         SeedRun::Skipped(reason) => panic!("seeding skipped: {reason}"),
         SeedRun::Abandoned => panic!("seeding abandoned"),
     }
-    assert!(fresh
-        .build_dir
-        .join(&unit_dir)
-        .join("fingerprint/dep-lib-itoa")
-        .is_file());
-    let output = cargo_build(&fresh_key.checkout, &fresh.build_dir, &home);
+    assert!(
+        expected == unit_files(&fresh.build_dir.join(&unit_dir)),
+        "the seeded unit matches every donor file"
+    );
+    let output = cargo_build(&fresh_key.checkout, &fresh.build_dir);
     let stderr = text(&output.stderr);
     assert!(output.status.success(), "{stderr}");
-    assert!(stderr.contains("Fresh itoa v1.0.18"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("Fresh itoa v{version}")),
+        "{stderr}"
+    );
     assert!(!stderr.contains("Compiling itoa"), "{stderr}");
     assert!(stderr.contains("Compiling probe"), "{stderr}");
     // The copied unit links: the binary runs with the seeded library.
@@ -270,10 +252,9 @@ fn a_cold_1_100_slot_seeds_from_an_idle_donor_and_cargo_reuses_the_unit() {
     store.release(fresh, None).expect("fresh release");
 
     // Cargo judges the copy: a changed profile is a new unit, so it compiles.
-    let (changed_key, changed) = recipient(&root, "changed", &store, &lock_bytes);
-    let mut manifest = MANIFEST.to_owned();
-    manifest.push_str("\n[profile.dev]\nopt-level = 1\n");
-    fs::write(changed_key.checkout.join("Cargo.toml"), manifest).unwrap();
+    let changed_manifest = format!("{manifest}opt-level = 1\n");
+    let (changed_key, changed) =
+        recipient(&root, "changed", &store, &changed_manifest, &lock_bytes);
     let mut changed_cache = SourceCache::new(&changed.store_id).unwrap();
     let seeded = store
         .seed(&changed, &producer, &lock, |_| {
@@ -281,19 +262,18 @@ fn a_cold_1_100_slot_seeds_from_an_idle_donor_and_cargo_reuses_the_unit() {
         })
         .expect("the changed seed");
     assert!(matches!(seeded, SeedRun::Seeded(..)));
-    let output = cargo_build(&changed_key.checkout, &changed.build_dir, &home);
+    let output = cargo_build(&changed_key.checkout, &changed.build_dir);
     let stderr = text(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(stderr.contains("Compiling itoa"), "{stderr}");
     store.release(changed, None).expect("changed release");
 
-    // Cargo judges the copy by its own state. An incomplete copy, a missing
-    // artifact, and an altered fingerprint hash are each rebuilt, never reused.
+    // Cargo also rebuilds a unit with a missing artifact or altered fingerprint.
     for (name, damage) in [
         ("missing", Damage::MissingArtifact),
         ("altered", Damage::AlteredFingerprint),
     ] {
-        let (key, lease) = recipient(&root, name, &store, &lock_bytes);
+        let (key, lease) = recipient(&root, name, &store, &manifest, &lock_bytes);
         let mut cache = SourceCache::new(&lease.store_id).unwrap();
         let seeded = store
             .seed(&lease, &producer, &lock, |_| {
@@ -308,7 +288,7 @@ fn a_cold_1_100_slot_seeds_from_an_idle_donor_and_cargo_reuses_the_unit() {
                 fs::write(unit.join("fingerprint/lib-itoa"), b"0").unwrap()
             }
         }
-        let output = cargo_build(&key.checkout, &lease.build_dir, &home);
+        let output = cargo_build(&key.checkout, &lease.build_dir);
         let stderr = text(&output.stderr);
         assert!(output.status.success(), "{stderr}");
         assert!(stderr.contains("Compiling itoa"), "{name}: {stderr}");

@@ -1,12 +1,13 @@
 //! Produce bounded, per-unit catalog evidence from a held producing slot.
-//! No source or donor is trusted from a filename alone: every offered output
-//! is joined through its own rustc dep-info to a verified source root.
+//! Each library artifact is joined through rustc dep-info to a verified source
+//! root. The layout v2 adapter also records the unit's split-debuginfo objects.
 
 use crate::seed_plan::VerifiedSource;
 use oxide_storage::lease::managed::{
     SeedFile, SeedFileKind, SeedJoin, SeedRejectReason, SeedRejection, SeedRole, SeedSourceKind,
     SeedUnit,
 };
+use oxide_storage::lease::seed::catalog::is_v2_debug_object;
 use oxide_storage::lease::seed::{
     parse_seed_join, seed_output_rule_proven, SeedLayout, MAX_JOIN_BYTES, SEED_MAX_FILES,
     SEED_MAX_REJECTED_UNITS, SEED_MAX_REJECTIONS, SEED_MAX_UNITS_PER_PACKAGE, SEED_MAX_UNIT_FILES,
@@ -473,7 +474,7 @@ impl Producer {
                 hash: hash.to_owned(),
             };
             let fingerprint: Vec<String> = expected.into_iter().collect();
-            if let Some(unit) = self.offer_lib_unit(source, &shape, &fingerprint) {
+            if let Some(unit) = self.offer_lib_unit(source, &shape, &fingerprint, None) {
                 units.push(unit);
             }
             if units.len() > SEED_MAX_UNITS_PER_PACKAGE {
@@ -485,8 +486,7 @@ impl Producer {
 
     /// Layout v2 library units, one per `<profile>/build/<package>/<hex>`
     /// directory. The unit's fingerprint files live in `fingerprint/` and its
-    /// outputs in `out/`. Debuginfo objects are not offered, because Cargo never
-    /// reads them for freshness or linking.
+    /// outputs in `out/`, including any split-debuginfo objects.
     fn units_v2(&mut self, profile: &str, source: &VerifiedSource) -> Option<Vec<SeedUnit>> {
         // A profile that holds layout v1 output is not a v2 producer's to
         // classify: the Cargo that wrote it is not the one this adapter names.
@@ -539,17 +539,7 @@ impl Producer {
             let Some(outputs) = self.names(Path::new(&outputs_dir)) else {
                 continue;
             };
-            let dep = format!("{target}-{hash}.d");
-            let rmeta = format!("lib{target}-{hash}.rmeta");
-            let rlib = format!("lib{target}-{hash}.rlib");
-            let object_prefix = format!("{target}-{hash}.");
-            if outputs.iter().any(|entry| {
-                entry != &dep
-                    && entry != &rmeta
-                    && entry != &rlib
-                    && !is_debuginfo_object(entry, &object_prefix)
-            }) || !outputs.contains(&dep)
-            {
+            if fingerprint.len() + outputs.len() > SEED_MAX_UNIT_FILES {
                 continue;
             }
             let shape = UnitShape {
@@ -558,7 +548,7 @@ impl Producer {
                 outputs: outputs_dir,
                 hash: hash.clone(),
             };
-            if let Some(unit) = self.offer_lib_unit(source, &shape, &fingerprint) {
+            if let Some(unit) = self.offer_lib_unit(source, &shape, &fingerprint, Some(&outputs)) {
                 units.push(unit);
             }
             if units.len() > SEED_MAX_UNITS_PER_PACKAGE {
@@ -576,22 +566,44 @@ impl Producer {
         source: &VerifiedSource,
         shape: &UnitShape,
         fingerprint: &[String],
+        listed_outputs: Option<&[String]>,
     ) -> Option<SeedUnit> {
         let target = source.package.name.replace('-', "_");
-        let dep = format!("{}/{target}-{}.d", shape.outputs, shape.hash);
+        let stem = format!("{target}-{}", shape.hash);
+        let dep_name = format!("{stem}.d");
+        let dep = format!("{}/{}", shape.outputs, dep_name);
         // A library unit's outputs are the `.rmeta` and, when the command
         // emitted one, the `.rlib`: `cargo check` produces the metadata only,
         // and a check-built donor is a supported donor (§3, §5.1). Every
         // artifact that does exist is joined through its own rule.
         let mut artifacts = Vec::new();
         for extension in ["rmeta", "rlib"] {
-            let path = format!("{}/lib{target}-{}.{extension}", shape.outputs, shape.hash);
-            if self.open_path(Path::new(&path), false).is_some() {
+            let name = format!("lib{stem}.{extension}");
+            let path = format!("{}/{}", shape.outputs, name);
+            let present = match listed_outputs {
+                Some(names) => names.contains(&name),
+                None => self.open_path(Path::new(&path), false).is_some(),
+            };
+            if present {
                 artifacts.push(path);
             }
         }
         if artifacts.is_empty() {
             return None;
+        }
+        let mut objects = Vec::new();
+        if let Some(names) = listed_outputs {
+            let prefix = format!("{stem}.");
+            for name in names {
+                let path = format!("{}/{}", shape.outputs, name);
+                if path == dep || artifacts.contains(&path) {
+                    continue;
+                }
+                if !is_v2_debug_object(name, &prefix) {
+                    return None;
+                }
+                objects.push(path);
+            }
         }
         let (dep_file, dep_bytes) = self.read_file(&dep, SeedFileKind::DepInfo, true)?;
         let parsed = parse_seed_join(&dep_bytes).ok()?;
@@ -648,6 +660,10 @@ impl Producer {
             let (file, _) = self.read_file(artifact, SeedFileKind::Artifact, false)?;
             files.push(file);
         }
+        for object in &objects {
+            let (file, _) = self.read_file(object, SeedFileKind::DebugObject, false)?;
+            files.push(file);
+        }
         let digest = dep_file.digest.clone();
         files.push(dep_file);
         if files.len() > SEED_MAX_UNIT_FILES {
@@ -687,12 +703,6 @@ fn is_unit_hash(text: &str) -> bool {
         && text
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-/// A rustc debuginfo object of one unit (`<target>-<hex>.<…>.o`). It is not
-/// offered: Cargo never reads it for freshness or linking.
-fn is_debuginfo_object(entry: &str, prefix: &str) -> bool {
-    entry.starts_with(prefix) && entry.ends_with(".o") && entry.len() > prefix.len() + 2
 }
 
 /// An entry of a run-only or build-script directory, which is not a library
@@ -1031,7 +1041,7 @@ mod tests {
 
     /// One complete layout v2 `cfg-if` unit: `fingerprint/` with the triple,
     /// `output-lib` and `invoked.timestamp`, and `out/` with the artifact, the
-    /// `.d` and a rustc debuginfo object the producer must not offer.
+    /// `.d` and a rustc debuginfo object.
     fn write_v2_unit(fixture: &Fixture, build: &Path, hash: &str, input: &Path) {
         let dir = format!("debug/build/cfg-if/{hash}");
         for name in [
@@ -1067,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_v2_offers_a_whole_unit_without_its_debuginfo_objects() {
+    fn layout_v2_offers_the_whole_unit_including_its_debug_object() {
         let fixture = Fixture::new();
         let (source, build) = v2_source(&fixture);
         let hash = "0123456789abcdef";
@@ -1082,8 +1092,7 @@ mod tests {
             format!("debug/build/cfg-if/{hash}")
         );
         let files = &units[0].files;
-        // Five fingerprint files, the artifact and the `.d`; the object is not offered.
-        assert_eq!(files.len(), 7, "{files:?}");
+        assert_eq!(files.len(), 8, "{files:?}");
         assert_eq!(
             files
                 .iter()
@@ -1091,10 +1100,45 @@ mod tests {
                 .count(),
             5
         );
-        assert!(
-            files.iter().all(|file| !file.path.ends_with(".o")),
-            "{files:?}"
-        );
+        let object =
+            format!("debug/build/cfg-if/{hash}/out/cfg_if-{hash}.cfg_if.aaaa-cgu.0.rcgu.o");
+        assert!(files
+            .iter()
+            .any(|file| { file.kind == SeedFileKind::DebugObject && file.path == object }));
+        assert!(!units[0]
+            .join
+            .targets
+            .iter()
+            .any(|path| path.ends_with(&object)));
+    }
+
+    #[test]
+    fn layout_v2_refuses_unknown_or_unreadable_outputs() {
+        let fixture = Fixture::new();
+        let (source, build) = v2_source(&fixture);
+        let hash = "0123456789abcdef";
+        write_v2_unit(&fixture, &build, hash, &source.root.join("src/lib.rs"));
+        let out = format!("build/debug/build/cfg-if/{hash}/out");
+        let unknown = format!("{out}/cfg_if-{hash}.stray.o");
+        fixture.write(&unknown, "unknown object name");
+        assert!(Producer::new(&build)
+            .unwrap()
+            .units("debug", &source, SeedLayout::V2)
+            .unwrap()
+            .is_empty());
+        fs::remove_file(fixture.0.join(unknown)).unwrap();
+
+        // A known name must be readable as an owned regular file.
+        std::os::unix::fs::symlink(
+            format!("libcfg_if-{hash}.rmeta"),
+            fixture.0.join(format!("{out}/libcfg_if-{hash}.rlib")),
+        )
+        .unwrap();
+        assert!(Producer::new(&build)
+            .unwrap()
+            .units("debug", &source, SeedLayout::V2)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1143,7 +1187,7 @@ mod tests {
     }
 
     /// Real Cargo 1.100.0 output for a registry leaf: the unit is offered whole,
-    /// its fingerprint triple, artifact and `.d` join, and no debuginfo object.
+    /// including any split-debuginfo objects on this platform.
     #[test]
     fn layout_v2_offers_the_unit_real_cargo_1_100_writes() {
         use crate::cargo_layout::support::{cargo_1_100, toolchain_installed};
@@ -1205,7 +1249,24 @@ mod tests {
             .expect("layout v2 units");
         assert_eq!(units.len(), 1, "{units:?}");
         assert_eq!(units[0].fingerprint_dir, format!("debug/build/itoa/{hash}"));
-        assert!(units[0].files.iter().all(|file| !file.path.ends_with(".o")));
+        let on_disk: BTreeSet<_> = ["fingerprint", "out"]
+            .into_iter()
+            .flat_map(|directory| fs::read_dir(unit.join(directory)).unwrap())
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .strip_prefix(&build)
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        let catalogued = units[0]
+            .files
+            .iter()
+            .map(|file| PathBuf::from(&file.path))
+            .collect();
+        assert_eq!(on_disk, catalogued);
         assert!(units[0]
             .files
             .iter()
