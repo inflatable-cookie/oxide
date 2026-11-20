@@ -7,8 +7,8 @@ use super::receipt::{
 };
 use super::transition::rename_no_replace;
 use super::{
-    Context, OutputsError, TargetState, EXTERNAL_DIR, GITIGNORE_LINE, LOCAL_DIR, LOCAL_ROOT,
-    MARKER, MEMBER, RECIPE,
+    Context, TargetState, EXTERNAL_DIR, GITIGNORE_LINE, LOCAL_DIR, LOCAL_ROOT, MARKER, MEMBER,
+    RECIPE,
 };
 use crate::identity;
 use crate::process;
@@ -16,39 +16,46 @@ use crate::removable::{self, DriveMode};
 use oxide_storage::volume::{self, Binding};
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Component, Path, PathBuf};
 
 /// A real directory and nothing else: never a symlink.
 pub(in crate::outputs) fn is_real_dir(metadata: &fs::Metadata) -> bool {
     metadata.is_dir() && !metadata.file_type().is_symlink()
 }
 
+/// Whether the entry at `path` is a real directory, never a symlink to one.
+/// Every classification of an owned root, member or ancestor goes through
+/// this one no-follow rule.
+pub(crate) fn is_real_dir_path(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| is_real_dir(&metadata))
+}
+
 /// Open one existing real directory through its own descriptor: the final
 /// component is never followed, and a directory swapped for another between
 /// the inspection and the open is refused.
-fn open_real_directory(path: &Path) -> Result<File, OutputsError> {
+fn open_real_directory(path: &Path) -> Result<File, String> {
     let named = fs::symlink_metadata(path)
-        .map_err(|error| OutputsError::io(format!("cannot inspect {}: {error}", path.display())))?;
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
     if !is_real_dir(&named) {
-        return Err(OutputsError::refused(format!(
+        return Err(format!(
             "{} is not a real directory; it is never followed",
             path.display()
-        )));
+        ));
     }
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
-        .map_err(|error| OutputsError::io(format!("cannot open {}: {error}", path.display())))?;
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
     let opened = directory
         .metadata()
-        .map_err(|error| OutputsError::io(format!("cannot inspect {}: {error}", path.display())))?;
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
     if !is_real_dir(&opened) || opened.dev() != named.dev() || opened.ino() != named.ino() {
-        return Err(OutputsError::corrupt(format!(
+        return Err(format!(
             "{} changed while it was being opened",
             path.display()
-        )));
+        ));
     }
     Ok(directory)
 }
@@ -60,9 +67,9 @@ fn create_directory_component(
     parent: &File,
     component: &str,
     shown: &Path,
-) -> Result<File, OutputsError> {
+) -> Result<File, String> {
     let name = std::ffi::CString::new(component)
-        .map_err(|_| OutputsError::refused(format!("{component} is not a usable name")))?;
+        .map_err(|_| format!("{component} is not a usable name"))?;
     // SAFETY: `parent` is a live descriptor and `name` is a live
     // NUL-terminated string that outlives the calls below.
     let created = unsafe {
@@ -75,10 +82,10 @@ fn create_directory_component(
     if !created {
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(OutputsError::io(format!(
+            return Err(format!(
                 "cannot create the member directory {}: {error}",
                 shown.display()
-            )));
+            ));
         }
     }
     // SAFETY: `parent` is a live descriptor and `name` outlives the call.
@@ -90,22 +97,22 @@ fn create_directory_component(
         )
     };
     if opened < 0 {
-        return Err(OutputsError::refused(format!(
+        return Err(format!(
             "the member entry {} is not a real directory ({}) and is never followed",
             shown.display(),
             std::io::Error::last_os_error()
-        )));
+        ));
     }
     // SAFETY: `opened` is a newly owned descriptor.
     let opened = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(opened) };
     if created
         && unsafe { libc::fchmod(std::os::unix::io::AsRawFd::as_raw_fd(&opened), 0o755) } != 0
     {
-        return Err(OutputsError::io(format!(
+        return Err(format!(
             "cannot set permissions on {}: {}",
             shown.display(),
             std::io::Error::last_os_error()
-        )));
+        ));
     }
     Ok(File::from(opened))
 }
@@ -120,7 +127,7 @@ fn create_directory_component(
 pub(in crate::outputs) fn ensure_member_directory(
     base: &Path,
     member: &str,
-) -> Result<PathBuf, OutputsError> {
+) -> Result<PathBuf, String> {
     let destination = member_destination(base, member);
     if member == MEMBER {
         return Ok(destination);
@@ -175,51 +182,30 @@ pub(in crate::outputs) fn ensure_member_ancestors(
             target.display()
         )
     })?;
+    // Every ancestor is created beneath its parent's own descriptor, so a
+    // symlinked intermediate is never followed the way `create_dir_all`
+    // would: a symlink, a file or any other entry refuses and is left
+    // untouched.
+    let mut directory = open_real_directory(&target)?;
     let mut current = target.clone();
+    let mut created = false;
     for component in relative.components() {
-        current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if is_real_dir(&metadata) => {}
-            Ok(_) => {
-                return Err(format!(
-                    "{} is not a real directory; Oxide never follows or replaces it",
-                    current.display()
-                ))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match fs::create_dir(&current) {
-                    Ok(()) => {
-                        fs::set_permissions(&current, fs::Permissions::from_mode(0o755)).map_err(
-                            |error| {
-                                format!(
-                                    "cannot set permissions on the member directory {}: {error}",
-                                    current.display()
-                                )
-                            },
-                        )?;
-                        sync_directory(&target)?;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        let metadata = fs::symlink_metadata(&current).map_err(|error| {
-                            format!("cannot inspect {}: {error}", current.display())
-                        })?;
-                        if !is_real_dir(&metadata) {
-                            return Err(format!(
-                                "{} is not a real directory; Oxide never follows or replaces it",
-                                current.display()
-                            ));
-                        }
-                    }
-                    Err(error) => {
-                        return Err(format!(
-                            "cannot create the member directory {}: {error}",
-                            current.display()
-                        ))
-                    }
-                }
-            }
-            Err(error) => return Err(format!("cannot inspect {}: {error}", current.display())),
-        }
+        let Component::Normal(name) = component else {
+            return Err(format!(
+                "{} is not beneath the checkout's target directory {}",
+                link.display(),
+                target.display()
+            ));
+        };
+        let name = name
+            .to_str()
+            .ok_or_else(|| format!("{} is not a usable member ancestor name", link.display()))?;
+        current.push(name);
+        directory = create_directory_component(&directory, name, &current)?;
+        created = true;
+    }
+    if created {
+        sync_directory(&target)?;
     }
     Ok(())
 }
@@ -661,29 +647,33 @@ pub(in crate::outputs) fn owned_root(
         return Err(format!("{} is not a real directory", root.display()));
     }
     let marker = read_marker(root)?;
-    check_marker(&marker, checkout, checkout_id)?;
+    check_marker(root, &marker, checkout, checkout_id)?;
     Ok(marker)
 }
 
-fn check_marker(marker: &Marker, checkout: &Path, checkout_id: &str) -> Result<(), String> {
-    let _ = marker;
+fn check_marker(
+    root: &Path,
+    marker: &Marker,
+    checkout: &Path,
+    checkout_id: &str,
+) -> Result<(), String> {
     marker.validate().map_err(|reason| {
         format!(
             "{} carries an unusable owner marker ({reason})",
-            checkout.display()
+            root.display()
         )
     })?;
     if marker.checkout != checkout || marker.checkout_id != checkout_id {
         return Err(format!(
             "{} belongs to {}, not this checkout",
-            marker.checkout.display(),
-            checkout.display()
+            root.display(),
+            marker.checkout.display()
         ));
     }
     if marker.recipe != RECIPE {
         return Err(format!(
             "{} carries owner recipe {:?}, not {RECIPE}",
-            checkout.display(),
+            root.display(),
             marker.recipe
         ));
     }
@@ -712,6 +702,14 @@ pub(in crate::outputs) fn validate_selected(
             selected.root.display(),
             marker.generation
         ));
+    }
+    if let Some(nonce) = selected.nonce() {
+        if !crate::prune::is_nonce(nonce) {
+            return Err(format!(
+                "{} names an unusable root nonce for this receipt",
+                selected.root.display()
+            ));
+        }
     }
     if let (Some(nonce), Some(recorded)) = (marker.nonce(), selected.nonce()) {
         if recorded != nonce {
@@ -1007,7 +1005,10 @@ pub(in crate::outputs) fn create_owned_directory(path: &Path) -> Result<(), Stri
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
     }
-    match fs::create_dir(path) {
+    // One exclusive create with the mode given to the call itself: unlike
+    // `create_dir` followed by `set_permissions`, the new directory is never
+    // visible with a wider mode in between, and `umask` can only narrow it.
+    match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // The path was positively absent a moment ago, so this entry was
@@ -1020,8 +1021,6 @@ pub(in crate::outputs) fn create_owned_directory(path: &Path) -> Result<(), Stri
         }
         Err(error) => return Err(format!("cannot create {}: {error}", path.display())),
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("cannot set permissions on {}: {error}", path.display()))?;
     sync_directory(path.parent().unwrap_or(path))
 }
 

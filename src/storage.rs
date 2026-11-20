@@ -727,16 +727,37 @@ impl PoolBacking {
 impl PoolStorage {
     /// Open (and declare) one pool's storage under its control directory.
     ///
-    /// The control directory is Oxide's own private directory; it is created
-    /// owner-only here so Barge's account state never widens its mode.
+    /// The control directory is Oxide's own private directory: it is created
+    /// owner-only here, with the mode given to the create itself, and every
+    /// open verifies that the directory it found is a real owner-only
+    /// directory of this user rather than a link or a wider one. Barge's
+    /// account state therefore never widens its mode.
     pub fn open(control: &Path, backing: &PoolBacking) -> Result<Self, String> {
         use std::os::unix::fs::DirBuilderExt;
-        if !control.exists() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(control)
-                .map_err(|error| format!("cannot create the pool control directory: {error}"))?;
+        match std::fs::symlink_metadata(control) {
+            Ok(metadata) => verify_private_control(control, &metadata)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(control)
+                    .map_err(|error| {
+                        format!("cannot create the pool control directory: {error}")
+                    })?;
+                let metadata = std::fs::symlink_metadata(control).map_err(|error| {
+                    format!(
+                        "cannot inspect the pool control directory {}: {error}",
+                        control.display()
+                    )
+                })?;
+                verify_private_control(control, &metadata)?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect the pool control directory {}: {error}",
+                    control.display()
+                ))
+            }
         }
         let storage = Storage::open(control)?;
         Self::from_storage(storage, backing)
@@ -1253,9 +1274,42 @@ fn project_folder(base: &str, area_folder: &str) -> Option<String> {
 }
 
 /// Make a directory Barge created owner-only, the mode Oxide writes slots in.
+///
+/// The directory is opened without following a final symlink and changed
+/// through its own descriptor, so a path swapped between the open and the
+/// chmod can never widen another entry, and a non-directory refuses.
 pub fn make_private(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    // SAFETY: `directory` is a live descriptor for a directory this call
+    // opened, and fchmod has no other precondition.
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The control directory must be a real directory of this user, owner-only:
+/// it is created that way and never reopened through a link or a wider mode.
+fn verify_private_control(control: &Path, metadata: &std::fs::Metadata) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(format!(
+            "{} must be an owner-only directory of this user",
+            control.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Read a root's hold without waiting. `None` means something else holds it.
@@ -1636,15 +1690,24 @@ mod tests {
         assert!(foreign.join("keep").exists());
     }
 
+    /// Create a pool control directory the way production does: owner-only
+    /// from the create itself, which every `PoolStorage::open` verifies.
+    fn owner_only_control(control: &Path) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::create_dir_all(control).expect("control parent");
+        let managed = control.join("oxide-managed");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&managed)
+            .expect("owner-only control directory");
+        managed
+    }
+
     fn pool_storage(fixture: &Fixture, label: &str) -> PoolStorage {
         let control = fixture._temp.path().join(format!("pool-{label}"));
-        std::fs::create_dir_all(control.join("oxide-managed")).expect("control");
+        let managed = owner_only_control(&control);
         fixture.os.add_volume(&control, Some(UUID), 100 << 30);
-        PoolStorage::open(
-            &control.join("oxide-managed"),
-            &PoolBacking::budget(&control, 1 << 30),
-        )
-        .expect("pool storage")
+        PoolStorage::open(&managed, &PoolBacking::budget(&control, 1 << 30)).expect("pool storage")
     }
 
     #[test]
@@ -1699,10 +1762,10 @@ mod tests {
     fn a_pool_space_policy_reports_its_cap_and_refuses_below_the_floor() {
         let fixture = Fixture::new("storage-pool-space");
         let control = fixture._temp.path().join("pool-space");
-        std::fs::create_dir_all(control.join("oxide-managed")).expect("control");
+        let managed = owner_only_control(&control);
         fixture.os.add_volume(&control, Some(UUID), 1 << 30);
         let pool = PoolStorage::open(
-            &control.join("oxide-managed"),
+            &managed,
             &PoolBacking {
                 mount: control.clone(),
                 folder: "payload/slots".to_owned(),
@@ -1818,13 +1881,10 @@ mod tests {
     fn a_pool_adopts_a_legacy_nested_slot_in_its_project_area() {
         let fixture = Fixture::new("storage-adopt-nested");
         let control = fixture._temp.path().join("pool-nested");
-        std::fs::create_dir_all(control.join("oxide-managed")).expect("control");
+        let managed = owner_only_control(&control);
         fixture.os.add_volume(&control, Some(UUID), 100 << 30);
-        let pool = PoolStorage::open(
-            &control.join("oxide-managed"),
-            &PoolBacking::budget(&control, 1 << 30),
-        )
-        .expect("pool storage");
+        let pool = PoolStorage::open(&managed, &PoolBacking::budget(&control, 1 << 30))
+            .expect("pool storage");
         let base = control.join("payload/slots");
         let nested = base.join("oxide-f88047ec/quick-3");
         std::fs::create_dir_all(&nested).expect("nested slot");

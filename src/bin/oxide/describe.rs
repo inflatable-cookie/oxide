@@ -253,7 +253,11 @@ fn probe_volume(registration: &Registration) -> Result<Binding, Unavailable> {
             format!("nothing is mounted at {}", mount.display()),
         ));
     }
-    if facts.uuid.as_deref() != Some(uuid) {
+    if !facts
+        .uuid
+        .as_deref()
+        .is_some_and(|found| found.eq_ignore_ascii_case(uuid))
+    {
         return Err(unavailable(
             Reason::IdentityMismatch,
             format!("{} is not volume {uuid}", mount.display()),
@@ -410,14 +414,8 @@ fn bounded(program: &str, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
         Ok(read) => read.map_err(|error| format!("cannot read {program}: {error}"))?,
         Err(_) => {
             // A process in the group still holds the pipe open. Stop the whole
-            // group so it cannot keep running unseen. The group id stays reserved
-            // while any member exists, so this signal reaches only that group.
-            if let Ok(pid) = i32::try_from(child.id()) {
-                // SAFETY: the negative PID addresses the group this child led.
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                }
-            }
+            // group and reap the leader, so it cannot keep running unseen.
+            stop_group_and_reap(&mut child);
             return Err(format!("{program} output did not finish"));
         }
     };

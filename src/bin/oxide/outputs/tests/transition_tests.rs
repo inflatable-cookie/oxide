@@ -1356,10 +1356,7 @@ fn a_member_directory_never_follows_a_symlinked_ancestor() {
     symlink(&outside, spec.root().join("aarch64-apple-darwin")).unwrap();
     let refused = ensure_member_directory(spec.root(), "aarch64-apple-darwin/debug")
         .expect_err("a symlinked member ancestor was followed");
-    assert!(
-        refused.message().contains("not a real directory"),
-        "{refused}"
-    );
+    assert!(refused.contains("not a real directory"), "{refused}");
     assert!(
         !outside.join("debug").exists(),
         "the create escaped the owned root"

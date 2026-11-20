@@ -4,7 +4,7 @@ use super::bind::refuse_unowned_link;
 use super::receipt::{
     link_path, member_destination, LayoutKind, Receipt, ReceiptState, RootKind, Selected,
 };
-use super::root::{binding_for, link_state, validate_selected};
+use super::root::{binding_for, is_real_dir_path, link_state, validate_selected};
 use super::{Context, TargetState};
 use crate::removable::DriveMode;
 use crate::store::{self, Store};
@@ -204,7 +204,7 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
                     .roots
                     .iter()
                     .filter(|root| {
-                        !validated.iter().any(|known| known == &root.root) && root.root.is_dir()
+                        !validated.iter().any(|known| known == &root.root) && is_real_dir_path(&root.root)
                     })
                     .map(|root| root.root.clone())
                     .collect();
@@ -235,7 +235,7 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
             let inactive = receipt
                 .roots
                 .iter()
-                .filter(|root| root.root != selected.root && root.root.is_dir())
+                .filter(|root| root.root != selected.root && is_real_dir_path(&root.root))
                 .map(|root| root.root.clone())
                 .collect();
             Ok(Some(CleanPlacement {

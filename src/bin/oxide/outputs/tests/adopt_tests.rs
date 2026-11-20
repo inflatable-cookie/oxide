@@ -1276,10 +1276,7 @@ fn a_whole_target_detach_writes_its_receipt_before_the_link_goes() {
     // committed receipt selects is not followed, and the refusal names
     // the detach that finishes it.
     match bind_under_binding(&context, &store, 0, &stored, None, false) {
-        Bind::Refuse(error) => assert!(
-            error.message().contains("`oxide outputs detach`"),
-            "{error}"
-        ),
+        Bind::Refuse(error) => assert!(error.contains("`oxide outputs detach`"), "{error}"),
         _ => panic!("a leftover detach link was bound"),
     }
     // The next detach finishes the crash window and keeps every root.
@@ -1347,10 +1344,7 @@ fn a_profile_detach_writes_its_receipt_before_its_member_links() {
         );
     }
     match bind_profile(&context, &store, 0, &stored, None, false) {
-        Bind::Refuse(error) => assert!(
-            error.message().contains("`oxide outputs detach`"),
-            "{error}"
-        ),
+        Bind::Refuse(error) => assert!(error.contains("`oxide outputs detach`"), "{error}"),
         _ => panic!("a leftover member link was bound"),
     }
     detach_at(&context, || Ok(Some(store.handle_for_tests()))).unwrap();

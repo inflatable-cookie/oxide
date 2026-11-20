@@ -9,8 +9,8 @@ use super::receipt::{
 };
 use super::root::{
     binding_for_selected, ensure_member_ancestors, ensure_member_directory, ensure_root_with,
-    external_choice, external_spec, link_state, local_spec, owned_root, refuse_mount_root,
-    spec_for, validate_selected, RootSpec,
+    external_choice, external_spec, is_real_dir_path, link_state, local_spec, owned_root,
+    refuse_mount_root, spec_for, validate_selected, RootSpec,
 };
 use super::{Context, TargetState, MEMBER};
 use crate::process;
@@ -197,9 +197,8 @@ pub(in crate::outputs) fn transition_at(
                 )
             })?;
         }
-        (_, Some(selected), Start::Any | Start::Adopt)
-            if target.link_root()
-                == Some(member_destination(selected.root(), member).as_path()) => {}
+        (_, Some(_), Start::Any | Start::Adopt)
+            if receipt.matching_live_root(&target, member).is_some() => {}
         (_, _, Start::MissingOnly) => {
             return Err(format!(
                 "outputs: auto-adopt refused: {} is {}; Oxide never moves, adopts or deletes it. Nothing was changed",
@@ -569,16 +568,9 @@ pub(in crate::outputs) fn replay(context: &Context, receipt: Receipt) -> Result<
     // dangling one) is not this receipt's and is never renamed over. A
     // prepared receipt keeps the selection it is replacing in `selected`,
     // which is why the stored field is read here rather than the accessor.
-    let old_live = match (&target, receipt.selected_for(&member)) {
-        (TargetState::Missing, None) => true,
-        (TargetState::Missing, Some(_)) => true,
-        (_, Some(selected))
-            if target.link_root()
-                == Some(member_destination(selected.root(), &member).as_path()) =>
-        {
-            true
-        }
-        _ => false,
+    let old_live = match &target {
+        TargetState::Missing => true,
+        state => receipt.matching_live_root(state, &member).is_some(),
     };
     // An owned new root is validated in full (marker kind, volume UUID,
     // generation, live registered device and ancestry) before anything is
@@ -642,7 +634,7 @@ pub(in crate::outputs) fn replay(context: &Context, receipt: Receipt) -> Result<
     if let Some(placement) = rolled.placement_for_link_mut(&link) {
         placement.prepared = None;
     }
-    if prepared.to.root.is_dir() {
+    if is_real_dir_path(&prepared.to.root) {
         remember_root(&mut rolled, prepared.to.clone());
     }
     rolled.updated_ms = process::now_ms();

@@ -12,7 +12,10 @@ use super::root::{
 use super::transition::{
     desired_selection, replay, transition, transition_at, NonceAuthority, Start,
 };
-use super::{barrier, output_store, release_barrier, Context, OutputsError, TargetState, MARKER};
+use super::{
+    barrier, output_store, release_barrier, require_clear_custody, Context, TargetState, MARKER,
+    MEMBER,
+};
 use crate::identity;
 use crate::process;
 use crate::removable::{self, DriveMode};
@@ -216,7 +219,7 @@ fn bind_for_command_inner(
                     Some(receipt),
                 ))
             }
-            Bind::Refuse(error) => return Err(error.into()),
+            Bind::Refuse(error) => return Err(error),
             Bind::Wait => {
                 drop(lock);
                 if !announced {
@@ -243,13 +246,18 @@ pub(in crate::outputs) fn gated_replay(
     if receipt.state != ReceiptState::Prepared {
         return Ok(Some(receipt));
     }
-    match store.checkout_custody(&context.workspace, own_record)? {
-        CheckoutCustody::Unknown(reason) => Err(format!(
-            "outputs: refusing to replay the interrupted transition for {}: {reason}. The link, the prepared receipt and both roots are kept until that custody is resolved",
+    match require_clear_custody(
+        store,
+        context,
+        own_record,
+        &format!(
+            "replay the interrupted transition for {}",
             context.link().display()
-        )),
-        CheckoutCustody::Writers => Ok(None),
+        ),
+        "The link, the prepared receipt and both roots are kept until that custody is resolved",
+    )? {
         CheckoutCustody::Clear => replay(context, receipt).map(Some),
+        _ => Ok(None),
     }
 }
 
@@ -500,9 +508,30 @@ fn profile_member_parent_exists(base: &Path, member: &str) -> Result<bool, Strin
     }
 }
 
+/// The internal-pool fallback rule (oxide#117): a command whose intermediate
+/// slot came from the internal pool must never write through an external owned
+/// link, because only a removable store supervises that drive's removal.
+fn refuse_unsupervised_external(
+    context: &Context,
+    link: &Path,
+    wanted: &Selected,
+) -> Result<(), String> {
+    if wanted.kind != RootKind::External {
+        return Ok(());
+    }
+    let Some(reason) = context.pool_fallback.as_deref() else {
+        return Ok(());
+    };
+    Err(format!(
+        "outputs: this command's intermediate slot fell back to the internal pool ({reason}) while {} selects the external member root {}; the drive's removal is not supervised, so nothing was built. Restore the drive or run `oxide outputs adopt`",
+        link.display(),
+        wanted.root.display()
+    ))
+}
+
 fn profile_directory_exists(path: &Path) -> Result<bool, String> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(metadata) if is_real_dir(&metadata) => Ok(true),
         Ok(_) => Err(format!(
             "outputs: {} is not a real profile directory; Oxide never follows or replaces it. Run `oxide outputs adopt` or `oxide outputs detach`",
             path.display()
@@ -521,7 +550,7 @@ pub(in crate::outputs) enum Bind {
         outcome: Outcome,
         receipt: Receipt,
     },
-    Refuse(OutputsError),
+    Refuse(String),
     /// Another command may be writing in this checkout; release the mutex,
     /// wait, and try again.
     Wait,
@@ -529,7 +558,7 @@ pub(in crate::outputs) enum Bind {
 
 impl Bind {
     fn refused(reason: impl Into<String>) -> Self {
-        Self::Refuse(OutputsError::refused(reason))
+        Self::Refuse(reason.into())
     }
 }
 
@@ -574,7 +603,7 @@ pub(in crate::outputs) fn bind_under_binding(
             None => match desired_selection(context, receipt) {
                 Ok(Some(wanted)) => wanted,
                 Ok(None) => return Bind::refused("outputs: the receipt selects no root"),
-                Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
+                Err(reason) => return Bind::Refuse(reason),
             },
         },
         // `selects_nothing` answered both of these above.
@@ -584,7 +613,7 @@ pub(in crate::outputs) fn bind_under_binding(
     };
     let usable = match external_choice(context) {
         Ok(usable) => usable,
-        Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
+        Err(reason) => return Bind::Refuse(reason),
     };
     if wanted.kind == RootKind::External {
         if let Err(reason) = &usable {
@@ -596,7 +625,7 @@ pub(in crate::outputs) fn bind_under_binding(
     }
     let target = match context.target() {
         Ok(target) => target,
-        Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
+        Err(reason) => return Bind::Refuse(reason),
     };
     // The live link must agree with the committed selection: a link to
     // another owned root (an older selection restored by hand) is foreign,
@@ -628,16 +657,15 @@ pub(in crate::outputs) fn bind_under_binding(
             }
         }
         RootCheck::Contradiction(reason) => {
-            return Bind::Refuse(OutputsError::corrupt(format!(
+            return Bind::Refuse(format!(
                 "outputs: {reason}; nothing was changed. Run `oxide outputs adopt` to recheck this checkout's owned outputs"
-            )))
+            ))
         }
     }
     // A transition is needed: only this checkout's own link may be replaced.
-    let old_link = match (&target, receipt.current()) {
-        (TargetState::Missing, _) => true,
-        (_, Some(selected)) => target.link_root() == Some(selected.root.as_path()),
-        _ => false,
+    let old_link = match &target {
+        TargetState::Missing => true,
+        state => receipt.matching_live_root(state, MEMBER).is_some(),
     };
     if !old_link {
         return Bind::refused(format!(
@@ -646,13 +674,14 @@ pub(in crate::outputs) fn bind_under_binding(
             target.label()
         ));
     }
-    match store.checkout_custody(&context.workspace, own_record) {
-        Err(reason) => Bind::Refuse(OutputsError::io(reason)),
-        Ok(CheckoutCustody::Unknown(reason)) => Bind::refused(format!(
-            "outputs: refusing to relink {}: {reason}. The owned link and both roots are kept until that custody is resolved",
-            context.link().display()
-        )),
-        Ok(CheckoutCustody::Writers) => Bind::Wait,
+    match require_clear_custody(
+        store,
+        context,
+        own_record,
+        &format!("relink {}", context.link().display()),
+        "The owned link and both roots are kept until that custody is resolved",
+    ) {
+        Err(reason) => Bind::Refuse(reason),
         Ok(CheckoutCustody::Clear) => {
             // The slot's own keyed nonce is the only future-root authority a
             // leased command may bind (oxide#152).
@@ -694,6 +723,7 @@ pub(in crate::outputs) fn bind_under_binding(
                 )),
             }
         }
+        _ => Bind::Wait,
     }
 }
 
@@ -720,7 +750,7 @@ fn bind_real_directory(context: &Context, receipt: &Receipt) -> Bind {
         Ok(TargetState::RealEmpty | TargetState::RealNonEmpty) => {}
         Ok(TargetState::Missing) => {
             if let Err(reason) = recreate_target_directory(&context.workspace) {
-                return Bind::Refuse(OutputsError::io(reason));
+                return Bind::Refuse(reason);
             }
         }
         Ok(TargetState::OwnedLink(_) | TargetState::Dangling(_)) => {
@@ -733,7 +763,7 @@ fn bind_real_directory(context: &Context, receipt: &Receipt) -> Bind {
                 state.label()
             ))
         }
-        Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
+        Err(reason) => return Bind::Refuse(reason),
     }
     Bind::Bound {
         outcome: Outcome {
@@ -782,7 +812,7 @@ pub(in crate::outputs) fn bind_profile(
                     return Bind::refused(leftover_link_refusal(&link))
                 }
                 Ok(_) => {}
-                Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
+                Err(reason) => return Bind::Refuse(reason),
             }
         }
         return bind_real_directory(context, receipt);
@@ -825,13 +855,13 @@ pub(in crate::outputs) fn bind_profile(
                 state.label()
             ))
         }
-        Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
+        Err(reason) => return Bind::Refuse(reason),
     };
     for planned in &plan.members {
         let link = link_path(&context.workspace, &planned.member);
         let state = match link_state(&link, &context.workspace, &context.checkout_id) {
             Ok(state) => state,
-            Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
+            Err(reason) => return Bind::Refuse(reason),
         };
         // P4: this checkout's committed receipt still places the member on an
         // EXTERNAL root, but this command's fresh plan does not (a still-mounted
@@ -886,14 +916,8 @@ pub(in crate::outputs) fn bind_profile(
             {
                 // The legacy #117 rule: an internal-pool fallback slot must
                 // never write through an unsupervised external owned link.
-                if wanted.kind == RootKind::External {
-                    if let Some(reason) = context.pool_fallback.as_deref() {
-                        return Bind::refused(format!(
-                            "outputs: this command's intermediate slot fell back to the internal pool ({reason}) while {} selects the external member root {}; the drive's removal is not supervised, so nothing was built. Restore the drive or run `oxide outputs adopt`",
-                            link_path(&context.workspace, &planned.member).display(),
-                            wanted.root.display()
-                        ));
-                    }
+                if let Err(reason) = refuse_unsupervised_external(context, &link, wanted) {
+                    return Bind::refused(reason);
                 }
                 if let Err(reason) = check_bound_root(context, receipt.generation, wanted) {
                     return Bind::refused(format!(
@@ -928,14 +952,8 @@ pub(in crate::outputs) fn bind_profile(
                 // missing, unverified or foreign root fails `check_bound_root`
                 // here and refuses below, and every other command keeps the
                 // existing never-transition-automatically refusal.
-                if wanted.kind == RootKind::External {
-                    if let Some(reason) = context.pool_fallback.as_deref() {
-                        return Bind::refused(format!(
-                            "outputs: this command's intermediate slot fell back to the internal pool ({reason}) while {} selects the external member root {}; the drive's removal is not supervised, so nothing was built. Restore the drive or run `oxide outputs adopt`",
-                            link.display(),
-                            wanted.root.display()
-                        ));
-                    }
+                if let Err(reason) = refuse_unsupervised_external(context, &link, wanted) {
+                    return Bind::refused(reason);
                 }
                 if let Err(reason) = check_bound_root(context, receipt.generation, wanted) {
                     return Bind::refused(format!(
@@ -986,15 +1004,16 @@ pub(in crate::outputs) fn bind_profile(
         // Directory creation inside the owned root is a write, so it takes the
         // same writer custody as a relink: an unknown writer or a command that
         // may still be writing refuses or waits before the first creation.
-        match store.checkout_custody(&context.workspace, own_record) {
-            Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
-            Ok(CheckoutCustody::Unknown(reason)) => {
-                return Bind::refused(format!(
-                    "outputs: refusing to create the absent profile member directory: {reason}. Nothing was changed"
-                ))
-            }
+        match require_clear_custody(
+            store,
+            context,
+            own_record,
+            "create the absent profile member directory",
+            "Nothing was changed",
+        ) {
+            Err(reason) => return Bind::Refuse(reason),
             Ok(CheckoutCustody::Writers) => return Bind::Wait,
-            Ok(CheckoutCustody::Clear) => {}
+            Ok(_) => {}
         }
         for (member, wanted) in &absent {
             // Re-verify immediately before the write: the root's marker,
@@ -1027,7 +1046,7 @@ pub(in crate::outputs) fn bind_profile(
                         state.label()
                     ))
                 }
-                Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
+                Err(reason) => return Bind::Refuse(reason),
             }
         }
     }
@@ -1035,15 +1054,16 @@ pub(in crate::outputs) fn bind_profile(
     // stays the one this command was keyed on.
     let mut current = receipt.clone();
     if !needed.is_empty() {
-        match store.checkout_custody(&context.workspace, own_record) {
-            Err(reason) => return Bind::Refuse(OutputsError::io(reason)),
-            Ok(CheckoutCustody::Unknown(reason)) => {
-                return Bind::refused(format!(
-                    "outputs: refusing to link profile members: {reason}. Nothing was changed"
-                ))
-            }
+        match require_clear_custody(
+            store,
+            context,
+            own_record,
+            "link profile members",
+            "Nothing was changed",
+        ) {
+            Err(reason) => return Bind::Refuse(reason),
             Ok(CheckoutCustody::Writers) => return Bind::Wait,
-            Ok(CheckoutCustody::Clear) => {}
+            Ok(_) => {}
         }
         // The missing member links live inside the target directory this layout
         // keeps real, so a positively absent one is recreated before the first
@@ -1430,7 +1450,13 @@ pub(in crate::outputs) fn cancel_reservation(
             ))
         }
     }
-    match store.checkout_custody(&context.workspace, 0)? {
+    match require_clear_custody(
+        store,
+        context,
+        0,
+        "cancel this checkout's root reservation",
+        "the reservation is kept",
+    )? {
         CheckoutCustody::Clear => {}
         _ => {
             return Err("outputs: this checkout's root reservation changed while another command may hold it; nothing was built. Run the command again once other commands in this checkout finish".to_owned())

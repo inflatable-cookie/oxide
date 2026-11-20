@@ -7,8 +7,8 @@ use super::receipt::{
     write_receipt, LayoutKind, Receipt, ReceiptState, Selected, PROFILE_RECEIPT_VERSION,
 };
 use super::root::{
-    create_owned_directory, current_or_successor_spec, ensure_member_directory, ensure_root,
-    external_choice, external_spec, link_state, local_spec, recreate_target_directory, spec_for,
+    current_or_successor_spec, ensure_member_directory, ensure_root, external_choice,
+    external_spec, is_real_dir_path, link_state, local_spec, recreate_target_directory, spec_for,
     RootSpec,
 };
 use super::transition::{desired_selection, replay, transition_at, NonceAuthority, Start};
@@ -301,11 +301,9 @@ pub(in crate::outputs) fn adopt_profile_from(
                 )?;
             }
             // The lexical CARGO_TARGET_DIR stays real. Adoption creates it so
-            // Cargo's own top-level files land in a real directory.
-            create_owned_directory(&context.link())?;
-            fs::set_permissions(&context.link(), fs::Permissions::from_mode(0o755))
-                .map_err(|error| format!("cannot set permissions on the target: {error}"))?;
-            sync_directory(&context.workspace)?;
+            // Cargo's own top-level files land in a real directory, through the
+            // same exclusive, no-follow creator a missing profile target uses.
+            recreate_target_directory(&context.workspace)?;
         }
         TargetState::RealEmpty | TargetState::RealNonEmpty if start == Start::Adopt => {}
         TargetState::OwnedLink(root) => {
@@ -664,18 +662,17 @@ pub(in crate::outputs) fn detach_at(
     let guard = barrier(internal, &context.workspace, &mut waits)?;
     let outcome = (|| {
         refuse_unknown_custody(&internal, &context.workspace, "detach")?;
+        // One pre-lock read decides both questions below.
+        let recorded = read_receipt_for_prune(&control, &context.workspace, &context.checkout_id)?;
         // A pool adopted before the shared output format upgrades behind
         // the forward fence before its first receipt write (a no-op once
         // ready); a missing receipt changes nothing.
-        if read_receipt_for_prune(&control, &context.workspace, &context.checkout_id)?.is_some() {
+        if recorded.is_some() {
             crate::prune::ensure_ready(&internal, &context.workspace)?;
         }
         // Detach selects nothing, so an unused reservation is cancelled
         // through its journal first, before the admission lock.
-        if let Some(mut reserved) =
-            read_receipt_for_prune(&control, &context.workspace, &context.checkout_id)?
-                .filter(|receipt| receipt.reserved().is_some())
-        {
+        if let Some(mut reserved) = recorded.filter(|receipt| receipt.reserved().is_some()) {
             let _binding = internal.lock_binding(&context.workspace)?;
             cancel_reservation(&internal, &control, &context, &mut reserved)?;
         }
@@ -697,7 +694,7 @@ pub(in crate::outputs) fn detach_at(
             .cloned()
             .ok_or("the receipt selects no root; nothing to detach")?;
         let target = context.target()?;
-        if target.link_root() != Some(selected.root.as_path()) {
+        if receipt.matching_live_root(&target, MEMBER).is_none() {
             return Err(format!(
                 "outputs detach refused: {} is {}, not the owned link selecting {}; it is left untouched",
                 context.link().display(),
@@ -732,7 +729,7 @@ pub(in crate::outputs) fn detach_at(
             "outputs: preserved {} root {} ({})",
             root.kind.label(),
             root.root.display(),
-            if root.root.is_dir() {
+            if is_real_dir_path(&root.root) {
                 "present"
             } else {
                 "absent"
@@ -864,7 +861,7 @@ pub(in crate::outputs) fn settle_detached(
         // `target` itself is an entry of the checkout, and every profile member
         // it holds is an entry of `target`.
         sync_directory(&context.workspace)?;
-        if receipt.layout() == LayoutKind::Profile && context.link().is_dir() {
+        if receipt.layout() == LayoutKind::Profile && is_real_dir_path(&context.link()) {
             sync_directory(&context.link())?;
         }
     }
