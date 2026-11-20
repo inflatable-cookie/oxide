@@ -57,7 +57,9 @@ pub fn judge(path: &Path, facts: &Facts, expected_uuid: Option<&str>) -> Result<
         ));
     };
     if let Some(expected) = expected_uuid {
-        if uuid != expected {
+        // A volume UUID is case-insensitive; the platform and a registration
+        // may report the same identity in different case.
+        if !uuid.eq_ignore_ascii_case(expected) {
             return Err(format!(
                 "{} is volume {uuid}, not the registered volume {expected}",
                 path.display()
@@ -135,11 +137,11 @@ impl Binding {
     pub fn open_in(parent: &Path, name: &str, expected_uuid: Option<&str>) -> Result<Self, String> {
         let mount_point = parent.join(name);
         let parent_fd = open_dir(None, parent)?;
-        let fd = open_dir(Some(parent_fd.as_fd_ref()), Path::new(name))
+        let fd = open_dir(Some(parent_fd.as_fd()), Path::new(name))
             .map_err(|error| format!("{} is not available: {error}", mount_point.display()))?;
         let facts = observe(fd.as_fd())?;
         judge(&mount_point, &facts, expected_uuid)?;
-        if u64::try_from(fstat(parent_fd.as_fd_ref())?.st_dev).unwrap_or(u64::MAX) == facts.dev {
+        if u64::try_from(fstat(parent_fd.as_fd())?.st_dev).unwrap_or(u64::MAX) == facts.dev {
             return Err(format!(
                 "{} is on its parent's device, so it is not a mounted volume root",
                 mount_point.display()
@@ -169,7 +171,7 @@ impl Binding {
     }
 
     pub fn fd(&self) -> BorrowedFd<'_> {
-        self.fd.as_fd_ref()
+        self.fd.as_fd()
     }
 
     /// Recheck the held descriptor and the path: the descriptor is still the
@@ -232,12 +234,12 @@ pub fn writable(path: &Path) -> Result<bool, String> {
     if status == 0 {
         return Ok(true);
     }
-    match std::io::Error::last_os_error().raw_os_error() {
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
         Some(libc::EACCES | libc::EPERM | libc::EROFS) => Ok(false),
         _ => Err(format!(
-            "cannot check write access to {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
+            "cannot check write access to {}: {error}",
+            path.display()
         )),
     }
 }
@@ -278,7 +280,7 @@ pub fn dir_at(dir: BorrowedFd<'_>, name: &str, create: bool) -> Result<OwnedFd, 
     }
     let fd = open_dir(Some(dir), Path::new(name))?;
     let parent = fstat(dir)?;
-    let child = fstat(fd.as_fd_ref())?;
+    let child = fstat(fd.as_fd())?;
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     if child.st_uid != uid || u32::from(child.st_mode) & 0o077 != 0 {
@@ -290,16 +292,6 @@ pub fn dir_at(dir: BorrowedFd<'_>, name: &str, create: bool) -> Result<OwnedFd, 
         return Err(format!("{name} is on another device"));
     }
     Ok(fd)
-}
-
-trait AsFdRef {
-    fn as_fd_ref(&self) -> BorrowedFd<'_>;
-}
-
-impl AsFdRef for OwnedFd {
-    fn as_fd_ref(&self) -> BorrowedFd<'_> {
-        std::os::fd::AsFd::as_fd(self)
-    }
 }
 
 fn c_path(path: &Path) -> Result<std::ffi::CString, String> {
@@ -502,6 +494,30 @@ mod tests {
         }
     }
 
+    /// A volume UUID is case-insensitive: the platform and a registration may
+    /// report the same identity in different case, and that is not a mismatch.
+    #[test]
+    fn judge_compares_volume_uuids_case_insensitively() {
+        let path = Path::new("/Volumes/OxideBuild");
+        let lower = UUID.to_ascii_lowercase();
+        assert!(judge(
+            path,
+            &facts("/Volumes/OxideBuild", Some(&lower)),
+            Some(UUID)
+        )
+        .is_ok());
+        assert!(judge(
+            path,
+            &facts("/Volumes/OxideBuild", Some(UUID)),
+            Some(&lower)
+        )
+        .is_ok());
+        let other = "99999999-2222-3333-4444-555555555555";
+        let swapped =
+            judge(path, &facts("/Volumes/OxideBuild", Some(other)), Some(UUID)).unwrap_err();
+        assert!(swapped.contains("not the registered volume"), "{swapped}");
+    }
+
     #[test]
     fn judge_refuses_stale_directories_and_other_devices() {
         let path = Path::new("/Volumes/OxideBuild");
@@ -578,8 +594,8 @@ mod tests {
         let moved = parent.join("moved");
         std::fs::rename(&bound, &moved).unwrap();
         std::fs::create_dir(&bound).unwrap();
-        let created = dir_at(fd.as_fd_ref(), "slots", true).unwrap();
-        let inner = fstat(created.as_fd_ref()).unwrap();
+        let created = dir_at(fd.as_fd(), "slots", true).unwrap();
+        let inner = fstat(created.as_fd()).unwrap();
         assert!(moved.join("slots").is_dir());
         assert!(!bound.join("slots").exists());
         assert_eq!(
@@ -594,9 +610,9 @@ mod tests {
         let parent = scratch("links");
         let fd = open_dir(None, &parent).unwrap();
         std::os::unix::fs::symlink("/tmp", parent.join("link")).unwrap();
-        assert!(dir_at(fd.as_fd_ref(), "link", false).is_err());
-        assert!(dir_at(fd.as_fd_ref(), "..", true).is_err());
-        assert!(dir_at(fd.as_fd_ref(), "a/b", true).is_err());
+        assert!(dir_at(fd.as_fd(), "link", false).is_err());
+        assert!(dir_at(fd.as_fd(), "..", true).is_err());
+        assert!(dir_at(fd.as_fd(), "a/b", true).is_err());
         std::fs::remove_dir_all(parent).unwrap();
     }
 }

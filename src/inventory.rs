@@ -371,28 +371,11 @@ fn full_path_limit() -> usize {
     usize::try_from(libc::PATH_MAX).unwrap_or(0)
 }
 
-/// Metadata for one enumerated regular file: the live directory entry when the
-/// path name fits the platform limit, otherwise the former full-path no-follow
-/// operation. Both keep the ordinary directory-boundary fault seam.
-fn enumerated_file_metadata(entry: &fs::DirEntry, path: &Path) -> std::io::Result<fs::Metadata> {
-    if let Some(error) = boundary_fault(path, BoundaryPoint::Entry) {
-        return Err(error);
-    }
-    if path.as_os_str().as_bytes().len() < full_path_limit() {
-        entry_relative_metadata(entry)
-    } else {
-        full_path_metadata(path)
-    }
-}
-
-/// Metadata for one enumerated directory. It reads the live directory entry
-/// when the path name fits the platform limit and the former full-path no-follow
-/// operation when it does not. Directory entry reads keep the debug walk hook
-/// and the test-only boundary control, exactly as before.
-fn enumerated_directory_metadata(
-    entry: &fs::DirEntry,
-    path: &Path,
-) -> std::io::Result<fs::Metadata> {
+/// Metadata for one enumerated entry, file or directory: the live directory
+/// entry when the path name fits the platform limit, otherwise the former
+/// full-path no-follow operation. Both keep the ordinary directory-boundary
+/// fault seam and the debug walk hook.
+fn enumerated_entry_metadata(entry: &fs::DirEntry, path: &Path) -> std::io::Result<fs::Metadata> {
     if let Some(error) = boundary_fault(path, BoundaryPoint::Entry) {
         return Err(error);
     }
@@ -727,7 +710,7 @@ impl<'a> Walker<'a> {
                 } else if file_type.is_dir() {
                     let metadata = self
                         .test_hook_error(&path, WalkPoint::BeforeSymlinkMetadata)
-                        .map_or_else(|| enumerated_directory_metadata(&entry, &path), Err);
+                        .map_or_else(|| enumerated_entry_metadata(&entry, &path), Err);
                     let metadata = match metadata {
                         // A kind that contradicts the enumerated kind is never
                         // counted, queued or unioned as its replacement.
@@ -862,7 +845,7 @@ impl<'a> Walker<'a> {
     fn record_file(&mut self, entry: &fs::DirEntry, path: &Path, index: usize) {
         let metadata = self
             .test_hook_error(path, WalkPoint::BeforeSymlinkMetadata)
-            .map_or_else(|| enumerated_file_metadata(entry, path), Err);
+            .map_or_else(|| enumerated_entry_metadata(entry, path), Err);
         let metadata = match metadata {
             // A kind that contradicts the enumerated kind is never counted or
             // unioned as its replacement.
@@ -1053,14 +1036,20 @@ fn dominant_category(categories: &[CategoryInventory]) -> Option<Category> {
     }
     match best {
         Some((category, bytes)) if bytes > 0 => Some(category),
+        // The same first-wins rule as the allocated pass: a tie keeps the
+        // category that appears first, never whichever the last one happened
+        // to be.
         _ => {
-            let by_logical = categories
-                .iter()
-                .max_by_key(|entry| entry.accounting.logical_bytes)?;
-            if by_logical.accounting.logical_bytes > 0 {
-                Some(by_logical.category)
-            } else {
-                None
+            let mut best: Option<(Category, u64)> = None;
+            for entry in categories {
+                let bytes = entry.accounting.logical_bytes;
+                if best.is_none_or(|(_, current)| bytes > current) {
+                    best = Some((entry.category, bytes));
+                }
+            }
+            match best {
+                Some((category, bytes)) if bytes > 0 => Some(category),
+                _ => None,
             }
         }
     }
@@ -2904,5 +2893,36 @@ mod tests {
             case("root-guard-denied", guard_faults::Fault::Fail(libc::EACCES)),
             InventoryError::RootUnreadable { .. }
         ));
+    }
+
+    /// Both measures break a tie the same way: the category that appears first
+    /// in the fixed order wins, never whichever entry the iteration ended on.
+    #[test]
+    fn dominant_category_breaks_ties_first_wins_on_either_measure() {
+        let entry = |category, allocated_bytes, logical_bytes| CategoryInventory {
+            category,
+            accounting: Accounting {
+                allocated_bytes,
+                logical_bytes,
+                ..Accounting::default()
+            },
+        };
+        // Equal allocation keeps the first category.
+        let allocated_tie = [
+            entry(Category::Incremental, 16, 0),
+            entry(Category::Build, 16, 0),
+        ];
+        assert_eq!(
+            dominant_category(&allocated_tie),
+            Some(Category::Incremental)
+        );
+        // No allocation at all: the logical fallback keeps it too.
+        let logical_tie = [entry(Category::Deps, 0, 8), entry(Category::Other, 0, 8)];
+        assert_eq!(dominant_category(&logical_tie), Some(Category::Deps));
+        // A larger later allocation still wins outright.
+        let clear = [entry(Category::Deps, 16, 0), entry(Category::Other, 32, 0)];
+        assert_eq!(dominant_category(&clear), Some(Category::Other));
+        assert_eq!(dominant_category(&[entry(Category::Other, 0, 0)]), None);
+        assert_eq!(dominant_category(&[]), None);
     }
 }

@@ -1357,7 +1357,7 @@ fn a_member_directory_never_follows_a_symlinked_ancestor() {
     let refused = ensure_member_directory(spec.root(), "aarch64-apple-darwin/debug")
         .expect_err("a symlinked member ancestor was followed");
     assert!(
-        refused.message().contains("not a real directory"),
+        refused.contains("not a real directory"),
         "{refused}"
     );
     assert!(

@@ -778,3 +778,81 @@ fn a_marker_read_or_digest_never_follows_a_symlink() {
     assert_eq!(read_marker(spec.root()).unwrap(), marker);
     assert_eq!(marker_digest(spec.root()).unwrap().len(), 64);
 }
+
+/// The owner-marker refusal names the ROOT that carries the marker and the
+/// checkout the marker records. The two nouns are never swapped, so a reader
+/// can tell which side of the comparison disagreed.
+#[test]
+fn an_owner_marker_refusal_names_the_root_that_carries_it() {
+    let fixture = Fixture::without_git();
+    let other = Fixture::without_git();
+    let root = fixture.root.join("owned-root");
+    create_owned_directory(&root).unwrap();
+    let marker = Marker {
+        version: MARKER_VERSION.to_owned(),
+        checkout: other.checkout.clone(),
+        checkout_id: context_id(&other),
+        label: "other".to_owned(),
+        recipe: RECIPE.to_owned(),
+        kind: RootKind::Local,
+        volume_uuid: None,
+        nonce: Some("0123456789abcdef0123456789abcdef".to_owned()),
+        checkout_volume_uuid: None,
+        generation: 1,
+        created_ms: 1,
+    };
+    let path = root.join(MARKER);
+    fs::write(&path, serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
+    let refused = owned_root(&fixture.checkout, &context_id(&fixture), &root).unwrap_err();
+    assert!(
+        refused.starts_with(&format!("{} belongs to", root.display())),
+        "{refused}"
+    );
+    assert!(
+        refused.contains(&other.checkout.display().to_string()),
+        "{refused}"
+    );
+
+    // An unusable marker is reported against the root too, never against the
+    // checkout that asked.
+    let mut unusable = marker.clone();
+    unusable.recipe = "an-unknown-recipe".to_owned();
+    fs::write(&path, serde_json::to_vec_pretty(&unusable).unwrap()).unwrap();
+    let refused = owned_root(&fixture.checkout, &context_id(&fixture), &root).unwrap_err();
+    assert!(
+        refused.starts_with(&format!("{} carries owner recipe", root.display())),
+        "{refused}"
+    );
+}
+
+/// A recorded root nonce is the same lowercase 128-bit hex a fresh nonce is;
+/// a short, uppercase or non-hex value is refused by the receipt itself.
+#[test]
+fn a_receipt_root_nonce_must_be_lowercase_hex() {
+    let fixture = Fixture::new();
+    let id = context_id(&fixture);
+    let mut receipt = fixture.receipt();
+    receipt.state = ReceiptState::Committed;
+    receipt.generation = 1;
+    let mut selected = fixture.local().selected(1);
+    selected.nonce = Some("0123456789abcdef0123456789abcdef".to_owned());
+    receipt.link_mut().selected = Some(selected.clone());
+    receipt.roots = vec![selected.clone()];
+    receipt.validate(&fixture.checkout, &id).unwrap();
+
+    for bad in [
+        "9".repeat(31),
+        "9".repeat(31) + "A",
+        "9".repeat(31) + "g",
+        format!("{}0", "9".repeat(32)),
+    ] {
+        let mut refused_receipt = receipt.clone();
+        let mut refused_selected = selected.clone();
+        refused_selected.nonce = Some(bad.clone());
+        refused_receipt.link_mut().selected = Some(refused_selected);
+        let refused = refused_receipt
+            .validate(&fixture.checkout, &id)
+            .unwrap_err();
+        assert!(refused.contains("unusable root nonce"), "{bad}: {refused}");
+    }
+}

@@ -59,6 +59,7 @@ pub(crate) use receipt::{
     LinkPlacement, Receipt, Reservation,
 };
 pub use receipt::{RootKind, Selected};
+pub(crate) use root::is_real_dir_path;
 
 use crate::identity;
 use crate::removable::{self, DriveMode};
@@ -89,6 +90,7 @@ usage: oxide outputs plan      effect-free JSON plan for this checkout (oxide.ou
        oxide outputs adopt     explicitly convert this checkout's profile members
        oxide outputs detach    restore a real <checkout>/target directory; roots are kept
        oxide outputs status    read-only state of this checkout's owned outputs
+       oxide outputs cancel-reservation  drop this checkout's unused root reservation
        oxide outputs prune     explicitly prune roots whose checkout is gone
 
 Permanent drive mode keeps `<checkout>/target` a real directory and owns one
@@ -104,50 +106,6 @@ leased build of a fresh checkout (no receipt of any state) on the registered
 permanent drive, with one notice. `detach` works in either mode: it restores
 this checkout's real target and keeps every root, and automatic conversion
 never re-links it.";
-
-/// Why an owned-output operation stopped. The kind is decided where the
-/// condition is found, so no caller ever matches on message text.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum OutputsError {
-    /// A precondition of the command is not met; nothing was changed.
-    Refused(String),
-    /// A file-system or coordination operation failed.
-    Io(String),
-    /// A durable record is malformed or contradicts the live tree.
-    Corrupt(String),
-}
-
-impl OutputsError {
-    pub(in crate::outputs) fn refused(reason: impl Into<String>) -> Self {
-        Self::Refused(reason.into())
-    }
-
-    pub(in crate::outputs) fn io(reason: impl Into<String>) -> Self {
-        Self::Io(reason.into())
-    }
-
-    pub(in crate::outputs) fn corrupt(reason: impl Into<String>) -> Self {
-        Self::Corrupt(reason.into())
-    }
-
-    fn message(&self) -> &str {
-        match self {
-            Self::Refused(reason) | Self::Io(reason) | Self::Corrupt(reason) => reason,
-        }
-    }
-}
-
-impl std::fmt::Display for OutputsError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.message())
-    }
-}
-
-impl From<OutputsError> for String {
-    fn from(error: OutputsError) -> Self {
-        error.message().to_owned()
-    }
-}
 
 /// What `<checkout>/target` is right now.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -358,6 +316,25 @@ pub(in crate::outputs) fn refuse_unknown_custody(
             checkout.join("target").display()
         )),
         CheckoutCustody::Clear | CheckoutCustody::Writers => Ok(()),
+    }
+}
+
+/// One checkout's writer custody for an effect that needs every writer
+/// positively clear. Unknown custody refuses with the caller's `action` and
+/// the state it `kept`; the caller decides what live writers mean (wait, or
+/// refuse for a verb that must not wait).
+pub(in crate::outputs) fn require_clear_custody(
+    store: &Store,
+    context: &Context,
+    own_record: u64,
+    action: &str,
+    kept: &str,
+) -> Result<CheckoutCustody, String> {
+    match store.checkout_custody(&context.workspace, own_record)? {
+        CheckoutCustody::Unknown(reason) => {
+            Err(format!("outputs: refusing to {action}: {reason}. {kept}"))
+        }
+        holding => Ok(holding),
     }
 }
 

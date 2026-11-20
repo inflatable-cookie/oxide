@@ -4,23 +4,20 @@ use super::receipt::{
     link_path, member_destination, read_receipt_for_prune, receipt_state_label, LayoutKind,
     Receipt, ReceiptState, RootKind, Selected, SelectedView,
 };
-use super::root::{external_choice_read_only, external_spec, link_state, local_spec};
+use super::root::{
+    external_choice_read_only, external_spec, is_real_dir_path, link_state, local_spec,
+};
 use super::transition::destination_generation;
-use super::{mode_label, Context, TargetState};
+use super::{mode_label, Context, TargetState, MEMBER};
 use crate::removable::{self, DriveMode};
 use crate::store;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 const PLAN_VERSION: &str = "oxide.outputs.plan/2";
-/// The placement recipe a marker binds: `target/` with `target/debug`.
-
 const MAX_PLAN_BYTES: usize = 64 * 1024;
-/// Known roots kept per receipt; the oldest is dropped first.
-
 /// Cooperative holders named in a plan.
 const MAX_HOLDERS: usize = 16;
-/// One bounded Git probe's time limit.
 
 pub(in crate::outputs) fn plan_command() -> Result<u8, String> {
     let context = Context::open()?;
@@ -405,7 +402,7 @@ pub(in crate::outputs) fn output_status_lines(context: &Context) -> Result<Vec<S
     lines.push(format!(
         "outputs: local fallback root {} ({}{})",
         local.root().display(),
-        if local.root().is_dir() {
+        if is_real_dir_path(local.root()) {
             "present"
         } else {
             "absent"
@@ -425,7 +422,7 @@ pub(in crate::outputs) fn output_status_lines(context: &Context) -> Result<Vec<S
                 "outputs: preserved {} root {} ({}, never deleted)",
                 root.kind.label(),
                 root.root.display(),
-                if root.root.is_dir() {
+                if is_real_dir_path(&root.root) {
                     "present"
                 } else {
                     "absent"
@@ -460,7 +457,7 @@ pub(in crate::outputs) fn output_status_lines(context: &Context) -> Result<Vec<S
                 "outputs: layout whole-target (legacy); run `oxide outputs detach` then `oxide outputs adopt` to switch to profile member links"
                     .to_owned(),
             );
-            if target.link_root() != Some(selected.root.as_path()) {
+            if receipt.matching_live_root(&target, MEMBER).is_none() {
                 lines.push(format!(
                     "outputs: the target is {} rather than the owned link selecting {}; run `oxide outputs detach`",
                     target.label(),

@@ -4,6 +4,7 @@ use super::adopt::AUTO_ADOPT_MEMBERS;
 use super::Context;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -321,10 +322,13 @@ fn git_link_path(context: &Context, suffix: Option<&str>) -> Result<(PathBuf, St
     }
     parts.push("target".to_owned());
     if let Some(suffix) = suffix {
+        // The member is parsed once: its name must be the suffix exactly, and
+        // every component is then copied verbatim.
+        if !crate::layout::Member::parse(suffix).is_ok_and(|member| member.name() == suffix) {
+            return Err("the profile member is not a plain relative path".to_owned());
+        }
         for component in suffix.split('/') {
-            if !crate::layout::Member::parse(suffix).is_ok_and(|member| member.name() == suffix)
-                || component.is_empty()
-            {
+            if component.is_empty() {
                 return Err("the profile member is not a plain relative path".to_owned());
             }
             parts.push(component.to_owned());
@@ -402,7 +406,10 @@ fn git_probe(
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        // Its own process group, so a grandchild that inherits the pipes is
+        // stopped with the probe instead of outliving it.
+        .process_group(0);
     for variable in GIT_REPOSITORY_ENVIRONMENT {
         command.env_remove(variable);
     }
@@ -450,21 +457,25 @@ fn git_probe(
             Ok(Some(status)) => break status.code(),
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::describe::stop_group_and_reap(&mut child);
                 return Err(format!("git {name} did not finish in time"));
             }
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::describe::stop_group_and_reap(&mut child);
                 return Err(format!("cannot wait for git {name}: {error}"));
             }
         }
     };
-    let settle = Duration::from_secs(1);
+    // The output shares the one deadline the child was given: a grandchild
+    // that keeps the pipe open cannot extend the caller's wait past
+    // `GIT_PROBE_TIME` in total.
+    let settle = deadline.saturating_duration_since(Instant::now());
     let bytes = receiver
         .recv_timeout(settle)
-        .map_err(|_| format!("git {name} did not close its output in time"))?
+        .map_err(|_| {
+            crate::describe::stop_group_and_reap(&mut child);
+            format!("git {name} did not close its output in time")
+        })?
         .map_err(|error| format!("cannot read git {name} output: {error}"))?;
     if bytes.len() > MAX_GIT_PROBE_BYTES {
         return Err(format!("git {name} output is over its byte cap"));

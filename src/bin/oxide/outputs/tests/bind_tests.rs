@@ -1648,7 +1648,7 @@ fn a_dangling_requested_member_reserves_nothing_and_adopt_recovers() {
     .unwrap();
     match bind_profile(&context, &store, 0, &receipt, Some(&plan), false) {
         Bind::Refuse(reason) => {
-            assert!(reason.message().contains("not available now"), "{reason}")
+            assert!(reason.contains("not available now"), "{reason}")
         }
         _ => panic!("a dangling member bound"),
     }

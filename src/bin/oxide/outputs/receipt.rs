@@ -1,6 +1,6 @@
 //! Owned-output receipts, root markers, serialization and file digests.
 
-use super::{MARKER, MEMBER};
+use super::{TargetState, MARKER, MEMBER};
 use crate::process;
 use crate::store;
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(in crate::outputs) const RECEIPT_VERSION: &str = "oxide.outputs.transition/2";
 /// The bound successor receipt (oxide#133): `target` stays a real directory
@@ -452,7 +453,7 @@ impl Receipt {
                     );
                 }
                 if let Some(nonce) = selected.nonce() {
-                    if nonce.len() != 32 {
+                    if !crate::prune::is_nonce(nonce) {
                         return Err(
                             "the owned-output receipt has an unusable root nonce".to_owned()
                         );
@@ -550,6 +551,20 @@ impl Receipt {
             );
         }
         Ok(())
+    }
+
+    /// The recorded selection for `member` when `state` is the live owned link
+    /// selecting exactly its destination. The one rule every live-link
+    /// comparison uses, so a whole-target and a profile member can never be
+    /// classified differently.
+    pub(in crate::outputs) fn matching_live_root(
+        &self,
+        state: &TargetState,
+        member: &str,
+    ) -> Option<&Selected> {
+        let selected = self.selected_for(member)?;
+        (state.link_root() == Some(member_destination(selected.root(), member).as_path()))
+            .then_some(selected)
     }
 
     /// The root the current owned link must select, when committed.
@@ -993,13 +1008,34 @@ pub(in crate::outputs) fn write_receipt(control: &Path, receipt: &Receipt) -> Re
         return Err("the output receipt exceeds its byte limit".to_owned());
     }
     let path = receipt_path(control, &receipt.checkout_id);
-    // Only the admission-lock holder writes, so one temp name suffices.
-    let temp = directory.join(format!(
-        ".{}.tmp-{}",
-        receipt.checkout_id,
-        std::process::id()
-    ));
-    write_private(&temp, &bytes)?;
+    // Only the admission-lock holder writes, but a stale temp file from a
+    // killed process can still carry this PID: each candidate name is tried
+    // exclusively, so no writer ever appends to another's file.
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let (temp, mut file) = loop {
+        let seq = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temp = directory.join(format!(
+            ".{}.tmp-{}-{seq}",
+            receipt.checkout_id,
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temp)
+        {
+            Ok(file) => break (temp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("cannot write {}: {error}", temp.display())),
+        }
+    };
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("cannot write {}: {error}", temp.display()));
+    }
+    drop(file);
     fs::rename(&temp, &path).map_err(|error| {
         let _ = fs::remove_file(&temp);
         format!("cannot publish the output receipt: {error}")

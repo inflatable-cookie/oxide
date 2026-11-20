@@ -727,16 +727,37 @@ impl PoolBacking {
 impl PoolStorage {
     /// Open (and declare) one pool's storage under its control directory.
     ///
-    /// The control directory is Oxide's own private directory; it is created
-    /// owner-only here so Barge's account state never widens its mode.
+    /// The control directory is Oxide's own private directory: it is created
+    /// owner-only here, with the mode given to the create itself, and every
+    /// open verifies that the directory it found is a real owner-only
+    /// directory of this user rather than a link or a wider one. Barge's
+    /// account state therefore never widens its mode.
     pub fn open(control: &Path, backing: &PoolBacking) -> Result<Self, String> {
         use std::os::unix::fs::DirBuilderExt;
-        if !control.exists() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(control)
-                .map_err(|error| format!("cannot create the pool control directory: {error}"))?;
+        match std::fs::symlink_metadata(control) {
+            Ok(metadata) => verify_private_control(control, &metadata)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(control)
+                    .map_err(|error| {
+                        format!("cannot create the pool control directory: {error}")
+                    })?;
+                let metadata = std::fs::symlink_metadata(control).map_err(|error| {
+                    format!(
+                        "cannot inspect the pool control directory {}: {error}",
+                        control.display()
+                    )
+                })?;
+                verify_private_control(control, &metadata)?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect the pool control directory {}: {error}",
+                    control.display()
+                ))
+            }
         }
         let storage = Storage::open(control)?;
         Self::from_storage(storage, backing)
@@ -1253,9 +1274,42 @@ fn project_folder(base: &str, area_folder: &str) -> Option<String> {
 }
 
 /// Make a directory Barge created owner-only, the mode Oxide writes slots in.
+///
+/// The directory is opened without following a final symlink and changed
+/// through its own descriptor, so a path swapped between the open and the
+/// chmod can never widen another entry, and a non-directory refuses.
 pub fn make_private(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    // SAFETY: `directory` is a live descriptor for a directory this call
+    // opened, and fchmod has no other precondition.
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The control directory must be a real directory of this user, owner-only:
+/// it is created that way and never reopened through a link or a wider mode.
+fn verify_private_control(control: &Path, metadata: &std::fs::Metadata) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(format!(
+            "{} must be an owner-only directory of this user",
+            control.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Read a root's hold without waiting. `None` means something else holds it.

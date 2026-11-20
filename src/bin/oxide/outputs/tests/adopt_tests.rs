@@ -1277,7 +1277,7 @@ fn a_whole_target_detach_writes_its_receipt_before_the_link_goes() {
     // the detach that finishes it.
     match bind_under_binding(&context, &store, 0, &stored, None, false) {
         Bind::Refuse(error) => assert!(
-            error.message().contains("`oxide outputs detach`"),
+            error.contains("`oxide outputs detach`"),
             "{error}"
         ),
         _ => panic!("a leftover detach link was bound"),
@@ -1348,7 +1348,7 @@ fn a_profile_detach_writes_its_receipt_before_its_member_links() {
     }
     match bind_profile(&context, &store, 0, &stored, None, false) {
         Bind::Refuse(error) => assert!(
-            error.message().contains("`oxide outputs detach`"),
+            error.contains("`oxide outputs detach`"),
             "{error}"
         ),
         _ => panic!("a leftover member link was bound"),

@@ -37,7 +37,8 @@ const SNAPSHOT_TIME: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug, Serialize)]
 struct Registry {
     version: String,
-    /// The frozen numeric registry format, 1 (shared with `version`).
+    /// The frozen numeric registry format (`REGISTRY_SCHEMA`); `version`
+    /// names the same format in text.
     #[serde(default)]
     schema: u32,
     /// Advanced before every changed receipt, selection or root effect.
@@ -157,6 +158,18 @@ impl Row {
     fn live(&self) -> bool {
         self.selected || self.pending || self.reservation.is_some() || self.cancelling.is_some()
     }
+
+    /// The selected-root shape this row records, for the readers that need a
+    /// [`Selected`] (a row is never a receipt: this grants no authority).
+    fn to_selected(&self) -> Selected {
+        Selected {
+            kind: self.root_kind,
+            root: self.root.clone(),
+            volume_uuid: self.volume_uuid.clone(),
+            nonce: self.nonce.clone(),
+            generation: self.generation,
+        }
+    }
 }
 
 /// A fresh random 128-bit root or transaction nonce, lowercase hex. Entropy
@@ -243,15 +256,33 @@ fn seed_registry(control: &Path, registry: &mut Registry) -> Result<(), String> 
         {
             continue;
         }
-        let metadata = entry.metadata().map_err(|error| error.to_string())?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
+        // Only a real regular file is a receipt candidate: an entry type is
+        // read without following a link.
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
             continue;
         }
+        // Read through the same no-follow, owner-only open every receipt
+        // reader uses, capped one byte past this seed's remaining budget so a
+        // file that grew after its metadata is refused, not read whole.
+        let Some(file) = store::private_file(&entry.path(), false)? else {
+            continue;
+        };
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
         if metadata.len() > budget {
             return Err("the receipt seed exceeded its byte budget".to_owned());
         }
-        budget = budget.saturating_sub(metadata.len());
-        let bytes = fs::read(entry.path()).map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(budget.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("cannot read {}: {error}", entry.path().display()))?;
+        if bytes.len() as u64 > budget {
+            return Err("the receipt seed exceeded its byte budget".to_owned());
+        }
+        budget = budget.saturating_sub(bytes.len() as u64);
         let stub: Stub = serde_json::from_slice(&bytes)
             .map_err(|error| format!("{} is invalid: {error}", entry.path().display()))?;
         let receipt =
@@ -437,12 +468,18 @@ fn require_ready(store: &Store, control: &Path) -> Result<Registry, String> {
 /// record is an open writer), so the refusal names the explicit upgrade.
 pub fn require_registry(control: &Path) -> Result<(), String> {
     match read_registry(control)? {
-        Some(registry) => registry.validate(),
-        None => Err(format!(
-            "outputs: the output registry {} is missing, so no owned-output receipt is written and the link, receipt and roots are unchanged. A pool from before the shared output format is upgraded by `oxide outputs adopt` (or `oxide outputs detach`) in this checkout once no other Oxide command runs in either pool",
-            registry_path(control).display()
-        )),
+        Some(_) => Ok(()),
+        None => Err(registry_missing(control)),
     }
+}
+
+/// The refusal for a missing ready registry, shared by every reader so the
+/// upgrade path is named identically.
+fn registry_missing(control: &Path) -> String {
+    format!(
+        "outputs: the output registry {} is missing, so no owned-output receipt is written and the link, receipt and roots are unchanged. A pool from before the shared output format is upgraded by `oxide outputs adopt` (or `oxide outputs detach`) in this checkout once no other Oxide command runs in either pool",
+        registry_path(control).display()
+    )
 }
 
 /// The ready registry's current revision.
@@ -463,19 +500,18 @@ fn ready_registry(control: &Path) -> Result<Registry, String> {
 
 impl Registry {
     fn validate(&self) -> Result<(), String> {
-        let schema = match self.version.as_str() {
-            REGISTRY_VERSION if self.schema == REGISTRY_SCHEMA => REGISTRY_SCHEMA,
-            LEGACY_REGISTRY_VERSION if self.schema == LEGACY_REGISTRY_SCHEMA => {
-                LEGACY_REGISTRY_SCHEMA
-            }
-            _ => {
-                return Err(format!(
-                    "the output registry has an unsupported version {:?}",
-                    self.version
-                ))
-            }
-        };
-        let _ = schema;
+        // `version` and `schema` name the same format; one without the other
+        // is an unsupported document.
+        let supported = matches!(
+            (self.version.as_str(), self.schema),
+            (REGISTRY_VERSION, REGISTRY_SCHEMA) | (LEGACY_REGISTRY_VERSION, LEGACY_REGISTRY_SCHEMA)
+        );
+        if !supported {
+            return Err(format!(
+                "the output registry has an unsupported version {:?}",
+                self.version
+            ));
+        }
         if self.revision == 0 {
             return Err("the output registry has no revision".to_owned());
         }
@@ -598,9 +634,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// upgrades the document to schema 2, which only happens after the caller's
 /// forward fence.
 pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
-    require_registry(control)?;
-    let mut registry = ready_registry(control)?;
-    registry.validate()?;
+    // One read and one validation: this is exactly the document whose
+    // revision the receipt advances and whose rows it publishes into.
+    let mut registry = read_registry(control)?.ok_or_else(|| registry_missing(control))?;
     if receipt.layout() == outputs::LayoutKind::Profile {
         registry.version = REGISTRY_VERSION.to_owned();
         registry.schema = REGISTRY_SCHEMA;
@@ -640,20 +676,16 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
     // Barge's markers once per area, even when many rows share that area.
     let mut roots_by_area = HashMap::new();
     for row in &mut registry.rows {
+        // Both checks are no-follow: a symlink is never a root directory and
+        // never the marker inside one.
         if !row.live()
             || row.barge_id.is_some()
-            || !row.root.is_dir()
-            || !row.root.join(oxide_storage::storage::ROOT_MARKER).exists()
+            || !crate::outputs::is_real_dir_path(&row.root)
+            || fs::symlink_metadata(row.root.join(oxide_storage::storage::ROOT_MARKER)).is_err()
         {
             continue;
         }
-        let selected = Selected {
-            kind: row.root_kind,
-            root: row.root.clone(),
-            volume_uuid: row.volume_uuid.clone(),
-            nonce: row.nonce.clone(),
-            generation: row.generation,
-        };
+        let selected = row.to_selected();
         let (account, config) = output_area_config(control, &selected)?;
         let roots = match roots_by_area.entry((account, config.uuid.clone())) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -1401,11 +1433,10 @@ fn pin_references(control: &Path, receipt: &Receipt, registry: &Registry) -> Res
                 Err(error) => return Err(error.to_string()),
                 Ok(_) => {}
             }
-            if (pending
-                || !selected
-                    .root()
-                    .join(oxide_storage::storage::ROOT_MARKER)
-                    .exists())
+            let no_store_marker =
+                fs::symlink_metadata(selected.root().join(oxide_storage::storage::ROOT_MARKER))
+                    .is_err();
+            if (pending || no_store_marker)
                 && fs::symlink_metadata(selected.root().join(outputs::MARKER))
                     .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
             {
@@ -1458,13 +1489,7 @@ pub(crate) fn finish_receipt(control: &Path, receipt: &Receipt) -> Result<(), St
         let Some(id) = row.barge_id.as_deref() else {
             continue;
         };
-        let selected = Selected {
-            kind: row.root_kind,
-            root: row.root.clone(),
-            volume_uuid: row.volume_uuid.clone(),
-            nonce: row.nonce.clone(),
-            generation: row.generation,
-        };
+        let selected = row.to_selected();
         match output_area(control, &selected) {
             Ok(area) => match area.unpin(id) {
                 Ok(()) => {}
@@ -1537,13 +1562,7 @@ fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
         if row.pruned_ms.is_some() || row.barge_id.is_none() {
             continue;
         }
-        let selected = Selected {
-            kind: row.root_kind,
-            root: row.root.clone(),
-            volume_uuid: row.volume_uuid.clone(),
-            nonce: row.nonce.clone(),
-            generation: row.generation,
-        };
+        let selected = row.to_selected();
         let Some(parent) = selected.root().parent() else {
             continue;
         };
@@ -1614,13 +1633,7 @@ fn evict_planned_root(
                 && row.pruned_ms.is_none()
         })
         .ok_or("the planned Barge identity is no longer recorded; retained")?;
-    let selected = Selected {
-        kind: row.root_kind,
-        root: row.root.clone(),
-        volume_uuid: row.volume_uuid.clone(),
-        nonce: row.nonce.clone(),
-        generation: row.generation,
-    };
+    let selected = row.to_selected();
     let area = output_area(control, &selected)?;
     if area.key().label() != planned.area {
         return Err("the planned Barge area changed; retained".to_owned());
@@ -1881,13 +1894,7 @@ pub(crate) fn needs_successor(control: &Path, root: &Path) -> Result<bool, Strin
             return Ok(true);
         }
         if let Some(id) = &row.barge_id {
-            let selected = Selected {
-                kind: row.root_kind,
-                root: row.root.clone(),
-                volume_uuid: row.volume_uuid.clone(),
-                nonce: row.nonce.clone(),
-                generation: row.generation,
-            };
+            let selected = row.to_selected();
             match output_area(control, &selected)?.resolve(id) {
                 Ok(found) if found.path == root => {}
                 Ok(_) => return Ok(true),
