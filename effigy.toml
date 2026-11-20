@@ -33,17 +33,23 @@ minimum_effigy_version = "0.14.0"
 
 # Covering ordinary suite: the full workspace unit and integration tests, serial,
 # with every fixture below the caller's task TMPDIR. Effigy owns heavy admission
-# and the run deadline.
+# and the run deadline. A failing or interrupted run keeps its fixture root and
+# names it, including when a signal ends the suite.
 [tasks."rust:barge-adoption"]
 admission = "heavy"
 run = '''adoption_root=$(mktemp -d "${TMPDIR:?}/qa.XXXXXX") || exit 2
+retain_fixtures() {
+  echo "oxide adoption fixtures retained after $1: $adoption_root" >&2
+}
+trap 'retain_fixtures "interrupt"; exit 130' INT TERM
 echo "oxide adoption fixtures: $adoption_root"
 TMPDIR="$adoption_root" TMP="$adoption_root" TEMP="$adoption_root" OXIDE_TASK_SCRATCH_ROOT="$adoption_root" OXIDE_TEST_INTERNAL_ROOT="$adoption_root" oxide test --workspace --all-targets --locked -- --test-threads=1
 adoption_exit=$?
 if [ "$adoption_exit" -eq 0 ]; then
+  trap - INT TERM
   rm -rf -- "$adoption_root"
 else
-  echo "oxide adoption fixtures retained after exit $adoption_exit" >&2
+  retain_fixtures "exit $adoption_exit"
 fi
 exit "$adoption_exit"'''
 

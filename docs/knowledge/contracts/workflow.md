@@ -279,7 +279,7 @@ oxide exec --execution-budget 300s -- npm run tauri build
 
 ## Cross-checkout freshness
 
-Cargo 1.97.1 fingerprints local units by relative path and file mtime. It treats
+Cargo 1.97.1 and 1.100.0 fingerprint local units by relative path and file mtime. It treats
 an input whose `path_mtime <= reference_mtime` as fresh, and it embeds the
 checkout path in some dep-info. Without a gate, a slot reused from another
 checkout can keep stale units. The gate runs before Cargo whenever a slot's
@@ -640,7 +640,8 @@ to the registered drive, and Oxide owns the links that point there.
   `target` and keeps every root and its bytes, and handles legacy whole-target
   checkouts so they can switch via `detach` then `adopt`. It is the per-checkout opt-out in
   either mode. Creating a real empty `target` before the first build does the same
-  thing.
+  thing. `oxide outputs cancel-reservation` drops this checkout's unused reserved
+  nonce under the same barrier and binding lock, so the next build reserves afresh.
 - **Transitions.** A relink is write-ahead. It records `prepared`, creates the
   destination root and marker, creates a sibling link, renames it onto `target`,
   and then records `committed`. It waits for other commands in the checkout to stop

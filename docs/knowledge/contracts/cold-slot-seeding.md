@@ -228,8 +228,10 @@ refreshes an older catalog.
 A donor offers every unit it holds for the recipient's allowlisted packages.
 Oxide does not compute Cargo's package-id hash, unit metadata hash or
 fingerprint directory name. Cargo decides which copies it uses. Unused copies
-stay as counted bytes until ordinary whole-slot eviction. There is no per-unit
-pruning.
+stay as counted bytes and seeding itself deletes nothing: the slot is reclaimed
+by the whole-slot Barge eviction every slot is subject to. Layout-v2 warm-slot
+stale-unit pruning is a separate pass on **release**, not on a seeded
+recipient ([layout v2 pruning](workflow.md#stale-unit-pruning-layout-v2)).
 
 ## 6. Recipient transaction
 
@@ -324,13 +326,14 @@ pre-empted. Passive status reads never take these locks.
 | Removable volume lost | The existing removal and quarantine path runs. |
 
 A refusal reuses no lease, adds no grant and does no rebind. The retained
-generation is counted by the next admission walk, or evicted through the
-journaled `Prior::Unknown` path. It is never read as zero.
+generation is counted by the next admission walk, or reclaimed by the
+whole-slot Barge eviction that treats it as `Prior::Unknown`. It is never read
+as zero.
 
 Crash points: a crash after the untrusted origin, during the clone, or during
 the release leaves the untrusted origin and attempt record in place. No trusted
 origin is written, and the next command evicts the whole slot through the
-existing journaled eviction. A crash after `mark_spawning` but before the process
+ordinary whole-slot Barge eviction. A crash after `mark_spawning` but before the process
 group is recorded stays held for explicit recovery, as in
 [crash recovery](workflow.md#crash-recovery). Seeding adds no deletion
 mechanism of its own.
@@ -477,8 +480,9 @@ Oxide always sets.
   units; libraries whose `.d` names `OUT_DIR` or other outside-root inputs. A
   broader scope needs a new design and review.
 - Reading a held slot as a donor.
-- Per-unit pruning of unused copies, and any Cargo package-id or unit hash
-  computation.
+- Per-unit pruning of unused copies inside seeding, and any Cargo package-id or
+  unit hash computation. The separate layout-v2 release-time pruning of stale
+  units is not part of seeding.
 - A config key, flag or environment toggle beyond the `OXIDE_COLD_SEED=0`
   opt-out.
 - A unified start gate for commands that seed nothing.
@@ -505,5 +509,8 @@ ordinary tests are:
   source in the invoking Cargo cache. It skips when the pinned Cargo or an
   eligible cached test package is unavailable;
 - default-on and opt-out behaviour (`src/bin/oxide/main.rs`).
-  `tests/cold_seed_default_off.rs` compares `status` against a staged baseline
-  binary. It is `#[ignore]` by default and needs `OXIDE_SEED_BASELINE_BINARY`.
+  `tests/cold_seed_default_off.rs` builds a fixture crate on a fresh private pool
+  with `OXIDE_COLD_SEED=0` and asserts a successful build, no seeding notice and
+  no seed artifact. It is self-contained: no staged baseline binary and no
+  `#[ignore]`. Scratch-pool status is covered separately in
+  `tests/scratch_status.rs`.

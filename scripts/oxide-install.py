@@ -58,6 +58,9 @@ RECEIPT_VERSION = 2
 RECEIPT_MAX_BYTES = 64 * 1024
 DIGEST = re.compile(r"[a-f0-9]{64}")
 PIN = re.compile(r"[a-f0-9]{40}")
+# Every Git command here is local and small; a bounded wait keeps a wedged
+# index, hook or credential prompt from holding the install lock forever.
+GIT_SECONDS = 120
 
 
 class Refusal(Exception):
@@ -65,9 +68,19 @@ class Refusal(Exception):
 
 
 def git(*args):
-    return subprocess.run(
-        ["git", "-C", str(REPOSITORY), *args], check=True, capture_output=True, text=True
-    ).stdout.strip()
+    """Run one bounded Git command in this repository.
+
+    A command that exceeds `GIT_SECONDS` refuses instead of surfacing a raw
+    `TimeoutExpired` traceback: the install lock is held around this, so a
+    hung reader must end as a reportable refusal.
+    """
+    try:
+        return subprocess.run(
+            ["git", "-C", str(REPOSITORY), *args], check=True, capture_output=True,
+            text=True, timeout=GIT_SECONDS,
+        ).stdout.strip()
+    except subprocess.TimeoutExpired as error:
+        raise Refusal(f"git {' '.join(args)} exceeded {GIT_SECONDS}s: {error}") from error
 
 
 def sha256(path):
@@ -331,12 +344,21 @@ def build_environment(staging, pin, instance):
 def build(pin, instance, staging):
     source = staging / "source"
     source.mkdir()
-    archive = subprocess.Popen(
+    # The context manager owns the reader: it closes the parent's copy of the
+    # pipe and reaps the process on every path, so a refused `tar` cannot leave
+    # an archive writer running or a child waiting on a pipe this run holds.
+    with subprocess.Popen(
         ["git", "-C", str(REPOSITORY), "archive", pin], stdout=subprocess.PIPE
-    )
-    subprocess.run(["tar", "-x", "-C", str(source)], stdin=archive.stdout, check=True)
-    if archive.wait() != 0:
-        raise Refusal("git archive failed")
+    ) as archive:
+        try:
+            subprocess.run(["tar", "-x", "-C", str(source)], stdin=archive.stdout, check=True)
+        except BaseException:
+            archive.terminate()
+            raise
+        finally:
+            archive.stdout.close()
+        if archive.wait() != 0:
+            raise Refusal("git archive failed")
     environment = build_environment(staging, pin, instance)
     versions = {
         tool: subprocess.run(
@@ -482,6 +504,34 @@ def canary_compatibility(candidate):
                 raise Refusal(f"live canary needs matching {name}: installed {installed}, staged {version}")
 
 
+def verify_scratch_dir(path, expected_dev=None):
+    """Validate a scratch directory through one no-follow descriptor.
+
+    Ownership, mode and volume facts come from an `fstat` of the opened
+    directory rather than a second path lookup, so a path swapped between
+    checks cannot be validated as one directory and used as another. Returns
+    the directory's `(device, inode)` identity, the same pair
+    `directory_identity` reports.
+    """
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise Refusal(
+            f"scratch must be a directory this run can open without following links: {path} ({error})"
+        )
+    try:
+        info = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if info.st_uid != os.getuid():
+        raise Refusal(f"scratch must be owned by the user running the installer: {path}")
+    if info.st_mode & 0o022:
+        raise Refusal(f"scratch must be privately writable: {path}")
+    if expected_dev is not None and info.st_dev != expected_dev:
+        raise Refusal(f"scratch must be on the selected pool's volume: {path}")
+    return info.st_dev, info.st_ino
+
+
 def canary_scratch(description, override):
     if description["schema"] != "oxide.pool.describe/1":
         raise Refusal("the staged binary returned an unknown pool description")
@@ -510,11 +560,9 @@ def canary_scratch(description, override):
         raise Refusal("the staged binary could not identify an eligible live pool")
     if not scratch.is_absolute() or scratch.resolve(strict=True) != scratch or scratch == scratch.parent:
         raise Refusal(f"scratch must be an existing canonical directory: {scratch}")
-    info = scratch.stat()
-    if (not stat.S_ISDIR(info.st_mode) or info.st_dev != device or info.st_mode & 0o022
-            or scratch == pool or pool in scratch.parents or scratch in pool.parents):
-        raise Refusal(f"scratch must be on the selected volume, outside the pool and privately writable: {scratch}")
-    return pool, payload, scratch, (info.st_dev, info.st_ino)
+    if scratch == pool or pool in scratch.parents or scratch in pool.parents:
+        raise Refusal(f"scratch must be outside the pool and must not contain it: {scratch}")
+    return pool, payload, scratch, verify_scratch_dir(scratch, device)
 
 
 def directory_identity(path):
@@ -595,7 +643,10 @@ def assess_canary(label, result, wall, events, expected, payload, limit):
     return slot[1], admission
 
 
-LIVE_DOCUMENTS = ("config.json", "ledger.json", "oxide-managed/state.json")
+LIVE_CONFIG = "config.json"
+LIVE_LEDGER = "ledger.json"
+LIVE_CONTROL = "oxide-managed/state.json"
+LIVE_DOCUMENTS = (LIVE_CONFIG, LIVE_LEDGER, LIVE_CONTROL)
 DOCUMENT_BYTES = 64 * 1024 * 1024
 
 
@@ -692,10 +743,9 @@ def run_scratch_canary(built, arguments):
     """
     scratch = arguments.scratch_root
     if (not scratch.is_absolute() or scratch.resolve(strict=True) != scratch
-            or scratch == scratch.parent or not stat.S_ISDIR(scratch.stat().st_mode)
-            or scratch.stat().st_mode & 0o022):
+            or scratch == scratch.parent):
         raise Refusal(f"scratch must be an existing canonical, privately writable directory: {scratch}")
-    scratch_id = directory_identity(scratch)
+    scratch_id = verify_scratch_dir(scratch)
     root = Path(tempfile.mkdtemp(prefix="oxide-canary-pool.", dir=scratch))
     root_id = directory_identity(root)
     pool = root / "pool"  # Created by the staged binary at this explicit path.
@@ -722,40 +772,67 @@ def state_version(data):
     return value if type(value) is int else None
 
 
+def read_live_document(directory, name, optional=False):
+    """Read one live document relative to its already-opened pool directory.
+
+    `directory` is a descriptor for the pool itself, so every name resolves
+    under the pool this run opened and no path component can be re-pointed
+    between names. A document keeps its bytes and file identity, so the same
+    read can prove afterwards that nothing changed.
+    """
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    except FileNotFoundError:
+        if optional:
+            return None
+        raise Refusal(f"the live pool has no {name}")
+    except OSError as error:
+        raise Refusal(f"the live pool's {name} cannot be read without following links: {error}")
+    with os.fdopen(descriptor, "rb") as file:
+        info = os.fstat(file.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise Refusal(f"the live pool's {name} is not a regular file")
+        data = file.read(DOCUMENT_BYTES + 1)
+    if len(data) > DOCUMENT_BYTES:
+        raise Refusal(f"the live pool's {name} exceeds the byte limit")
+    identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    return data, identity
+
+
+def read_live_control(directory):
+    """The optional control document, through a no-follow control directory."""
+    try:
+        control = os.open("oxide-managed", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                          dir_fd=directory)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise Refusal(f"the live control directory cannot be opened without following links: {error}")
+    try:
+        return read_live_document(control, "state.json", optional=True)
+    finally:
+        os.close(control)
+
+
 def read_live_documents(pool):
     """Read the live control and ledger documents without writing or following links.
 
     Config and ledger are required. The control state is optional: a pool the
-    front door has never used has none. Each document keeps its bytes and file
-    identity, so the same read can prove afterwards that nothing changed.
+    front door has never used has none. The pool is opened once as a directory
+    descriptor and every document is read relative to it.
     """
-    documents = {}
-    for name in LIVE_DOCUMENTS:
-        path = pool / name
-        optional = name == "oxide-managed/state.json"
-        if optional:
-            try:
-                if not stat.S_ISDIR(os.lstat(pool / "oxide-managed").st_mode):
-                    raise Refusal("the live control directory is not a real directory")
-            except FileNotFoundError:
-                continue
-        try:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        except FileNotFoundError:
-            if optional:
-                continue
-            raise Refusal(f"the live pool has no {name}")
-        except OSError as error:
-            raise Refusal(f"the live pool's {name} cannot be read without following links: {error}")
-        with os.fdopen(descriptor, "rb") as file:
-            info = os.fstat(file.fileno())
-            if not stat.S_ISREG(info.st_mode):
-                raise Refusal(f"the live pool's {name} is not a regular file")
-            data = file.read(DOCUMENT_BYTES + 1)
-        if len(data) > DOCUMENT_BYTES:
-            raise Refusal(f"the live pool's {name} exceeds the byte limit")
-        identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
-        documents[name] = (data, identity)
+    try:
+        directory = os.open(pool, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise Refusal(f"the live pool cannot be opened without following links: {error}")
+    try:
+        documents = {name: read_live_document(directory, name)
+                     for name in (LIVE_CONFIG, LIVE_LEDGER)}
+        control = read_live_control(directory)
+    finally:
+        os.close(directory)
+    if control is not None:
+        documents[LIVE_CONTROL] = control
     return documents
 
 
@@ -770,7 +847,7 @@ def write_document_copy(root, documents):
     copy = root / "pool"
     copy.mkdir(mode=0o700)
     (copy / "payload").mkdir(mode=0o700)
-    if "oxide-managed/state.json" in documents:
+    if LIVE_CONTROL in documents:
         (copy / "oxide-managed").mkdir(mode=0o700)
     for name, (data, _) in documents.items():
         descriptor = os.open(copy / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -793,7 +870,7 @@ def run_format_canary(built, arguments, capabilities):
     pool, _, scratch, scratch_id = canary_scratch(json.loads(described.stdout), arguments.scratch_root)
     before = read_live_documents(pool)
     staged = capabilities["control_state_version"]
-    live_version = state_version(before["oxide-managed/state.json"][0]) if "oxide-managed/state.json" in before else None
+    live_version = state_version(before[LIVE_CONTROL][0]) if LIVE_CONTROL in before else None
     if live_version is not None and live_version > staged:
         raise Refusal(f"the live control state (version {live_version}) is newer than the staged build ({staged})")
     print(f"format-change: read {len(before)} live documents read-only: {', '.join(before)}", flush=True)

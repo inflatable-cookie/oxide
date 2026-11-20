@@ -3,14 +3,14 @@
 Status: implemented. `oxide exec` without `--output` derives a tool's output
 members from the checkout's committed receipt (oxide#160, S1, and the profile
 default S4b). oxide#164 applies the same derivation to external Cargo
-subcommands. The code is in `src/bin/oxide/outputs.rs` (`exec_declaration`,
+subcommands. The code is in `src/bin/oxide/outputs/exec.rs` (`exec_declaration`,
 `exec_members`, `lease_declaration`, `needs_reservation`) and the tool-directory
 notice (`tool_directories_note`).
 
 Not built: the optional post-run observation S2, the launcher guard S3 (not
-planned), migration of existing whole-target checkouts beyond explicit
-`oxide outputs adopt` (S4c, gated), and derived link creation or a member cap
-above eight (S5). S5 is open in
+planned), migration of existing whole-target checkouts beyond the explicit
+`oxide outputs detach` followed by `oxide outputs adopt` (S4c, gated), and
+derived link creation or a member cap above eight (S5). S5 is open in
 [Q-019](../questions.md#q-019--how-should-oxide-exec-know-a-tools-profile-output-members).
 
 This file owns how `oxide exec` derives a tool's output members. The
@@ -145,8 +145,9 @@ directory, a triple the checkout has never built, or a deliberate subset.
 - **S3, launcher guard.** Not planned. It would need PATH or `$CARGO`
   interception, which the product direction defers, and its own review.
 - **S4c, migration of whole-target checkouts.** Gated, and not part of this
-  design. Explicit `oxide outputs adopt` is the only route, starting with the
-  primary consumer checkout under its owners' gates.
+  design. Explicit `oxide outputs detach` followed by `oxide outputs adopt` is
+  the only route, starting with the primary consumer checkout under its owners'
+  gates.
 - **S5, open in Q-019.** Whether a derived member may ever be newly linked, which
   needs a keyed reservation and a custody change, and whether a derived set may
   exceed eight members.
