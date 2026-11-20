@@ -459,7 +459,7 @@ because the producer identity is keyed by version.
 
 ## 13. Tests
 
-Ordinary unit tests cover the library (`src/lease/seed/tests.rs`), the source
+Under the lean validation policy ([vision](../vision.md#validation-policy)), ordinary unit tests cover the library (`src/lease/seed/tests.rs`), the source
 adapter (`src/seed_source/tests.rs`), the front door (the seed tests in
 `src/bin/oxide/store.rs` and the `seed_*.rs` modules), and the default-on and
 opt-out behaviour (`src/bin/oxide/main.rs`). `tests/cold_seed_default_off.rs`

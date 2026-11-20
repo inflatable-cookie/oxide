@@ -1,6 +1,6 @@
 # Open questions
 
-This file owns unresolved design decisions only. Settled rulings live in [vision](vision.md) and their owning contracts; a question leaves this file once it is settled. Headings keep their numbers so existing links still resolve.
+This file owns unresolved design decisions only. Settled rulings live in [vision](vision.md) and their owning contracts; a question leaves this file once it is settled. Question numbers are stable identifiers and may have gaps.
 
 ## Q-001 — What implementation shape best supports durable exclusive ownership?
 
@@ -8,11 +8,7 @@ Open. A per-user local daemon remains the recommended production hub for one dur
 
 ## Q-002 — What exact toolchain and checkout-path portability can be supported?
 
-Open for useful cross-path reuse. The mapped-root and logical-path route is retired. Ordinary Cargo reuse across fresh checkout paths is limited to the narrower result in [project adoption](contracts/project-adoption.md). Open: whether a consumer can supply a finite pool of physical task-worktree roots with exclusive allocation and recycling. Remapping stays off until a supported Cargo passes the full qualification gate without a per-root map, and each Cargo or rustc upgrade needs a reassessment.
-
-## Q-003 — What partitions, budgets and reconciliation proofs are sufficient?
-
-Open for production capacity. Still needed: an enforced disposable-footprint cap, the production host locking and process containment, and later product budgets. The 20 GiB host free-space threshold is a monitored start and abort threshold, not a guarantee; see [architecture](architecture.md#storage-invariants).
+Open for useful cross-path reuse. The mapped-root and logical-path route is retired. Ordinary Cargo reuse across fresh checkout paths is limited to the narrower result in [project adoption](contracts/project-adoption.md). Open: whether a consumer can supply a finite pool of physical task-worktree roots with exclusive allocation and recycling. Remapping stays off until a supported Cargo demonstrates reuse without a per-root map; each Cargo or rustc upgrade needs reassessment.
 
 ## Q-005 — What names are safe to publish?
 
@@ -36,11 +32,7 @@ Open in part. The design direction (non-reserving, cancellable waiting, advisory
 
 ## Q-012 — How does the consumer bind task admission, storage acquire and host-run scheduling?
 
-Open. The consumer boundary and first core-test contract are in [Nucleus core reuse](contracts/nucleus-core-reuse.md). Open gates: an installed, authenticated Oxide binding; a qualified source pool; agreement on the opt-in, allocation epochs, bounded retention and exact source identity before root recycling; third-party and native input audit; and a successful live recovery. Storage busy creates no host run.
-
-## Q-016 — How should Oxide proceed after the #086 no-go?
-
-Paused. Tom paused the build-script skip path and withdrew its readers ([vision](vision.md#product-workflow-direction), 2026-10-19). No skip or reader coverage is admitted. The shipped freshness gate is qualified on the Cargo pins listed in the [workflow matrix](contracts/workflow.md#cargo-version-matrix); future Rust qualification covers those shipped features only. The #086 normal-path overhead result is a final no-go.
+Open. The consumer boundary and core-test work are tracked in Nucleus. Open gates: an installed, authenticated Oxide binding; a qualified source pool; agreement on the opt-in, allocation epochs, bounded retention and exact source identity before root recycling; third-party and native input audit; and a successful live recovery. Storage busy creates no host run.
 
 ## Q-017 — Can sccache sharing preserve Oxide's slot writer closure?
 
@@ -56,11 +48,7 @@ Open, narrowed. The receipt-derived member set is implemented: [exec output infe
 
 ## Q-020 — How should nested Oxide lease joining and permit borrowing work?
 
-Open. The proposal is in [nested lease](contracts/nested-lease.md) and is not implemented or frozen. Open: the broker interface for a joined compile; which of the nested and [idle exec](contracts/idle-exec-sessions.md) designs lands first; deadline inheritance (Q-018); hostile same-UID code; and non-macOS and Linux platforms.
-
-## Q-021 — How should Oxide's output roots move to Barge?
-
-Open. The lean boundary is recorded in [Barge adoption](contracts/barge-adoption.md). The operator choices this entry used to list are no longer in that contract, so the planner must restate them before a ruling.
+Open. Nested calls currently take independent leases, and idle exec sessions hold their host permit throughout. The future joining and permit-borrowing design is tracked in Nucleus. Open: the broker interface; implementation order; deadline inheritance (Q-018); hostile same-UID code; and non-macOS and Linux platforms.
 
 ## Q-022 — Can a held zombie establish its group's lifetime?
 

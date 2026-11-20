@@ -18,15 +18,10 @@ Oxide aims to make Rust development easy and light: predictable storage, less bu
 - [Project adoption](knowledge/contracts/project-adoption.md): the consumer integration boundary.
 - [Optimization adoption](knowledge/contracts/optimization-adoption.md): policy for component-lazy preparation.
 - [Local lease](knowledge/contracts/local-lease.md): the retained lease library semantics.
-- [Nested lease](knowledge/contracts/nested-lease.md): proposed design for nested lease joining; not implemented.
 - [Warm-reuse admission](knowledge/contracts/warm-reuse-admission.md): admission without a recursive size scan.
-- [Storage inventory](knowledge/contracts/storage-inventory.md): the read-only inventory diagnostic.
 - [Stable Cargo profiles](knowledge/contracts/stable-cargo-profiles.md): Oxide's own profile recipes.
-- [Build-context policy](knowledge/contracts/build-context-policy.md): proposed context semantics; production policy inert.
 - [Cold-slot seeding](knowledge/contracts/cold-slot-seeding.md): seeding a new slot from an idle donor.
-- [Idle exec sessions](knowledge/contracts/idle-exec-sessions.md): proposed design for idle sessions and run-slot custody; not implemented.
 - [Exec output inference](knowledge/contracts/exec-output-inference.md): `oxide exec` derives a tool's output members from the receipt; derived link creation is not implemented.
-- [Nucleus core reuse](knowledge/contracts/nucleus-core-reuse.md) and [Nucleus input roots](knowledge/contracts/nucleus-input-roots.md): condensed historical records.
 - [Release contract](knowledge/contracts/release.md): publication restrictions.
 
 ## Background

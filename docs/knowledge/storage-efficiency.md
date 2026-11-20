@@ -1,9 +1,7 @@
 # Storage-efficiency findings
 
 Current observations about storage cost in Oxide and in the consumer routes it
-serves, with their limits. This file owns the findings. [Optimization
-adoption](contracts/optimization-adoption.md) owns route policy, [build-context
-policy](contracts/build-context-policy.md) owns the incremental-state policy,
+serves, with their limits. This file owns the findings. [Optimization adoption](contracts/optimization-adoption.md) owns route policy,
 [stable Cargo profiles](contracts/stable-cargo-profiles.md) owns the profile
 recipes, and [workflow](contracts/workflow.md) owns command behaviour. None of
 these findings is a measured storage saving, and none authorises a change in an

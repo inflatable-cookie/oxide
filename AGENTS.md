@@ -48,7 +48,6 @@ tasks` lists the live set.
 - `docs:check`: links, changelog fragments and whitespace.
 - `changelog:check` / `changelog:fold` / `changelog:test`: changelog fragments; `fold` is release-only.
 - `dogfood:scripts:test`: synthetic installer, pin, canary and wire-format cases.
-- `offline-seed:test`: synthetic offline-seeder cases.
 - `oxide:canary` / `oxide:install` / `oxide:reinstall` / `oxide:rollback`: planner-only, after reviewed merge.
 
 Workflow and install contracts: [workflow](docs/knowledge/contracts/workflow.md).
