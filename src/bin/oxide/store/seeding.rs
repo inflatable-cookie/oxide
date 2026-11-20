@@ -11,7 +11,7 @@ use crate::freshness::{Built, Prior};
 use crate::process;
 use crate::watchdog::Watchdog;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use oxide_storage::lease::LeaseError;
 
@@ -75,8 +75,18 @@ impl Store {
                 })
                 .cloned()
                 .collect();
-            pass.locked(cargo_home, &offered, cache, process::now_ms())
+            pass.locked(cargo_home, &offered, cache, Self::unix_seconds()?)
         })
+    }
+
+    /// The cache's `verified_at` is Unix **seconds**, as `seed_sources::verify_pass`
+    /// and the cache record document it. A millisecond reading would be stored
+    /// as a verification far in the future.
+    fn unix_seconds() -> Result<u64, &'static str> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .map_err(|_| "the clock is before the Unix epoch")
     }
 
     /// Build and publish a catalog for a successful, still-held producing
@@ -471,5 +481,22 @@ impl Store {
             .ok_or("the removable pool has no registration")?;
         crate::removable::verified_registration(&self.control, &registration)?;
         Ok(registration.mount_point)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the seed cache recorded `process::now_ms()` where the cache
+    /// record and `seed_sources::verify_pass` both mean Unix **seconds**. A
+    /// millisecond reading lands about a thousand times in the future.
+    #[test]
+    fn source_verification_time_is_unix_seconds_not_milliseconds() {
+        let now = Store::unix_seconds().expect("the clock is after the epoch");
+        assert!(
+            (1_700_000_000..4_000_000_000).contains(&now),
+            "{now} is not a plausible Unix-second reading"
+        );
     }
 }

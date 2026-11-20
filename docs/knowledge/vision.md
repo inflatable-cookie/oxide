@@ -71,8 +71,9 @@ An upstream roadmap is never a reason to defer today's relief.
 - **Upstream contributions** are welcome, but neither their acceptance nor
   their timing is assumed.
 - **Cargo's planned cross-workspace cache** is the preferred long-term
-  complement to Oxide's slots. The new build-dir layout in Rust 1.100
-  (2026-11-12) is the next upgrade point.
+  complement to Oxide's slots. Oxide is pinned to Rust 1.100 and reads the
+  build-directory layout Cargo actually wrote: v2 by default, and v1 under
+  Cargo's own opt-out.
 
 ## Ownership
 
@@ -112,16 +113,15 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   consistently reliable.
 - **Adoption** happens through the `oxide init` agent-docs block, the Oxide
   skill and each project's Effigy selectors.
-- **Diagnostic and adoption direction** (Tom, 2026-10-23): default
-  `oxide status` should be fast and read-only, showing recorded sizes with
+- **Diagnostics and adoption direction** (Tom, 2026-10-23; implemented):
+  default `oxide status` is fast and read-only, showing recorded sizes with
   their age and source, or "not measured". Explicit `status --measure`
-  requests bounded measurement; observation must not reconcile deletions.
-  These diagnostic facts do not decide admission or reopen cached accounting.
-  In a Git repository, `oxide init` should put one managed block in the
+  requests bounded measurement; observation never reconciles deletions, and
+  these diagnostic facts do not decide admission or reopen cached accounting.
+  In a Git repository, `oxide init` writes one managed block in the
   work-tree root's `AGENTS.md`, listing the Cargo workspaces it covers.
-  Existing nested blocks are reported and retained; outside Git the current
-  workspace-local behavior stays. These are approved correction targets,
-  not claims about the installed binary.
+  Existing nested blocks are reported and retained; outside Git the
+  workspace-local block stands.
 - **Crash recovery:** Oxide recovers its own interrupted commands. A
   recovery requires a free record lock and matching lease ownership, plus
   either an empty Cargo process group (`ESRCH`) or a recorded pre-launch
@@ -130,13 +130,13 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   with Oxide storage (#107). When a checkout's slot is busy, a further command
   in that checkout takes a compatible spare slot. Whether Tauri honours
   build-dir is still unverified.
-- **Command time budgets** (Tom, 2026-10-23): approved direction is separate
-  finite admission and child-execution budgets, with a typed child-start
-  boundary. Independent design review precedes implementation. Compilation,
-  Cargo locks and nested admissions consume the execution budget once it
-  starts; nested calls never pause or reset an outer budget. Preserve signal
-  forwarding and conservative group closure. Consumer adoption and installation
-  remain separate gates; this is not an installed capability.
+- **Command time budgets** (Tom, 2026-10-23; implemented): leased commands
+  accept separate finite admission and child-execution budgets, with a typed
+  child-start boundary reported as an event. Compilation, Cargo locks and
+  nested admissions consume the execution budget once it starts; nested calls
+  never pause or reset an outer budget. Signal forwarding and conservative
+  group closure are preserved. Consumer adoption and installation remain
+  separate gates.
 Nested commands currently take an independent lease. Idle `oxide exec`
 sessions hold their host permit for the full session. The future lease-joining and
 permit-borrowing designs are tracked in Nucleus and are not implemented.
@@ -193,8 +193,11 @@ operator instruction; the general lean reset is not deletion authority.
   cooperative root-bound lease, not a descendant sandbox. Implementation and
   targeted verification proceed through the scoped Nucleus brief and independent
   review; the ruling itself establishes no runtime or QA readiness.
-- **Internal pool:** `~/Dev/oxide`, with a 100 GB budget. Config follows
-  Longhorn's storage-location policy, through Longhorn's own resolver.
+- **Internal pool:** the account cache directory's `build-pool`
+  (`~/Library/Caches/oxide/build-pool` on macOS,
+  `$XDG_CACHE_HOME/oxide/build-pool` elsewhere), with a 100 GB budget. An
+  explicit `[pool] path` overrides it. Config follows Longhorn's
+  storage-location policy, through Longhorn's own resolver.
 - **The Builds drive** is the preferred pool:
   - a registered removable APFS volume, permanently attached and treated as
     consumable;
@@ -202,9 +205,10 @@ operator instruction; the general lean reset is not deletion authority.
 - **Drive mode:** the Builds drive is registered as permanent or ephemeral,
   with a loud warning when a build falls back to the internal pool.
   `oxide pool describe --json` reports it to other tools.
-- **Low space on the Builds drive** (approved, not built; delivered through Barge stage 3, not in Oxide): the pool cap counts
-  pool bytes only; caches, scratch and other data on the drive never count
-  against it. The drive's registered reserve is a prune trigger, not a stop:
+- **Low space on the Builds drive** (built through Barge, not a second Oxide
+  engine): the pool cap counts pool bytes only; caches, scratch and other data
+  on the drive never count against it. The drive's registered reserve is a
+  prune trigger, not a stop:
   below it, at admission and while builds run, Oxide evicts the
   least-recently-used idle whole slots on the drive until it is back above the
   reserve. Only a 10 GiB hard floor stops work: below it with no idle slot left,
@@ -220,18 +224,19 @@ operator instruction; the general lean reset is not deletion authority.
 - **Owned links at profile directories** (v1, operator accepted): a converted
   checkout keeps `target` itself a real directory and owns only the positively
   identified members `debug`, `release`, `<triple>/debug` and
-  `<triple>/release`, so tools that mount `target` keep working. An existing
-  whole-target link moves only through an explicit `oxide outputs adopt` under
-  a durable journal, a real nonempty profile directory is never moved or
-  converted, and an undeclared opaque tool refuses instead of guessing. The
-  profile layout is implemented; `oxide outputs detach` recognises the host
-  triple and every other supported member link by its approved destination
-  and this checkout's root marker, so a `<triple>/debug` member no longer
-  refuses a safe detach, while an unowned, wrong-destination, dangling or
-  malformed link still refuses with nothing changed. Corrected native
-  coverage of detach, clean and prune is still unactivated. The as-is
-  acceptance, contract, formats and evidence limits are owned by the
-  [workflow](contracts/workflow.md).
+  `<triple>/release`, so tools that mount `target` keep working. A legacy
+  whole-target link switches through an explicit `oxide outputs detach`
+  followed by `oxide outputs adopt`; the switch is a write-ahead receipt
+  transition (`prepared`, sibling link, rename, `committed`, replayed after a
+  crash), with no separate migration journal. A real nonempty profile
+  directory is never moved or converted, and an undeclared opaque tool refuses
+  instead of guessing. `oxide outputs detach` recognises the host triple and
+  every other supported member link by its approved destination and this
+  checkout's root marker, so a `<triple>/debug` member no longer refuses a
+  safe detach, while an unowned, wrong-destination, dangling or malformed link
+  still refuses with nothing changed. Detach, clean and prune are covered by
+  ordinary regression tests. The contract, formats and evidence limits are
+  owned by the [workflow](contracts/workflow.md).
 - **Machine pool from the account:** Oxide resolves its config, pool and
   drive from the account home, not `$HOME`, so a harness that overrides
   HOME still uses them; private pools need an explicit setting. Its proof
@@ -303,8 +308,8 @@ operator instruction; the general lean reset is not deletion authority.
     matrix.
   - Newer or patch versions are not assumed to qualify.
   - Any unqualified version turns those features off rather than guessing.
-- **Next upgrade point:** Rust 1.100. Qualifying on it after release is
-  approved.
+- **Next upgrade point:** a Rust release newer than the pinned 1.100 is
+  qualified separately before its layout or internals are assumed.
 
 ## Validation policy
 

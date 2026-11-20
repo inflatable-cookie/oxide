@@ -243,7 +243,17 @@ fn probe_volume(registration: &Registration) -> Result<Binding, Unavailable> {
     // stale mount point on the internal disk, is never the drive.
     let facts =
         volume::observe_path(mount).map_err(|error| unavailable(Reason::MetadataUnknown, error))?;
-    if facts.mounted_on != *mount || facts.uuid.as_deref() != Some(uuid) {
+    // A positively stale directory (the path is not its own mount root) is the
+    // absent volume, matching `crate::storage::judge_mount_identity`: a mount
+    // point left behind by an unclean detach is not a different volume. Only a
+    // mounted root carrying another identity is a mismatch.
+    if facts.mounted_on != *mount {
+        return Err(unavailable(
+            Reason::Absent,
+            format!("nothing is mounted at {}", mount.display()),
+        ));
+    }
+    if facts.uuid.as_deref() != Some(uuid) {
         return Err(unavailable(
             Reason::IdentityMismatch,
             format!("{} is not volume {uuid}", mount.display()),
@@ -818,5 +828,55 @@ mod tests {
     fn bounded_reads_return_small_output() {
         let bytes = bounded("/bin/echo", &["hello"], None).unwrap();
         assert_eq!(bytes, b"hello\n");
+    }
+
+    fn registration(mount: &Path, uuid: &str) -> Registration {
+        Registration {
+            version: 2,
+            mount_point: mount.to_path_buf(),
+            volume_uuid: uuid.to_owned(),
+            container_uuid: "B7BD4FE8-44FB-47C5-9193-8365DF302FE3".to_owned(),
+            reserve_bytes: 0,
+            cap_bytes: 0,
+            quota_bytes: None,
+            capacity_bytes: None,
+            registered_ms: 0,
+            mode: DriveMode::Ephemeral,
+        }
+    }
+
+    /// Regression: a stale `/Volumes/<name>` directory left by an unclean
+    /// detach was reported as an identity mismatch here, while the storage path
+    /// (`storage::judge_mount_identity`) calls the same observation absent.
+    #[test]
+    fn a_stale_mount_point_directory_is_absent_not_a_different_volume() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stale = std::env::temp_dir().join(format!(
+            "oxide-describe-stale-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&stale).unwrap();
+        let refusal = probe_volume(&registration(
+            &stale,
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+        ))
+        .expect_err("a plain directory is not the drive");
+        assert_eq!(refusal.reason, Reason::Absent, "{refusal:?}");
+        fs::remove_dir_all(&stale).expect("remove own fixture");
+    }
+
+    /// A path that really is a mount root, under another identity, is still a
+    /// mismatch: absent is reserved for a positively stale directory.
+    #[test]
+    fn a_mounted_root_with_another_identity_is_a_mismatch() {
+        let refusal = probe_volume(&registration(
+            Path::new("/"),
+            "00000000-0000-0000-0000-000000000000",
+        ))
+        .expect_err("a root with another identity is refused");
+        assert_eq!(refusal.reason, Reason::IdentityMismatch, "{refusal:?}");
     }
 }

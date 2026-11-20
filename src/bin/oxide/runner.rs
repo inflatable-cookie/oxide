@@ -514,7 +514,10 @@ fn seed_recipient(
                 }
                 Ok(store::SeedRun::Seeded(_, last)) => {
                     eprintln!("{}", seed_summary::summary(&last));
-                    production = Some(prepared);
+                    // The recipient was populated by a seed, so it is not a
+                    // producing generation: publishing its catalog would spend
+                    // the post-build verification pass only to discard the
+                    // result.
                 }
                 Ok(store::SeedRun::Abandoned) => {
                     (held, gate, binding) = match abandon_seed_and_reacquire(
@@ -1108,6 +1111,36 @@ fn exec_stdin() -> Stdio {
     }
 }
 
+/// A child that never started: release the held slot, then always emit the
+/// invocation's one terminal budget event. A failed release never suppresses
+/// that event, and its error is preserved alongside the original failure.
+///
+/// The event's lease state comes from the release's own disposition: a deferred
+/// release keeps the lease held for a later command, and a failed one leaves
+/// unknown custody, so both are reported `held`.
+fn fail_unstarted(custody: ProgramCustody<'_>, error: String) -> Result<u8, String> {
+    let slot = custody.held.slot_id.clone();
+    let released = custody.store.release(custody.held, custody.origin);
+    let lease_state = match &released {
+        Ok(store::ReleaseDisposition::Released) => budget::Lease::Released,
+        Ok(store::ReleaseDisposition::Deferred) | Err(_) => budget::Lease::Held,
+    };
+    budget::finished(
+        budget::Outcome::SpawnFailure,
+        None,
+        custody.execution_started,
+        budget::Drain::NotReached,
+        lease_state,
+        1,
+    );
+    match released {
+        Ok(_) => Err(error),
+        Err(release) => Err(format!(
+            "{error}; releasing slot {slot} also failed: {release}"
+        )),
+    }
+}
+
 /// Run a converted checkout's program under the held lease, as `oxide exec`
 /// runs a tool: its own process group, the record naming that group (so a
 /// crash leaves the slot held until the group is empty), signals forwarded,
@@ -1131,17 +1164,15 @@ fn run_owned_program(
         eprintln!("oxide: warning: {error}; the program runs without Cargo's full run environment");
     }
     if let Err(error) = custody.store.mark_spawning(&custody.held) {
-        custody.store.release(custody.held, custody.origin)?;
-        return Err(error);
+        return fail_unstarted(custody, error);
     }
     let (mut group, foreground) = match process::start_foreground_group(&mut command) {
         Ok(started) => started,
         Err(error) => {
-            custody.store.release(custody.held, custody.origin)?;
-            return Err(format!(
-                "could not execute {}: {error}",
-                target.program.display()
-            ));
+            return fail_unstarted(
+                custody,
+                format!("could not execute {}: {error}", target.program.display()),
+            )
         }
     };
     budget::program_started();
@@ -1872,6 +1903,195 @@ mod tests {
         assert!(held.build_dir.join("partial").exists());
         store.discard(held).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn event_pipe() -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0_i32; 2];
+        // SAFETY: two valid output slots.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: both descriptors are ours and valid.
+        unsafe {
+            libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    fn drain_event_records(reader: &mut std::fs::File) -> Vec<serde_json::Value> {
+        use std::io::Read;
+        let mut text = String::new();
+        let mut chunk = [0_u8; 1024];
+        for _ in 0..50 {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => text.push_str(&String::from_utf8_lossy(&chunk[..read])),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        text.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    /// Regression: the spawn-failure path released the lease with `?` before
+    /// `budget::finished`, so a failing release ended the invocation with no
+    /// terminal event at all. The event is emitted first, the release error is
+    /// preserved, and the lease is reported held.
+    #[test]
+    fn a_failed_release_still_emits_the_terminal_budget_event() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: getuid has no preconditions.
+        if unsafe { libc::getuid() } == 0 {
+            return; // The superuser can write in a read-only directory.
+        }
+        let (mut reader, writer) = event_pipe();
+        budget::clear();
+        budget::install(budget::Options {
+            admission: None,
+            execution: None,
+            events: Some(writer.as_raw_fd()),
+        })
+        .expect("a clock");
+        let (root, store, key) = store::tests::seed_fixture();
+        let held = store::tests::seed_fixture_lease(&store, &key);
+        let chosen = child_temp::Chosen::Inherited(std::env::temp_dir());
+        let custody = ProgramCustody {
+            store: &store,
+            held,
+            origin: None,
+            execution_started: None,
+            child_temp: &chosen,
+            production: None,
+            seed_profile: "debug",
+        };
+        // A control directory the caller cannot write makes the release's
+        // final state write fail after the child never started.
+        let control = store.pool.join(oxide_storage::lease::MANAGED_NAME);
+        std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o500))
+            .expect("read-only control");
+        let result = fail_unstarted(custody, "could not start the program".to_owned());
+        std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o700))
+            .expect("restore control");
+        let error = result.expect_err("the release failure is preserved");
+        assert!(error.contains("could not start the program"), "{error}");
+        assert!(error.contains("also failed"), "{error}");
+        let records = drain_event_records(&mut reader);
+        assert!(
+            records.iter().any(|record| record["event"] == "finished"
+                && record["outcome"] == "spawn_failure"
+                && record["lease"] == "held"),
+            "{records:?}"
+        );
+        budget::clear();
+        std::fs::remove_dir_all(root).expect("remove own fixture");
+    }
+
+    /// Arm the budget with an event sink. The writer is returned too: the
+    /// installed state holds only its descriptor, so it must outlive the event.
+    fn install_event_sink() -> (std::fs::File, std::fs::File) {
+        use std::os::fd::AsRawFd;
+        let (reader, writer) = event_pipe();
+        budget::clear();
+        budget::install(budget::Options {
+            admission: None,
+            execution: None,
+            events: Some(writer.as_raw_fd()),
+        })
+        .expect("a clock");
+        (reader, writer)
+    }
+
+    fn finished_leases(mut reader: std::fs::File) -> Vec<String> {
+        let records = drain_event_records(&mut reader);
+        records
+            .iter()
+            .filter(|record| record["event"] == "finished")
+            .filter_map(|record| record["lease"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// Regression: a deferred release returns `Ok` from `Store::release` while
+    /// keeping the lease held (owned scratch cleanup could not confirm
+    /// closure), so treating every `Ok` as `released` emitted a false terminal
+    /// event. Only a ledger without this lease proves the slot went back.
+    #[test]
+    fn a_deferred_release_is_reported_held() {
+        let (reader, _writer) = install_event_sink();
+        let (root, store, key) = store::tests::seed_fixture();
+        let mut held = store::tests::seed_fixture_lease(&store, &key);
+        let slot_dir = held.build_dir.parent().expect("slot dir").to_path_buf();
+        let scratch = child_temp::choose_with(
+            None,
+            &store.payload,
+            &slot_dir,
+            child_temp::Identity {
+                store_id: held.store_id.clone(),
+                slot_id: held.slot_id.clone(),
+                incarnation: held.incarnation.clone(),
+                lease_id: held.lease_id().to_owned(),
+            },
+            4096,
+        )
+        .expect("the owned directory");
+        let owned = scratch.owned().expect("owned directory");
+        // Removing the ownership marker makes cleanup refuse, so the release
+        // defers instead of handing the slot back.
+        std::fs::remove_file(owned.path().join("owner")).expect("the marker");
+        held.scratch = Some(owned.clone());
+        let chosen = child_temp::Chosen::Inherited(std::env::temp_dir());
+        let custody = ProgramCustody {
+            store: &store,
+            held,
+            origin: None,
+            execution_started: None,
+            child_temp: &chosen,
+            production: None,
+            seed_profile: "debug",
+        };
+        let error = fail_unstarted(custody, "could not start the program".to_owned())
+            .expect_err("the spawn failure is still an error");
+        assert_eq!(error, "could not start the program");
+        assert_eq!(finished_leases(reader), ["held"]);
+        assert!(owned.path().is_dir(), "a deferred scratch is kept");
+        budget::clear();
+        std::fs::remove_dir_all(root).expect("remove own fixture");
+    }
+
+    /// The ordinary success: the release reports `Released`, so the terminal
+    /// event says so. This keeps the deferred case from being "fixed" by
+    /// labelling every spawn failure held.
+    #[test]
+    fn a_completed_release_is_reported_released() {
+        let (reader, _writer) = install_event_sink();
+        let (root, store, key) = store::tests::seed_fixture();
+        let held = store::tests::seed_fixture_lease(&store, &key);
+        let chosen = child_temp::Chosen::Inherited(std::env::temp_dir());
+        let custody = ProgramCustody {
+            store: &store,
+            held,
+            origin: None,
+            execution_started: None,
+            child_temp: &chosen,
+            production: None,
+            seed_profile: "debug",
+        };
+        let error = fail_unstarted(custody, "could not start the program".to_owned())
+            .expect_err("the spawn failure is still an error");
+        assert_eq!(error, "could not start the program");
+        assert_eq!(finished_leases(reader), ["released"]);
+        budget::clear();
+        std::fs::remove_dir_all(root).expect("remove own fixture");
     }
 
     #[test]

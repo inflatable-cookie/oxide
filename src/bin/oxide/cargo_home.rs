@@ -381,10 +381,19 @@ fn bounded_stdout(
             }
         }
     }
-    let bytes = receiver
-        .recv_timeout(timeout)
-        .map_err(|_| "Cargo -V output did not finish".to_owned())?
-        .map_err(|error| format!("cannot read Cargo -V output: {error}"))?;
+    // The output shares the one deadline the child was given: a grandchild that
+    // keeps the pipe open cannot extend the caller's wait past `timeout` in
+    // total, as a second full bound after the child exited would.
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let bytes = match receiver.recv_timeout(remaining) {
+        Ok(read) => read.map_err(|error| format!("cannot read Cargo -V output: {error}"))?,
+        Err(_) => {
+            // A process in the group still holds the pipe open. Stop the whole
+            // group so it cannot keep running unseen.
+            crate::describe::stop_group_and_reap(&mut child);
+            return Err("Cargo -V output did not finish".to_owned());
+        }
+    };
     if bytes.len() as u64 > cap {
         return Err(format!("Cargo -V output is over {cap} bytes"));
     }
@@ -881,6 +890,48 @@ mod tests {
                 .expect("a version"),
             b"cargo 1.97.1 (x)"
         );
+    }
+
+    /// Regression: after the direct child exited, its output read was given a
+    /// second full bound, so a grandchild that kept the pipe open could hold
+    /// the caller for nearly twice the timeout. One deadline covers both, and
+    /// the timeout stops the whole group.
+    #[test]
+    fn output_held_open_by_a_grandchild_stays_within_one_deadline() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "oxide-cargo-version-held-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture");
+        let pidfile = dir.join("pid");
+        let script = format!("sleep 20 & echo $! > \"{}\"; sleep 1", pidfile.display());
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &script]);
+        let started = std::time::Instant::now();
+        let error = bounded_stdout(command, std::time::Duration::from_secs(3), VERSION_CAP)
+            .expect_err("the held pipe must be refused");
+        let elapsed = started.elapsed();
+        assert!(error.contains("did not finish"), "{error}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(3_500),
+            "the output wait ran past the one deadline: {elapsed:?}"
+        );
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("the grandchild's pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // SAFETY: signal 0 only probes the PID this test started.
+        while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // SAFETY: as above.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the grandchild survived");
+        std::fs::remove_dir_all(&dir).expect("remove own fixture");
     }
 
     #[test]

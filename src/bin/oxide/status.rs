@@ -393,6 +393,22 @@ fn recent_use_line(uses: &[(&str, Result<Option<store::LastUse>, String>)], now_
     }
 }
 
+/// The block size a filesystem's capacity figures are expressed in. macOS
+/// reports it as `f_bsize`; elsewhere the fundamental fragment size is the
+/// authoritative unit, matching `watchdog::available_bytes`.
+fn filesystem_block_size(sample: &libc::statfs) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(u64::from(sample.f_bsize))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        u64::try_from(sample.f_frsize)
+            .ok()
+            .filter(|block| *block > 0)
+    }
+}
+
 /// Backend, use, slots and recoveries of one recorded or measured pool,
 /// under `header`.
 fn print_pool(
@@ -436,7 +452,7 @@ fn print_pool(
                 store.budget(report.cap_bytes) / 1_000_000
             );
             let physical = store::statfs(&store.payload).and_then(|sample| {
-                let block = u64::try_from(sample.f_bsize).ok()?;
+                let block = filesystem_block_size(&sample)?;
                 Some((
                     sample.f_blocks.checked_mul(block)?,
                     sample.f_bavail.checked_mul(block)?,
@@ -1111,5 +1127,31 @@ mod tests {
         );
         let legacy = recent_use_line(&[("internal", Ok(Some(last("1", "a", None))))], now);
         assert!(legacy.ends_with("time not recorded"), "{legacy}");
+    }
+
+    /// Regression: physical capacity was scaled by `f_bsize` everywhere, while
+    /// the watchdog and the rest of the platform seam use the fundamental
+    /// fragment size off macOS. A synthetic sample proves the platform unit is
+    /// used, not only the macOS one.
+    #[test]
+    fn filesystem_capacity_uses_the_platform_block_unit() {
+        // SAFETY: a plain struct of integers; every field is then set below.
+        let mut sample: libc::statfs = unsafe { std::mem::zeroed() };
+        sample.f_bsize = 4096;
+        sample.f_blocks = 10;
+        sample.f_bavail = 4;
+        #[cfg(not(target_os = "macos"))]
+        {
+            sample.f_frsize = 8192;
+        }
+        #[cfg(target_os = "macos")]
+        let expected = Some((10 * 4096, 4 * 4096));
+        #[cfg(not(target_os = "macos"))]
+        let expected = Some((10 * 8192, 4 * 8192));
+        let block = filesystem_block_size(&sample).expect("a block size");
+        assert_eq!(
+            (sample.f_blocks * block, sample.f_bavail * block),
+            expected.unwrap()
+        );
     }
 }

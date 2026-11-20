@@ -1409,6 +1409,9 @@ fn validate_request(request: &SeedRequest) -> Result<(), LeaseError> {
             "seed catalog digest is not a lowercase SHA-256",
         ));
     }
+    if request.units.is_empty() {
+        return Err(LeaseError::InvalidInput("seed plan names no units"));
+    }
     for unit in &request.units {
         let valid = !unit.fingerprint_dir.is_empty()
             && unit.fingerprint_dir.len() <= MAX_PATH_BYTES
@@ -1608,37 +1611,7 @@ fn donor_control(pool_root: &Path, record_id: u64) -> DonorControl {
     let Ok(state) = serde_json::from_slice::<ControlState>(&bytes) else {
         return DonorControl::Unknown;
     };
-    let supported = state.version == CONTROL_STATE_VERSION
-        || (state.version == 7
-            && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
-            && state.one_use_workspaces.is_none()
-            && state
-                .records
-                .iter()
-                .all(|record| !record.class.0 && !record.class_reason.0))
-        || (state.version == 8
-            && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
-            && state.slot_ceiling.as_deref() == Some("oxide.slots/256")
-            && state.one_use_workspaces.is_none()
-            && state
-                .records
-                .iter()
-                .all(|record| !record.class.0 && !record.class_reason.0))
-        // Version 9 adds the whole-tree holding fence (oxide#190) and changes
-        // nothing this donor check reads: a record's phase, holder and lease are
-        // still the donor's own durable facts.
-        || ((state.version == super::control::HOLDING_STATE_VERSION
-            || (state.version == super::control::WRITER_STATE_VERSION
-                && state.minimum_writer_generation.is_some_and(|generation| generation > 0)))
-            && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
-            && state.slot_ceiling.as_deref() == Some("oxide.slots/256")
-            && state.holding.as_deref() == Some("oxide.holding/1")
-            && state.one_use_workspaces.is_none()
-            && state
-                .records
-                .iter()
-                .all(|record| !record.class.0 && !record.class_reason.0));
-    if !supported {
+    if !donor_state_supported(&state) {
         return DonorControl::Unknown;
     }
     let Some(record) = state.records.iter().find(|record| record.id == record_id) else {
@@ -1660,6 +1633,49 @@ fn donor_control(pool_root: &Path, record_id: u64) -> DonorControl {
         }
     }
     DonorControl::Eligible
+}
+
+/// Whether this control-state shape is one a donor may be read from.
+///
+/// The one-use fence is inert: the retired feature never wrote one in a shipped
+/// build, and `control::State::validate` still accepts a document carrying the
+/// known value at any version from 6 on. A donor check must not be stricter
+/// than the writer that reads the same state.
+fn donor_state_supported(state: &ControlState) -> bool {
+    let inert_one_use = matches!(
+        state.one_use_workspaces.as_deref(),
+        None | Some(super::CONTROL_ONE_USE_FENCE)
+    );
+    state.version == CONTROL_STATE_VERSION
+        || (state.version == 7
+            && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
+            && inert_one_use
+            && state
+                .records
+                .iter()
+                .all(|record| !record.class.0 && !record.class_reason.0))
+        || (state.version == 8
+            && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
+            && state.slot_ceiling.as_deref() == Some("oxide.slots/256")
+            && inert_one_use
+            && state
+                .records
+                .iter()
+                .all(|record| !record.class.0 && !record.class_reason.0))
+        // Version 9 adds the whole-tree holding fence (oxide#190) and changes
+        // nothing this donor check reads: a record's phase, holder and lease are
+        // still the donor's own durable facts.
+        || ((state.version == super::control::HOLDING_STATE_VERSION
+            || (state.version == super::control::WRITER_STATE_VERSION
+                && state.minimum_writer_generation.is_some_and(|generation| generation > 0)))
+            && state.eviction_accounting.as_deref() == Some("oxide.eviction-accounting/1")
+            && state.slot_ceiling.as_deref() == Some("oxide.slots/256")
+            && state.holding.as_deref() == Some("oxide.holding/1")
+            && inert_one_use
+            && state
+                .records
+                .iter()
+                .all(|record| !record.class.0 && !record.class_reason.0))
 }
 
 /// Read one owner-only sidecar under its byte ceiling, or `None` when it is
@@ -2470,5 +2486,86 @@ mod sidecar_regressions {
         write_sidecar_bounded(&path, bytes, crate::seed_source::MAX_CACHE_BYTES as usize).unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod plan_and_donor_regressions {
+    use super::*;
+
+    fn request(units: Vec<SeedUnitRef>) -> SeedRequest {
+        SeedRequest {
+            recipient: SeedRecipient {
+                slot_id: "1".to_owned(),
+                incarnation: "1".to_owned(),
+                lease_id: "recipient-lease".to_owned(),
+            },
+            donor: SeedDonor {
+                slot_id: "2".to_owned(),
+                incarnation: "1".to_owned(),
+                lease_id: "donor-lease".to_owned(),
+                record_id: 1,
+                catalog_digest: "a".repeat(64),
+            },
+            units,
+            work_budget_ms: None,
+        }
+    }
+
+    /// Regression: an empty plan passed validation and reached the transaction,
+    /// which then had nothing to seed and wrote an attempt for it.
+    #[test]
+    fn a_plan_with_no_units_is_refused() {
+        assert!(matches!(
+            validate_request(&request(Vec::new())),
+            Err(LeaseError::InvalidInput(_))
+        ));
+        let one = SeedUnitRef {
+            fingerprint_dir: "debug/.fingerprint/cfg-if-aaaaaaaaaaaaaaaa".to_owned(),
+            role: SeedRole::Lib,
+        };
+        assert!(validate_request(&request(vec![one])).is_ok());
+    }
+
+    fn state(version: u32) -> ControlState {
+        let mut value = serde_json::json!({
+            "version": version,
+            "eviction_accounting": "oxide.eviction-accounting/1",
+            "records": [{"id": 1}],
+        });
+        if version >= 8 {
+            value["slot_ceiling"] = serde_json::json!("oxide.slots/256");
+        }
+        if version >= 9 {
+            value["holding"] = serde_json::json!("oxide.holding/1");
+        }
+        if version >= super::super::control::WRITER_STATE_VERSION {
+            value["minimum_writer_generation"] = serde_json::json!(1);
+        }
+        serde_json::from_value(value).expect("a donor state")
+    }
+
+    /// Regression: the donor reader required the retired one-use fence to be
+    /// absent, while the control writer still accepts its known inert value on
+    /// an upgraded v7-v10 pool. A valid donor was skipped as unknown custody.
+    #[test]
+    fn the_inert_one_use_fence_is_accepted_on_upgraded_pools() {
+        for version in 7..=super::super::control::WRITER_STATE_VERSION {
+            let mut state = state(version);
+            assert!(
+                donor_state_supported(&state),
+                "version {version} without the fence"
+            );
+            state.one_use_workspaces = Some(super::super::CONTROL_ONE_USE_FENCE.to_owned());
+            assert!(
+                donor_state_supported(&state),
+                "version {version} with the known inert fence"
+            );
+            state.one_use_workspaces = Some("oxide.one-use/2".to_owned());
+            assert!(
+                !donor_state_supported(&state),
+                "version {version} with an unknown fence"
+            );
+        }
     }
 }

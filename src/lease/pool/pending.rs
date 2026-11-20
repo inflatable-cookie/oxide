@@ -238,7 +238,7 @@ pub fn settle(pool: &Path) -> Result<Vec<String>, LeaseError> {
     // this pass reads the config or creates and takes the pool lock: a
     // symlinked, foreign or retired pool must refuse untouched, and no other
     // window may leave a lock file in one (oxide#337).
-    crate::lease::canonical_existing_dir(pool, false)?;
+    crate::lease::canonical_existing_dir(pool, true)?;
     super::refuse_foreign_pool_entries(pool)?;
     super::refuse_retired_image_pool(pool)?;
     let config = read_config(pool)?;
@@ -257,6 +257,8 @@ pub fn settle(pool: &Path) -> Result<Vec<String>, LeaseError> {
         }
         records
     };
+    #[cfg(test)]
+    maybe_bump_writer(pool);
     let backing = pool_backing(pool, &config)?;
     let storage = crate::storage::PoolStorage::open(&pool.join(MANAGED_NAME), &backing)
         // Barge's own failure keeps its own message: this is custody that could
@@ -327,6 +329,10 @@ pub fn settle(pool: &Path) -> Result<Vec<String>, LeaseError> {
     }
     if !settled.is_empty() {
         let _lock = lock_pool(pool)?;
+        // The first window's writer check is stale: another binary may have
+        // published a newer writer generation while the evictions ran. Refuse
+        // before removing any record rather than acting on the old decision.
+        check_control_writer(&pool.join(MANAGED_NAME))?;
         remove_settled(pool, &settled)?;
     }
     Ok(messages)
@@ -339,6 +345,39 @@ thread_local! {
     /// records leaves it `true`.
     static FAIL_SWEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static POOL_LOCK_FREE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Publish a newer writer generation between the two lock windows of the
+    /// next settle on this thread.
+    static BUMP_WRITER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test seam: make the next settle on this thread see a newer writer generation
+/// after its first pool-lock window, as a concurrently installed binary would.
+#[cfg(test)]
+fn bump_writer_on_next_settle() {
+    BUMP_WRITER.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+fn maybe_bump_writer(pool: &Path) {
+    if !BUMP_WRITER.with(|flag| flag.replace(false)) {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let control = pool.join(MANAGED_NAME);
+    fs::create_dir_all(&control).expect("the control directory");
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).expect("control mode");
+    let path = control.join("state.json");
+    let mut state: serde_json::Value = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(
+            || serde_json::json!({"version": crate::lease::control::WRITER_STATE_VERSION}),
+        );
+    state["version"] = serde_json::json!(crate::lease::control::WRITER_STATE_VERSION);
+    state["minimum_writer_generation"] =
+        serde_json::json!(crate::lease::control::WRITER_GENERATION + 1);
+    fs::write(&path, serde_json::to_vec(&state).expect("control JSON")).expect("write state");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("state mode");
 }
 
 /// Whether the last settle on this thread made every Barge eviction without
@@ -351,4 +390,102 @@ pub(crate) fn last_settle_held_no_pool_lock() -> bool {
 #[cfg(test)]
 pub(crate) fn fail_next_sweep() {
     FAIL_SWEEP.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+mod regressions {
+    use super::*;
+    use crate::lease::managed;
+    use crate::lease::{LeaseRequest, Profile, SlotLayout};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fixture(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let root = base.join(format!(
+            "lease-pending-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("fixture");
+        let root = fs::canonicalize(&root).expect("canonical fixture");
+        let project = root.join("project");
+        fs::create_dir_all(&project).expect("project");
+        (root.clone(), root.join("pool"), project)
+    }
+
+    fn request(pool: &Path, project: &Path) -> LeaseRequest {
+        LeaseRequest {
+            pool: pool.to_path_buf(),
+            project: project.to_path_buf(),
+            workspace: project.to_path_buf(),
+            profile: Profile::Dev,
+            holder: "holder".to_owned(),
+            budget_bytes: None,
+            reserve_bytes: None,
+            layout: Some(SlotLayout {
+                folders: vec!["repo".to_owned()],
+                profile: "dev".to_owned(),
+            }),
+            replace_slot: None,
+        }
+    }
+
+    /// Init a pool, commit one idle-eviction decision for a released slot, and
+    /// leave the record for a settle to finish.
+    fn ready_pool(pool: &Path, project: &Path) {
+        managed::init_budget_pool(pool, 8 << 20).expect("pool");
+        let leased = managed::lease(request(pool, project)).expect("lease");
+        let slot = leased.grant.slot_id.clone();
+        managed::release(pool, &leased.grant.lease_id).expect("release");
+        drop(leased);
+        managed::evict_idle_slot(pool, &slot).expect("decision");
+        assert!(records_path(pool).is_file(), "a decision is recorded");
+    }
+
+    /// Regression: settle accepted a pool directory that every other mutating
+    /// open refuses, so it could lock and write in a group-writable directory.
+    #[test]
+    fn settle_refuses_a_pool_directory_that_is_not_owner_only() {
+        if crate::lease::current_uid() == 0 {
+            return; // The superuser is not stopped by the group-writable bit.
+        }
+        let (root, pool, _project) = fixture("owner-only");
+        managed::init_budget_pool(&pool, 8 << 20).expect("pool");
+        fs::set_permissions(&pool, fs::Permissions::from_mode(0o770)).expect("mode");
+        let refused = managed::settle_pending_evictions(&pool);
+        assert!(
+            matches!(refused, Err(LeaseError::UnsafePath(_))),
+            "{refused:?}"
+        );
+        fs::set_permissions(&pool, fs::Permissions::from_mode(0o700)).expect("mode");
+        fs::remove_dir_all(&root).expect("remove own fixture");
+    }
+
+    /// Regression: the first pool-lock window's writer check was stale, so a
+    /// settle that outlived another binary's writer fence removed records on a
+    /// decision it must no longer act on.
+    #[test]
+    fn settle_rechecks_the_writer_generation_before_removing_records() {
+        let (root, pool, project) = fixture("writer-recheck");
+        ready_pool(&pool, &project);
+        bump_writer_on_next_settle();
+        let refused = managed::settle_pending_evictions(&pool);
+        assert!(
+            matches!(refused, Err(LeaseError::WriterUpdated)),
+            "{refused:?}"
+        );
+        let bytes = fs::read(records_path(&pool)).expect("the record survives");
+        let records: serde_json::Value = serde_json::from_slice(&bytes).expect("records");
+        assert!(
+            records["records"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty()),
+            "{records}"
+        );
+        fs::remove_dir_all(&root).expect("remove own fixture");
+    }
 }

@@ -163,10 +163,13 @@ digest and the receipt digest are reported under separate labels.
 
 ### Slots and layout
 
-- New slots live at `slots/<label>-<short-id>/<profile>-<n>`. The label is the
-  sanitised last segment of `origin`, else the repository directory name. Existing
-  `slots/<n>` directories are never renamed or moved. Cargo records absolute
-  paths in them. A ledger without a directory field works unchanged.
+- New slots are single-level Barge roots at
+  `slots/<label>-<profile>-<16-hex>`. The label is the sanitised last segment
+  of `origin`, else the repository directory name; the profile is the
+  command's profile; the 16-hex id is Barge's root id. Legacy `slots/<n>` and
+  nested `slots/<folder>/<profile>-<n>` directories are never renamed or moved.
+  Cargo records absolute paths in them. A ledger without a directory field
+  works unchanged.
 - Eviction removes only the slot directory. Project folders are left in place.
 - A slot holds Cargo's build directory, the child temporary directory (see
   [temporary files](#child-temporary-files)) and the slot's
@@ -825,8 +828,9 @@ Oxide's own repository is the only adopter that installs the binary.
   FAIL before the attempt, and PASS only after both checks and cleanup. The crate is
   removed only after writer closure is confirmed.
 - **Canary modes** (oxide#323). All modes share one receipt per pin:
-  - *Live* (default): as above. It refuses when the staged control-state version
-    differs from the installed receipt's.
+  - *Live* (default): as above. It refuses when any staged capability differs
+    from the installed receipt's: `control_state_version`,
+    `registration_version`, `ledger_version` and `writer_generation`.
   - *`--scratch-root DIR`*: a fresh pool under `DIR`, created at an explicit path
     with `OXIDE_POOL_CREATE=1`. No live pool is read or written and no live-version
     check applies.

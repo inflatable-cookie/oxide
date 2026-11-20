@@ -56,6 +56,7 @@ pub(crate) use control_io::{
     publish_writer_generation, statfs, writer_updated,
 };
 pub(crate) use recovery::Return;
+pub(crate) use release::ReleaseDisposition;
 pub(crate) use seeding::SeedRun;
 pub(crate) use status::{
     active_holders, recorded_last_use, recorded_lost, Accounting, LastUse, Report, SlotView,

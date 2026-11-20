@@ -66,12 +66,18 @@ pub(crate) fn profile_members(target: &Path) -> Vec<PathBuf> {
     for root in roots {
         for profile in PROFILES {
             let member = root.join(profile);
-            if member.is_dir() {
+            if is_directory(&member) {
                 members.push(member);
             }
         }
     }
     members
+}
+
+/// Whether `path` is a real directory, without following a symlink: a linked
+/// profile member or fingerprint is not layout Cargo wrote here.
+fn is_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
 /// Whether a profile member holds layout v2 units: `build/<pkg>/<meta>/fingerprint`.
@@ -82,7 +88,7 @@ pub(crate) fn holds_v2_build(member: &Path) -> bool {
         .any(|package| {
             child_dirs(&package)
                 .into_iter()
-                .any(|unit| unit.join("fingerprint").is_dir())
+                .any(|unit| is_directory(&unit.join("fingerprint")))
         })
 }
 
@@ -99,6 +105,13 @@ pub(crate) struct Stray {
     pub(crate) complete: bool,
 }
 
+/// One call's share of the scan budget. It never truncates to zero: a zero
+/// millisecond limit would stop a call before it read anything (many members
+/// under a small budget used to do exactly that).
+fn per_call_ms(budget_ms: u64, calls: u64) -> u64 {
+    (budget_ms.min(MAX_INVENTORY_MS) / calls.max(1)).max(1)
+}
+
 /// Count stray intermediates. `budget_ms` bounds the whole scan. Layout v2
 /// `build/` is counted only beneath members that hold v2 units, so v1
 /// output keeps its existing meaning.
@@ -108,7 +121,7 @@ pub(crate) fn scan_stray(target: &Path, budget_ms: u64) -> Result<Stray, String>
         .filter(|member| holds_v2_build(member))
         .collect();
     let calls = u64::try_from(members.len() + 1).unwrap_or(u64::MAX);
-    let per_call = budget_ms.min(MAX_INVENTORY_MS) / calls;
+    let per_call = per_call_ms(budget_ms, calls);
     let limits = InventoryLimits {
         max_entries: MAX_INVENTORY_ENTRIES,
         max_depth: MAX_INVENTORY_DEPTH,
@@ -148,7 +161,7 @@ fn child_dirs(dir: &Path) -> Vec<PathBuf> {
         .take(MAX_ENTRIES)
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
+        .filter(|path| is_directory(path))
         .collect()
 }
 
@@ -273,6 +286,57 @@ mod tests {
         assert!(members.contains(&target.0.join("debug")));
         assert!(members.contains(&target.0.join("x86_64-test/release")));
         assert!(!members.iter().any(|member| member.ends_with("doc/debug")));
+    }
+
+    /// Regression: layout shapes were read with symlink-following `is_dir()`, so
+    /// a linked profile member, triple directory or fingerprint counted as
+    /// Cargo's layout and the scan walked outside the tree it was given.
+    #[test]
+    fn symlinked_members_and_fingerprints_are_not_layout() {
+        use std::os::unix::fs::symlink;
+
+        let target = Fixture::new("linked");
+        let outside = Fixture::new("linked-outside");
+        outside.file("elsewhere/debug/deps/app-1.d");
+        outside.file("linked-profile/release/keep");
+        outside.file("unit/fingerprint/lib-app");
+
+        // `debug` is a link to another tree's debug directory.
+        symlink(outside.0.join("elsewhere/debug"), target.0.join("debug")).unwrap();
+        // A triple directory that is a link.
+        symlink(
+            outside.0.join("linked-profile"),
+            target.0.join("x86_64-linked"),
+        )
+        .unwrap();
+        // A v2 unit whose fingerprint directory is a link.
+        fs::create_dir_all(target.0.join("release/build/app/meta")).unwrap();
+        symlink(
+            outside.0.join("unit/fingerprint"),
+            target.0.join("release/build/app/meta/fingerprint"),
+        )
+        .unwrap();
+
+        let members = profile_members(&target.0);
+        assert!(!members.contains(&target.0.join("debug")), "{members:?}");
+        assert!(
+            !members
+                .iter()
+                .any(|member| member.to_string_lossy().contains("x86_64-linked")),
+            "{members:?}"
+        );
+        assert!(members.contains(&target.0.join("release")), "{members:?}");
+        assert!(!holds_v2_build(&target.0.join("release")));
+    }
+
+    /// Regression: many members under a small remaining budget truncated a
+    /// call's share to `0 ms`, which stopped the scan before it read anything.
+    #[test]
+    fn a_small_budget_never_collapses_a_call_to_zero_ms() {
+        assert_eq!(per_call_ms(0, 8), 1);
+        assert_eq!(per_call_ms(1, 4), 1);
+        assert_eq!(per_call_ms(1_000, 1), 1_000);
+        assert_eq!(per_call_ms(9_000, 3), MAX_INVENTORY_MS / 3);
     }
 
     #[test]
