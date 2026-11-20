@@ -1,1 +1,0 @@
-Fixed the owned-outputs paired fence upgrade to check writer closure, and made every reader of the paired pool's control state refuse on an unreadable or parser-rejected document instead of treating it as clear.

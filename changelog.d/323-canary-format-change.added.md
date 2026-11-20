@@ -1,1 +1,0 @@
-`oxide:canary --format-change` upgrades a read-only copy of the live control and ledger documents with the staged binary and reports PASS or FAIL, so a format-changing release can be canaried without writing the live pool.

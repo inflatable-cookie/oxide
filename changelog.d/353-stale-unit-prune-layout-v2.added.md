@@ -1,1 +1,0 @@
-Prune stale unused Cargo layout v2 unit directories (`<profile>/build/<pkg>/<16-hex>`) in warm slots under the exclusive Barge hold after clean builds, leaving active units, layout v1 slots, and unknown entries untouched within bounded walk and time limits.

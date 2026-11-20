@@ -1,1 +1,0 @@
-Split `src/bin/oxide/main.rs` into `status.rs` (`oxide status` reporting) and `runner.rs` (leased invocation stages, `run_owned_program`, `TrashSettler`, and summary reporting), keeping `main.rs` as the CLI dispatch entrypoint with no behaviour changes.

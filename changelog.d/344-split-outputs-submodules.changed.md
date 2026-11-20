@@ -1,1 +1,0 @@
-Split `src/bin/oxide/outputs.rs` into focused submodules under `src/bin/oxide/outputs/` (`adopt`, `bind`, `clean`, `exec`, `git`, `plan`, `receipt`, `root`, `transition` and `tests/`) and deduplicated `clean_placement` root validation (`validate_clean_selected`), `binding_for_selected` and `sha256_hex` without changing `pub(crate)` signatures or product behaviour.

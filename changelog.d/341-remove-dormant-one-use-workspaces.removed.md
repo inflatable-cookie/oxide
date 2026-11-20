@@ -1,1 +1,0 @@
-Removed the dormant one-use workspaces subsystem, including guarded output overrides and multi-root inventory, and retired the pre-Barge pool allocation path. Existing control state stays readable with `one_use_workspaces` as an inert fence.

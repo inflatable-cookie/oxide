@@ -1,1 +1,0 @@
-Record the prospective sleep-counting host clock ruling for the bounded common-clock source tranche, preserving original-origin and narrowing requirements, historical evidence and later qualification gates.

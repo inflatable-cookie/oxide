@@ -1,1 +1,0 @@
-Cold-slot seeding supports Cargo 1.100.0's build-directory layout v2. A cold slot clones complete eligible registry library units, including split-debuginfo objects, from an idle same-volume donor. Cargo decides whether to reuse them.

@@ -1,1 +1,0 @@
-Removed retired proof-supervisor hooks and their env-driven test controls, the dormant Git seed verifier, the unused `oxide-storage-inventory` binary, the internal `dep_info` decoder and the `offline_seed.py` offline seeder with its `offline-seed:test` selector.

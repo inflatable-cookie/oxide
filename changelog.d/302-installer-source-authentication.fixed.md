@@ -1,1 +1,0 @@
-The installer's `authenticate_pin` fetches the advertised main tip into a private per-invocation ref deleted in the same call and decides only from that ref, so concurrent fetch activity can no longer change the source identity through shared `FETCH_HEAD`.
