@@ -363,6 +363,9 @@ prefix. Oxide itself is pinned to 1.100.0 in `rust-toolchain.toml`.
   inherited rustc wrapper, and a `PATH` whose `rustc` belongs to another install
   than its `cargo`.
 - A new Cargo release joins the table only after its source facts are rechecked.
+- `oxide clean --cargo-cache` (`QUALIFIED_CARGO` in `src/bin/oxide/cargo_home.rs`)
+  is qualified on Cargo 1.97.1 (`c980f4866`) and Cargo 1.100.0 (`3acc79c0c`); see
+  [Cargo home hygiene](#cargo-home-hygiene).
 
 ### Stale-unit pruning (layout v2)
 
@@ -730,9 +733,10 @@ itself.
 - `oxide clean --cargo-cache` takes no other argument. It runs one pass of Cargo's
   own automatic cleanup, with `cache.auto-clean-frequency="always"`, and with
   network refused. Oxide's loopback listener closes every connection, and the
-  libcurl proxy variables are removed. It runs only under Cargo 1.97.1, so it
-  refuses inside Oxide's own checkout, which builds on the pinned 1.100.0, until
-  that release is qualified. It refuses before Cargo runs when the environment or
+  libcurl proxy variables are removed. It runs under Cargo 1.97.1 (`c980f4866`)
+  and Cargo 1.100.0 (`3acc79c0c`), so it now runs inside Oxide's own pinned
+  1.100.0 checkout as well, and continues to refuse unqualified Cargo releases.
+  It refuses before Cargo runs when the environment or
   config could disable, redirect or fetch:
   - environment that disables cleanup, uses the Git CLI, or redirects registries,
     sources or unstable features;

@@ -23,8 +23,9 @@ Cargo releases independently. Cold-slot seeding has one adapter per layout: Carg
 own Cargo. The layout v2 adapter clones complete eligible library units,
 including rustc's split-debuginfo objects. A consumer that sets Cargo's layout
 opt-out builds cold ([cold-slot contract](contracts/cold-slot-seeding.md#10-cargo-layout-adapters)).
-`clean --cargo-cache` still runs only under Cargo 1.97.1 until that release is
-qualified.
+`clean --cargo-cache` is qualified on both Cargo 1.97.1 (`c980f4866`) and Cargo
+1.100.0 (`3acc79c0c`), so it also runs inside Oxide's own pinned 1.100.0
+checkout ([Cargo home hygiene](contracts/workflow.md#cargo-home-hygiene)).
 
 The unpublished root package uses Rust edition 2021 and declares
 `rust-version = "1.100.0"`. Its internal name is `oxide-storage`; publication
