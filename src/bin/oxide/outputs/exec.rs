@@ -627,6 +627,12 @@ pub fn refuse_unknown_layout(
 /// (unlinked) member keeps Cargo's own path.
 pub fn program_target(checkout: &Path, root: &Path, program: &Path) -> Option<PathBuf> {
     let relative = program.strip_prefix(&checkout.join("target")).ok()?;
+    if !relative
+        .components()
+        .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return None;
+    }
     let mut components = relative
         .components()
         .filter_map(|component| match component {
@@ -650,12 +656,6 @@ pub fn program_target(checkout: &Path, root: &Path, program: &Path) -> Option<Pa
     if fs::read_link(checkout.join("target")).ok().as_deref() == Some(root) {
         let checkout_id = identity::digest(&checkout.to_string_lossy());
         owned_root(checkout, &checkout_id, root).ok()?;
-        if !relative
-            .components()
-            .all(|part| matches!(part, Component::Normal(_)))
-        {
-            return None;
-        }
         let mapped = root.join(relative);
         return mapped.is_file().then_some(mapped);
     }

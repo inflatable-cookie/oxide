@@ -289,6 +289,94 @@ fn release_admission_wait_is_bounded_when_the_holder_never_lets_go() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn wait_release_admission_caps_to_bound_when_budget_exceeds_bound() {
+    let (root, _store, _key) = lease_fixture("release-admission-long-budget");
+    let path = root.join("bound-lock");
+    let holder = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let waiter = OpenOptions::new().write(true).open(&path).unwrap();
+    flock_blocking(&holder).unwrap();
+    let started = Instant::now();
+    // Simulate an active admission budget longer than the 120s lock bound:
+    // `expired` stays false, yet the wait must stop at `bound`.
+    let refusal = wait_release_admission(
+        &waiter,
+        Duration::ZERO,
+        Duration::from_millis(60),
+        || true,
+        || false,
+        || {},
+    )
+    .unwrap_err();
+    assert!(
+        refusal.starts_with("gave up waiting for the admission lock after "),
+        "{refusal}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    drop(holder);
+    drop(waiter);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn post_build_release_succeeds_under_contention_after_expired_admission_budget() {
+    crate::budget::clear();
+    crate::budget::install(crate::budget::Options {
+        admission: Some(Duration::from_millis(1)),
+        execution: None,
+        events: None,
+    })
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    assert!(crate::budget::admission_expired());
+    crate::budget::arm_execution(Instant::now(), crate::budget::Phase::PrimaryCargo);
+
+    let (root, store, key) = seed_fixture();
+    let held = seed_fixture_lease(&store, &key);
+    let lock_file = open_admission_file(store.control()).unwrap().unwrap();
+    flock_blocking(&lock_file).unwrap();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(40));
+        drop(lock_file);
+    });
+    let disposition = store
+        .release(held, None)
+        .expect("post-build release must survive contention after arm_execution");
+    assert_eq!(disposition, ReleaseDisposition::Released);
+    releaser.join().unwrap();
+
+    // Even before arm_execution (e.g. a pre-child abort right as the window
+    // closes), an already-expired admission deadline does not block release().
+    crate::budget::clear();
+    crate::budget::install(crate::budget::Options {
+        admission: Some(Duration::from_millis(1)),
+        execution: None,
+        events: None,
+    })
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    assert!(crate::budget::admission_expired());
+    let held = seed_fixture_lease(&store, &key);
+    let lock_file = open_admission_file(store.control()).unwrap().unwrap();
+    flock_blocking(&lock_file).unwrap();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(40));
+        drop(lock_file);
+    });
+    let disposition = store
+        .release(held, None)
+        .expect("release with an already-expired budget must still wait on the bound");
+    assert_eq!(disposition, ReleaseDisposition::Released);
+    releaser.join().unwrap();
+
+    crate::budget::clear();
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// A ledger as an earlier Oxide wrote it reads back, keeps its stored
 /// digests and serializes to the same bytes (oxide#103 sha2 0.11.0).
 #[test]
@@ -1981,12 +2069,12 @@ fn a_lost_slot_is_never_active_or_reused() {
         .describe(false)
         .contains("deleted whole"));
     lost.lost.as_mut().unwrap().unclosed = Some("why".to_owned());
-    assert!(lost
-        .lost
-        .as_ref()
-        .unwrap()
-        .describe(false)
-        .starts_with("quarantined"));
+    let description = lost.lost.as_ref().unwrap().describe(false);
+    assert!(description.starts_with("quarantined"), "{description}");
+    assert!(
+        !description.contains("release-quarantined"),
+        "post-Barge quarantined descriptions must not recommend release-quarantined: {description}"
+    );
     let encoded = serde_json::to_string(&lost).unwrap();
     let decoded: Record = serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded.lost.unwrap().unclosed.as_deref(), Some("why"));

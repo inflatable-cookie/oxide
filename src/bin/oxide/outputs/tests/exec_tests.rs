@@ -947,6 +947,33 @@ fn profile_members_select_distinct_destinations_and_run_maps_only_owned_members(
         None,
         "a real member program must keep Cargo's path"
     );
+    // Non-normal components (`..`) must be rejected on profile members
+    // just as on whole-target layouts, even when the target file exists.
+    let escaped = root.join("outside-app");
+    fs::write(&escaped, b"escaped").unwrap();
+    for bad in [
+        context.link().join("debug").join("..").join("outside-app"),
+        context
+            .link()
+            .join("triple")
+            .join("debug")
+            .join("..")
+            .join("..")
+            .join("outside-app"),
+        context
+            .link()
+            .join("debug")
+            .join("..")
+            .join("debug")
+            .join("profileapp"),
+    ] {
+        assert_eq!(
+            program_target(&fixture.checkout, &root, &bad),
+            None,
+            "non-normal path {} must be refused",
+            bad.display()
+        );
+    }
     assert!(owned.is_file());
 }
 
