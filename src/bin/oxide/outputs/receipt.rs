@@ -272,13 +272,6 @@ impl Receipt {
         }
     }
 
-    /// The first placement: the legacy `target` link, or the first profile
-    /// member in sorted order. Profile paths address members explicitly.
-    #[allow(dead_code)]
-    pub(in crate::outputs) fn link(&self) -> &LinkPlacement {
-        &self.links[0]
-    }
-
     /// The first placement's mutable handle. Every production writer addresses
     /// placements by member (`place_member`, `detached_receipt`); the tests
     /// still build single-placement fixtures through it.
@@ -369,12 +362,6 @@ impl Receipt {
         &mut self.reserved
     }
 
-    /// Whether this receipt places the given profile member.
-    #[allow(dead_code)]
-    pub(crate) fn holds_member(&self, member: &str) -> bool {
-        self.placement(member).is_some()
-    }
-
     /// Add a placement for one profile member, keeping members sorted.
     pub(in crate::outputs) fn place_member(&mut self, member: &str) -> &mut LinkPlacement {
         let position = self
@@ -395,12 +382,6 @@ impl Receipt {
                     .unwrap_or(0)
             });
         &mut self.links[position]
-    }
-
-    /// Drop one member's placement after an explicit detach of that member.
-    #[allow(dead_code)]
-    pub(in crate::outputs) fn forget_member(&mut self, member: &str) {
-        self.links.retain(|placement| placement.member != member);
     }
 
     pub(in crate::outputs) fn validate(

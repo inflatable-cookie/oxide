@@ -60,15 +60,6 @@ pub(crate) use receipt::{
 };
 pub use receipt::{RootKind, Selected};
 
-#[allow(unused_imports)]
-pub use bind::Outcome;
-#[allow(unused_imports)]
-pub(crate) use exec::PlannedMember;
-#[allow(unused_imports)]
-pub use exec::{exec_declaration, refuse_unknown_layout};
-#[allow(unused_imports)]
-pub(crate) use receipt::{member_destination, Marker, Prepared};
-
 use crate::identity;
 use crate::removable::{self, DriveMode};
 use crate::store::{self, CheckoutCustody, CleanGuard, Cleaning, Store, WaitAccounting};

@@ -1261,14 +1261,13 @@ pub(in crate::outputs) fn check_bound_root(
 ) -> Result<(), String> {
     let root = &wanted.root;
     let binding = binding_for_selected(context, wanted)?;
-    validate_selected(
+    let marker = validate_selected(
         &context.workspace,
         &context.checkout_id,
         wanted,
         binding.as_ref(),
         receipt_generation,
     )?;
-    let marker = read_marker(root)?;
     if wanted.nonce.is_some() && marker.nonce != wanted.nonce {
         return Err(format!(
             "{} carries another root nonce than the keyed one; run the command again",

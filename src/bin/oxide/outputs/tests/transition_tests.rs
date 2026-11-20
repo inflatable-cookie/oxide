@@ -1373,3 +1373,66 @@ fn a_member_directory_never_follows_a_symlinked_ancestor() {
     );
     assert!(created.is_dir());
 }
+
+#[test]
+fn a_committed_profile_member_replays_when_its_old_link_is_live() {
+    let fixture = Fixture::new();
+    let context = fixture.context();
+    let old_spec = fixture.local();
+    ensure_root(&context, &old_spec, 1).unwrap();
+    let old_root = old_spec.root().to_path_buf();
+    publish_committed_profile_members(&fixture, &old_root);
+
+    let new_root = fixture.checkout.join(".oxide-outputs/local-2");
+    let new_spec = RootSpec::Local {
+        root: new_root.clone(),
+    };
+    ensure_root(&context, &new_spec, 2).unwrap();
+    ensure_member_directory(&new_root, "release").unwrap();
+    let new_nonce = read_marker(&new_root).unwrap().nonce;
+    let new_selected = new_spec.selected(2).with_nonce(new_nonce);
+
+    // 1. Crash at "prepared" (no sibling yet) with the old profile link live:
+    //    replay rolls back cleanly instead of miscomparing against bare root.
+    let mut prepared_only = committed_profile_receipt(&fixture, &old_root);
+    let release_link = link_path(&fixture.checkout, "release");
+    prepared_only.state = ReceiptState::Prepared;
+    prepared_only.place_member("release").prepared = Some(Prepared {
+        generation: 2,
+        to: new_selected.clone(),
+        link: release_link.clone(),
+    });
+    write_receipt(&fixture.control, &prepared_only).unwrap();
+    let rolled = replay(&context, prepared_only).unwrap();
+    assert_eq!(rolled.state, ReceiptState::Committed);
+    assert_eq!(rolled.generation, 1);
+    assert_eq!(rolled.selected_for("release").unwrap().root, old_root);
+    assert_eq!(
+        fs::read_link(&release_link).unwrap(),
+        member_destination(&old_root, "release")
+    );
+
+    // 2. Crash at "linked" (live sibling) with the old profile link live:
+    //    replay completes the rename and commits the prepared root.
+    let mut linked = committed_profile_receipt(&fixture, &old_root);
+    linked.state = ReceiptState::Prepared;
+    linked.place_member("release").prepared = Some(Prepared {
+        generation: 2,
+        to: new_selected,
+        link: release_link.clone(),
+    });
+    write_receipt(&fixture.control, &linked).unwrap();
+    let sibling = sibling_link(&release_link, 2);
+    symlink(member_destination(&new_root, "release"), &sibling).unwrap();
+
+    let committed = replay(&context, linked).unwrap();
+    assert_eq!(committed.state, ReceiptState::Committed);
+    assert_eq!(committed.generation, 2);
+    assert!(committed.prepared_ref().is_none());
+    assert_eq!(committed.selected_for("release").unwrap().root, new_root);
+    assert_eq!(
+        fs::read_link(&release_link).unwrap(),
+        member_destination(&new_root, "release")
+    );
+    assert!(!sibling.exists());
+}

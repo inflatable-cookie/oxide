@@ -1,8 +1,8 @@
 //! Read-only `oxide outputs plan` and `oxide outputs status` reporting.
 
 use super::receipt::{
-    link_path, read_receipt_for_prune, receipt_state_label, LayoutKind, Receipt, ReceiptState,
-    RootKind, Selected, SelectedView,
+    link_path, member_destination, read_receipt_for_prune, receipt_state_label, LayoutKind,
+    Receipt, ReceiptState, RootKind, Selected, SelectedView,
 };
 use super::root::{external_choice_read_only, external_spec, link_state, local_spec};
 use super::transition::destination_generation;
@@ -255,49 +255,79 @@ pub(in crate::outputs) fn plan_report(context: &Context) -> Result<PlanReport, S
         );
         return Ok(report);
     };
-    match (&target, target.link_root()) {
-        (_, Some(root)) if root == selected.root.as_path() => {
-            if receipt.layout() == LayoutKind::WholeTarget {
-                report.action = "refuse";
-                report.reason = Some(
-                    "this checkout uses the legacy whole-target layout; run `oxide outputs detach` then `oxide outputs adopt` to switch to profile member links"
-                        .to_owned(),
-                );
-                return Ok(report);
-            }
+    if receipt.layout() == LayoutKind::Profile {
+        if matches!(target, TargetState::RealEmpty | TargetState::RealNonEmpty) {
             let wanted = match &usable {
                 Ok(registration) => {
                     external_spec(registration, &context.workspace).selected(next_generation)
                 }
                 Err(_) => local.selected(next_generation),
             };
-            report.action = if wanted.same_place(&selected) {
-                "noop"
-            } else {
-                "relink"
-            };
+            let mut members = vec!["debug".to_owned(), "release".to_owned()];
+            for placement in receipt.links() {
+                members.push(placement.member().to_owned());
+            }
+            members.sort();
+            members.dedup();
+            let mut needs_relink = false;
+            for member in &members {
+                let link = link_path(&context.workspace, member);
+                let state = link_state(&link, &context.workspace, &context.checkout_id)?;
+                match state {
+                    TargetState::Foreign => {
+                        report.action = "refuse";
+                        report.reason = Some(format!(
+                            "{} is {}; it is never followed or replaced",
+                            link.display(),
+                            state.label()
+                        ));
+                        return Ok(report);
+                    }
+                    TargetState::RealNonEmpty => {}
+                    TargetState::OwnedLink(root)
+                        if root == member_destination(&wanted.root, member)
+                            && receipt
+                                .selected_for(member)
+                                .is_some_and(|bound| bound.same_place(&wanted)) => {}
+                    TargetState::RealEmpty
+                    | TargetState::Missing
+                    | TargetState::OwnedLink(_)
+                    | TargetState::Dangling(_) => {
+                        needs_relink = true;
+                    }
+                }
+            }
+            report.action = if needs_relink { "relink" } else { "noop" };
             if let Err(reason) = &usable {
                 report.reason = Some(format!(
                     "the volume is not usable ({reason}); the next command would select {}",
                     local.root().display()
                 ));
             }
+            return Ok(report);
+        }
+        report.reason = Some(format!(
+            "the receipt selects {} but the target is {}; `oxide outputs adopt` rechecks and relinks it",
+            selected.root.display(),
+            target.label()
+        ));
+        return Ok(report);
+    }
+    match (&target, target.link_root()) {
+        (_, Some(root)) if root == selected.root.as_path() => {
+            report.action = "refuse";
+            report.reason = Some(
+                "this checkout uses the legacy whole-target layout; run `oxide outputs detach` then `oxide outputs adopt` to switch to profile member links"
+                    .to_owned(),
+            );
             Ok(report)
         }
         _ => {
-            if receipt.layout() == LayoutKind::WholeTarget {
-                report.reason = Some(format!(
-                    "the legacy whole-target receipt selects {} and the target is {}; run `oxide outputs detach` then `oxide outputs adopt` to switch to profile member links",
-                    selected.root.display(),
-                    target.label()
-                ));
-            } else {
-                report.reason = Some(format!(
-                    "the receipt selects {} but the target is {}; `oxide outputs adopt` rechecks and relinks it",
-                    selected.root.display(),
-                    target.label()
-                ));
-            }
+            report.reason = Some(format!(
+                "the legacy whole-target receipt selects {} and the target is {}; run `oxide outputs detach` then `oxide outputs adopt` to switch to profile member links",
+                selected.root.display(),
+                target.label()
+            ));
             Ok(report)
         }
     }
@@ -411,7 +441,9 @@ pub(in crate::outputs) fn output_status_lines(context: &Context) -> Result<Vec<S
                 let link = link_path(&context.workspace, placement.member());
                 let state = link_state(&link, &context.workspace, &context.checkout_id)?;
                 let text = match (&state, placement.selected_ref()) {
-                    (TargetState::OwnedLink(root), Some(selected)) if root == &selected.root => {
+                    (TargetState::OwnedLink(root), Some(selected))
+                        if root == &member_destination(&selected.root, placement.member()) =>
+                    {
                         format!("owned link to {}", root.display())
                     }
                     (TargetState::RealEmpty, _) => "real empty directory, not owned".to_owned(),

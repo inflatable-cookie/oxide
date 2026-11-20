@@ -572,7 +572,12 @@ pub(in crate::outputs) fn replay(context: &Context, receipt: Receipt) -> Result<
     let old_live = match (&target, receipt.selected_for(&member)) {
         (TargetState::Missing, None) => true,
         (TargetState::Missing, Some(_)) => true,
-        (_, Some(selected)) if target.link_root() == Some(selected.root.as_path()) => true,
+        (_, Some(selected))
+            if target.link_root()
+                == Some(member_destination(selected.root(), &member).as_path()) =>
+        {
+            true
+        }
         _ => false,
     };
     // An owned new root is validated in full (marker kind, volume UUID,
