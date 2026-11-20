@@ -2412,4 +2412,227 @@ mod tests {
             std::fs::remove_dir_all(root).expect("remove own fixture");
         }
     }
+
+    fn toolchain_installed_matching(toolchain: &str, version_prefix: &str) -> bool {
+        Command::new("rustup")
+            .args(["run", toolchain, "cargo", "-V"])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).starts_with(version_prefix)
+            })
+    }
+
+    fn clean_cargo_for(toolchain: &str, dir: &Path) -> Command {
+        let mut command = Command::new(CARGO);
+        command.current_dir(dir).env("RUSTUP_TOOLCHAIN", toolchain);
+        for name in [
+            "CARGO_TARGET_DIR",
+            "CARGO_BUILD_BUILD_DIR",
+            "CARGO_BUILD_TARGET_DIR",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_PROFILE_DEV_DEBUG",
+            "CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG",
+            "CARGO_PROFILE_DEBUG_DEBUG",
+            "CARGO_PROFILE_DEBUG_BUILD_OVERRIDE_DEBUG",
+            "CARGO_INCREMENTAL",
+        ] {
+            command.env_remove(name);
+        }
+        command
+    }
+
+    fn create_profile_probe_workspace(root: &Path, extra_app_toml: &str) -> (PathBuf, PathBuf) {
+        let dep = root.join("dep");
+        let app = root.join("app");
+        let slot_build = root.join("slot/build");
+        std::fs::create_dir_all(dep.join("src")).expect("dep src");
+        std::fs::create_dir_all(app.join("src")).expect("app src");
+        std::fs::create_dir_all(&slot_build).expect("slot build");
+        std::fs::write(
+            dep.join("Cargo.toml"),
+            "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("dep manifest");
+        std::fs::write(dep.join("src/lib.rs"), "pub fn value() -> u32 { 7 }\n").expect("dep lib");
+        std::fs::write(
+            app.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndep = {{ path = \"../dep\" }}\n{extra_app_toml}"
+            ),
+        )
+        .expect("app manifest");
+        std::fs::write(app.join("build.rs"), "fn main() {}\n").expect("build script");
+        std::fs::write(
+            app.join("src/main.rs"),
+            "fn main() { println!(\"{}\", dep::value()); }\n#[test]\nfn ok() { assert_eq!(dep::value(), 7); }\n",
+        )
+        .expect("app main");
+        (app, slot_build)
+    }
+
+    fn rustc_line<'a>(stderr: &'a str, crate_name: &str) -> &'a str {
+        let marker = format!("--crate-name {crate_name} ");
+        stderr
+            .lines()
+            .find(|line| line.trim_start().starts_with("Running `") && line.contains(&marker))
+            .unwrap_or_else(|| panic!("missing rustc line for {crate_name} in:\n{stderr}"))
+    }
+
+    #[test]
+    fn cargo_1_100_native_debug_profile_keeps_dev_recipe_requirements() {
+        const VERSION_PREFIX: &str = "cargo 1.100.0 (3acc79c0c ";
+        if !toolchain_installed_matching("1.100.0", VERSION_PREFIX) {
+            eprintln!("skipped: Cargo 1.100.0 is not installed");
+            return;
+        }
+        let fixture = crate::cargo_layout::support::Fixture::new("profile-1-100");
+        let (app, _slot_unused) = create_profile_probe_workspace(&fixture.0, "");
+
+        // 1. Native `cargo build --profile debug` on 1.100.0 outputs to
+        // `target/debug/`, yet omits debuginfo on build scripts (`build-override`).
+        let native = clean_cargo_for("1.100.0", &app)
+            .args(["build", "--profile", "debug", "-v"])
+            .output()
+            .expect("cargo 1.100.0 --profile debug");
+        let native_stderr = String::from_utf8_lossy(&native.stderr);
+        assert!(native.status.success(), "{native_stderr}");
+        assert!(app.join("target/debug/app").is_file());
+        assert!(
+            !rustc_line(&native_stderr, "build_script_build").contains("debuginfo="),
+            "expected native --profile debug to omit build-script debuginfo:\n{native_stderr}"
+        );
+        assert!(rustc_line(&native_stderr, "dep").contains("-C debuginfo=2"));
+        assert!(rustc_line(&native_stderr, "app").contains("-C debuginfo=2"));
+
+        // 2. Native `--profile debug` inherits `dev` (`CARGO_PROFILE_DEV_DEBUG`).
+        std::fs::remove_dir_all(app.join("target")).expect("clean target");
+        let inherited = clean_cargo_for("1.100.0", &app)
+            .args(["build", "--profile", "debug", "-v"])
+            .env("CARGO_PROFILE_DEV_DEBUG", "line-tables-only")
+            .output()
+            .expect("cargo 1.100.0 --profile debug with dev override");
+        let inherited_stderr = String::from_utf8_lossy(&inherited.stderr);
+        assert!(inherited.status.success(), "{inherited_stderr}");
+        assert!(rustc_line(&inherited_stderr, "dep").contains("-C debuginfo=line-tables-only"));
+        assert!(rustc_line(&inherited_stderr, "app").contains("-C debuginfo=line-tables-only"));
+
+        // 3. Oxide's `dev` recipe (`Profile::Debug`) overrides `[profile.dev]`
+        // settings, compiles workspace, dependency and build-script units with
+        // `-C debuginfo=2`, preserves `[profile.test]` inheritance on `test`,
+        // and keeps final outputs in `target/debug/` while slot intermediates
+        // stay in `slot_build`.
+        let (app_custom, slot_custom) = create_profile_probe_workspace(
+            &fixture.0.join("custom"),
+            "\n[profile.dev]\ndebug = false\n\n[profile.test]\nopt-level = 1\n",
+        );
+        let mut debug_build = clean_cargo_for("1.100.0", &app_custom);
+        debug_build.args(["build", "-v"]);
+        apply_storage(&mut debug_build, &slot_custom, &app_custom, Profile::Debug);
+        let debug_out = debug_build.output().expect("oxide debug build");
+        let debug_stderr = String::from_utf8_lossy(&debug_out.stderr);
+        assert!(debug_out.status.success(), "{debug_stderr}");
+        assert!(app_custom.join("target/debug/app").is_file());
+        assert!(slot_custom.join("debug").is_dir());
+        for unit in ["build_script_build", "dep", "app"] {
+            assert!(
+                rustc_line(&debug_stderr, unit).contains("-C debuginfo=2"),
+                "expected full debuginfo for {unit}:\n{debug_stderr}"
+            );
+        }
+
+        // `test` inherits `[profile.test]` (`opt-level=1`) alongside `dev` debuginfo,
+        // whereas native `cargo test --profile debug` drops `[profile.test]`.
+        let slot_test = fixture.0.join("slot-test/build");
+        std::fs::create_dir_all(&slot_test).expect("test slot");
+        let mut debug_test = clean_cargo_for("1.100.0", &app_custom);
+        debug_test.args(["test", "-v"]);
+        apply_storage(&mut debug_test, &slot_test, &app_custom, Profile::Debug);
+        let test_out = debug_test.output().expect("oxide debug test");
+        let test_stderr = String::from_utf8_lossy(&test_out.stderr);
+        assert!(test_out.status.success(), "{test_stderr}");
+        assert!(rustc_line(&test_stderr, "app").contains("-C opt-level=1"));
+        assert!(rustc_line(&test_stderr, "app").contains("-C debuginfo=2"));
+        assert!(rustc_line(&test_stderr, "build_script_build").contains("-C debuginfo=2"));
+
+        let native_test = clean_cargo_for("1.100.0", &app_custom)
+            .args(["test", "--profile", "debug", "-v"])
+            .output()
+            .expect("cargo test --profile debug");
+        let native_test_stderr = String::from_utf8_lossy(&native_test.stderr);
+        assert!(native_test.status.success(), "{native_test_stderr}");
+        assert!(
+            !rustc_line(&native_test_stderr, "app").contains("opt-level=1"),
+            "native test --profile debug bypassed [profile.test]:\n{native_test_stderr}"
+        );
+
+        // 4. `Profile::Quick` produces `line-tables-only` for library/binary
+        // units, omits build-script debuginfo, and outputs to `target/debug/`.
+        std::fs::remove_dir_all(app_custom.join("target")).expect("clean target");
+        let slot_quick = fixture.0.join("slot-quick/build");
+        std::fs::create_dir_all(&slot_quick).expect("quick slot");
+        let mut quick_build = clean_cargo_for("1.100.0", &app_custom);
+        quick_build.args(["build", "-v"]);
+        apply_storage(&mut quick_build, &slot_quick, &app_custom, Profile::Quick);
+        let quick_out = quick_build.output().expect("oxide quick build");
+        let quick_stderr = String::from_utf8_lossy(&quick_out.stderr);
+        assert!(quick_out.status.success(), "{quick_stderr}");
+        assert!(app_custom.join("target/debug/app").is_file());
+        assert!(!rustc_line(&quick_stderr, "build_script_build").contains("debuginfo="));
+        assert!(rustc_line(&quick_stderr, "dep").contains("-C debuginfo=line-tables-only"));
+        assert!(rustc_line(&quick_stderr, "app").contains("-C debuginfo=line-tables-only"));
+    }
+
+    #[test]
+    fn cargo_1_97_1_rejects_profile_debug_and_keeps_dev_recipe() {
+        const VERSION_PREFIX: &str = "cargo 1.97.1 (c980f4866 ";
+        if !toolchain_installed_matching("1.97.1", VERSION_PREFIX) {
+            eprintln!("skipped: Cargo 1.97.1 is not installed");
+            return;
+        }
+        let fixture = crate::cargo_layout::support::Fixture::new("profile-1-97-1");
+        let (app, slot_build) = create_profile_probe_workspace(&fixture.0, "");
+
+        let rejected = clean_cargo_for("1.97.1", &app)
+            .args(["build", "--profile", "debug"])
+            .output()
+            .expect("cargo 1.97.1 --profile debug");
+        assert!(!rejected.status.success());
+        let rejected_stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            rejected_stderr.contains("profile name `debug` is reserved"),
+            "{rejected_stderr}"
+        );
+
+        let mut debug_build = clean_cargo_for("1.97.1", &app);
+        debug_build.args(["build", "-v"]);
+        apply_storage(&mut debug_build, &slot_build, &app, Profile::Debug);
+        let debug_out = debug_build.output().expect("1.97.1 oxide debug build");
+        let debug_stderr = String::from_utf8_lossy(&debug_out.stderr);
+        assert!(debug_out.status.success(), "{debug_stderr}");
+        assert!(app.join("target/debug/app").is_file());
+        for unit in ["build_script_build", "dep", "app"] {
+            assert!(
+                rustc_line(&debug_stderr, unit).contains("-C debuginfo=2"),
+                "expected full debuginfo for {unit} on 1.97.1:\n{debug_stderr}"
+            );
+        }
+
+        let slot_quick = fixture.0.join("slot-quick/build");
+        std::fs::create_dir_all(&slot_quick).expect("quick slot");
+        let mut quick_build = clean_cargo_for("1.97.1", &app);
+        quick_build.args(["build", "-v"]);
+        apply_storage(&mut quick_build, &slot_quick, &app, Profile::Quick);
+        let quick_out = quick_build.output().expect("1.97.1 oxide quick build");
+        let quick_stderr = String::from_utf8_lossy(&quick_out.stderr);
+        assert!(quick_out.status.success(), "{quick_stderr}");
+        assert!(app.join("target/debug/app").is_file());
+        assert!(!rustc_line(&quick_stderr, "build_script_build").contains("debuginfo="));
+        assert!(rustc_line(&quick_stderr, "dep").contains("-C debuginfo=line-tables-only"));
+        assert!(rustc_line(&quick_stderr, "app").contains("-C debuginfo=line-tables-only"));
+    }
 }

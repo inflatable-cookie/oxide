@@ -421,11 +421,13 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
         selected.unwrap_or(Profile::Quick)
     };
     // Oxide consumes its own `--profile` and never forwards `quick` or
-    // `debug` as a Cargo profile name, even where a newer Cargo accepts
-    // `--profile debug`. Their recipe is `dev` tuned by the environment, so
-    // commands keep Cargo's default profile (`dev`, or `test` inheriting it).
-    // `bench` defaults to a release-based profile, so an explicit quick or
-    // debug bench names `dev`.
+    // `debug` as a Cargo profile name. Even on Cargo 1.99.1 / 1.100.0 where
+    // `--profile debug` is accepted into `target/debug/`, Cargo's `debug`
+    // profile inherits `dev` without enabling `build-override` debuginfo,
+    // bypasses `[profile.test]` on `test --profile debug`, and does not reach
+    // `exec` tools invoking `dev`. Keeping the `dev` environment recipe handles
+    // Cargo 1.95.0–1.100.0 uniformly (`test` inherits `dev`; `bench` with an
+    // explicit quick or debug profile passes `--profile dev`).
     let flags = match profile {
         Profile::Release => vec![OsString::from("--release")],
         Profile::Quick | Profile::Debug if command == "bench" && selected.is_some() => {
@@ -992,6 +994,9 @@ mod tests {
         let bench = parse_leased("bench", &args(&[])).unwrap();
         assert_eq!(bench.profile, Profile::Quick);
         assert_eq!(bench.cargo_args, args(&["bench"]));
+        let bench = parse_leased("bench", &args(&["--profile", "quick"])).unwrap();
+        assert_eq!(bench.profile, Profile::Quick);
+        assert_eq!(bench.cargo_args, args(&["bench", "--profile", "dev"]));
         let bench = parse_leased("bench", &args(&["--profile", "debug"])).unwrap();
         assert_eq!(bench.profile, Profile::Debug);
         assert_eq!(bench.cargo_args, args(&["bench", "--profile", "dev"]));

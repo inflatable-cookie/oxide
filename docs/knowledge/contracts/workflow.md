@@ -113,12 +113,33 @@ digest and the receipt digest are reported under separate labels.
   latest build wins. `quick` clears the build-override debug setting, so an
   outer `debug` setting never reaches a nested quick build. Dependencies keep
   line tables under `quick`.
+- Oxide keeps this `dev` environment recipe for `--profile debug` on Cargo
+  1.100.0 (`3acc79c0c`) as well as on older verified Cargo releases (such as
+  1.97.1). Verified on `cargo 1.100.0` vs `cargo 1.97.1`:
+  - Cargo 1.97.1 and 1.98.1 reject `--profile debug` as a reserved name.
+  - Cargo 1.99.1 and 1.100.0 accept `--profile debug` and write to
+    `target/debug/`, but Cargo's native `debug` profile inherits `dev`
+    (`dir-name = "debug"`): it still omits debuginfo on build scripts
+    (`build-override`) unless `CARGO_PROFILE_*_BUILD_OVERRIDE_DEBUG=full` is
+    set, inherits `[profile.dev]` or `CARGO_PROFILE_DEV_*` overrides unless
+    `CARGO_PROFILE_DEBUG_*` overrides them, bypasses `[profile.test]` on
+    `cargo test --profile debug`, and is not selected by `oxide exec --profile
+    debug` tools that invoke Cargo without `--profile debug`.
+  - Keeping the `dev` environment recipe (`CARGO_PROFILE_DEV_DEBUG=full` and
+    `CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG=full`) preserves `target/debug/`
+    placement, full debuginfo on workspace, dependency and build-script units,
+    `[profile.test]` inheritance, `oxide exec --profile debug`, and uniform
+    compatibility across Cargo 1.95.0–1.100.0.
 - `test` inherits the recipe. `bench` keeps its release-based default. An
   explicit quick or debug `bench` passes `--profile dev`.
 - External tools receive the quick recipe through the inherited `dev` settings,
   with no flag. Use `oxide nextest run` for that.
 - Cargo's own `--profile debug` is not Oxide's `debug`. A tool argument such as
-  `--cargo-profile debug` passes through and selects Cargo's profile.
+  `--cargo-profile debug` passes through and selects Cargo's profile. On Cargo
+  1.97.1 and 1.98.1 Cargo itself rejects `--profile debug`; on Cargo 1.99.1 and
+  1.100.0 Cargo's `debug` profile inherits `dev`, so under Oxide's default
+  `quick` recipe it receives `CARGO_PROFILE_DEV_DEBUG=line-tables-only` unless
+  `CARGO_PROFILE_DEBUG_*` or `[profile.debug]` sets otherwise.
 - The deprecated `oxide-quick` and `oxide-debug` profiles remain defined in the
   environment. `--cargo-profile oxide-quick` still builds, into
   `target/oxide-quick/`. Drop the flag.

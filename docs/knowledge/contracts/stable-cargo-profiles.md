@@ -58,6 +58,30 @@ probe is an ordinary integration test. Covering checks are `rust:compile`,
 `rust:compile-release` and `rust:format`, plus the ordinary suite
 (`rust:barge-adoption`).
 
+## Cargo 1.100.0 native `debug` profile
+
+Verified in scratch fixtures on `cargo 1.100.0 (3acc79c0c 2026-11-05)` vs
+`cargo 1.97.1 (c980f4866 2026-06-30)` (and `1.99.1`):
+
+- Cargo 1.97.1 and 1.98.1 reject `--profile debug` (`profile name 'debug' is
+  reserved`).
+- Cargo 1.99.1 and 1.100.0 accept `--profile debug` and place outputs in
+  `target/debug/`, but Cargo's native `debug` profile inherits `dev`
+  (`dir-name = "debug"`):
+  - Build-script (`build-override`) units still compile without `-C debuginfo`
+    unless `CARGO_PROFILE_*_BUILD_OVERRIDE_DEBUG=full` is set.
+  - Because `debug` inherits `dev`, `[profile.dev]` or `CARGO_PROFILE_DEV_*`
+    settings apply to `--profile debug` unless overridden on `debug`.
+  - `cargo test --profile debug` bypasses `[profile.test]`, whereas tuning
+    `dev` preserves `[profile.test]` inheritance.
+  - Child Cargo invocations inside `oxide exec --profile debug` run `dev`
+    unless the tool explicitly passes `--profile debug`.
+- Both Oxide's `--profile debug` `dev` environment recipe
+  (`CARGO_PROFILE_DEV_DEBUG=full`, `CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG=full`
+  in [workflow](workflow.md#profiles-and-strategies)) and `oxide-full-debug`'s
+  explicit `build-override` table therefore remain necessary on Cargo 1.100.0 as
+  well as older Cargo releases.
+
 ## Limits
 
 - No benefit, speed, write reduction or universal result is claimed. The
