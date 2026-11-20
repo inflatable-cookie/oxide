@@ -10,10 +10,28 @@ use oxide_storage::lease::managed::{evict_idle_slot, release};
 
 use super::control_io::lease_error;
 
+/// What one release call did with the slot.
+///
+/// `Ok` alone is not enough for a caller's terminal report: a release may be
+/// deliberately deferred and leave the lease held.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReleaseDisposition {
+    /// The slot was handed back and its record marked idle.
+    Released,
+    /// The release was deliberately deferred (the owned child temporary
+    /// directory could not be removed, or a removable flush could not
+    /// complete). The lease stays held for a later command to recover.
+    Deferred,
+}
+
 impl Store {
     /// Release after every writer in the group has exited, recording the
     /// slot's compile origin (`None`: untrusted from now on).
-    pub fn release(&self, held: Lease, origin: Option<Built>) -> Result<(), String> {
+    pub fn release(
+        &self,
+        held: Lease,
+        origin: Option<Built>,
+    ) -> Result<ReleaseDisposition, String> {
         let _admission =
             oxide_storage::release_trace::phase("admission lock", || self.release_admission())?;
         if !oxide_storage::release_trace::phase("temporary directory removal", || {
@@ -21,7 +39,7 @@ impl Store {
         }) || !oxide_storage::release_trace::phase("removable flush", || {
             self.flush_before_idle(&held.slot_id, held.record)
         })? {
-            return Ok(());
+            return Ok(ReleaseDisposition::Deferred);
         }
         release(&self.pool, &held.lease_id)
             .map_err(|error| lease_error("could not release the slot", &error))?;
@@ -38,6 +56,7 @@ impl Store {
             }
             self.save(&state)
         })
+        .map(|()| ReleaseDisposition::Released)
     }
 
     /// The gate refused a slot taken from another checkout before Cargo ran:
