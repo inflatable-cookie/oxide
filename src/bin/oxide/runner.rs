@@ -514,7 +514,10 @@ fn seed_recipient(
                 }
                 Ok(store::SeedRun::Seeded(_, last)) => {
                     eprintln!("{}", seed_summary::summary(&last));
-                    production = Some(prepared);
+                    // The recipient was populated by a seed, so it is not a
+                    // producing generation: publishing its catalog would spend
+                    // the post-build verification pass only to discard the
+                    // result.
                 }
                 Ok(store::SeedRun::Abandoned) => {
                     (held, gate, binding) = match abandon_seed_and_reacquire(
@@ -1132,12 +1135,30 @@ fn run_owned_program(
     }
     if let Err(error) = custody.store.mark_spawning(&custody.held) {
         custody.store.release(custody.held, custody.origin)?;
+        // The budgeted invocation still ends with one `finished` event; a
+        // command that fails before its child starts is a spawn failure.
+        budget::finished(
+            budget::Outcome::SpawnFailure,
+            None,
+            custody.execution_started,
+            budget::Drain::NotReached,
+            budget::Lease::Released,
+            1,
+        );
         return Err(error);
     }
     let (mut group, foreground) = match process::start_foreground_group(&mut command) {
         Ok(started) => started,
         Err(error) => {
             custody.store.release(custody.held, custody.origin)?;
+            budget::finished(
+                budget::Outcome::SpawnFailure,
+                None,
+                custody.execution_started,
+                budget::Drain::NotReached,
+                budget::Lease::Released,
+                1,
+            );
             return Err(format!(
                 "could not execute {}: {error}",
                 target.program.display()

@@ -529,98 +529,138 @@ impl Git {
         // One absolute deadline covers execution and settlement: the
         // per-call cap intersected with the cumulative remainder.
         let limit = self.call_time.min(remaining);
-        let mut child = git_command(dir, args)
-            .stdin(if input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("could not start git: {error}"))?;
-        let writer = match input {
-            None => None,
-            Some(bytes) => {
-                let mut stdin = child.stdin.take().ok_or("git stdin was not captured")?;
-                let bytes = bytes.to_vec();
-                let (sender, receiver) = mpsc::channel();
-                std::thread::spawn(move || {
-                    let _ = sender.send(stdin.write_all(&bytes));
-                });
-                Some(receiver)
-            }
-        };
-        let stdout = child.stdout.take().ok_or("git stdout was not captured")?;
-        let stderr = child.stderr.take().ok_or("git stderr was not captured")?;
-        let (out_sender, out_receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = out_sender.send(read_capped(stdout, MAX_GIT_BYTES));
-        });
-        let (err_sender, err_receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = err_sender.send(read_capped(stderr, MAX_METADATA_ERROR_BYTES));
-        });
-        let started = Instant::now();
-        let deadline = started + limit;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Ok(None) if Instant::now() >= deadline => {
-                    // Our own child; a bounded KILL and reap closes its pipes
-                    // unless something it started still holds them. Those
-                    // readers are detached, so the gate keeps its own clock.
-                    let _ = crate::budget::kill_and_reap(&mut child);
-                    break Err(format!("git {name} did not finish in time"));
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-                Err(error) => break Err(format!("could not wait for git: {error}")),
-            }
-        };
-        self.waited = self.waited.saturating_add(started.elapsed());
-        let status = status?;
-        // One settle window for all three readers, never past the call's own
-        // deadline: each wait takes only what remains of the same window, so
-        // sequential waits cannot overrun it.
-        let settle_deadline = (Instant::now() + self.settle_time).min(deadline);
-        let left = || settle_deadline.saturating_duration_since(Instant::now());
-        let settling = Instant::now();
-        let out = out_receiver.recv_timeout(left());
-        let err = err_receiver.recv_timeout(left());
-        let written = writer
-            .as_ref()
-            .map(|receiver| receiver.recv_timeout(left()));
-        self.waited = self.waited.saturating_add(settling.elapsed());
-        if Instant::now() > deadline {
-            return Err(format!("git {name} did not finish in time"));
-        }
-        let (stdout, overflow) = out
-            .map_err(|_| format!("git {name} did not close its output in time"))?
-            .map_err(|error| format!("cannot read git output: {error}"))?;
-        let stderr = err
-            .map_err(|_| format!("git {name} did not close its errors in time"))?
-            .map(|(bytes, _)| bytes)
-            .unwrap_or_default();
-        let written = match written {
-            None => Ok(()),
-            Some(result) => {
-                result.map_err(|_| format!("git {name} did not finish its input in time"))?
-            }
-        };
-        self.charge(stdout.len() as u64)?;
-        if !status.success() || written.is_err() {
+        let output = run_bounded(name, git_command(dir, args), input, limit, self.settle_time)?;
+        self.waited = self.waited.saturating_add(output.waited);
+        self.charge(output.stdout.len() as u64)?;
+        if output.failed {
             return Err(format!(
                 "git {name} failed: {}",
-                String::from_utf8_lossy(&stderr).trim()
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        if overflow {
+        if output.overflow {
             return Err(format!(
                 "git {name} printed more than {MAX_GIT_BYTES} bytes"
             ));
         }
-        Ok(stdout)
+        Ok(output.stdout)
     }
+}
+
+/// One bounded child's settled output.
+struct BoundedOutput {
+    stdout: Vec<u8>,
+    overflow: bool,
+    stderr: Vec<u8>,
+    /// The child exited non-zero, or its input could not be written.
+    failed: bool,
+    /// Wall wait spent on the exit and on draining the pipes.
+    waited: Duration,
+}
+
+/// Run one child in its own process group under a single absolute deadline.
+///
+/// The exit wait and every pipe drain share that deadline, so a descendant
+/// that keeps a pipe open cannot extend the call. On timeout the whole group is
+/// killed and its leader reaped within a finite bound, so nothing the child
+/// started outlives it. A timeout is reported as itself, never as a later
+/// pipe-settle error.
+fn run_bounded(
+    name: &str,
+    mut command: Command,
+    input: Option<&[u8]>,
+    limit: Duration,
+    settle_time: Duration,
+) -> Result<BoundedOutput, String> {
+    use std::os::unix::process::CommandExt;
+    let mut child = command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| format!("could not start git: {error}"))?;
+    let writer = match input {
+        None => None,
+        Some(bytes) => {
+            let mut stdin = child.stdin.take().ok_or("git stdin was not captured")?;
+            let bytes = bytes.to_vec();
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(stdin.write_all(&bytes));
+            });
+            Some(receiver)
+        }
+    };
+    let stdout = child.stdout.take().ok_or("git stdout was not captured")?;
+    let stderr = child.stderr.take().ok_or("git stderr was not captured")?;
+    let (out_sender, out_receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = out_sender.send(read_capped(stdout, MAX_GIT_BYTES));
+    });
+    let (err_sender, err_receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = err_sender.send(read_capped(stderr, MAX_METADATA_ERROR_BYTES));
+    });
+    let started = Instant::now();
+    let deadline = started + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() >= deadline => {
+                // Our own child: the group KILL closes its pipes unless
+                // something it started still holds them. Those readers are
+                // detached, so the gate keeps its own clock.
+                crate::describe::stop_group_and_reap(&mut child);
+                break Err(format!("git {name} did not finish in time"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(error) => break Err(format!("could not wait for git: {error}")),
+        }
+    };
+    // A timeout (or a failed wait) is its own answer: it is never masked by a
+    // later drain failure.
+    let status = status?;
+    let mut waited = started.elapsed();
+    // One settle window for all three readers, never past the call's own
+    // deadline: each wait takes only what remains of the same window, so
+    // sequential waits cannot overrun it.
+    let settle_deadline = (Instant::now() + settle_time).min(deadline);
+    let left = || settle_deadline.saturating_duration_since(Instant::now());
+    let settling = Instant::now();
+    let out = out_receiver.recv_timeout(left());
+    let err = err_receiver.recv_timeout(left());
+    let written = writer
+        .as_ref()
+        .map(|receiver| receiver.recv_timeout(left()));
+    waited = waited.saturating_add(settling.elapsed());
+    if Instant::now() > deadline {
+        return Err(format!("git {name} did not finish in time"));
+    }
+    let (stdout, overflow) = out
+        .map_err(|_| format!("git {name} did not close its output in time"))?
+        .map_err(|error| format!("cannot read git output: {error}"))?;
+    let stderr = err
+        .map_err(|_| format!("git {name} did not close its errors in time"))?
+        .map(|(bytes, _)| bytes)
+        .unwrap_or_default();
+    let written = match written {
+        None => Ok(()),
+        Some(result) => {
+            result.map_err(|_| format!("git {name} did not finish its input in time"))?
+        }
+    };
+    Ok(BoundedOutput {
+        stdout,
+        overflow,
+        stderr,
+        failed: !status.success() || written.is_err(),
+        waited,
+    })
 }
 
 fn utf8(bytes: Vec<u8>) -> Result<String, String> {
@@ -1523,11 +1563,25 @@ pub(crate) struct CargoOutput {
 }
 
 /// Run one Cargo call, bounded in output and lifetime.
-pub(crate) fn run_cargo(mut command: Command, stdout_cap: u64) -> Result<CargoOutput, String> {
+pub(crate) fn run_cargo(command: Command, stdout_cap: u64) -> Result<CargoOutput, String> {
+    run_cargo_bounded(command, stdout_cap, crate::budget::clamp(METADATA_TIME))
+}
+
+/// `run_cargo` with an explicit lifetime bound, so the deadline and the group
+/// stop can be exercised directly.
+fn run_cargo_bounded(
+    mut command: Command,
+    stdout_cap: u64,
+    timeout: Duration,
+) -> Result<CargoOutput, String> {
+    use std::os::unix::process::CommandExt;
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Its own group, so a timeout can stop everything Cargo started and
+        // not only the leader that inherited the pipes.
+        .process_group(0)
         .spawn()
         .map_err(|error| format!("could not start Cargo: {error}"))?;
     let stdout = child.stdout.take().ok_or("Cargo stdout was not captured")?;
@@ -1542,40 +1596,52 @@ pub(crate) fn run_cargo(mut command: Command, stdout_cap: u64) -> Result<CargoOu
     std::thread::spawn(move || {
         let _ = err_sender.send(read_capped(stderr, MAX_METADATA_ERROR_BYTES));
     });
-    let deadline = Instant::now() + crate::budget::clamp(METADATA_TIME);
-    let mut killed = false;
+    // One absolute deadline covers the exit wait and both pipe drains. The
+    // pipe drains are not given a second full bound after the child exits.
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Ok(None) if Instant::now() >= deadline => {
-                // Our own child; a bounded reap closes its pipes unless
-                // something it started still holds them.
-                killed = true;
-                let reaped = crate::budget::kill_and_reap(&mut child);
-                break Err(if reaped {
-                    "Cargo did not finish in time".to_owned()
-                } else {
-                    "Cargo did not finish in time and could not be reaped inside the closeout bound"
-                        .to_owned()
-                });
+                // Our own child and the group it led: a bounded KILL and reap
+                // closes its pipes unless something it started still holds
+                // them. Those readers are detached.
+                crate::describe::stop_group_and_reap(&mut child);
+                break Err("Cargo did not finish in time".to_owned());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(error) => break Err(format!("could not wait for Cargo: {error}")),
+            Err(error) => {
+                crate::describe::stop_group_and_reap(&mut child);
+                break Err(format!("could not wait for Cargo: {error}"));
+            }
         }
     };
-    let settle = Instant::now() + crate::budget::CLOSE_BOUND;
-    let left = || settle.saturating_duration_since(Instant::now());
+    let left = || deadline.saturating_duration_since(Instant::now());
     let read_bounded = |receiver: &mpsc::Receiver<_>, what: &str| -> Result<_, String> {
         receiver
             .recv_timeout(left())
-            .map_err(|_| format!("{what} did not settle inside the closeout bound"))
+            .map_err(|_| format!("{what} did not finish in time"))
     };
-    let out = read_bounded(&out_receiver, "Cargo output")?;
-    let err = read_bounded(&err_receiver, "Cargo error output")?;
+    let out = read_bounded(&out_receiver, "Cargo output");
+    let err = read_bounded(&err_receiver, "Cargo error output");
+    // A timed-out or failed child is its own answer: it is never masked by a
+    // later drain failure.
     let status = status?;
-    let (stdout, overflow) = out.map_err(|error| format!("cannot read Cargo output: {error}"))?;
-    let stderr = err.map(|(bytes, _)| bytes).unwrap_or_default();
-    let _ = killed;
+    let stop = |child: &mut std::process::Child| crate::describe::stop_group_and_reap(child);
+    let (stdout, overflow) = match out {
+        Ok(read) => read.map_err(|error| format!("cannot read Cargo output: {error}"))?,
+        Err(error) => {
+            stop(&mut child);
+            return Err(error);
+        }
+    };
+    let stderr = match err {
+        Ok(read) => read.map(|(bytes, _)| bytes).unwrap_or_default(),
+        Err(error) => {
+            stop(&mut child);
+            return Err(error);
+        }
+    };
     Ok(CargoOutput {
         status,
         stdout,
@@ -2620,5 +2686,84 @@ mod tests {
             .expect("cargo build");
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains(LOCK_REFUSAL));
+    }
+
+    fn held_pipe_fixture(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "oxide-freshness-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("fixture");
+        let pidfile = dir.join("pid");
+        (dir, pidfile)
+    }
+
+    fn assert_gone(pid: i32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only probes the PID this test started.
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // SAFETY: as above.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the grandchild survived");
+    }
+
+    fn read_pid(pidfile: &std::path::Path) -> i32 {
+        fs::read_to_string(pidfile)
+            .expect("the grandchild's pid")
+            .trim()
+            .parse()
+            .expect("a pid")
+    }
+
+    /// Regression: a timed-out `git` call killed only its direct child, so a
+    /// grandchild that inherited the pipes kept running unseen. The whole
+    /// group is stopped now.
+    #[test]
+    fn a_timed_out_git_call_leaves_no_grandchild() {
+        let (dir, pidfile) = held_pipe_fixture("git-group");
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "sleep 20 & echo $! > \"$1\"; wait",
+            "oxide-test",
+            pidfile.to_str().expect("UTF-8 path"),
+        ]);
+        let error = run_bounded(
+            "test",
+            command,
+            None,
+            Duration::from_millis(400),
+            Duration::from_millis(100),
+        )
+        .err()
+        .expect("a timed-out call is refused");
+        assert!(error.contains("did not finish in time"), "{error}");
+        assert_gone(read_pid(&pidfile));
+        fs::remove_dir_all(&dir).expect("remove own fixture");
+    }
+
+    /// Regression: a timed-out Cargo call killed only its direct child, so a
+    /// process it started outlived it. The group is stopped now, and the
+    /// timeout is reported as itself, not as a later pipe-settle error.
+    #[test]
+    fn a_timed_out_cargo_call_reports_the_timeout_and_stops_its_group() {
+        let (dir, pidfile) = held_pipe_fixture("cargo-group");
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "sleep 20 & echo $! > \"$1\"; wait",
+            "oxide-test",
+            pidfile.to_str().expect("UTF-8 path"),
+        ]);
+        let error = run_cargo_bounded(command, 1024, Duration::from_millis(300))
+            .err()
+            .expect("a timed-out call is refused");
+        assert_eq!(error, "Cargo did not finish in time", "{error}");
+        assert_gone(read_pid(&pidfile));
+        fs::remove_dir_all(&dir).expect("remove own fixture");
     }
 }

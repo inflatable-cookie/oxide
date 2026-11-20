@@ -13,7 +13,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -91,18 +91,19 @@ pub(super) fn create_parents(path: &Path) -> Result<(), String> {
         .parent()
         .ok_or("the pool path has no existing ancestor")?;
     create_parents(parent)?;
-    match fs::create_dir(path) {
-        Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .map_err(|error| error.to_string()),
+    // The mode is set at creation, never after it: a `create_dir` followed by
+    // `set_permissions` leaves the umask-controlled mode readable to others
+    // until the second call (oxide#337).
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(format!("cannot create {}: {error}", path.display())),
     }
 }
 
 pub(super) fn ensure_private_dir(path: &Path) -> Result<(), String> {
-    match fs::create_dir(path) {
-        Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .map_err(|error| error.to_string())?,
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(format!("cannot create {}: {error}", path.display())),
     }
@@ -522,4 +523,65 @@ thread_local! {
 /// `WriterUpdated` (oxide#337).
 pub(crate) fn writer_updated() -> bool {
     WRITER_UPDATED.take()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::PathBuf;
+
+    fn fixture(label: &str) -> PathBuf {
+        let base = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let root = base.join(format!(
+            "oxide-control-io-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("fixture");
+        root
+    }
+
+    /// Regression: `create_dir` followed by `set_permissions` left a window in
+    /// which a new directory carried the umask-controlled mode. The mode is set
+    /// at creation now, so even a fully permissive umask cannot widen it.
+    #[test]
+    fn new_private_directories_are_owner_only_from_creation() {
+        let root = fixture("private-mode");
+        // SAFETY: `umask` is process-wide. The adoption suite runs with
+        // `--test-threads=1`, and the previous value is restored immediately.
+        let previous = unsafe { libc::umask(0) };
+        let nested = create_parents(&root.join("a/b/c"));
+        let private = ensure_private_dir(&root.join("private"));
+        unsafe { libc::umask(previous) };
+        nested.expect("the ancestors");
+        private.expect("the private directory");
+        for path in [
+            root.join("a"),
+            root.join("a/b"),
+            root.join("a/b/c"),
+            root.join("private"),
+        ] {
+            let mode = fs::symlink_metadata(&path).expect("directory").mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} has mode {mode:o}", path.display());
+        }
+        fs::remove_dir_all(&root).expect("remove own fixture");
+    }
+
+    #[test]
+    fn an_existing_directory_is_left_as_it_is() {
+        let root = fixture("existing");
+        let existing = root.join("existing");
+        fs::create_dir(&existing).expect("fixture directory");
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).expect("mode");
+        create_parents(&existing).expect("existing ancestors are accepted");
+        ensure_private_dir(&existing).expect_err("a readable directory is not private");
+        assert_eq!(
+            fs::symlink_metadata(&existing).expect("directory").mode() & 0o777,
+            0o755
+        );
+        fs::remove_dir_all(&root).expect("remove own fixture");
+    }
 }

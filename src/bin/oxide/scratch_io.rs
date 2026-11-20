@@ -24,9 +24,11 @@ impl ReadDocument {
     }
 }
 fn read_document(path: &Path, limit: u64) -> ReadDocument {
+    // A non-blocking open and close-on-exec keep this read-only probe from
+    // blocking on a FIFO's writer or leaking the descriptor into a child.
     let file = match OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
     {
         Ok(file) => file,
@@ -427,6 +429,21 @@ mod tests {
         )
         .unwrap();
         leaf
+    }
+
+    /// Regression: a FIFO at a document path blocked the open forever, because
+    /// the read-only probe used only `O_NOFOLLOW`. A non-blocking open makes it
+    /// an invalid document at once.
+    #[test]
+    fn a_fifo_document_path_is_refused_without_blocking() {
+        let root = fixture();
+        let fifo = root.join("pool.json");
+        let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `mkfifo` with a valid, NUL-terminated path inside this
+        // fixture, owned by the test's user.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(matches!(read_document(&fifo, 1024), ReadDocument::Invalid));
+        fs::remove_dir_all(&root).expect("remove own fixture");
     }
 
     #[test]
