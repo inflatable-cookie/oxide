@@ -20,7 +20,7 @@ use crate::identity::SlotKey;
 use crate::process;
 use crate::seed_context::{self, ProducerFacts};
 use crate::seed_plan::VerifiedSource;
-use oxide_storage::lease::managed::{SeedCatalog, SeedProducer};
+use oxide_storage::lease::managed::{SeedCatalog, SeedFileKind, SeedProducer};
 use oxide_storage::lease::seed::ADAPTER_V2;
 use oxide_storage::seed_source::SourceCache;
 use std::fs;
@@ -227,6 +227,14 @@ fn a_cold_1_100_slot_seeds_from_an_idle_donor_and_cargo_reuses_the_unit() {
         .collect();
     assert_eq!(units.len(), 1, "one library unit for itoa: {catalog:?}");
     let unit_dir = units[0].fingerprint_dir.clone();
+    // The rmeta path carries the unit hash, which the test does not predict.
+    let artifact = units[0]
+        .files
+        .iter()
+        .find(|file| file.kind == SeedFileKind::Artifact && file.path.ends_with(".rmeta"))
+        .expect("the rmeta artifact")
+        .path
+        .clone();
     assert!(unit_dir.starts_with("debug/build/itoa/"), "{unit_dir}");
     store.release(donor, Some(origin)).expect("donor release");
 
@@ -295,9 +303,7 @@ fn a_cold_1_100_slot_seeds_from_an_idle_donor_and_cargo_reuses_the_unit() {
         assert!(matches!(seeded, SeedRun::Seeded(..)));
         let unit = lease.build_dir.join(&unit_dir);
         match damage {
-            Damage::MissingArtifact => {
-                fs::remove_file(unit.join("out/libitoa-497cf91033786c66.rmeta")).unwrap()
-            }
+            Damage::MissingArtifact => fs::remove_file(lease.build_dir.join(&artifact)).unwrap(),
             Damage::AlteredFingerprint => {
                 fs::write(unit.join("fingerprint/lib-itoa"), b"0").unwrap()
             }
