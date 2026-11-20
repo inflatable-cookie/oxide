@@ -2,8 +2,7 @@
 //!
 //! Receipts and their bounded index describe Oxide member links and pending
 //! transitions. Barge alone decides storage ownership, holds, pins and trash.
-//! Historical unfinished prune intents refuse adoption; they are never replayed
-//! by the replacement and their bytes remain available for explicit recovery.
+//! Historical registries with non-empty prune intents are refused safely.
 
 use crate::outputs::{self, Receipt, RootKind, Selected};
 use crate::process;
@@ -24,21 +23,18 @@ pub const REGISTRY_VERSION: &str = "oxide.outputs.registry/2";
 /// reference per profile member and is read from a version-1 document without
 /// changing its meaning.
 const LEGACY_REGISTRY_VERSION: &str = "oxide.outputs.registry/1";
-pub const INTENT_VERSION: &str = "oxide.outputs.prune-intent/1";
 const REGISTRY_FILE: &str = "registry.json";
 const REGISTRY_SCHEMA: u32 = 2;
 const LEGACY_REGISTRY_SCHEMA: u32 = 1;
 const OBSERVATIONS_FILE: &str = "prune-observations.json";
 const MAX_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ROWS: usize = 4096;
-const MAX_INTENTS: usize = 256;
 const MAX_TEXT_BYTES: usize = 1024;
 const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const SNAPSHOT_TIME: Duration = Duration::from_secs(10);
 
 /// The registry's one writer-facing document.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
 struct Registry {
     version: String,
     /// The frozen numeric registry format, 1 (shared with `version`).
@@ -53,15 +49,53 @@ struct Registry {
     created_by: String,
     #[serde(default)]
     rows: Vec<Row>,
-    /// Unfinished prune journals. Safety entries: never compacted, never
-    /// reconstructed, and they count toward the live caps.
+    /// Historical prune journals; refused safely if non-empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    intents: Vec<Intent>,
-    /// Overflow reservations whose cancellation began but whose receipt has
-    /// not yet committed without them. A safety journal: binding refuses any
-    /// listed reservation; never compacted.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    cancelled_overflow: Vec<String>,
+    intents: Vec<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for Registry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RegistryDoc {
+            version: String,
+            #[serde(default)]
+            schema: u32,
+            revision: u64,
+            complete: bool,
+            #[serde(default)]
+            incomplete: Option<Incomplete>,
+            created_by: String,
+            #[serde(default)]
+            rows: Vec<Row>,
+            #[serde(default)]
+            intents: Vec<serde_json::Value>,
+            /// Tolerated when empty for compatibility with existing registries;
+            /// refused if non-empty.
+            #[serde(default)]
+            cancelled_overflow: Vec<serde_json::Value>,
+        }
+        let doc = RegistryDoc::deserialize(deserializer)?;
+        if !doc.cancelled_overflow.is_empty() {
+            return Err(serde::de::Error::custom(
+                "the output registry contains unfinished overflow cancellations; recover or remove them before continuing",
+            ));
+        }
+        Ok(Registry {
+            version: doc.version,
+            schema: doc.schema,
+            revision: doc.revision,
+            complete: doc.complete,
+            incomplete: doc.incomplete,
+            created_by: doc.created_by,
+            rows: doc.rows,
+            intents: doc.intents,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -108,9 +142,6 @@ struct Row {
     marker_digest: Option<String>,
     selected: bool,
     pending: bool,
-    /// Set while a prune intent references this root.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pruning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pruned_ms: Option<u64>,
     /// The receipt reservation transaction that created this pending row.
@@ -124,113 +155,8 @@ struct Row {
 
 impl Row {
     fn live(&self) -> bool {
-        self.selected
-            || self.pending
-            || self.pruning.is_some()
-            || self.reservation.is_some()
-            || self.cancelling.is_some()
+        self.selected || self.pending || self.reservation.is_some() || self.cancelling.is_some()
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum IntentPhase {
-    /// The journal entry exists; no filesystem effect has happened.
-    Intent,
-    /// The root leaf was exclusively renamed to its quarantine leaf.
-    Renamed,
-    /// Deletion of the quarantined tree has begun.
-    Deleting,
-    /// Everything except the marker is gone.
-    MarkerLast,
-    /// The quarantine leaf is gone: positive completion proof.
-    Deleted,
-    /// Settled by an explicit operator resolution without deletion.
-    Resolved,
-}
-
-/// Root identity recorded in the journal. Version-2 roots carry a nonce;
-/// legacy roots (written before oxide#129) never need one.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RootIdentity {
-    checkout_id: String,
-    checkout: PathBuf,
-    receipt: PathBuf,
-    member: String,
-    root: PathBuf,
-    root_kind: RootKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    volume_uuid: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    nonce: Option<String>,
-    generation: u64,
-    dev: u64,
-    ino: u64,
-    marker_digest: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Intent {
-    version: String,
-    id: String,
-    identity: RootIdentity,
-    phase: IntentPhase,
-    quarantine: PathBuf,
-    preview_sha256: String,
-    created_ms: u64,
-    updated_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    resolved_ms: Option<u64>,
-    /// The checkout receipt's terminal state committed after the registry
-    /// terminal state. A `deleted` or `resolved` intent without it is still
-    /// unfinished: its receipt step is replayed, never assumed.
-    #[serde(default)]
-    receipt_settled: bool,
-    /// Whether the representative registry row was a live selection when the
-    /// intent was journaled. Only a group member's own flag is restored from
-    /// [`Intent::group`]; this field is diagnostic for the representative.
-    #[serde(default = "selected_by_default")]
-    was_selected: bool,
-    /// The checkout receipt's exact bytes at intent publication. A replay or
-    /// rollback acts only while the live receipt still matches this preimage.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    prior_receipt_sha: String,
-    /// Every verified reference of this (checkout, root) group, sorted by
-    /// member. The group — never a single row — is the transaction scope.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    group: Vec<GroupRow>,
-    /// Persisted before the terminal receipt publication: the exact terminal
-    /// image digest and its FIXED timestamp. A replay accepts only the
-    /// recorded preimage or this exact image.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    expected_terminal_sha: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    terminal_ms: Option<u64>,
-}
-
-/// One reference of an intent's (checkout, root) group: its member, immutable
-/// root-creation generation, nonce and recorded identity, and the selection
-/// flag the rollback restores.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GroupRow {
-    member: String,
-    generation: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    nonce: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    root_dev: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    root_ino: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    marker_digest: Option<String>,
-    selected: bool,
-}
-
-fn selected_by_default() -> bool {
-    true
 }
 
 /// A fresh random 128-bit root or transaction nonce, lowercase hex. Entropy
@@ -376,7 +302,6 @@ fn seed_registry(control: &Path, registry: &mut Registry) -> Result<(), String> 
                     marker_digest: identity.digest,
                     selected: is_selected,
                     pending: !is_selected,
-                    pruning: None,
                     pruned_ms: None,
                     reservation: None,
                     cancelling: None,
@@ -431,7 +356,6 @@ fn create_or_validate_registry(
                 created_by: transaction.to_owned(),
                 rows: Vec::new(),
                 intents: Vec::new(),
-                cancelled_overflow: Vec::new(),
             };
             // Seed live references from the bounded committed receipts this
             // control directory already holds. Never from markers, and never
@@ -522,6 +446,7 @@ pub fn require_registry(control: &Path) -> Result<(), String> {
 }
 
 /// The ready registry's current revision.
+#[cfg(test)]
 pub fn registry_revision(control: &Path) -> Result<u64, String> {
     Ok(ready_registry(control)?.revision)
 }
@@ -557,8 +482,14 @@ impl Registry {
         if !text(&self.created_by) {
             return Err("the output registry has an unusable transaction identity".to_owned());
         }
-        if self.rows.len() > MAX_ROWS || self.intents.len() > MAX_INTENTS {
+        if self.rows.len() > MAX_ROWS {
             return Err("the output registry exceeds a collection limit".to_owned());
+        }
+        if !self.intents.is_empty() {
+            return Err(
+                "the output registry contains historical prune intents; recover or remove them before continuing"
+                    .to_owned(),
+            );
         }
         if let Some(incomplete) = &self.incomplete {
             if self.complete || !text(&incomplete.reason) {
@@ -571,9 +502,6 @@ impl Registry {
         for row in &self.rows {
             row.validate()?;
         }
-        for intent in &self.intents {
-            intent.validate()?;
-        }
         Ok(())
     }
 
@@ -583,10 +511,6 @@ impl Registry {
             .checked_add(1)
             .ok_or("the output registry revision is exhausted")?;
         Ok(())
-    }
-
-    fn unfinished_intents(&self) -> impl Iterator<Item = &Intent> {
-        self.intents.iter().filter(|intent| !intent.settled())
     }
 }
 
@@ -600,55 +524,6 @@ impl Row {
             || !self.receipt.is_absolute()
         {
             return Err("the output registry has an unusable row".to_owned());
-        }
-        // A prepared transition may name its current root as both the
-        // selected and the proposed reference; that is one row with both
-        // flags, never a contradiction. A pruning row is never selected or
-        // pending, because its blocking intent owns it.
-        if self.pruning.is_some() && (self.selected || self.pending) {
-            return Err("the output registry row is pruning and still referenced".to_owned());
-        }
-        Ok(())
-    }
-}
-
-impl Intent {
-    /// Settled only once both the registry terminal state and the checkout
-    /// receipt's terminal state committed.
-    fn settled(&self) -> bool {
-        matches!(self.phase, IntentPhase::Deleted | IntentPhase::Resolved) && self.receipt_settled
-    }
-
-    fn validate(&self) -> Result<(), String> {
-        if self.version != INTENT_VERSION
-            || !hex32(&self.id)
-            || !hex64(&self.identity.checkout_id)
-            || !self.identity.root.is_absolute()
-            || !self.identity.receipt.is_absolute()
-            || !self.quarantine.is_absolute()
-            || !hex64(&self.preview_sha256)
-        {
-            return Err("the output registry has an unusable prune intent".to_owned());
-        }
-        if !self.prior_receipt_sha.is_empty() && !hex64(&self.prior_receipt_sha) {
-            return Err("the output registry has an unusable intent preimage".to_owned());
-        }
-        if let Some(sha) = &self.expected_terminal_sha {
-            if !hex64(sha) || self.terminal_ms.is_none() {
-                return Err("the output registry has an unusable terminal image".to_owned());
-            }
-        }
-        let mut names: Vec<&str> = self.group.iter().map(|row| row.member.as_str()).collect();
-        let sorted = names.clone();
-        names.sort_unstable();
-        names.dedup();
-        if names != sorted {
-            return Err("the prune intent group is not sorted and unique".to_owned());
-        }
-        for row in &self.group {
-            if !text(&row.member) {
-                return Err("the prune intent group has an unusable member".to_owned());
-            }
         }
         Ok(())
     }
@@ -700,7 +575,7 @@ fn hex32(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-pub(crate) fn hex64(value: &str) -> bool {
+fn hex64(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -716,19 +591,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         hex.push_str(&format!("{byte:02x}"));
     }
     hex
-}
-
-/// The unsettled prune intent for one checkout, if any. Binding, adoption and
-/// replay refuse while it exists.
-pub fn unsettled_for(control: &Path, checkout_id: &str) -> Result<Option<String>, String> {
-    let Some(registry) = read_registry(control)? else {
-        return Ok(None);
-    };
-    let found = registry
-        .unfinished_intents()
-        .find(|intent| intent.identity.checkout_id == checkout_id)
-        .map(|intent| intent.id.clone());
-    Ok(found)
 }
 
 /// Publish one receipt's live references into the registry. Called from
@@ -843,7 +705,6 @@ fn note_placement(
             if row.root == selected.root() {
                 row.selected = keep_selected;
                 matched_selected = keep_selected;
-                row.pruning = None;
                 row.pending = false;
                 if keep_selected {
                     // The committed root now exists: refresh the identity the
@@ -913,7 +774,6 @@ fn note_placement(
                     marker_digest: identity.digest,
                     selected: keep_selected,
                     pending: false,
-                    pruning: None,
                     pruned_ms: None,
                     reservation: None,
                     cancelling: None,
@@ -946,7 +806,6 @@ fn note_placement(
                     marker_digest: identity.digest,
                     selected: false,
                     pending: true,
-                    pruning: None,
                     pruned_ms: None,
                     reservation: None,
                     cancelling: None,
@@ -957,29 +816,15 @@ fn note_placement(
     Ok(())
 }
 
-/// The marker a reservation write returns after it durably published sticky
-/// incompleteness: the caller retries once with an overflow tag.
-pub const OVERFLOW_RETRY: &str =
-    "the output registry reached its row limit and is now sticky-incomplete";
-
-/// Most overflow cancellations in flight at once.
-const MAX_CANCELLED_OVERFLOW: usize = 64;
-
 /// Whether `value` is a 128-bit lowercase-hex nonce.
 pub fn is_nonce(value: &str) -> bool {
     hex32(value)
 }
 
-fn overflow_key(checkout_id: &str, id: &str) -> String {
-    format!("{checkout_id}/{id}")
-}
-
 /// Publish a receipt's reservation reference. An indexed reservation is a
-/// pending row carrying its transaction and nonce; an overflow reservation
-/// adds no row and is valid only against the durably sticky-incomplete
-/// registry it names. A reservation whose cancellation began is never
-/// republished, and a dropped reservation without its cancellation journal
-/// is refused rather than read as non-selection.
+/// pending row carrying its transaction and nonce. A reservation whose
+/// cancellation began is never republished, and a dropped reservation without
+/// its cancellation journal is refused rather than read as non-selection.
 fn note_reservation(
     registry: &mut Registry,
     receipt: &Receipt,
@@ -1029,24 +874,6 @@ fn note_reservation(
     let Some(reserved) = reserved else {
         return Ok(());
     };
-    if let Some(tag) = &reserved.overflow {
-        if registry.complete || tag.registry != registry.created_by {
-            return Err(
-                "an overflow reservation needs the durably sticky-incomplete registry it names; refusing"
-                    .to_owned(),
-            );
-        }
-        if registry
-            .cancelled_overflow
-            .contains(&overflow_key(checkout_id, &reserved.id))
-        {
-            return Err(format!(
-                "reservation {} is being cancelled; refusing to republish it",
-                reserved.id
-            ));
-        }
-        return Ok(());
-    }
     if let Some(row) = registry
         .rows
         .iter_mut()
@@ -1067,10 +894,7 @@ fn note_reservation(
         return Ok(());
     }
     if !registry.complete || registry.rows.len() >= MAX_ROWS {
-        mark_incomplete(registry, "the registry row limit was reached")?;
-        return Err(format!(
-            "{OVERFLOW_RETRY}; reserve again with an overflow tag"
-        ));
+        return Err("the output registry reached its row limit; reservation refused".to_owned());
     }
     registry.rows.push(Row {
         checkout_id: checkout_id.to_owned(),
@@ -1090,7 +914,6 @@ fn note_reservation(
         marker_digest: None,
         selected: false,
         pending: true,
-        pruning: None,
         pruned_ms: None,
         reservation: Some(reserved.id.clone()),
         cancelling: None,
@@ -1098,46 +921,12 @@ fn note_reservation(
     Ok(())
 }
 
-/// The overflow tag for a new reservation: `Some` only once the registry is
-/// durably sticky-incomplete. Its revision is provenance only.
-pub fn overflow_tag(
-    control: &Path,
-    id: &str,
-    nonce: &str,
-) -> Result<Option<outputs::OverflowTag>, String> {
-    let registry = ready_registry(control)?;
-    registry.validate()?;
-    if registry.complete {
-        return Ok(None);
-    }
-    Ok(Some(outputs::OverflowTag {
-        registry: registry.created_by.clone(),
-        transaction: id.to_owned(),
-        nonce: nonce.to_owned(),
-        revision: registry.revision,
-    }))
-}
-
-/// Binding validation of an exact surviving reservation. Indexed: its row
-/// carries the same transaction, nonce and root and no cancellation. Overflow:
-/// the same registry identity is still sticky-incomplete and no cancellation
-/// of this transaction began. An unrelated revision advance never refuses.
+/// Binding validation of an exact surviving reservation: its row carries the
+/// same transaction, nonce and root and no cancellation. An unrelated revision
+/// advance never refuses.
 pub fn validate_reservation(control: &Path, reserved: &outputs::Reservation) -> Result<(), String> {
     let registry = ready_registry(control)?;
     registry.validate()?;
-    if let Some(tag) = &reserved.overflow {
-        if registry.complete || tag.registry != registry.created_by {
-            return Err("its overflow tag names another registry state".to_owned());
-        }
-        if registry
-            .cancelled_overflow
-            .iter()
-            .any(|key| key.ends_with(&format!("/{}", reserved.id)))
-        {
-            return Err("its cancellation began".to_owned());
-        }
-        return Ok(());
-    }
     match registry
         .rows
         .iter()
@@ -1158,55 +947,32 @@ pub fn validate_reservation(control: &Path, reserved: &outputs::Reservation) -> 
 /// First cancellation step, durable before the receipt drops the
 /// reservation: the authority is invalidated and the revision advances.
 /// Idempotent for the exact same transaction.
-pub fn begin_cancel(
-    control: &Path,
-    checkout_id: &str,
-    reserved: &outputs::Reservation,
-) -> Result<(), String> {
+pub fn begin_cancel(control: &Path, reserved: &outputs::Reservation) -> Result<(), String> {
     let _guard = store::publication_guard(control)?;
     let mut registry = ready_registry(control)?;
     registry.validate()?;
-    if reserved.overflow.is_some() {
-        let key = overflow_key(checkout_id, &reserved.id);
-        if !registry.cancelled_overflow.contains(&key) {
-            if registry.cancelled_overflow.len() >= MAX_CANCELLED_OVERFLOW {
-                return Err(
-                    "too many overflow reservation cancellations are unfinished; refusing"
-                        .to_owned(),
-                );
-            }
-            registry.cancelled_overflow.push(key);
-        }
-    } else {
-        let Some(row) = registry
-            .rows
-            .iter_mut()
-            .find(|row| row.reservation.as_deref() == Some(reserved.id.as_str()))
-        else {
-            return Err(format!(
-                "reservation {} has no registry row; it is kept",
-                reserved.id
-            ));
-        };
-        row.cancelling = Some(reserved.id.clone());
-        row.pending = false;
-    }
+    let Some(row) = registry
+        .rows
+        .iter_mut()
+        .find(|row| row.reservation.as_deref() == Some(reserved.id.as_str()))
+    else {
+        return Err(format!(
+            "reservation {} has no registry row; it is kept",
+            reserved.id
+        ));
+    };
+    row.cancelling = Some(reserved.id.clone());
+    row.pending = false;
     registry.bump()?;
     write_registry(control, &registry)
 }
 
 /// Last cancellation step, after the receipt committed without the
-/// reservation: remove the abandoned row (or overflow journal entry).
-pub fn finish_cancel(
-    control: &Path,
-    checkout_id: &str,
-    reserved: &outputs::Reservation,
-) -> Result<(), String> {
+/// reservation: remove the abandoned row.
+pub fn finish_cancel(control: &Path, reserved: &outputs::Reservation) -> Result<(), String> {
     let _guard = store::publication_guard(control)?;
     let mut registry = ready_registry(control)?;
     registry.validate()?;
-    let key = overflow_key(checkout_id, &reserved.id);
-    registry.cancelled_overflow.retain(|entry| entry != &key);
     registry
         .rows
         .retain(|row| row.cancelling.as_deref() != Some(reserved.id.as_str()));
@@ -1223,17 +989,13 @@ pub fn finish_dropped_cancels(
 ) -> Result<(), String> {
     let _guard = store::publication_guard(control)?;
     let mut registry = ready_registry(control)?;
-    let before = (registry.rows.len(), registry.cancelled_overflow.len());
+    let before = registry.rows.len();
     registry.rows.retain(|row| {
         row.checkout_id != checkout_id
             || row.cancelling.is_none()
             || row.cancelling.as_deref() == current
     });
-    registry.cancelled_overflow.retain(|key| {
-        !key.starts_with(&format!("{checkout_id}/"))
-            || current.is_some_and(|id| key.ends_with(&format!("/{id}")))
-    });
-    if (registry.rows.len(), registry.cancelled_overflow.len()) == before {
+    if registry.rows.len() == before {
         return Ok(());
     }
     registry.bump()?;
@@ -1390,70 +1152,14 @@ pub(crate) fn seed_test_registry(control: &Path) -> Result<(), String> {
     }
 }
 
-/// Test-only: publish one prune intent for `checkout_id` into a ready
-/// registry, so the guarded branch's unsettled-intent refusal (and the shipped
-/// definition of a *settled* intent) is exercisable without running a real
-/// prune. Returns the intent ID.
+/// Test-only view of registry rows: root, selected, pending.
 #[cfg(test)]
-pub(crate) fn seed_test_intent(control: &Path, checkout_id: &str, settled: bool) -> String {
-    let mut registry = ready_registry(control).unwrap();
-    let id = "b".repeat(32);
-    registry.intents.push(Intent {
-        version: INTENT_VERSION.to_owned(),
-        id: id.clone(),
-        identity: RootIdentity {
-            checkout_id: checkout_id.to_owned(),
-            checkout: PathBuf::from("/checkout"),
-            receipt: control.join("outputs").join(format!("{checkout_id}.json")),
-            member: "debug".to_owned(),
-            root: PathBuf::from("/root"),
-            root_kind: RootKind::External,
-            volume_uuid: None,
-            nonce: Some("a".repeat(32)),
-            generation: 1,
-            dev: 1,
-            ino: 2,
-            marker_digest: "c".repeat(64),
-        },
-        phase: if settled {
-            IntentPhase::Resolved
-        } else {
-            IntentPhase::Intent
-        },
-        quarantine: PathBuf::from("/quarantine"),
-        preview_sha256: "f".repeat(64),
-        created_ms: 1,
-        updated_ms: 1,
-        resolved_ms: None,
-        receipt_settled: settled,
-        was_selected: true,
-        prior_receipt_sha: String::new(),
-        group: Vec::new(),
-        expected_terminal_sha: None,
-        terminal_ms: None,
-    });
-    registry.bump().unwrap();
-    write_registry(control, &registry).unwrap();
-    id
-}
-
-/// Test-only view of registry rows: root, selected, pending, pruning.
-#[cfg(test)]
-pub(crate) fn test_rows(
-    control: &Path,
-) -> Result<Vec<(PathBuf, bool, bool, Option<String>)>, String> {
+pub(crate) fn test_rows(control: &Path) -> Result<Vec<(PathBuf, bool, bool)>, String> {
     let registry = ready_registry(control)?;
     Ok(registry
         .rows
         .iter()
-        .map(|row| {
-            (
-                row.root.clone(),
-                row.selected,
-                row.pending,
-                row.pruning.clone(),
-            )
-        })
+        .map(|row| (row.root.clone(), row.selected, row.pending))
         .collect())
 }
 
@@ -1827,21 +1533,9 @@ struct Preview {
     roots: Vec<PlannedRoot>,
 }
 
-/// The reason a root is kept while a historical prune intent names it. Barge
-/// never replays or settles old deletion journals, so there is no automatic
-/// path: an operator with writers stopped recovers the bytes by hand. This is
-/// the one wording the outputs refusals reuse.
-pub(crate) const RETAINED_BY_INTENT: &str = "a historical prune intent names this root, so it is retained. Barge does not replay or settle old deletion journals; with writers stopped, inspect the paths recorded for the intent in outputs/registry.json and recover them by hand";
-
 fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
     let mut roots = Vec::new();
     let mut locations = std::collections::HashSet::new();
-    // Only the roots an unfinished intent names are kept; the rest of the
-    // registry still previews and executes.
-    let retained: std::collections::HashSet<&Path> = registry
-        .unfinished_intents()
-        .map(|intent| intent.identity.root.as_path())
-        .collect();
     for row in &registry.rows {
         if row.pruned_ms.is_some() || row.barge_id.is_none() {
             continue;
@@ -1863,9 +1557,6 @@ fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
             continue;
         };
         for root in output_roots(&area)? {
-            if retained.contains(root.path.as_path()) {
-                continue;
-            }
             let recorded = registry
                 .rows
                 .iter()
@@ -2063,13 +1754,6 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
         Some(store::publication_guard(control)?)
     };
     let mut registry = require_ready(&internal, control)?;
-    // Only the roots an unfinished intent names are refused, below in preview.
-    for intent in registry.unfinished_intents() {
-        eprintln!(
-            "oxide: kept {}: {RETAINED_BY_INTENT}",
-            intent.identity.root.display()
-        );
-    }
     let planned = preview(control, &registry)?;
     let bytes = serde_json::to_vec_pretty(&planned).map_err(|error| error.to_string())?;
     match command {
@@ -2158,7 +1842,6 @@ pub(crate) fn seed_output_neighbors(
             marker_digest: None,
             selected: true,
             pending: false,
-            pruning: None,
             pruned_ms: None,
             reservation: None,
             cancelling: None,
@@ -2298,7 +1981,6 @@ mod plan_identity_tests {
             marker_digest: None,
             selected: false,
             pending: false,
-            pruning: None,
             pruned_ms: None,
             reservation: None,
             cancelling: None,
@@ -2511,34 +2193,37 @@ mod plan_identity_tests {
         assert!(row.pruned_ms.is_none());
     }
 
-    /// An unsettled legacy intent keeps its own root out of the plan, and no
-    /// other root is refused with it.
     #[test]
-    fn an_unsettled_intent_retains_only_the_root_it_names() {
+    fn historical_intents_or_cancelled_overflow_refuse_safely() {
         let Fixture {
             _temp,
             control,
-            area,
-            original,
+            mut registry,
             ..
         } = fixture();
-        let neighbor = area.create_root("neighbor").unwrap();
-        let mut registry = ready_registry(&control).unwrap();
-        let mut row = registry.rows[0].clone();
-        row.root = neighbor.path.clone();
-        row.barge_id = Some(neighbor.id.clone());
-        registry.rows.push(row);
-        write_registry(&control, &registry).unwrap();
-        seed_test_intent(&control, &"a".repeat(64), false);
-        let mut registry = ready_registry(&control).unwrap();
-        registry.intents[0].identity.root = original.path.clone();
-        registry.bump().unwrap();
-        write_registry(&control, &registry).unwrap();
+        // Empty `intents` and `cancelled_overflow` deserialize cleanly for existing registries.
+        let mut doc = serde_json::to_value(&registry).unwrap();
+        doc["intents"] = serde_json::json!([]);
+        doc["cancelled_overflow"] = serde_json::json!([]);
+        fs::write(registry_path(&control), serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert!(read_registry(&control).unwrap().is_some());
 
-        let plan = preview(&control, &ready_registry(&control).unwrap()).unwrap();
+        // Non-empty `intents` refuses safely.
+        registry.intents = vec![serde_json::json!({"id": "legacy-intent"})];
+        fs::write(
+            registry_path(&control),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        let err = read_registry(&control).unwrap_err();
+        assert!(err.contains("historical prune intents"), "{err}");
 
-        let planned: Vec<&str> = plan.roots.iter().map(|root| root.id.as_str()).collect();
-        assert_eq!(planned, [neighbor.id.as_str()]);
+        // Non-empty `cancelled_overflow` refuses safely on deserialize.
+        doc["intents"] = serde_json::json!([]);
+        doc["cancelled_overflow"] = serde_json::json!(["checkout/tx"]);
+        fs::write(registry_path(&control), serde_json::to_vec(&doc).unwrap()).unwrap();
+        let err = read_registry(&control).unwrap_err();
+        assert!(err.contains("overflow cancellations"), "{err}");
     }
 
     #[test]

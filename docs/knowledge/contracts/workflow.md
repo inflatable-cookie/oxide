@@ -543,8 +543,9 @@ to the registered drive, and Oxide owns the links that point there.
   `<triple>/debug`, `<triple>/release`), and each member points at its own subpath
   of one owned root. Cargo's top-level files, `target/tmp`, `target/doc` and
   other tool directories stay real. The older whole-target layout makes
-  `<checkout>/target` itself a link. It migrates only through an explicit
-  `oxide outputs adopt`. A member link points at its approved subpath only.
+  `<checkout>/target` itself a link; checkouts switch to the profile layout via
+  `oxide outputs detach` followed by `oxide outputs adopt`. A member link points
+  at its approved subpath only.
 - **Roots and marker.** A root is `<mount>/oxide-outputs/<project>-<checkout id>/`
   on the registered volume, or the local fallback
   `<checkout>/.oxide-outputs/local/`. Each root carries `.oxide-output.json` (the
@@ -570,9 +571,10 @@ to the registered drive, and Oxide owns the links that point there.
   prints `oxide: auto-adopted <target> -> <root> …` once.
 - **Explicit commands.** `oxide outputs status` and `oxide outputs plan` are
   read-only. `plan` prints bounded JSON (`oxide.outputs.plan/2`) and writes nothing.
-  `oxide outputs adopt` converts a missing or empty real target, and migrates a
-  legacy whole-target layout. `oxide outputs detach` restores a real empty
-  `target` and keeps every root and its bytes. It is the per-checkout opt-out in
+  `oxide outputs adopt` converts a missing or empty real target (or a detached
+  checkout). `oxide outputs detach` restores a real empty
+  `target` and keeps every root and its bytes, and handles legacy whole-target
+  checkouts so they can switch via `detach` then `adopt`. It is the per-checkout opt-out in
   either mode. Creating a real empty `target` before the first build does the same
   thing.
 - **Transitions.** A relink is write-ahead. It records `prepared`, creates the
@@ -596,7 +598,7 @@ to the registered drive, and Oxide owns the links that point there.
 - **Limits per command.** At most eight members per command and 32 per receipt. A
   non-empty real member directory is used locally, with a notice. An empty real
   member converts only under an explicit `adopt`.
-- **Custody.** Create, relink, detach, clean and migration each wait for all
+- **Custody.** Create, relink, detach and clean each wait for all
   checkout writers, with positive closure across pools. Unknown writer custody
   refuses, and nothing is downgraded to "clear". A converted checkout's `run` keeps
   its lease while the program runs from its path in the real root. The removal
@@ -610,10 +612,9 @@ to the registered drive, and Oxide owns the links that point there.
   durable. `oxide outputs prune --dry-run` previews the candidates and prints a
   SHA-256. `oxide outputs prune --plan <file> --plan-sha256 <hex>` applies that
   exact plan, and Barge rechecks holds and pins before moving a root to
-  marker-checked trash. Unknown legacy roots are retained. A root named by an
-  unfinished historical prune intent is kept and reported; the rest of the plan
-  still runs. Nothing replays or settles those intents, so an operator recovers
-  such a root by hand with writers stopped. A root whose trash copy could not be
+  marker-checked trash. Unknown legacy roots are retained. A historical registry
+  with non-empty `intents` or `cancelled_overflow` refuses safely instead of
+  mutating roots. A root whose trash copy could not be
   deleted is settled in the registry, frees no space, and makes `--plan` exit 1
   with a count of roots not freed. So does a root Barge keeps.
 

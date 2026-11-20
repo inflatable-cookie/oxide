@@ -867,14 +867,13 @@ class PersistedFormatTests(unittest.TestCase):
               "Ticket", "Clean", "Flush", "OutputsInit"),
              "99bb43f34292750d3b49f30eaa3007020fe46644c69911e4611fd570f40ada2e"),
             ("registry", "src/bin/oxide/prune.rs", "REGISTRY_VERSION", '"oxide.outputs.registry/2"',
-             "src/bin/oxide/prune.rs", ("Registry", "Row", "Incomplete", "Intent", "RootIdentity",
-                                       "GroupRow", "IntentPhase"),
-             "77cee06380b26869e27c0d3c51845b40a59e685deb80711241f04d882ea883fa"),
+             "src/bin/oxide/prune.rs", ("Registry", "RegistryDoc", "Row", "Incomplete"),
+             "a4d2e9d58c996c060573ac543a7e84693ae230b1f2972d4569e33b0bffee90c2"),
             ("output receipt", "src/bin/oxide/outputs.rs", "PROFILE_RECEIPT_VERSION",
              '"oxide.outputs.transition/3"', "src/bin/oxide/outputs.rs",
              ("Doc", "PlacementDoc", "Selected", "Prepared", "Reservation", "RootKind",
-              "LayoutKind", "ReceiptState", "Migration", "MigrationPhase", "OverflowTag", "PruneRecord"),
-             "d8b1a506dd5a21cfc2bb846eb0a70c3a6e2d3c69e6c9d5f3abe240dd4fd03a3c"),
+              "LayoutKind", "ReceiptState"),
+             "db688fa32749588e6aebf843ccea3c3bcf5b13db5a607948970b393760a62894"),
         )
         for label, version_path, constant, version, path, names, digest in cases:
             with self.subTest(format=label):
