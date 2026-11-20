@@ -35,12 +35,12 @@ Tom's 2026-11-17 lean reset ([vision](docs/knowledge/vision.md#validation-policy
 
 ## Quality gate (Hill-climb standing standard)
 
-Verified floor (2026-11-20, commit `12b39824`): **7/10** across all 9 code, test, script, and doc parts (`Lease core` 8, `Seeding` 8, `outputs/` 7, `store/` 7, `Storage boundary` 7, `Front door` 7, `Config & support` 7, `Tests & scripts` 7, `Docs` 7); `Integration` is at **6/10** pending the remaining release/budget-event and `SKILL.md` cleanup.
+Verified floor (2026-11-20, commit `73120917`): **8/10** across all 9 code, test, script, and doc parts plus `Integration` (`Lease core` 8, `Seeding` 8, `outputs/` 8, `store/` 8, `Storage boundary` 8, `Front door` 8, `Config & support` 8, `Tests & scripts` 8, `Docs` 8, `Integration` 8).
 
 Rubric (1–10 per part): correctness & safety, clarity, structure, error handling, tests, idiom & simplicity (docs: correctness, clarity, structure, freshness; integration: seams, duplication, contract alignment). Anchors: 8 solid, 7 good with improvements due, 5–6 real debt, below 5 risky.
 
 - Every worker rates the parts it touched (and integration, if cross-part seams changed) in the PR body.
-- Every reviewer checks the same scores at the exact head and sends back any change that lowers an existing score or introduces a new part below **7**.
+- Every reviewer checks the same scores at the exact head and sends back any change that lowers an existing score or introduces a new part below **8**.
 
 ## Effigy command map
 
