@@ -194,29 +194,34 @@ macOS, and there is no deadline inheritance for nested `oxide` calls.
   <size> [--mode ephemeral|permanent]`; the default is `ephemeral`. Change an
   existing registration with `oxide pool set-mode <ephemeral|permanent>`.
   The setting can be changed while the drive is absent. Both modes use the
-  same availability checks and pool preference, and final outputs stay in
-  `<workspace>/target`. A slot lost with an unplugged drive stays held:
-  `oxide pool recover-interrupted <slot>` releases an interrupted one, while a
-  slot quarantined in the current boot session refuses that command and is
-  released with `oxide pool release-quarantined <slot>
-  --confirm-writers-stopped` once its writers are stopped (`--dry-run` first
-  prints the same descriptor census and changes nothing).
+  same availability checks and pool preference: `ephemeral` keeps final outputs
+  in `<workspace>/target`, while `permanent` places them on the drive. A slot
+  lost with an unplugged drive stays held or quarantined:
+  `oxide pool recover-interrupted <slot>` releases an interrupted one, while
+  legacy quarantined generations remain retained (`oxide pool
+  release-quarantined` refuses them because they lack cooperative Barge hold
+  history, even with `--confirm-writers-stopped` and `--dry-run`).
 - If a permanent drive cannot be used, Oxide warns before admission with the
   actual fallback reason, then includes that reason in the command summary
   when one is produced. Ephemeral mode keeps the existing fallback line.
   `oxide status` shows configured mode separately from the pool selected for
   the next build, including its fallback reason.
-- In permanent mode a checkout's `<workspace>/target` becomes an owned link
-  into the drive, after its first build (one notice) or an explicit `oxide
-  outputs adopt`. To keep one checkout's outputs in place, run `oxide outputs
-  detach` in that checkout: it restores a real empty `target`, keeps the
-  drive's output root and its bytes, and records the checkout as detached.
-  Detach works in either mode. A detached checkout stays unconverted
-  automatically; the next builds use its real `target`. Before its first
-  build, create a real empty `<workspace>/target` directory to opt that
-  checkout out. Oxide never converts an existing real `target` automatically.
-  `oxide outputs adopt` converts a detached checkout again, but only when its
-  `target` is missing or empty; a nonempty real target is refused and kept.
+- In permanent mode `<workspace>/target` stays a real directory and Oxide owns
+  profile-member links (`debug`, `release`, `<triple>/debug`,
+  `<triple>/release`) into the drive's output root, after a fresh checkout's
+  first build (one notice) or an explicit `oxide outputs adopt`. Legacy
+  whole-target checkouts (where `target` itself is a link) switch to the
+  profile layout via `oxide outputs detach` followed by `oxide outputs adopt`.
+  To keep one checkout's outputs in place, run `oxide outputs detach` in that
+  checkout: it restores a real empty `target`, keeps every output root and its
+  bytes, and records the checkout as detached. Detach works in either mode. A
+  detached checkout stays unconverted automatically; the next builds use its
+  real `target`. Before its first build, create a real empty
+  `<workspace>/target` directory to opt that checkout out. Oxide never converts
+  an existing real `target` automatically. `oxide outputs adopt` converts a
+  missing or empty real `target` (or a detached checkout), and converts empty
+  real member directories; a nonempty real `target` or nonempty real member
+  refuses and is kept.
 - A first conversion (`oxide outputs adopt`, or the automatic one on a fresh
   checkout's first build in permanent mode) publishes owned
   `<workspace>/target/<member>` links only when Git ignores each exact
@@ -235,15 +240,13 @@ macOS, and there is no deadline inheritance for nested `oxide` calls.
 - A root whose checkout is gone is never cleaned automatically. Inspect it
   with `oxide outputs prune --dry-run`, which prints a bounded preview and its
   SHA-256 and changes nothing; a real run needs those exact bytes
-  (`--plan FILE --plan-sha256 HEX`) and revalidates every predicate. Roots
-  whose checkout is present, whose selection is not the last live one, whose
-  writer custody is unknown, whose marker or volume does not verify, or which
-  predate the version-2 registry identity are kept. A root refused by a
-  fresh check before its intent is kept and the run continues: exit 0 lists
-  what was deleted and kept, exit 2 means nothing changed. An unfinished intent
-  reports exit 3 and is settled only with `oxide outputs resolve-intent
-  <intent-id>` when both the original and quarantine leaves are positively
-  absent. Never prune by hand or delete an `oxide-outputs` directory.
+  (`--plan FILE --plan-sha256 HEX`), and Barge rechecks holds and pins before
+  moving a root to marker-checked trash. Unknown legacy roots are retained, and
+  a historical registry with non-empty `intents` or `cancelled_overflow`
+  refuses safely instead of mutating roots. If any planned root is kept by
+  Barge or its trash copy could not be deleted (so it frees no space),
+  `--plan` exits 1 with a count of roots not freed; otherwise it exits 0. Never
+  prune by hand or delete an `oxide-outputs` directory.
 - A build that needs a new owned root reserves its nonce first; a
   `cancelled or replaced` refusal means another command or
   `oxide outputs cancel-reservation` changed that reservation: run the command

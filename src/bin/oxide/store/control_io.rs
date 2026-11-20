@@ -279,11 +279,14 @@ pub(super) fn lock_admission_inner(
         return Err(format!("{} does not exist", control.display()));
     };
     if let Some(pool) = release_pool {
+        let wait_started = Instant::now();
+        let active_budget =
+            crate::budget::admission_deadline().is_some_and(|expires| expires > wait_started);
         wait_release_admission(
             &file,
             Duration::from_secs(5),
             crate::budget::UNBUDGETED_LOCK_BOUND,
-            || crate::budget::admission_deadline().is_some(),
+            || active_budget,
             crate::budget::admission_expired,
             || {
                 let slot = snapshot(pool)
@@ -330,10 +333,11 @@ pub(super) fn wait_release_admission(
                 "the admission budget expired while waiting for the admission lock".to_owned(),
             );
         }
-        // Without an admission budget the wait still ends: a holder that
-        // outlives the bound is a refusal, never an unbounded flock (oxide#325).
+        // Every release wait is capped at `bound` (120 s) even when an
+        // admission budget exceeds it, matching `pool_lock_deadline` and
+        // `bounded_lock` (oxide#325).
         let waited = started.elapsed();
-        if !budgeted() && waited >= bound {
+        if waited >= bound {
             return Err(format!(
                 "gave up waiting for the admission lock after {:.1}s (the {:.0}s bound was reached; the notice above names its holder)",
                 waited.as_secs_f64(),

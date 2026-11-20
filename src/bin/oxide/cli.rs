@@ -203,7 +203,8 @@ pub const EXEC_USAGE: &str = "\
 USAGE:
     oxide exec [--admission-budget <dur>] [--execution-budget <dur>]
                [--budget-events <fd>] [--manifest-path <Cargo.toml>]
-               [--profile quick|debug|release] -- <command> [args]
+               [--profile quick|debug|release] [--output <member>]...
+               -- <command> [args]
 
 A budget is opt-in and independently optional: --admission-budget bounds the
 time before the tool starts, --execution-budget the tool's whole group (its
@@ -214,13 +215,16 @@ one Cargo workspace, with Oxide's storage, profile recipe and rustc-wrapper
 policy in its environment. The workspace comes from the current directory or
 --manifest-path; the tool keeps this working directory and its arguments.
 --profile selects the recipe and slot only: the tool still picks its own
-dev or release build. Final outputs stay in <workspace>/target. The tool runs
-as leader of its own process group; the slot stays held until every process
-in that group has exited. Its exit code is returned (128 + signal when a
-signal ended it). A terminal standard input is not passed: the tool reads
-end-of-file. Cooperative only: a tool that sets its own target or build
-directory, changes workspace or toolchain, or leaves its process group with
-setsid escapes Oxide's storage and closure.
+dev or release build. --output <member> declares a profile output member
+(repeatable, e.g. debug, release, <triple>/debug) in a profile-layout
+checkout; without it, the set derives from the checkout's receipt. Final
+outputs stay in <workspace>/target (or the placed profile members in
+permanent mode). The tool runs as leader of its own process group; the slot
+stays held until every process in that group has exited. Its exit code is
+returned (128 + signal when a signal ended it). A terminal standard input is
+not passed: the tool reads end-of-file. Cooperative only: a tool that sets its
+own target or build directory, changes workspace or toolchain, or leaves its
+process group with setsid escapes Oxide's storage and closure.
 ";
 
 /// Parse `oxide exec`. Oxide's options come before the mandatory `--`; the
@@ -1224,5 +1228,10 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.manifest_path, Some(PathBuf::from("/w/Cargo.toml")));
         assert_eq!(parsed.target.as_deref(), Some("x86_64-apple-darwin"));
+    }
+
+    #[test]
+    fn exec_usage_lists_output_member_option() {
+        assert!(EXEC_USAGE.contains("--output <member>"));
     }
 }

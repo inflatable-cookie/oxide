@@ -674,13 +674,13 @@ fn execute_primary_group(
         Ok(group) => group,
         Err(error) => {
             let origin = held.prior.unchanged();
-            prepared.store.release(held, origin)?;
+            let disposition = prepared.store.release(held, origin)?;
             budget::finished(
                 budget::Outcome::SpawnFailure,
                 None,
                 None,
                 budget::Drain::NotReached,
-                budget::Lease::Released,
+                release_lease_state(disposition),
                 1,
             );
             return match error {
@@ -923,7 +923,7 @@ fn finish_released_invocation(
             )
         });
     }
-    custody.store.release(custody.held, custody.origin)?;
+    let disposition = custody.store.release(custody.held, custody.origin)?;
     let (status, executable, drained) = execution.outcome?;
     let status = status.ok_or("Cargo ended without a status")?;
     print_summary(summary);
@@ -990,7 +990,7 @@ fn finish_released_invocation(
         if retired {
             budget::Lease::Retired
         } else {
-            budget::Lease::Released
+            release_lease_state(disposition)
         },
         code,
     );
@@ -1118,12 +1118,19 @@ fn exec_stdin() -> Stdio {
 /// The event's lease state comes from the release's own disposition: a deferred
 /// release keeps the lease held for a later command, and a failed one leaves
 /// unknown custody, so both are reported `held`.
+fn release_lease_state(disposition: store::ReleaseDisposition) -> budget::Lease {
+    match disposition {
+        store::ReleaseDisposition::Released => budget::Lease::Released,
+        store::ReleaseDisposition::Deferred => budget::Lease::Held,
+    }
+}
+
 fn fail_unstarted(custody: ProgramCustody<'_>, error: String) -> Result<u8, String> {
     let slot = custody.held.slot_id.clone();
     let released = custody.store.release(custody.held, custody.origin);
     let lease_state = match &released {
-        Ok(store::ReleaseDisposition::Released) => budget::Lease::Released,
-        Ok(store::ReleaseDisposition::Deferred) | Err(_) => budget::Lease::Held,
+        Ok(disposition) => release_lease_state(*disposition),
+        Err(_) => budget::Lease::Held,
     };
     budget::finished(
         budget::Outcome::SpawnFailure,
@@ -1202,13 +1209,13 @@ fn run_owned_program(
                 group.id, custody.held.slot_id
             ));
         }
-        custody.store.release(custody.held, None)?;
+        let disposition = custody.store.release(custody.held, None)?;
         budget::finished(
             budget::Outcome::InternalError,
             None,
             custody.execution_started,
             budget::Drain::NotReached,
-            budget::Lease::Released,
+            release_lease_state(disposition),
             1,
         );
         return Err(error);
@@ -1272,7 +1279,7 @@ fn run_owned_program(
             custody.seed_profile,
         );
     }
-    custody.store.release(custody.held, custody.origin)?;
+    let disposition = custody.store.release(custody.held, custody.origin)?;
     if let Some(origin) = budget::origin() {
         budget::report_stop(origin);
     }
@@ -1292,7 +1299,7 @@ fn run_owned_program(
         status,
         custody.execution_started,
         budget::Drain::Complete,
-        budget::Lease::Released,
+        release_lease_state(disposition),
         code,
     );
     Ok(code)
@@ -2276,5 +2283,133 @@ mod tests {
             );
         }
         budget::clear();
+    }
+
+    fn lease_with_deferred_scratch(store: &Store, key: &SlotKey) -> (store::Lease, PathBuf) {
+        let mut held = store::tests::seed_fixture_lease(store, key);
+        let slot_dir = held.build_dir.parent().expect("slot dir").to_path_buf();
+        let scratch = child_temp::choose_with(
+            None,
+            &store.payload,
+            &slot_dir,
+            child_temp::Identity {
+                store_id: held.store_id.clone(),
+                slot_id: held.slot_id.clone(),
+                incarnation: held.incarnation.clone(),
+                lease_id: held.lease_id().to_owned(),
+            },
+            4096,
+        )
+        .expect("the owned directory");
+        let owned = scratch.owned().expect("owned directory");
+        std::fs::remove_file(owned.path().join("owner")).expect("the marker");
+        let owned_path = owned.path().to_path_buf();
+        held.scratch = Some(owned);
+        (held, owned_path)
+    }
+
+    #[test]
+    fn finish_released_invocation_reports_deferred_release_as_held() {
+        for deferred in [true, false] {
+            let (reader, _writer) = install_event_sink();
+            let (root, store, key) = store::tests::seed_fixture();
+            let (held, owned_path) = if deferred {
+                let (held, path) = lease_with_deferred_scratch(&store, &key);
+                (held, Some(path))
+            } else {
+                (store::tests::seed_fixture_lease(&store, &key), None)
+            };
+            let slot = held.slot_id.clone();
+            let chosen = child_temp::Chosen::Inherited(std::env::temp_dir());
+            let mut invocation = budget_invocation();
+            invocation.command = "check".to_owned();
+            let waits = store::WaitAccounting::default();
+            let summary = SummaryContext {
+                store: &store,
+                invocation: &invocation,
+                slot: &slot,
+                warm: false,
+                measured: None,
+                started: Instant::now(),
+                note: None,
+                waits: &waits,
+            };
+            let custody = ProgramCustody {
+                store: &store,
+                held,
+                origin: None,
+                execution_started: None,
+                child_temp: &chosen,
+                production: None,
+                seed_profile: "debug",
+            };
+            let status = Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .status()
+                .unwrap();
+            let execution = PrimaryExecution {
+                outcome: Ok((Some(status), None, true)),
+                execution_started: None,
+                budget_stop: process::Stop::new(),
+                watchdog: None,
+                target_entries_before: None,
+            };
+            assert_eq!(
+                finish_released_invocation(custody, &summary, execution).unwrap(),
+                0
+            );
+            let expected = if deferred { "held" } else { "released" };
+            assert_eq!(finished_leases(reader), [expected]);
+            if let Some(path) = owned_path {
+                assert!(path.is_dir(), "a deferred scratch is kept");
+            }
+            budget::clear();
+            std::fs::remove_dir_all(root).expect("remove own fixture");
+        }
+    }
+
+    #[test]
+    fn run_owned_program_reports_deferred_release_as_held() {
+        for deferred in [true, false] {
+            let (reader, _writer) = install_event_sink();
+            let (root, store, key) = store::tests::seed_fixture();
+            let (held, owned_path) = if deferred {
+                let (held, path) = lease_with_deferred_scratch(&store, &key);
+                (held, Some(path))
+            } else {
+                (store::tests::seed_fixture_lease(&store, &key), None)
+            };
+            let chosen = child_temp::Chosen::Inherited(std::env::temp_dir());
+            let custody = ProgramCustody {
+                store: &store,
+                held,
+                origin: None,
+                execution_started: None,
+                child_temp: &chosen,
+                production: None,
+                seed_profile: "debug",
+            };
+            let manifest = root.join("Cargo.toml");
+            let args = [OsString::from("-c"), OsString::from("exit 0")];
+            let mut stop = process::Stop::new();
+            let code = run_owned_program(
+                custody,
+                OwnedProgram {
+                    program: Path::new("/bin/sh"),
+                    manifest: &manifest,
+                    args: &args,
+                },
+                &mut stop,
+            )
+            .unwrap();
+            assert_eq!(code, 0);
+            let expected = if deferred { "held" } else { "released" };
+            assert_eq!(finished_leases(reader), [expected]);
+            if let Some(path) = owned_path {
+                assert!(path.is_dir(), "a deferred scratch is kept");
+            }
+            budget::clear();
+            std::fs::remove_dir_all(root).expect("remove own fixture");
+        }
     }
 }

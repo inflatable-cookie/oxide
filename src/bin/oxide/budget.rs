@@ -428,6 +428,10 @@ pub fn arm_execution(started: Instant, phase: Phase) {
                 .checked_duration_since(admission.expires)
                 .map(millis)
         });
+        // Once the primary child has started, the admission window has ended
+        // and must not block post-build release or closeout locks.
+        state.admission = None;
+        oxide_storage::lease::set_admission_deadline(None);
         events_started(
             state,
             phase,
@@ -568,7 +572,7 @@ pub fn program_started() {
             return;
         }
         let seq = next_seq(state);
-        let admission_limit = state.admission.as_ref().map(|entry| entry.limit);
+        let admission_limit = state.options.admission;
         let execution_limit = state.options.execution.map(millis);
         let execution_started_ms = state
             .execution
@@ -1069,6 +1073,7 @@ fn group_empty(group: i32) -> bool {
 /// Test helper: forget the clock (tests in other modules use the same owner).
 #[cfg(test)]
 pub(crate) fn clear() {
+    oxide_storage::lease::set_admission_deadline(None);
     STATE.with(|cell| *cell.borrow_mut() = None);
 }
 
@@ -1724,5 +1729,71 @@ mod lock_wait_tests {
         drop(holder);
         assert!(bounded_lock(&waiter, "admission", None, Duration::from_secs(5)).is_ok());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn arm_execution_clears_admission_deadline_while_preserving_program_started_limit() {
+        let (mut reader, writer) = {
+            let mut fds = [0_i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            unsafe {
+                libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK);
+                libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
+                libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+                libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            use std::os::unix::io::FromRawFd;
+            unsafe {
+                (
+                    std::fs::File::from_raw_fd(fds[0]),
+                    std::fs::File::from_raw_fd(fds[1]),
+                )
+            }
+        };
+        use std::os::unix::io::AsRawFd;
+        clear();
+        install(Options {
+            admission: Some(Duration::from_millis(1)),
+            execution: Some(Duration::from_secs(30)),
+            events: Some(writer.as_raw_fd()),
+        })
+        .expect("a clock");
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(admission_expired());
+        assert!(oxide_storage::lease::admission_deadline().is_some());
+
+        // Arming execution inside the window preserves admission_ms for
+        // RunProgram, while clearing the admission deadline so post-build
+        // locks are never refused on admission expiry.
+        arm_execution(
+            Instant::now() - Duration::from_millis(5),
+            Phase::PrimaryCargo,
+        );
+        assert_eq!(admission_deadline(), None);
+        assert_eq!(oxide_storage::lease::admission_deadline(), None);
+        assert!(!admission_expired());
+        assert_eq!(clamp(Duration::from_secs(10)), Duration::from_secs(10));
+
+        program_started();
+        let mut text = String::new();
+        let mut chunk = [0_u8; 1024];
+        for _ in 0..50 {
+            match std::io::Read::read(&mut reader, &mut chunk) {
+                Ok(0) => break,
+                Ok(read) => text.push_str(&String::from_utf8_lossy(&chunk[..read])),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records[1]["phase"], "run_program");
+        assert_eq!(records[1]["admission_ms"], 1);
+        clear();
     }
 }

@@ -60,15 +60,15 @@ oxide: Cargo with managed build storage and profiles
 USAGE:
     oxide <check|test|clippy|build|run> [budget options] [--profile quick|debug|release] [cargo args] [-- args]
     oxide <other cargo command> [args]   passed to Cargo; leased when it can build
-    oxide exec [budget options] [--manifest-path <Cargo.toml>] [--profile quick|debug|release] -- <command> [args]
+    oxide exec [budget options] [--manifest-path <Cargo.toml>] [--profile quick|debug|release] [--output <member>]... -- <command> [args]
                                          run a tool that calls Cargo itself, leased
     oxide clean [--dry-run] [--include-foreign]
                                          remove <workspace>/target and slot affinity; slots stay
     oxide clean <-p|--doc|--profile ...> Cargo's selected clean, same storage rules
     oxide clean --cargo-cache            one pass of Cargo's own home cleanup, no network
-    oxide outputs plan|adopt|detach|status
-                                         permanent drive: plan, explicitly convert or
-                                         detach the owned <checkout>/target link
+    oxide outputs plan|adopt|detach|status|prune
+                                         permanent drive: plan, explicitly convert,
+                                         detach, inspect or prune owned outputs
     oxide status                         recorded pool, slots and waits; no walk or reconcile
     oxide status --measure               bounded payload, slot, checkout and Cargo-home walks
     oxide status --launch-check          macOS: time a new executable's first launch
@@ -76,6 +76,8 @@ USAGE:
                                          macOS: register an APFS volume; mode defaults to ephemeral
     oxide pool set-mode <ephemeral|permanent>
                                          change mode on an existing removable registration
+    oxide pool recover-interrupted <slot>
+                                         release an interrupted slot once writers stopped
     oxide pool describe --json           the registered drive as read-only JSON
     oxide init [cargo init args] [path]  cargo init if no Cargo.toml, then adopt Oxide
     oxide new <path> [cargo new args]    cargo new, then adopt Oxide
@@ -321,5 +323,13 @@ mod tests {
         assert_eq!(cold_seed_notice_when(true, Some(OsStr::new("0"))), None);
         // The outer gate is exactly the constant this slice flips last.
         assert_eq!(cold_seed_active(None), COLD_SEED_QUALIFIED);
+    }
+
+    #[test]
+    fn usage_lists_current_outputs_pool_and_exec_options() {
+        assert!(USAGE.contains("outputs plan|adopt|detach|status|prune"));
+        assert!(USAGE.contains("pool recover-interrupted <slot>"));
+        assert!(USAGE.contains("--output <member>"));
+        assert!(!USAGE.contains("owned <checkout>/target link"));
     }
 }
