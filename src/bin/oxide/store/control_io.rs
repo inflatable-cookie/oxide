@@ -10,11 +10,12 @@ use oxide_storage::lease::managed::{init_budget_pool, snapshot};
 use oxide_storage::lease::{check_control_writer, fence_admission_writer, LeaseError};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Caller-available bytes of the filesystem holding the new pool's parent.
@@ -436,6 +437,59 @@ pub(super) fn read_state(path: &Path) -> Result<Option<State>, String> {
     bounded_read(path, MAX_STATE_BYTES)?
         .map(|bytes| parse_state(&bytes))
         .transpose()
+}
+
+/// The state document of one control directory. `Ok(None)` means no state
+/// exists: the directory or its `state.json` is absent. Every other failure to
+/// inspect or read it is an error, never "no records". `exists()` maps every
+/// metadata error to `false`, so it is not used for this. A symlink or other
+/// non-directory at the control path is refused.
+pub(super) fn read_control_state_if_present(control: &Path) -> Result<Option<State>, String> {
+    match fs::symlink_metadata(control) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(format!("{} is not a real directory", control.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "{} cannot be inspected: {error}",
+                control.display()
+            ))
+        }
+    }
+    read_state(&control.join("state.json"))
+}
+
+/// Replace `dir/name` with `bytes`, atomically and durably. The bytes go to a
+/// fresh owner-only temp file in `dir`, created exclusively, synced, renamed
+/// over `name`, and then `dir` is synced so the rename itself survives a crash.
+/// Any failure removes the temp file. The temp name carries this process's ID
+/// and a counter, so a temp left by a crashed writer never blocks a later one.
+pub(super) fn atomic_write_private(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let temp = dir.join(format!(
+        "{name}.{}.{}.tmp",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = write_then_rename(&temp, &dir.join(name), dir, bytes);
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn write_then_rename(temp: &Path, dest: &Path, dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(temp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temp, dest)?;
+    File::open(dir)?.sync_all()
 }
 
 pub(super) enum Probe {

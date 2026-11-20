@@ -16,7 +16,8 @@ use std::time::Instant;
 
 use super::admission::{Wait, WaitAccounting, WAIT_POLL};
 use super::control_io::{
-    ensure_private_dir, lock_admission, private_file, probe_lock, publish_writer_generation, Probe,
+    ensure_private_dir, lock_admission, private_file, probe_lock, publish_writer_generation,
+    read_control_state_if_present, Probe,
 };
 use super::recovery::{boot_session, closed_by_boot};
 
@@ -88,16 +89,10 @@ pub(super) fn custody_verdict(
                     // A restart closed a quarantined record whose holder
                     // predates this boot session; its slot is released and
                     // deleted whole at the next admission.
-                    #[cfg(not(test))]
                     let unclosed = lost
                         .unclosed
                         .as_deref()
                         .filter(|_| !closed_by_boot(record, boot));
-                    #[cfg(test)]
-                    let unclosed = lost.unclosed.as_deref().filter(|_| {
-                        let closed = closed_by_boot(record, boot);
-                        !closed
-                    });
                     if let Some(why) = unclosed {
                         return CheckoutCustody::Unknown(format!(
                             "slot {} in the {pool} pool is lost with writers that were never confirmed closed ({why})",
@@ -192,11 +187,7 @@ impl Store {
     pub fn checkout_custody(&self, checkout: &Path, own: u64) -> Result<CheckoutCustody, String> {
         let _sibling = self.sibling_admission()?;
         let _admission = self.admission()?;
-        let own_state = if self.control.exists() {
-            Some(self.load()?)
-        } else {
-            None
-        };
+        let own_state = read_control_state_if_present(&self.control)?;
         // A sibling with no state file has no records; any failure to read or
         // parse one is unknown custody, never "clear".
         let other_state = match self.checked_sibling_state() {

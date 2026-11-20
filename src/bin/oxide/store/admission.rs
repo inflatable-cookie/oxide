@@ -17,9 +17,7 @@ use oxide_storage::lease::{
     SlotOccupancy,
 };
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs::{self, File};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -59,7 +57,9 @@ pub(super) enum Wait {
     HostLimit(usize),
     Checkout,
     Clean,
-    #[allow(dead_code)]
+    /// Test-only: a project cap is a replacement or a refusal, never a wait
+    /// that production admission reports (see [`ProjectCap`]).
+    #[cfg(test)]
     ProjectCap,
     Uncertain,
     Capacity(Option<String>),
@@ -72,6 +72,7 @@ impl Wait {
             Self::HostLimit(_) => WaitCategory::HostLimit,
             Self::Checkout => WaitCategory::Checkout,
             Self::Clean => WaitCategory::Clean,
+            #[cfg(test)]
             Self::ProjectCap => WaitCategory::ProjectCap,
             Self::Uncertain => WaitCategory::Uncertain,
             Self::Capacity(_) => WaitCategory::Capacity,
@@ -86,6 +87,7 @@ impl Wait {
             }
             Self::Checkout => "another oxide command in this checkout".to_owned(),
             Self::Clean => "oxide clean in this checkout".to_owned(),
+            #[cfg(test)]
             Self::ProjectCap => {
                 format!("an idle slot of this project (cap {PROJECT_SLOT_CAP} slots)")
             }
@@ -644,10 +646,6 @@ impl Store {
         share: bool,
         view: &LedgerView,
     ) -> Result<SlotChoice, String> {
-        let has_slot = |record: &Record| {
-            let project = self.affinity_dir(record.id);
-            view.slots.iter().any(|slot| slot.project == project)
-        };
         self.forget_stale_records(state, key, view);
         let (existing, mut lock, busy) = self.find_own_slot(state, key, view)?;
         let mut existing = existing;
@@ -656,7 +654,9 @@ impl Store {
         // A project-cap replacement the library performs as part of the
         // admission below; choosing it never deletes anything itself.
         let mut replace: Option<(u64, String)> = None;
-        let shared = if share && !existing.is_some_and(|index| has_slot(&state.records[index])) {
+        let shared = if share
+            && !existing.is_some_and(|index| self.record_has_slot(&state.records[index], view))
+        {
             self.shared_candidate(state, key, view)?
         } else {
             None
@@ -675,7 +675,7 @@ impl Store {
             shared_origin = Some(origin);
             lock = Some(file);
             existing = Some(index);
-        } else if !existing.is_some_and(|index| has_slot(&state.records[index])) {
+        } else if !existing.is_some_and(|index| self.record_has_slot(&state.records[index], view)) {
             match self.project_cap_replacement(state, key, view, existing, busy) {
                 Ok(ProjectCap::Room) => {}
                 Ok(ProjectCap::Replace(id, slot_id)) => replace = Some((id, slot_id)),
@@ -709,6 +709,12 @@ impl Store {
         })
     }
 
+    /// Whether the ledger holds a slot for this record's private project.
+    pub(super) fn record_has_slot(&self, record: &Record, view: &LedgerView) -> bool {
+        let project = self.affinity_dir(record.id);
+        view.slots.iter().any(|slot| slot.project == project)
+    }
+
     /// Decide what this project's slot cap allows a record that owns no slot
     /// of it. A record that is held, retired or uncertain (a live or
     /// unattributable lock) is never a candidate for replacement.
@@ -720,14 +726,10 @@ impl Store {
         existing: Option<usize>,
         busy: bool,
     ) -> Result<ProjectCap, String> {
-        let has_slot = |record: &Record| {
-            let project = self.affinity_dir(record.id);
-            view.slots.iter().any(|slot| slot.project == project)
-        };
         let project_slots = state
             .records
             .iter()
-            .filter(|record| record.identity == key.identity && has_slot(record))
+            .filter(|record| record.identity == key.identity && self.record_has_slot(record, view))
             .count();
         if project_slots < PROJECT_SLOT_CAP {
             return Ok(ProjectCap::Room);
@@ -739,7 +741,9 @@ impl Store {
             .records
             .iter()
             .filter(|record| {
-                record.phase == Phase::Idle && record.identity == key.identity && has_slot(record)
+                record.phase == Phase::Idle
+                    && record.identity == key.identity
+                    && self.record_has_slot(record, view)
             })
             .filter_map(|record| {
                 let project = self.affinity_dir(record.id);
@@ -960,10 +964,6 @@ impl Store {
         key: &SlotKey,
         view: &LedgerView,
     ) -> Result<(Option<usize>, Option<File>, bool), String> {
-        let has_slot = |record: &Record| {
-            let project = self.affinity_dir(record.id);
-            view.slots.iter().any(|slot| slot.project == project)
-        };
         let matches = |record: &Record| {
             record.phase != Phase::Retired
                 && record.checkout.as_deref() == Some(key.checkout.as_path())
@@ -981,7 +981,7 @@ impl Store {
             .collect();
         own.sort_by_key(|&index| {
             let record = &state.records[index];
-            std::cmp::Reverse((has_slot(record), record.last_used))
+            std::cmp::Reverse((self.record_has_slot(record, view), record.last_used))
         });
         let mut existing = None;
         let mut lock = None;
@@ -1005,10 +1005,6 @@ impl Store {
 
     /// Forget idle records that no longer own a slot or match this key.
     pub(super) fn forget_stale_records(&self, state: &mut State, key: &SlotKey, view: &LedgerView) {
-        let has_slot = |record: &Record| {
-            let project = self.affinity_dir(record.id);
-            view.slots.iter().any(|slot| slot.project == project)
-        };
         let same_key = |record: &Record| {
             record.phase != Phase::Retired
                 && record.checkout.as_deref() == Some(key.checkout.as_path())
@@ -1017,7 +1013,11 @@ impl Store {
         let stale: Vec<u64> = state
             .records
             .iter()
-            .filter(|record| record.phase == Phase::Idle && !has_slot(record) && !same_key(record))
+            .filter(|record| {
+                record.phase == Phase::Idle
+                    && !self.record_has_slot(record, view)
+                    && !same_key(record)
+            })
             .map(|record| record.id)
             .collect();
         for id in stale {
@@ -1129,18 +1129,7 @@ impl Store {
                 _ => Ok(()),
             };
         }
-        let temp = path.with_extension("json.tmp");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temp)
-            .map_err(|error| format!("cannot write a slot origin: {error}"))?;
-        file.write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .and_then(|()| fs::rename(&temp, &path))
+        atomic_write_private(&self.control.join("origins"), &format!("{id}.json"), &bytes)
             .map_err(|error| format!("cannot write a slot origin: {error}"))
     }
 

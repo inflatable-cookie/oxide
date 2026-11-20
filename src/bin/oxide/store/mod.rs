@@ -73,19 +73,18 @@ pub(crate) use status::{
 
 use crate::config::{self, Backup, Facts, Found, Settings};
 use crate::watchdog::Watchdog;
-use oxide_storage::lease::managed::{ledger_view, prepare_pool, snapshot, status as pool_status};
+use oxide_storage::lease::managed::{ledger_view, prepare_pool, snapshot};
 use oxide_storage::lease::{
     read_writer_state, LedgerView, PoolStatus, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
     VOLUME_BACKEND_APFS_V1,
 };
 
 use self::control_io::{
-    check_writer_generation, create_pool, ensure_private_dir, free_bytes_for_creation, lease_error,
-    lock_admission_inner, prepare_front_door_pool, read_state, verify_private_dir,
+    atomic_write_private, check_writer_generation, create_pool, ensure_private_dir,
+    free_bytes_for_creation, lease_error, lock_admission_inner, prepare_front_door_pool,
+    read_control_state_if_present, read_state, verify_private_dir,
 };
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 pub const GIB: u64 = 1024 * 1024 * 1024;
@@ -238,7 +237,7 @@ impl Store {
         // ordinary directory both get the hint instead of the generic open
         // error (oxide#182).
         config::pool_annotation_refused(&path, source)?;
-        let scratch = { crate::scratch_io::evaluate(&settings, false) }.map_err(|error| {
+        let scratch = crate::scratch_io::evaluate(&settings, false).map_err(|error| {
             if matches!(source, config::Source::Environment("OXIDE_POOL")) {
                 format!("OXIDE_POOL names {}: {error}", path.display())
             } else {
@@ -260,7 +259,7 @@ impl Store {
                     if available < HOST_RESERVE_BYTES {
                         return Err("refusing to create the pool: host free space is below the 20 GiB reserve".into());
                     }
-                    { crate::scratch_io::create(&settings, uuid, admission_budget(&settings)) }?;
+                    crate::scratch_io::create(&settings, uuid, admission_budget(&settings))?;
                 } else {
                     create_pool(&path, admission_budget(&settings))?;
                 }
@@ -269,7 +268,7 @@ impl Store {
             Found::Directory | Found::Unknown => {}
         }
         if let Some(uuid) = &scratch {
-            { crate::scratch_io::repair(&settings, uuid) }?;
+            crate::scratch_io::repair(&settings, uuid)?;
         }
         let store = match Self::open_at(&path, &settings) {
             Ok(store) => store,
@@ -286,10 +285,8 @@ impl Store {
             }
             Err(error) => return Err(error),
         };
-        if !{ config::has_sticky_exclusion(&store.pool) } {
-            match {
-                config::exclude_from_backup(&store.pool)
-            } {
+        if !config::has_sticky_exclusion(&store.pool) {
+            match config::exclude_from_backup(&store.pool) {
                 Backup::Excluded | Backup::NotApplicable => {}
                 Backup::NotExcluded(reason) => {
                     return Err(format!(
@@ -300,7 +297,7 @@ impl Store {
             }
         }
         if !matches!(settings.pool_source, config::Source::Environment(_)) {
-            if let Err(error) = { config::remember_pool(&Facts::from_env(), &store.pool) } {
+            if let Err(error) = config::remember_pool(&Facts::from_env(), &store.pool) {
                 eprintln!("oxide: could not record the pool path for status: {error}");
             }
         }
@@ -372,14 +369,23 @@ impl Store {
     }
 
     fn open_existing_mode(settings: &Settings, repair: bool) -> Result<Option<Self>, String> {
-        if std::env::var_os("OXIDE_SCRATCH_ROOT").is_some() {
-            crate::scratch_io::evaluate(settings, false)?;
-        }
+        // A declared scratch root is judged before the pool is inspected, so
+        // its refusal holds even for an absent pool. That judgement is reused
+        // for the repair below instead of being evaluated a second time.
+        let declared = if std::env::var_os("OXIDE_SCRATCH_ROOT").is_some() {
+            Some(crate::scratch_io::evaluate(settings, false)?)
+        } else {
+            None
+        };
         match config::inspect(&settings.pool) {
             Found::Absent => Ok(None),
             Found::LegacyImage => Err(legacy_refusal()),
             Found::Directory | Found::Unknown => {
-                if let Some(uuid) = crate::scratch_io::evaluate(settings, false)? {
+                let scratch = match declared {
+                    Some(scratch) => scratch,
+                    None => crate::scratch_io::evaluate(settings, false)?,
+                };
+                if let Some(uuid) = scratch {
                     if repair {
                         crate::scratch_io::repair(settings, &uuid)?;
                     }
@@ -546,14 +552,8 @@ impl Store {
         self.max_active
     }
 
-    /// Passive status using recorded slot observations.
-    #[allow(dead_code)]
-    pub fn status(&self) -> Result<PoolStatus, String> {
-        pool_status(&self.pool).map_err(|error| lease_error("cannot read the pool", &error))
-    }
-
     /// Ledger membership with no accounting walk, for selection, affinity,
-    /// waits and recovery. It refuses where [`Store::status`] does.
+    /// waits and recovery.
     pub fn ledger(&self) -> Result<LedgerView, String> {
         ledger_view(&self.pool).map_err(|error| lease_error("cannot read the pool", &error))
     }
@@ -666,24 +666,9 @@ impl Store {
         let Some(sibling) = self.sibling.as_ref() else {
             return Ok(None);
         };
-        // The control directory itself is inspected first: a genuinely absent
-        // one means the other pool has no state at all, while a symlinked,
-        // dangling, foreign or unreadable one is unknown custody. Reading
-        // `state.json` alone would map a dangling control directory to ENOENT
-        // and so to "no records" — exactly the direction this must not take.
-        match fs::symlink_metadata(&sibling.control) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(format!(
-                    "the other pool's control directory cannot be inspected: {error}"
-                ))
-            }
-            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
-                return Err("the other pool's control path is not a real directory".to_owned())
-            }
-            Ok(_) => {}
-        }
-        read_state(&sibling.control.join("state.json"))
+        // A dangling control directory must not read as "no records", so the
+        // helper inspects the directory itself before reading its state.
+        read_control_state_if_present(&sibling.control)
             .map_err(|error| format!("the other pool's record state is unreadable: {error}"))
     }
 
@@ -854,22 +839,7 @@ impl Store {
         if bytes.len() as u64 > MAX_STATE_BYTES {
             return Err("Oxide state reached its byte limit".to_owned());
         }
-        // Only the admission-lock holder writes, so one temp name suffices.
-        let temp = self.control.join("state.json.tmp");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temp)
-            .map_err(|error| format!("cannot write Oxide state: {error}"))?;
-        file.write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| format!("cannot write Oxide state: {error}"))?;
-        fs::rename(&temp, self.control.join("state.json"))
-            .and_then(|()| File::open(&self.control)?.sync_all())
-            .map_err(|error| format!("cannot replace Oxide state: {error}"))?;
-        Ok(())
+        atomic_write_private(&self.control, "state.json", &bytes)
+            .map_err(|error| format!("cannot write Oxide state: {error}"))
     }
 }

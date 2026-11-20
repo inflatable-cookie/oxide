@@ -30,6 +30,18 @@ pub(super) fn fence_paired(
     sibling.save_for_writer(state)
 }
 
+/// Refuse an owned-outputs fence that is neither the successor nor an accepted
+/// predecessor. An absent fence is not refused here; each caller decides what
+/// absence means for it.
+fn check_predecessor_fence(owned_outputs: Option<&str>, holder: &str) -> Result<(), String> {
+    if owned_outputs.is_some_and(|fence| !predecessor_owned_outputs_fence(fence)) {
+        return Err(format!(
+            "{holder} carries an unknown owned-outputs fence; refusing"
+        ));
+    }
+    Ok(())
+}
+
 /// Positive writer closure in one pool's state for owned-outputs
 /// initialization (see [`Store::initialize_outputs`]). Anything that is not
 /// positively idle, closed or the caller's own barrier refuses.
@@ -98,16 +110,10 @@ impl Store {
             let _admission = store.admission()?;
             let mut state = store.load()?;
             if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
-                if state
-                    .owned_outputs
-                    .as_deref()
-                    .is_some_and(|fence| !predecessor_owned_outputs_fence(fence))
-                {
-                    return Err(format!(
-                        "Oxide state in {} carries an unknown owned-outputs fence; refusing",
-                        store.control.display()
-                    ));
-                }
+                check_predecessor_fence(
+                    state.owned_outputs.as_deref(),
+                    &format!("the Oxide state in {}", store.control.display()),
+                )?;
                 if state.outputs_init.is_some() {
                     return Err(format!(
                         "Oxide state in {} already records an output-registry transaction but not the successor fence; refusing",
@@ -125,12 +131,6 @@ impl Store {
     /// has begun. Read without a lock; callers that mutate recheck it under
     /// admission.
     pub fn outputs_initialization(&self) -> Result<Option<OutputsInit>, String> {
-        #[cfg(test)]
-        {
-            let state = self.load()?;
-            Ok(state.outputs_init)
-        }
-        #[cfg(not(test))]
         Ok(self.load()?.outputs_init)
     }
 
@@ -242,16 +242,7 @@ impl Store {
         match &state.outputs_init {
             Some(OutputsInit::Ready { transaction, .. }) if transaction == recorded => {
                 if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
-                    if state
-                        .owned_outputs
-                        .as_deref()
-                        .is_some_and(|fence| !predecessor_owned_outputs_fence(fence))
-                    {
-                        return Err(
-                            "the paired pool carries an unknown owned-outputs fence; refusing"
-                                .to_owned(),
-                        );
-                    }
+                    check_predecessor_fence(state.owned_outputs.as_deref(), "the paired pool")?;
                     // The internal control may already carry the successor
                     // fence (a crash between the two saves), so this paired
                     // upgrade is the only remaining closure check: it must
@@ -279,16 +270,7 @@ impl Store {
                 // Parity with the `Ready` arm above: the released `/1` fence
                 // is a legitimate predecessor here too, not an unknown value
                 // (oxide#159).
-                if state
-                    .owned_outputs
-                    .as_deref()
-                    .is_some_and(|fence| !predecessor_owned_outputs_fence(fence))
-                {
-                    return Err(
-                        "the paired pool carries an unknown owned-outputs fence; refusing"
-                            .to_owned(),
-                    );
-                }
+                check_predecessor_fence(state.owned_outputs.as_deref(), "the paired pool")?;
                 // A new or reappearing control is fenced only with its own
                 // writers positively closed.
                 fence_paired(&sibling, &mut state, recorded, own_checkout)?;
@@ -457,11 +439,7 @@ impl Store {
             );
         }
         writers_closed(&internal_state, "the internal", own_checkout)?;
-        let sibling = self
-            .sibling
-            .as_ref()
-            .filter(|sibling| sibling.control != internal_control)
-            .map(|sibling| (self.view(&sibling.control), sibling.barrier));
+        let sibling = self.paired_view(&internal_control);
         let mut sibling_admission = None;
         if let Some((sibling, _barrier)) = &sibling {
             sibling.ensure_control()?;

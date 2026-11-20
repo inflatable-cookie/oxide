@@ -2252,6 +2252,116 @@ fn pending_recovery_survives_a_crash_after_the_ledger_change() {
     assert!(state.records[0].pending_recovery.is_none());
 }
 
+/// A crashed record whose lease is still held, with its lock free, plus one
+/// unrelated record whose lock a live command holds. Returns the crashed
+/// record's ID and the live command's lock.
+fn crashed_record_beside_a_live_one(
+    label: &str,
+) -> (PathBuf, Store, u64, File, Option<barge::Hold>) {
+    let (root, store, key) = lease_fixture(label);
+    let leased = lease(&store, &key, None).expect("fixture lease");
+    let crashed = store
+        .load()
+        .unwrap()
+        .records
+        .iter()
+        .find(|record| record.active())
+        .expect("an active record")
+        .id;
+    // The crash shape: the ledger still holds the slot, the record lock is
+    // free, and Cargo never started (so its group was never recorded). The
+    // slot's Barge root hold stays with the ledger, which otherwise reads a
+    // held slot whose holder has gone as idle.
+    let mut leased = leased;
+    let root_hold = leased._root_hold.take();
+    drop(leased);
+    let mut state = store.load().unwrap();
+    let record = state
+        .records
+        .iter_mut()
+        .find(|record| record.id == crashed)
+        .expect("the crashed record");
+    record.phase = Phase::Acquiring;
+    record.process_group = None;
+    let lease_id = record
+        .lease_id
+        .clone()
+        .expect("the crashed record's lease ID");
+    store.save(&state).unwrap();
+    // The ledger still holds the slot under that lease: the crash left it held.
+    let ledger_path = store.pool.join("ledger.json");
+    let mut ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    let slot = ledger["slots"]
+        .as_array_mut()
+        .expect("slots")
+        .first_mut()
+        .expect("the fixture slot");
+    slot["state"] = serde_json::json!("held");
+    slot["lease_id"] = serde_json::json!(lease_id);
+    fs::write(&ledger_path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+    let live = hold_record_for_tests(&store, &key.checkout, 900);
+    (root, store, crashed, live, root_hold)
+}
+
+/// Regression (oxide#356): a flush whose reload drops the record it was
+/// settling must not leave the recovery loop indexing past the end of the
+/// reloaded records.
+#[test]
+fn recover_settled_survives_a_reload_that_drops_a_record() {
+    let (root, store, crashed, _live, _root_hold) =
+        crashed_record_beside_a_live_one("recover-drops");
+    let flushes = std::cell::Cell::new(0);
+    let mut state = store.load().unwrap();
+    store
+        .recover_settled_with(&mut state, |store, _slot, _record| {
+            flushes.set(flushes.get() + 1);
+            // The flush retires the record, and the reload that follows
+            // no longer holds it.
+            let mut reloaded = store.load()?;
+            reloaded.records.retain(|record| record.id != crashed);
+            store.save(&reloaded)?;
+            Ok(false)
+        })
+        .expect("recovery settles without indexing past the reloaded records");
+    assert_eq!(flushes.get(), 1, "the flush did not run");
+    assert!(state.records.iter().all(|record| record.id != crashed));
+    assert!(state
+        .records
+        .iter()
+        .any(|record| record.id == 900 && record.phase == Phase::Running));
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Regression (oxide#356): a flush whose reload reorders the records must
+/// still recover the record it settled, found by its ID rather than position.
+#[test]
+fn recover_settled_finds_its_record_after_a_reload_reorders_them() {
+    let (root, store, crashed, _live, _root_hold) =
+        crashed_record_beside_a_live_one("recover-reorders");
+    let mut state = store.load().unwrap();
+    store
+        .recover_settled_with(&mut state, |store, _slot, _record| {
+            let mut reloaded = store.load()?;
+            reloaded.records.reverse();
+            store.save(&reloaded)?;
+            Ok(true)
+        })
+        .expect("recovery settles after the reload reorders the records");
+    let settled = state
+        .records
+        .iter()
+        .find(|record| record.id == crashed)
+        .expect("the crashed record is kept");
+    assert_eq!(settled.phase, Phase::Idle);
+    assert_eq!(state.recoveries.len(), 1);
+    assert!(state
+        .records
+        .iter()
+        .any(|record| record.id == 900 && record.phase == Phase::Running));
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn pool_cap_parses_decimal_and_binary_units() {
     let budget = Backend::DirectoryBudget;
@@ -3448,14 +3558,13 @@ fn a_failed_fence_write_leaves_the_ledger_and_journals_byte_identical() {
     let state_path = store.control.join("state.json");
     let ledger_bytes = fs::read(&ledger_path).unwrap();
     let state_bytes = fs::read(&state_path).unwrap();
-    // Force the atomic state write to fail: its temp path is a directory.
-    let temp = store.control.join("state.json.tmp");
-    if temp.exists() {
-        fs::remove_file(&temp).unwrap();
-    }
-    fs::create_dir(&temp).unwrap();
+    // Force the atomic state write to fail: a read-only control directory
+    // refuses the exclusive temp file it must create.
+    let mode = fs::metadata(&store.control).unwrap().permissions().mode() & 0o777;
+    fs::set_permissions(&store.control, fs::Permissions::from_mode(0o500)).unwrap();
 
     let outcome = store.admission();
+    fs::set_permissions(&store.control, fs::Permissions::from_mode(mode)).unwrap();
     assert!(outcome.is_err(), "a failed fence write did not refuse");
     assert_eq!(
         fs::read(&ledger_path).unwrap(),
