@@ -58,7 +58,7 @@ computed. They are deliberately different.
 - **Classified set.** Every existing candidate member path under `target`. It
   can only refuse. It never plans, keys, converts or grants.
 
-Candidates come from the existing migration traversal. `debug` and `release` are
+Candidates come from the existing profile member traversal. `debug` and `release` are
 matched as member names before any triple descent, so a profile's payload is
 never listed. Links are not followed. Each candidate gets `symlink_metadata`,
 and a link gets `read_link`. A link target is never resolved, opened or
@@ -81,7 +81,7 @@ Checkout states:
 | --- | --- |
 | Profile receipt, committed | Derived plan |
 | Profile receipt, detached | Empty set; runs locally with real directories, no owned destination |
-| Profile receipt, prepared, pruning or pruned | Refuse under the existing custody rules; pruned names `oxide outputs adopt` |
+| Profile receipt, prepared or pruned | Refuse under the existing custody rules; pruned names `oxide outputs adopt` |
 | Whole-target receipt | Unchanged; the declaration is not consulted (`outputs-2` key) |
 | Never converted | Unchanged ephemeral behaviour; no destination in the key |
 | Member-shaped foreign link, no profile receipt | Refuse: an unconverted checkout's `target` must be real |

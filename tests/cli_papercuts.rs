@@ -866,6 +866,13 @@ fn whole_target_fixture(scratch: &Scratch, bin: &Path) -> (PathBuf, PathBuf, Pat
     )
     .unwrap();
     fs::write(app.join("src/lib.rs"), "pub fn v() -> u32 { 1 }\n").unwrap();
+    let git_init = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&app)
+        .status()
+        .unwrap();
+    assert!(git_init.success(), "git init failed in fixture");
+    fs::write(app.join(".gitignore"), "/target/\n/.oxide-outputs/\n").unwrap();
     let checkout = fs::canonicalize(&app).unwrap();
     let pool = scratch.path().join("fixture-pool");
     created_pool(scratch, bin, &manifest, &pool);
@@ -874,6 +881,10 @@ fn whole_target_fixture(scratch: &Scratch, bin: &Path) -> (PathBuf, PathBuf, Pat
     // a wrong-volume refusal, never the local fallback this fixture needs.
     let mount = scratch.path().join("absent-mount");
     registration_at(&control, &mount);
+    let removable_control = control.join("removable").join("oxide-managed");
+    fs::create_dir_all(&removable_control).unwrap();
+    fs::set_permissions(control.join("removable"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&removable_control, fs::Permissions::from_mode(0o700)).unwrap();
     let id = checkout_id(&checkout);
     let root = scratch.path().join("owned-root");
     fs::create_dir_all(&root).unwrap();
@@ -912,13 +923,13 @@ fn whole_target_fixture(scratch: &Scratch, bin: &Path) -> (PathBuf, PathBuf, Pat
     (checkout, pool, root)
 }
 
-/// oxide#182 item 2, at the CLI boundary: `oxide outputs plan` reports the
-/// migration `adopt` would perform for a committed whole-target checkout —
-/// action, the same classified member set, the root/1→root/2 marker upgrade
-/// with its reserved nonce where it applies, the same root at the next
-/// generation, and `data_move: false` — and changes no receipt or marker byte.
+/// At the CLI boundary, `oxide outputs plan`, `oxide outputs status`,
+/// `oxide outputs detach`, and `oxide outputs adopt` handle committed
+/// `transition/2` and `transition/1` whole-target checkouts cleanly: `plan` and
+/// `status` read them read-only without changing receipt/marker bytes, direct
+/// `adopt` refuses, and `detach` + `adopt` switches to profile member links.
 #[test]
-fn outputs_plan_reports_the_whole_target_migration() {
+fn outputs_plan_status_and_detach_handle_legacy_whole_target_receipts() {
     let scratch = Scratch::new();
     let manifest = scratch.path().join("app/Cargo.toml");
     fs::create_dir_all(manifest.parent().unwrap()).unwrap();
@@ -960,60 +971,103 @@ fn outputs_plan_reports_the_whole_target_migration() {
     let report = plan(&checkout, &pool);
     assert_eq!(report["version"], "oxide.outputs.plan/2", "{report}");
     assert_eq!(report["layout"], "whole-target", "{report}");
-    assert_eq!(report["action"], "migrate", "{report}");
+    assert_eq!(report["action"], "refuse", "{report}");
     assert_eq!(report["data_move"], json!(false), "{report}");
-    assert_eq!(
-        report["migration_members"],
-        json!(["debug", "release"]),
+    assert!(report.get("migration_members").is_none(), "{report}");
+    assert!(report.get("marker_upgrade").is_none(), "{report}");
+    assert!(
+        report["reason"].as_str().is_some_and(
+            |r| r.contains("oxide outputs detach") && r.contains("oxide outputs adopt")
+        ),
         "{report}"
     );
-    assert!(report.get("marker_upgrade").is_none(), "{report}");
-    assert_eq!(
-        report["proposed_root"]["root"],
-        json!(root.to_string_lossy())
-    );
-    assert_eq!(report["proposed_root"]["generation"], json!(2));
-    assert_eq!(
-        fs::read(&marker).unwrap(),
-        marker_before,
-        "the plan rewrote the marker"
-    );
-    assert_eq!(
-        fs::read(&receipt).unwrap(),
-        receipt_before,
-        "the plan rewrote the receipt"
-    );
+    assert_eq!(fs::read(&marker).unwrap(), marker_before);
+    assert_eq!(fs::read(&receipt).unwrap(), receipt_before);
+    assert_eq!(fs::read(pool.join("ledger.json")).unwrap(), ledger_before);
 
-    // A root/1 marker is upgraded by `adopt`; the plan says so without
-    // reserving the nonce, and writes nothing.
+    // Read-only `oxide outputs status` also handles transition/2 and transition/1.
+    let status = private_env(scratch.path(), &bin, &pool)
+        .current_dir(&checkout)
+        .args(["outputs", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(stdout.contains("oxide outputs detach"), "{stdout}");
+    assert_eq!(fs::read(&receipt).unwrap(), receipt_before);
+
+    // Rewrite as a transition/1 receipt with a root/1 marker: `plan`, `status`,
+    // and `detach` + `adopt` handle it cleanly too.
+    let id = checkout_id(&checkout);
+    write_private(
+        &receipt,
+        serde_json::to_vec(&json!({
+            "version": "oxide.outputs.transition/1",
+            "checkout": checkout,
+            "checkout_id": id,
+            "generation": 1,
+            "state": "committed",
+            "selected": {"kind": "local", "root": root, "generation": 1},
+            "roots": [{"kind": "local", "root": root, "generation": 1}],
+            "updated_ms": 1,
+        }))
+        .unwrap()
+        .as_slice(),
+    );
     let mut one: Value = serde_json::from_slice(&marker_before).unwrap();
     one["version"] = json!("oxide.outputs.root/1");
     one.as_object_mut().unwrap().remove("nonce");
     one.as_object_mut().unwrap().remove("checkout_volume_uuid");
     fs::write(&marker, serde_json::to_vec(&one).unwrap()).unwrap();
+    let v1_receipt_before = fs::read(&receipt).unwrap();
     let marker_one = fs::read(&marker).unwrap();
+
     let report = plan(&checkout, &pool);
-    assert_eq!(report["action"], "migrate", "{report}");
-    assert_eq!(
-        report["marker_upgrade"],
-        json!({
-            "from": "oxide.outputs.root/1",
-            "to": "oxide.outputs.root/2",
-            "nonce": "reserve",
-        }),
-        "{report}"
+    assert_eq!(report["layout"], "whole-target", "{report}");
+    assert_eq!(report["action"], "refuse", "{report}");
+    assert_eq!(fs::read(&marker).unwrap(), marker_one);
+    assert_eq!(fs::read(&receipt).unwrap(), v1_receipt_before);
+
+    let status = private_env(scratch.path(), &bin, &pool)
+        .current_dir(&checkout)
+        .args(["outputs", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
     );
-    assert_eq!(
-        fs::read(&marker).unwrap(),
-        marker_one,
-        "the plan rewrote the marker"
+    assert_eq!(fs::read(&receipt).unwrap(), v1_receipt_before);
+
+    let detach = private_env(scratch.path(), &bin, &pool)
+        .current_dir(&checkout)
+        .args(["outputs", "detach"])
+        .output()
+        .unwrap();
+    assert!(
+        detach.status.success(),
+        "{}",
+        String::from_utf8_lossy(&detach.stderr)
     );
-    assert_eq!(
-        fs::read(&receipt).unwrap(),
-        receipt_before,
-        "the plan rewrote the receipt"
+
+    let adopt = private_env(scratch.path(), &bin, &pool)
+        .current_dir(&checkout)
+        .args(["outputs", "adopt"])
+        .output()
+        .unwrap();
+    assert!(
+        adopt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&adopt.stderr)
     );
-    assert_eq!(fs::read(pool.join("ledger.json")).unwrap(), ledger_before);
+    let final_receipt: Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(final_receipt["version"], "oxide.outputs.transition/3");
+    assert_eq!(final_receipt["layout"], "profile");
 }
 
 /// Every path (directories included) and file byte under one tree, so an
