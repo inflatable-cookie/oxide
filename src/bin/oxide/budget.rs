@@ -443,6 +443,9 @@ pub fn arm_execution(started: Instant, phase: Phase) {
     });
 }
 
+/// One admitted-child-start record. The primary child passes its real lateness
+/// and admission overshoot; a bounded `run`'s program passes `false` and
+/// `None`, because no admission decision happens at that point.
 fn events_started(
     state: &mut State,
     phase: Phase,
@@ -455,20 +458,27 @@ fn events_started(
         return;
     }
     let seq = next_seq(state);
-    let execution_started = execution_limit.map(|_| 0_u64);
-    let record = format!(
-        "{{\"v\":1,\"invocation\":\"{}\",\"seq\":{},\"event\":\"admitted_child_started\",\"phase\":\"{}\",\"spawn\":true,\"spawn_late\":{},\"admission_expired_before_start\":{},\"admission_ms\":{},\"execution_ms\":{},\"admission_elapsed_ms\":{},\"execution_started_ms\":{},\"admission_overshoot_ms\":{}}}",
-        state.invocation,
-        seq,
-        phase.label(),
-        late,
-        late,
-        optional(admission_limit.map(millis)),
-        optional(execution_limit.map(millis)),
-        millis(state.started.elapsed()),
-        optional(execution_started),
-        optional(overshoot_ms),
-    );
+    let record = serde_json::json!({
+        "v": 1,
+        "invocation": state.invocation,
+        "seq": seq,
+        "event": "admitted_child_started",
+        "phase": phase.label(),
+        "spawn": true,
+        "spawn_late": late,
+        "admission_expired_before_start": late,
+        "admission_ms": admission_limit.map(millis),
+        "execution_ms": execution_limit.map(millis),
+        "admission_elapsed_ms": millis(state.started.elapsed()),
+        "execution_started_ms": execution_limit.map(|_| {
+            state
+                .execution
+                .as_ref()
+                .map_or(0, |live| millis(live.started.elapsed()))
+        }),
+        "admission_overshoot_ms": overshoot_ms,
+    })
+    .to_string();
     emit(state, &record);
 }
 
@@ -481,10 +491,6 @@ fn next_seq(state: &mut State) -> u64 {
         }
         None => 0,
     }
-}
-
-fn optional(value: Option<u64>) -> String {
-    value.map_or_else(|| "null".to_owned(), |value| value.to_string())
 }
 
 fn emit(state: &mut State, record: &str) {
@@ -568,27 +574,14 @@ pub fn origin() -> Option<Origin> {
 pub fn program_started() {
     with(|state| {
         let Some(state) = state else { return };
-        if state.events_lost {
-            return;
-        }
-        let seq = next_seq(state);
-        let admission_limit = state.options.admission;
-        let execution_limit = state.options.execution.map(millis);
-        let execution_started_ms = state
-            .execution
-            .as_ref()
-            .map(|live| millis(live.started.elapsed()));
-        let record = format!(
-            "{{\"v\":1,\"invocation\":\"{}\",\"seq\":{},\"event\":\"admitted_child_started\",\"phase\":\"{}\",\"spawn\":true,\"spawn_late\":false,\"admission_expired_before_start\":false,\"admission_ms\":{},\"execution_ms\":{},\"admission_elapsed_ms\":{},\"execution_started_ms\":{},\"admission_overshoot_ms\":null}}",
-            state.invocation,
-            seq,
-            Phase::RunProgram.label(),
-            optional(admission_limit.map(millis)),
-            optional(execution_limit),
-            millis(state.started.elapsed()),
-            optional(execution_started_ms),
+        events_started(
+            state,
+            Phase::RunProgram,
+            false,
+            state.options.admission,
+            state.options.execution,
+            None,
         );
-        emit(state, &record);
     });
 }
 
@@ -610,28 +603,31 @@ pub fn finished(
         let signal = child.and_then(|status| status.signal());
         let code = child.and_then(|status| status.code());
         let seq = next_seq(state);
-        let record = format!(
-            "{{\"v\":1,\"invocation\":\"{}\",\"seq\":{},\"event\":\"finished\",\"outcome\":\"{}\",\"stop_origin\":{},\"child_exit_code\":{},\"child_signal\":{},\"admission_ms\":{},\"execution_ms\":{},\"admission_elapsed_ms\":{},\"execution_elapsed_ms\":{},\"drain\":\"{}\",\"lease\":\"{}\",\"exit_code\":{}}}",
-            state.invocation,
-            seq,
-            outcome.label(),
-            state
-                .origin
-                .map_or_else(|| "null".to_owned(), |origin| format!("\"{}\"", origin.label())),
-            optional(code.and_then(|code| u32::try_from(code).ok()).map(u64::from)),
-            optional(signal.map(|signal| u64::try_from(signal).unwrap_or(0))),
-            optional(state.options.admission.map(millis)),
-            optional(state.options.execution.map(millis)),
-            millis(state.started.elapsed()),
-            optional(
-                execution_started
-                    .map(|started| millis(Instant::now().saturating_duration_since(started)))
-                    .or_else(|| state.execution.as_ref().map(|live| millis(live.started.elapsed()))),
-            ),
-            drain.label(),
-            lease.label(),
-            exit_code,
-        );
+        let record = serde_json::json!({
+            "v": 1,
+            "invocation": state.invocation,
+            "seq": seq,
+            "event": "finished",
+            "outcome": outcome.label(),
+            "stop_origin": state.origin.map(|origin| origin.label()),
+            "child_exit_code": code.and_then(|code| u32::try_from(code).ok()),
+            "child_signal": signal.map(|signal| u64::try_from(signal).unwrap_or(0)),
+            "admission_ms": state.options.admission.map(millis),
+            "execution_ms": state.options.execution.map(millis),
+            "admission_elapsed_ms": millis(state.started.elapsed()),
+            "execution_elapsed_ms": execution_started
+                .map(|started| millis(Instant::now().saturating_duration_since(started)))
+                .or_else(|| {
+                    state
+                        .execution
+                        .as_ref()
+                        .map(|live| millis(live.started.elapsed()))
+                }),
+            "drain": drain.label(),
+            "lease": lease.label(),
+            "exit_code": exit_code,
+        })
+        .to_string();
         emit(state, &record);
     });
 }
@@ -953,12 +949,14 @@ fn supervise(
         let now = Instant::now();
         if now >= deadline && term_at.is_none() {
             term_at = Some(now);
-            signal_group(id, libc::SIGTERM);
+            // TERM then CONT: a group stopped by job control acts on TERM
+            // only once it is continued.
+            crate::process::terminate_group(id);
         }
         if let Some(term) = term_at {
             if now.duration_since(term) >= GRACE && kill_at.is_none() {
                 kill_at = Some(now);
-                signal_group(id, libc::SIGKILL);
+                crate::process::signal_group(id, libc::SIGKILL);
             }
         }
         if let Some(kill) = kill_at {
@@ -970,7 +968,7 @@ fn supervise(
         std::thread::sleep(POLL);
     }
     if gave_up {
-        signal_group(id, libc::SIGKILL);
+        crate::process::signal_group(id, libc::SIGKILL);
         let _ = child.kill();
         return Err(std::io::Error::other(format!(
             "the preparation step did not close inside the admission budget and could not be positively reaped (group {id})"
@@ -980,14 +978,14 @@ fn supervise(
     if let Some(term) = term_at {
         // The child only ended because the admission window closed: report the
         // step as stopped rather than as its (induced) signal status.
-        kill_group(id);
+        crate::process::signal_group(id, libc::SIGKILL);
         return Err(std::io::Error::other(format!(
             "the preparation step was stopped after {}ms of its admission budget",
             Instant::now().saturating_duration_since(term).as_millis()
         )));
     }
     let captured = settle(receiver, Some(deadline + CLOSE_BOUND));
-    if !group_empty(id) {
+    if !crate::process::group_empty(id) {
         return Err(std::io::Error::other(format!(
             "the preparation step's process group {id} did not close inside the admission budget"
         )));
@@ -1048,28 +1046,6 @@ fn read_capped(mut stream: impl Read) -> Result<Vec<u8>, String> {
     }
 }
 
-fn kill_group(group: i32) {
-    signal_group(group, libc::SIGKILL);
-}
-
-fn signal_group(group: i32, signal: libc::c_int) {
-    if group > 1 {
-        // SAFETY: a negative PID addresses the group this step created.
-        unsafe {
-            libc::kill(-group, signal);
-        }
-    }
-}
-
-fn group_empty(group: i32) -> bool {
-    if group <= 1 {
-        return false;
-    }
-    // SAFETY: signal 0 to a negative PID only checks group existence.
-    let result = unsafe { libc::kill(-group, 0) };
-    result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-}
-
 /// Test helper: forget the clock (tests in other modules use the same owner).
 #[cfg(test)]
 pub(crate) fn clear() {
@@ -1114,10 +1090,6 @@ mod tests {
     use super::*;
     use std::os::unix::io::AsRawFd;
 
-    fn clear() {
-        super::STATE.with(|cell| *cell.borrow_mut() = None);
-    }
-
     fn budgeted() -> bool {
         with(|state| state.is_some_and(|state| state.options.any()))
     }
@@ -1133,10 +1105,6 @@ mod tests {
     fn guard(options: Options) {
         clear();
         install(options).expect("a clock");
-    }
-
-    fn reset() {
-        clear();
     }
 
     #[test]
@@ -1236,7 +1204,7 @@ mod tests {
 
     #[test]
     fn admission_clamps_and_never_arms_on_its_own() {
-        reset();
+        clear();
         assert!(!budgeted());
         guard(Options {
             admission: Some(Duration::from_secs(30)),
@@ -1248,12 +1216,12 @@ mod tests {
         assert!(clamp(Duration::from_secs(60)) <= Duration::from_secs(30));
         assert_eq!(take_execution_stop(), None);
         assert_eq!(origin(), None);
-        reset();
+        clear();
     }
 
     #[test]
     fn execution_arms_once_and_a_late_start_latches_admission() {
-        reset();
+        clear();
         guard(Options {
             admission: Some(Duration::from_millis(1)),
             execution: Some(Duration::from_secs(30)),
@@ -1273,7 +1241,7 @@ mod tests {
         // A second arm cannot grant a new window.
         arm_execution(Instant::now(), Phase::PrimaryCargo);
         assert_eq!(take_execution_stop(), None);
-        reset();
+        clear();
     }
 
     fn drain_records(reader: &mut std::fs::File) -> Vec<serde_json::Value> {
@@ -1297,7 +1265,7 @@ mod tests {
     #[test]
     fn started_records_carry_real_elapsed_and_nullable_budget_fields() {
         let (mut reader, writer) = pipe(true);
-        reset();
+        clear();
         guard(Options {
             admission: None,
             execution: Some(Duration::from_secs(30)),
@@ -1317,13 +1285,13 @@ mod tests {
         assert!(elapsed < 30_000);
         assert_eq!(started["admission_overshoot_ms"], serde_json::Value::Null);
         assert_eq!(started["spawn_late"], false);
-        reset();
+        clear();
     }
 
     #[test]
     fn program_started_reports_the_running_clock_without_resetting_it() {
         let (mut reader, writer) = pipe(true);
-        reset();
+        clear();
         guard(Options {
             admission: Some(Duration::from_secs(30)),
             execution: Some(Duration::from_secs(30)),
@@ -1341,12 +1309,12 @@ mod tests {
         assert_eq!(program["execution_ms"], 30_000);
         assert!(program["execution_started_ms"].as_u64().unwrap() >= 20);
         assert!(program["admission_elapsed_ms"].as_u64().unwrap() >= 20);
-        reset();
+        clear();
     }
 
     #[test]
     fn an_admission_only_late_start_still_requests_its_stop() {
-        reset();
+        clear();
         guard(Options {
             admission: Some(Duration::from_millis(1)),
             execution: None,
@@ -1359,13 +1327,13 @@ mod tests {
         assert_eq!(take_execution_stop(), Some(Origin::Admission));
         assert_eq!(take_execution_stop(), None);
         assert_eq!(exit_code(0), 124);
-        reset();
+        clear();
     }
 
     #[test]
     fn an_admission_only_start_emits_the_started_record_with_a_null_axis() {
         let (mut reader, writer) = pipe(true);
-        reset();
+        clear();
         guard(Options {
             admission: Some(Duration::from_secs(30)),
             execution: None,
@@ -1381,12 +1349,12 @@ mod tests {
         assert_eq!(started["spawn_late"], false);
         // No execution axis means no execution stop can fire.
         assert_eq!(take_execution_stop(), None);
-        reset();
+        clear();
     }
 
     #[test]
     fn a_lost_stream_never_writes_again_or_advances_its_sequence() {
-        reset();
+        clear();
         guard(Options {
             admission: Some(Duration::from_secs(1)),
             execution: Some(Duration::from_secs(1)),
@@ -1408,12 +1376,12 @@ mod tests {
             before,
             "a suppressed record must not advance seq"
         );
-        reset();
+        clear();
     }
 
     #[test]
     fn a_normal_start_keeps_the_child_status_unless_the_deadline_fires() {
-        reset();
+        clear();
         guard(Options {
             admission: None,
             execution: Some(Duration::from_secs(30)),
@@ -1424,12 +1392,12 @@ mod tests {
         assert_eq!(origin(), None);
         assert_eq!(exit_code(125), 125);
         assert_eq!(take_execution_stop(), None);
-        reset();
+        clear();
     }
 
     #[test]
     fn the_execution_trigger_latches_its_origin_once() {
-        reset();
+        clear();
         guard(Options {
             admission: None,
             execution: Some(Duration::from_millis(1)),
@@ -1440,7 +1408,7 @@ mod tests {
         assert_eq!(take_execution_stop(), Some(Origin::Execution));
         assert_eq!(take_execution_stop(), None);
         assert_eq!(exit_code(143), 125);
-        reset();
+        clear();
     }
 
     fn pipe(nonblocking: bool) -> (std::fs::File, std::fs::File) {
@@ -1473,14 +1441,14 @@ mod tests {
     #[test]
     fn an_event_pipe_must_be_a_nonblocking_writable_fifo() {
         let (reader, writer) = pipe(true);
-        reset();
+        clear();
         assert!(install(Options {
             admission: Some(Duration::from_secs(1)),
             execution: Some(Duration::from_secs(1)),
             events: Some(writer.as_raw_fd()),
         })
         .is_ok());
-        reset();
+        clear();
         // A read end is refused.
         assert!(install(Options {
             admission: Some(Duration::from_secs(1)),
@@ -1506,13 +1474,13 @@ mod tests {
         })
         .is_err());
         let _ = std::fs::remove_file(path);
-        reset();
+        clear();
     }
 
     #[test]
     fn records_are_bounded_single_writes_and_loss_is_sticky() {
         let (mut reader, writer) = pipe(true);
-        reset();
+        clear();
         install(Options {
             admission: Some(Duration::from_secs(1)),
             execution: Some(Duration::from_secs(1)),
@@ -1547,13 +1515,13 @@ mod tests {
         assert!(text.contains("\"event\":\"finished\""), "{text}");
         assert!(text.lines().all(|line| line.len() < EVENT_BYTES));
         assert!(!events_lost());
-        reset();
+        clear();
     }
 
     #[test]
     fn a_broken_reader_disables_the_stream_and_never_panics() {
         let (reader, writer) = pipe(true);
-        reset();
+        clear();
         install(Options {
             admission: Some(Duration::from_secs(1)),
             execution: Some(Duration::from_secs(1)),
@@ -1585,13 +1553,13 @@ mod tests {
             reader_info.dev(), reader_info.ino(), writer_info.dev(), writer_info.ino(), fd,
             duplicate_flags, writer_flags, polled, observation.revents);
         assert_eq!(std::process::id(), std::process::id());
-        reset();
+        clear();
     }
 
     #[test]
     fn a_full_pipe_loses_later_records_without_blocking() {
         let (_reader, writer) = pipe(true);
-        reset();
+        clear();
         install(Options {
             admission: Some(Duration::from_secs(1)),
             execution: Some(Duration::from_secs(1)),
@@ -1611,12 +1579,12 @@ mod tests {
         }
         arm_execution(Instant::now(), Phase::PrimaryCargo);
         assert!(events_lost());
-        reset();
+        clear();
     }
 
     #[test]
     fn term_and_successful_child_status_never_override_a_latched_deadline() {
-        reset();
+        clear();
         guard(Options {
             admission: None,
             execution: Some(Duration::from_millis(1)),
@@ -1628,19 +1596,19 @@ mod tests {
         assert_eq!(exit_code(143), 125);
         assert_eq!(exit_code(137), 125);
         assert_eq!(exit_code(0), 125);
-        reset();
+        clear();
         guard(Options {
             admission: Some(Duration::from_millis(1)),
             execution: None,
             events: None,
         });
         assert_eq!(exit_code(0), 0);
-        reset();
+        clear();
     }
 
     #[test]
     fn bounded_output_stops_a_sleeper_at_the_admission_deadline() {
-        reset();
+        clear();
         guard(Options {
             admission: Some(Duration::from_millis(200)),
             execution: None,
@@ -1651,12 +1619,12 @@ mod tests {
         let started = Instant::now();
         let error = output(&mut command).expect_err("the sleeper must be stopped");
         assert!(started.elapsed() < Duration::from_secs(5), "{error}");
-        reset();
+        clear();
     }
 
     #[test]
     fn unbudgeted_output_is_exactly_the_existing_call() {
-        reset();
+        clear();
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "printf ready"]);
         let result = output(&mut command).expect("a plain child");
@@ -1667,7 +1635,7 @@ mod tests {
     #[test]
     fn over_cap_child_output_is_refused_on_both_paths() {
         for budgeted in [false, true] {
-            reset();
+            clear();
             if budgeted {
                 guard(Options {
                     admission: Some(Duration::from_secs(30)),
@@ -1682,7 +1650,7 @@ mod tests {
                 error.to_string().contains("byte cap"),
                 "budgeted={budgeted}: {error}"
             );
-            reset();
+            clear();
         }
     }
 }

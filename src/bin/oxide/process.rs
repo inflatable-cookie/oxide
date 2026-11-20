@@ -117,7 +117,9 @@ pub fn signal_exit_code(signal: i32) -> u8 {
     128_u8.saturating_add(u8::try_from(signal).unwrap_or(0))
 }
 
-fn signal_group(group: i32, signal: libc::c_int) {
+/// Signal one process group. Nothing is sent to a group id that could name
+/// this process (`<= 1`).
+pub(crate) fn signal_group(group: i32, signal: libc::c_int) {
     if group > 1 {
         // SAFETY: a negative PID addresses the group this command created.
         unsafe {

@@ -67,9 +67,10 @@ USAGE:
                                          remove <workspace>/target and slot affinity; slots stay
     oxide clean <-p|--doc|--profile ...> Cargo's selected clean, same storage rules
     oxide clean --cargo-cache            one pass of Cargo's own home cleanup, no network
-    oxide outputs plan|adopt|detach|status|prune
+    oxide outputs plan|adopt|detach|cancel-reservation|status|prune
                                          permanent drive: plan, explicitly convert,
-                                         detach, inspect or prune owned outputs
+                                         detach, cancel an unused reservation,
+                                         inspect or prune owned outputs
     oxide status                         recorded pool, slots and waits; no walk or reconcile
     oxide status --measure               bounded payload, slot, checkout and Cargo-home walks
     oxide status --launch-check          macOS: time a new executable's first launch
@@ -227,6 +228,21 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
                 .to_owned(),
         );
     }
+    // `exec` is parsed once, before any budget is installed: a usage request
+    // (`oxide exec --help`, or `oxide exec` with no `--`) prints Oxide's usage
+    // and ends before an event descriptor, clock or hand-off check exists, and
+    // nothing below parses the arguments again.
+    let exec = if class == Class::Exec {
+        match cli::parse_exec(rest)? {
+            Some(invocation) => Some(invocation),
+            None => {
+                print!("{}", cli::EXEC_USAGE);
+                return Ok(0);
+            }
+        }
+    } else {
+        None
+    };
     let budgeted = leased && budget::reserved_prefix(rest);
     if budgeted {
         // Syntax and descriptor shape first, then the one monotonic owner:
@@ -236,10 +252,9 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
         budget::install(options)?;
     }
     // One pre-effect hand-off check (oxide#122), after help, version, list and
-    // toolchain handling and before any arm opens a store. Plain passthrough,
-    // usage-only `exec` and `status --launch-check` do no work of their own.
+    // toolchain handling and before any arm opens a store. Plain passthrough
+    // and `status --launch-check` do no work of their own.
     let no_effect = class == Class::Plain
-        || (class == Class::Exec && !matches!(cli::parse_exec(rest), Ok(Some(_))))
         || (class == Class::Status && matches!(rest, [flag] if flag == "--launch-check"));
     if !no_effect {
         if let Some(code) = handoff::preflight(budgeted) {
@@ -254,12 +269,9 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
         Class::Clean => clean::run(rest),
         Class::Init => adopt::run_init(rest),
         Class::New => adopt::run_new(rest),
-        Class::Exec => match cli::parse_exec(rest)? {
+        Class::Exec => match exec {
             Some(invocation) => runner::run_invocation(invocation),
-            None => {
-                print!("{}", cli::EXEC_USAGE);
-                Ok(0)
-            }
+            None => unreachable!("a usage-only exec returned above"),
         },
         Class::Modelled | Class::Building => runner::run_leased(command, rest),
     }
@@ -328,7 +340,7 @@ mod tests {
 
     #[test]
     fn usage_lists_current_outputs_pool_and_exec_options() {
-        assert!(USAGE.contains("outputs plan|adopt|detach|status|prune"));
+        assert!(USAGE.contains("outputs plan|adopt|detach|cancel-reservation|status|prune"));
         assert!(USAGE.contains("pool recover-interrupted <slot>"));
         assert!(USAGE.contains("--output <member>"));
         assert!(!USAGE.contains("owned <checkout>/target link"));

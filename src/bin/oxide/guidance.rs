@@ -21,6 +21,8 @@ const MAX_COVERS: usize = 64;
 const MAX_COVER_BYTES: usize = 1024;
 /// Time limit for the placement probe.
 const GIT_TIME: Duration = Duration::from_secs(5);
+/// Extra time after [`GIT_TIME`] for both output drains to settle, together.
+const SETTLE_TIME: Duration = Duration::from_secs(1);
 /// Byte cap for the probe's stdout; an answer over it refuses.
 const MAX_GIT_BYTES: usize = 64 * 1024;
 /// Stderr kept for classification; the rest is not read.
@@ -105,12 +107,20 @@ pub fn placement(workspace: &Path) -> Result<Placement, String> {
             }
         }
     };
-    let settle = Duration::from_secs(1);
+    // One settle bound for both drains, counted from the same deadline: two
+    // separate full seconds would double the bound a descendant holding a pipe
+    // can impose after the child exited.
+    let settle_until = deadline + SETTLE_TIME;
+    let left = || {
+        settle_until
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1))
+    };
     let stdout = out_receiver
-        .recv_timeout(settle)
+        .recv_timeout(left())
         .map_err(|_| "git rev-parse did not close its output in time".to_owned())??;
     let stderr = err_receiver
-        .recv_timeout(settle)
+        .recv_timeout(left())
         .map_err(|_| "git rev-parse did not close its error output in time".to_owned())??;
     match code {
         Some(0) => toplevel(workspace, &stdout),

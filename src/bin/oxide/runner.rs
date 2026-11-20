@@ -322,7 +322,7 @@ fn prepare_invocation(invocation: &mut Invocation) -> Result<Step<PreparedInvoca
                 Ok(value) => value,
                 Err(error) => {
                     if budget::admission_expired() {
-                        return Ok(Step::Exit(stop_for_admission()));
+                        return Ok(Step::Exit(stop_for_admission(budget::Lease::Released)));
                     }
                     return Err(error);
                 }
@@ -333,17 +333,17 @@ fn prepare_invocation(invocation: &mut Invocation) -> Result<Step<PreparedInvoca
         return Ok(Step::Exit(code));
     }
     if budget::admission_expired() {
-        return Ok(Step::Exit(stop_for_admission()));
+        return Ok(Step::Exit(stop_for_admission(budget::Lease::Released)));
     }
     let internal = prep!(Store::open_or_create());
     let output_control = internal.control().to_path_buf();
     if budget::admission_expired() {
-        return Ok(Step::Exit(stop_for_admission()));
+        return Ok(Step::Exit(stop_for_admission(budget::Lease::Released)));
     }
     let checkout =
         prep!({ identity::locate_workspace(CARGO, invocation.manifest_path.as_deref()) });
     if budget::admission_expired() {
-        return Ok(Step::Exit(stop_for_admission()));
+        return Ok(Step::Exit(stop_for_admission(budget::Lease::Released)));
     }
     // The final-output destination is part of the slot's compatibility
     // identity: a slot's uplifted artifacts belong to one real root. The
@@ -355,7 +355,7 @@ fn prepare_invocation(invocation: &mut Invocation) -> Result<Step<PreparedInvoca
     // watchdog supervises the drive's removal.
     let selected = prep!(removable::select(internal));
     if budget::admission_expired() {
-        return Ok(Step::Exit(stop_for_admission()));
+        return Ok(Step::Exit(stop_for_admission(budget::Lease::Released)));
     }
     let selection_mode = selected.mode;
     let fallback_reason = selected.fallback_reason.clone();
@@ -369,7 +369,7 @@ fn prepare_invocation(invocation: &mut Invocation) -> Result<Step<PreparedInvoca
     // released before this command takes a slot.
     prep!(outputs::auto_adopt(&selected.store, &checkout, &selected));
     if budget::admission_expired() {
-        return Ok(Step::Exit(stop_for_admission()));
+        return Ok(Step::Exit(stop_for_admission(budget::Lease::Released)));
     }
     let store = selected.store;
     // The declaration is pure parsing and is computed BEFORE the reservation:
@@ -407,7 +407,7 @@ fn prepare_invocation(invocation: &mut Invocation) -> Result<Step<PreparedInvoca
         ));
     }
     if budget::admission_expired() {
-        return Ok(Step::Exit(stop_for_admission()));
+        return Ok(Step::Exit(stop_for_admission(budget::Lease::Released)));
     }
     // #133 supplies the profile declaration; #140 keeps the admission window
     // around the same preparation step.
@@ -427,7 +427,7 @@ fn prepare_invocation(invocation: &mut Invocation) -> Result<Step<PreparedInvoca
         &incremental_key,
     ));
     if budget::admission_expired() {
-        return Ok(Step::Exit(stop_for_admission()));
+        return Ok(Step::Exit(stop_for_admission(budget::Lease::Released)));
     }
     if !selected.removable {
         if selection_mode == Some(removable::DriveMode::Permanent) {
@@ -464,12 +464,14 @@ fn acquire_and_bind(
         Ok(leased) => leased,
         Err(Stop::Signal(signal)) => return Ok(Step::Exit(process::signal_exit_code(signal))),
         Err(Stop::Cargo(code)) => return Ok(Step::Exit(code)),
-        Err(Stop::Admission) => return Ok(Step::Exit(stop_for_admission())),
+        Err(Stop::Admission) => return Ok(Step::Exit(stop_for_admission(budget::Lease::Released))),
     };
     if budget::admission_expired() {
         let origin = held.prior.unchanged();
-        request.store.release(held, origin)?;
-        return Ok(Step::Exit(stop_for_admission()));
+        return match stop_after_release(request.store.release(held, origin)) {
+            Ok(code) => Ok(Step::Exit(code)),
+            Err(reason) => Err(reason),
+        };
     }
     if let Some(signal) = process::received_signal() {
         let origin = held.prior.unchanged();
@@ -500,17 +502,25 @@ fn acquire_and_bind(
         Ok(binding) => binding,
         Err(reason) => {
             let origin = held.prior.unchanged();
-            request.store.release(held, origin)?;
+            let release = request.store.release(held, origin);
             if budget::admission_expired() {
-                return Ok(Step::Exit(stop_for_admission()));
+                return match stop_after_release(release) {
+                    Ok(code) => Ok(Step::Exit(code)),
+                    Err(released) => Err(released),
+                };
             }
-            return Err(reason);
+            match release {
+                Ok(_) => return Err(reason),
+                Err(released) => return Err(release_failed(released)),
+            }
         }
     };
     if budget::admission_expired() {
         let origin = held.prior.unchanged();
-        request.store.release(held, origin)?;
-        return Ok(Step::Exit(stop_for_admission()));
+        return match stop_after_release(request.store.release(held, origin)) {
+            Ok(code) => Ok(Step::Exit(code)),
+            Err(reason) => Err(reason),
+        };
     }
     seed_recipient(
         request,
@@ -564,7 +574,9 @@ fn seed_recipient(
                             return Ok(Step::Exit(process::signal_exit_code(signal)))
                         }
                         Err(Stop::Cargo(code)) => return Ok(Step::Exit(code)),
-                        Err(Stop::Admission) => return Ok(Step::Exit(stop_for_admission())),
+                        Err(Stop::Admission) => {
+                            return Ok(Step::Exit(stop_for_admission(budget::Lease::Released)))
+                        }
                     };
                     eprintln!("oxide: seeding skipped: recipient walk incomplete");
                 }
@@ -648,8 +660,10 @@ fn prepare_primary_command(
         Ok(chosen) => chosen,
         Err(reason) => {
             let origin = held.prior.unchanged();
-            prepared.store.release(held, origin)?;
-            return Err(reason);
+            return match prepared.store.release(held, origin) {
+                Ok(_) => Err(reason),
+                Err(released) => Err(release_failed(released)),
+            };
         }
     };
     chosen_temp.apply(&mut cargo);
@@ -667,8 +681,10 @@ fn prepare_primary_command(
     // forbids starting a primary child.
     if budget::admission_expired() {
         let origin = held.prior.unchanged();
-        prepared.store.release(held, origin)?;
-        return Ok(Step::Exit(stop_for_admission()));
+        return match stop_after_release(prepared.store.release(held, origin)) {
+            Ok(code) => Ok(Step::Exit(code)),
+            Err(reason) => Err(reason),
+        };
     }
     let prune_session = cargo_prune::prepare(&held);
     Ok(Step::Continue((
@@ -711,33 +727,48 @@ fn execute_primary_group(
     let mut group = match started_group {
         Ok(group) => group,
         Err(error) => {
+            let slot = held.slot_id.clone();
+            // A shell's convention for a tool Oxide could not start: 127 not
+            // found, 126 not runnable. Anything else is an internal failure.
+            let code = match &error {
+                Unstarted::Spawn(spawn) if prepared.exec => {
+                    if spawn.kind() == std::io::ErrorKind::NotFound {
+                        127
+                    } else {
+                        126
+                    }
+                }
+                _ => 1,
+            };
             let origin = held.prior.unchanged();
-            let disposition = prepared.store.release(held, origin)?;
-            budget::finished(
-                budget::Outcome::SpawnFailure,
-                None,
-                None,
-                budget::Drain::NotReached,
-                release_lease_state(disposition),
-                1,
+            // The terminal event is emitted whichever way the release ends,
+            // and the code it records is the one this invocation returns.
+            let released = release_and_emit(
+                prepared.store.release(held, origin),
+                Terminal {
+                    outcome: budget::Outcome::SpawnFailure,
+                    child: None,
+                    execution_started: None,
+                    drain: budget::Drain::NotReached,
+                    exit_code: code,
+                    lease: None,
+                },
             );
+            let also_failed = released
+                .map(|released| format!("; releasing slot {slot} also failed: {released}"))
+                .unwrap_or_default();
             return match error {
-                Unstarted::Record(error) => Err(error),
+                Unstarted::Record(error) => Err(format!("{error}{also_failed}")),
                 Unstarted::Spawn(error) if prepared.exec => {
                     eprintln!(
-                        "oxide: could not start {}: {error}",
+                        "oxide: could not start {}: {error}{also_failed}",
                         wrapper::shown(&invocation.tool[0].to_string_lossy())
                     );
-                    // A shell's convention: 127 not found, 126 not runnable.
-                    Ok(Step::Exit(
-                        if error.kind() == std::io::ErrorKind::NotFound {
-                            127
-                        } else {
-                            126
-                        },
-                    ))
+                    Ok(Step::Exit(code))
                 }
-                Unstarted::Spawn(error) => Err(format!("could not start Cargo: {error}")),
+                Unstarted::Spawn(error) => {
+                    Err(format!("could not start Cargo: {error}{also_failed}"))
+                }
             };
         }
     };
@@ -951,11 +982,23 @@ fn finish_released_invocation(
         && budget::origin().is_none()
         && process::received_signal().is_none();
     let store = custody.store;
+    let slot = custody.held.slot_id.clone();
     let execution_started = custody.execution_started;
     let child_temp = custody.child_temp;
-    let disposition = custody.finish_and_release(successful, successful)?;
-    let (status, executable, drained) = execution.outcome?;
-    let status = status.ok_or("Cargo ended without a status")?;
+    // The release happens here, but its failure never ends the invocation
+    // before the terminal event: the event is emitted below with the code this
+    // command returns, and the release error travels after it.
+    let release = custody.finish_and_release(successful, successful);
+    // A failed wait or a missing status is this command's own error, reported
+    // after its terminal record rather than past it.
+    let outcome = execution.outcome.and_then(|(status, executable, drained)| {
+        let status = status.ok_or_else(|| "Cargo ended without a status".to_owned())?;
+        Ok((status, executable, drained))
+    });
+    let (status, executable, drained) = match outcome {
+        Ok(parts) => parts,
+        Err(reason) => return Err(release_error_after(release, reason)),
+    };
     print_summary(summary);
     let mut retired = false;
     if store.backend == Backend::ApfsVolume {
@@ -998,32 +1041,36 @@ fn finish_released_invocation(
         code = process::signal_exit_code(signal);
     }
     let code = budget::exit_code(code);
-    budget::finished(
-        if budget::origin() == Some(budget::Origin::Admission) {
-            budget::Outcome::AdmissionDeadline
-        } else if budget::origin() == Some(budget::Origin::Execution) {
-            budget::Outcome::ExecutionDeadline
-        } else if status.code() == Some(0) {
-            budget::Outcome::ChildExit
-        } else if std::os::unix::process::ExitStatusExt::signal(&status).is_some() {
-            budget::Outcome::ChildSignal
-        } else {
-            budget::Outcome::ChildExit
+    let released = release_and_emit(
+        release,
+        Terminal {
+            outcome: if budget::origin() == Some(budget::Origin::Admission) {
+                budget::Outcome::AdmissionDeadline
+            } else if budget::origin() == Some(budget::Origin::Execution) {
+                budget::Outcome::ExecutionDeadline
+            } else if status.code() == Some(0) {
+                budget::Outcome::ChildExit
+            } else if std::os::unix::process::ExitStatusExt::signal(&status).is_some() {
+                budget::Outcome::ChildSignal
+            } else {
+                budget::Outcome::ChildExit
+            },
+            child: Some(status),
+            execution_started,
+            drain: if drained {
+                budget::Drain::Complete
+            } else {
+                budget::Drain::Gapped
+            },
+            exit_code: code,
+            lease: retired.then_some(budget::Lease::Retired),
         },
-        Some(status),
-        execution_started,
-        if drained {
-            budget::Drain::Complete
-        } else {
-            budget::Drain::Gapped
-        },
-        if retired {
-            budget::Lease::Retired
-        } else {
-            release_lease_state(disposition)
-        },
-        code,
     );
+    if let Some(released) = released {
+        return Err(format!(
+            "releasing slot {slot} failed after Cargo ran: {released}"
+        ));
+    }
     // A latched budget stop (an expired window) ends the command the same way:
     // the program is never launched after it.
     if stopped.is_some() || interrupted.is_some() || budget::origin().is_some() {
@@ -1105,7 +1152,11 @@ fn pick_run_target(invocation: &mut Invocation) -> Result<Option<u8>, String> {
 }
 
 /// Latch and report an admission-budget stop before any primary child starts.
-fn stop_for_admission() -> u8 {
+///
+/// `lease` is what became of this command's slot: [`budget::Lease::Released`]
+/// when none was taken yet, and otherwise the state its release left behind,
+/// so the terminal record never claims a slot went back when it did not.
+fn stop_for_admission(lease: budget::Lease) -> u8 {
     budget::latch(budget::Origin::Admission);
     budget::report_stop(budget::Origin::Admission);
     budget::finished(
@@ -1113,7 +1164,7 @@ fn stop_for_admission() -> u8 {
         None,
         None,
         budget::Drain::NotReached,
-        budget::Lease::Released,
+        lease,
         124,
     );
     124
@@ -1141,13 +1192,9 @@ fn exec_stdin() -> Stdio {
     }
 }
 
-/// A child that never started: release the held slot, then always emit the
-/// invocation's one terminal budget event. A failed release never suppresses
-/// that event, and its error is preserved alongside the original failure.
-///
-/// The event's lease state comes from the release's own disposition: a deferred
-/// release keeps the lease held for a later command, and a failed one leaves
-/// unknown custody, so both are reported `held`.
+/// The lease state a finished release reports: `Released` only when the
+/// release proved the slot went back, `Held` for a deferred one (owned scratch
+/// cleanup could not confirm closure, so a later command keeps it).
 fn release_lease_state(disposition: store::ReleaseDisposition) -> budget::Lease {
     match disposition {
         store::ReleaseDisposition::Released => budget::Lease::Released,
@@ -1155,24 +1202,126 @@ fn release_lease_state(disposition: store::ReleaseDisposition) -> budget::Lease 
     }
 }
 
-fn fail_unstarted(custody: ProgramCustody<'_>, error: String) -> Result<u8, String> {
-    let slot = custody.held.slot_id.clone();
-    let released = custody.store.release(custody.held, custody.origin);
-    let lease_state = match &released {
+/// What one terminal budget record reports besides the lease state.
+struct Terminal {
+    outcome: budget::Outcome,
+    child: Option<ExitStatus>,
+    execution_started: Option<Instant>,
+    drain: budget::Drain,
+    exit_code: u8,
+    /// A lease state this command's own outcome decides (a retired slot),
+    /// used instead of the release's disposition.
+    lease: Option<budget::Lease>,
+}
+
+/// Emit the invocation's one terminal budget event.
+fn emit_terminal(lease: budget::Lease, terminal: Terminal) {
+    budget::finished(
+        terminal.outcome,
+        terminal.child,
+        terminal.execution_started,
+        terminal.drain,
+        terminal.lease.unwrap_or(lease),
+        terminal.exit_code,
+    );
+}
+
+/// Emit the invocation's one terminal budget event for a release that just
+/// happened, and return the release's own error when it failed.
+///
+/// The lease state is the release's own disposition: `Released` only when the
+/// release proved the slot went back, `Held` for a deferred or failed one. The
+/// event is emitted before the error is looked at, so no release path can
+/// `?`-return past it.
+fn release_and_emit(
+    release: Result<store::ReleaseDisposition, String>,
+    terminal: Terminal,
+) -> Option<String> {
+    let lease = match &release {
         Ok(disposition) => release_lease_state(*disposition),
         Err(_) => budget::Lease::Held,
     };
-    budget::finished(
-        budget::Outcome::SpawnFailure,
-        None,
-        custody.execution_started,
-        budget::Drain::NotReached,
-        lease_state,
-        1,
+    emit_terminal(lease, terminal);
+    release.err()
+}
+
+/// Stop for the admission window after releasing the held slot, recording
+/// what the release left behind. A failed release ends the command as an
+/// internal error instead, and its record says the slot stays held.
+fn stop_after_release(release: Result<store::ReleaseDisposition, String>) -> Result<u8, String> {
+    match release {
+        Ok(disposition) => Ok(stop_for_admission(release_lease_state(disposition))),
+        Err(reason) => Err(release_failed(reason)),
+    }
+}
+
+/// Keep the caller's own outcome after a release; a failed release becomes
+/// this command's error, with the terminal record it deserves. The `?` this
+/// backs can therefore never skip the event.
+fn release_ok(release: Result<store::ReleaseDisposition, String>) -> Result<(), String> {
+    match release {
+        Ok(_) => Ok(()),
+        Err(reason) => Err(release_failed(reason)),
+    }
+}
+
+/// An error that ends the invocation after its lease was released: emit the
+/// one terminal record (`internal_error` with the release's lease state and
+/// exit code 1) and keep the release's own error beside the caller's.
+fn release_error_after(
+    release: Result<store::ReleaseDisposition, String>,
+    error: String,
+) -> String {
+    let released = release_and_emit(
+        release,
+        Terminal {
+            outcome: budget::Outcome::InternalError,
+            child: None,
+            execution_started: None,
+            drain: budget::Drain::NotReached,
+            exit_code: 1,
+            lease: None,
+        },
     );
     match released {
-        Ok(_) => Err(error),
-        Err(release) => Err(format!(
+        None => error,
+        Some(released) => format!("{error}; the release also failed: {released}"),
+    }
+}
+
+/// Report a release that failed outside a stop: the terminal record says the
+/// slot stays held with exit code 1, matching the error this command returns.
+fn release_failed(reason: String) -> String {
+    emit_terminal(
+        budget::Lease::Held,
+        Terminal {
+            outcome: budget::Outcome::InternalError,
+            child: None,
+            execution_started: None,
+            drain: budget::Drain::NotReached,
+            exit_code: 1,
+            lease: None,
+        },
+    );
+    reason
+}
+
+fn fail_unstarted(custody: ProgramCustody<'_>, error: String) -> Result<u8, String> {
+    let slot = custody.held.slot_id.clone();
+    let released = release_and_emit(
+        custody.store.release(custody.held, custody.origin),
+        Terminal {
+            outcome: budget::Outcome::SpawnFailure,
+            child: None,
+            execution_started: custody.execution_started,
+            drain: budget::Drain::NotReached,
+            exit_code: 1,
+            lease: None,
+        },
+    );
+    match released {
+        None => Err(error),
+        Some(release) => Err(format!(
             "{error}; releasing slot {slot} also failed: {release}"
         )),
     }
@@ -1239,16 +1388,22 @@ fn run_owned_program(
                 group.id, custody.held.slot_id
             ));
         }
-        let disposition = custody.store.release(custody.held, None)?;
-        budget::finished(
-            budget::Outcome::InternalError,
-            None,
-            custody.execution_started,
-            budget::Drain::NotReached,
-            release_lease_state(disposition),
-            1,
+        let slot = custody.held.slot_id.clone();
+        let released = release_and_emit(
+            custody.store.release(custody.held, None),
+            Terminal {
+                outcome: budget::Outcome::InternalError,
+                child: None,
+                execution_started: custody.execution_started,
+                drain: budget::Drain::NotReached,
+                exit_code: 1,
+                lease: None,
+            },
         );
-        return Err(error);
+        return Err(match released {
+            None => error,
+            Some(released) => format!("{error}; releasing slot {slot} also failed: {released}"),
+        });
     }
     let status = match watchdog.as_mut() {
         Some(watchdog) => process::wait_leader_watched(&mut group, watchdog, budget_stop)?,
@@ -1303,30 +1458,42 @@ fn run_owned_program(
     let prune_successful =
         stopped.is_none() && budget::origin().is_none() && process::received_signal().is_none();
     let execution_started = custody.execution_started;
-    let disposition = custody.finish_and_release(seed_successful, prune_successful)?;
+    let slot = custody.held.slot_id.clone();
+    // The release runs before the code is settled, but its failure never
+    // suppresses the terminal event: the code this command returns and the
+    // event always agree, and the release's own error is preserved.
+    let release = custody.finish_and_release(seed_successful, prune_successful);
     if let Some(origin) = budget::origin() {
         budget::report_stop(origin);
     }
     let code = status.map_or(1, process::exit_code);
     let code = if stopped.is_some() { code.max(1) } else { code };
     let code = budget::exit_code(code);
-    budget::finished(
-        if budget::origin().is_some() {
-            budget::Outcome::ExecutionDeadline
-        } else if status
-            .is_some_and(|status| std::os::unix::process::ExitStatusExt::signal(&status).is_some())
-        {
-            budget::Outcome::ChildSignal
-        } else {
-            budget::Outcome::ChildExit
+    let released = release_and_emit(
+        release,
+        Terminal {
+            outcome: if budget::origin().is_some() {
+                budget::Outcome::ExecutionDeadline
+            } else if status.is_some_and(|status| {
+                std::os::unix::process::ExitStatusExt::signal(&status).is_some()
+            }) {
+                budget::Outcome::ChildSignal
+            } else {
+                budget::Outcome::ChildExit
+            },
+            child: status,
+            execution_started,
+            drain: budget::Drain::Complete,
+            exit_code: code,
+            lease: None,
         },
-        status,
-        execution_started,
-        budget::Drain::Complete,
-        release_lease_state(disposition),
-        code,
     );
-    Ok(code)
+    match released {
+        None => Ok(code),
+        Some(released) => Err(format!(
+            "releasing slot {slot} failed after the program ran: {released}"
+        )),
+    }
 }
 
 /// One reserve-stop line, then a read-only capacity diagnostic for the same
@@ -1402,11 +1569,13 @@ fn refuse_seed(
     reason: String,
 ) -> Result<u8, String> {
     drop(binding);
-    store.release(held, None)?;
+    let release = store.release(held, None);
     if budget::admission_expired() {
-        Ok(stop_for_admission())
-    } else {
-        Err(reason)
+        return stop_after_release(release);
+    }
+    match release {
+        Ok(_) => Err(reason),
+        Err(released) => Err(release_failed(released)),
     }
 }
 
@@ -1420,7 +1589,7 @@ fn abandon_seed_and_reacquire(
     binding: outputs::OutputBinding,
 ) -> Result<Result<(store::Lease, Gate, outputs::OutputBinding), Stop>, String> {
     drop(binding);
-    request.store.release(held, None)?;
+    release_ok(request.store.release(held, None))?;
     grants.share = false;
     let (held, gate) = match lease_with_gate(request, waits, grants)? {
         Ok(leased) => leased,
@@ -1437,7 +1606,7 @@ fn abandon_seed_and_reacquire(
         Ok(binding) => Ok(Ok((held, gate, binding))),
         Err(reason) => {
             let origin = held.prior.unchanged();
-            request.store.release(held, origin)?;
+            release_ok(request.store.release(held, origin))?;
             if budget::admission_expired() {
                 Ok(Err(Stop::Admission))
             } else {
@@ -2124,6 +2293,123 @@ mod tests {
             .expect_err("the spawn failure is still an error");
         assert_eq!(error, "could not start the program");
         assert_eq!(finished_leases(reader), ["released"]);
+        budget::clear();
+        std::fs::remove_dir_all(root).expect("remove own fixture");
+    }
+
+    /// The terminal record carries the code the invocation returns, so a tool
+    /// that could not be started is reported 127 (not found) or 126 (not
+    /// runnable) rather than a generic 1.
+    #[test]
+    fn the_spawn_failure_record_carries_the_code_the_command_returns() {
+        let (mut reader, _writer) = install_event_sink();
+        let (root, store, key) = store::tests::seed_fixture();
+        let held = store::tests::seed_fixture_lease(&store, &key);
+        let origin = held.prior.unchanged();
+        assert_eq!(
+            release_and_emit(
+                store.release(held, origin),
+                Terminal {
+                    outcome: budget::Outcome::SpawnFailure,
+                    child: None,
+                    execution_started: None,
+                    drain: budget::Drain::NotReached,
+                    exit_code: 127,
+                    lease: None,
+                },
+            ),
+            None
+        );
+        let records = drain_event_records(&mut reader);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["outcome"], "spawn_failure");
+        assert_eq!(records[0]["lease"], "released");
+        assert_eq!(records[0]["exit_code"], 127);
+        budget::clear();
+        std::fs::remove_dir_all(root).expect("remove own fixture");
+    }
+
+    /// Regression: `stop_for_admission` always reported `released`, so an
+    /// admission stop after a deferred release claimed the slot went back
+    /// while it was still held.
+    #[test]
+    fn an_admission_stop_reports_a_deferred_release_as_held() {
+        let (reader, _writer) = install_event_sink();
+        let (root, store, key) = store::tests::seed_fixture();
+        let mut held = store::tests::seed_fixture_lease(&store, &key);
+        let slot_dir = held.build_dir.parent().expect("slot dir").to_path_buf();
+        let scratch = child_temp::choose_with(
+            None,
+            &store.payload,
+            &slot_dir,
+            child_temp::Identity {
+                store_id: held.store_id.clone(),
+                slot_id: held.slot_id.clone(),
+                incarnation: held.incarnation.clone(),
+                lease_id: held.lease_id().to_owned(),
+            },
+            4096,
+        )
+        .expect("the owned directory");
+        let owned = scratch.owned().expect("owned directory");
+        // Removing the ownership marker makes cleanup refuse, so the release
+        // defers instead of handing the slot back.
+        std::fs::remove_file(owned.path().join("owner")).expect("the marker");
+        held.scratch = Some(owned.clone());
+        let origin = held.prior.unchanged();
+        assert_eq!(
+            stop_after_release(store.release(held, origin)).expect("the admission stop"),
+            124
+        );
+        assert_eq!(finished_leases(reader), ["held"]);
+        budget::clear();
+        std::fs::remove_dir_all(root).expect("remove own fixture");
+    }
+
+    /// The ordinary admission stop: the release reported `Released`, so the
+    /// terminal record says so.
+    #[test]
+    fn an_admission_stop_reports_a_completed_release_as_released() {
+        let (reader, _writer) = install_event_sink();
+        let (root, store, key) = store::tests::seed_fixture();
+        let held = store::tests::seed_fixture_lease(&store, &key);
+        let origin = held.prior.unchanged();
+        assert_eq!(
+            stop_after_release(store.release(held, origin)).expect("the admission stop"),
+            124
+        );
+        assert_eq!(finished_leases(reader), ["released"]);
+        budget::clear();
+        std::fs::remove_dir_all(root).expect("remove own fixture");
+    }
+
+    /// A release that fails at an admission stop ends the command as an
+    /// internal error whose record says the slot stays held; the stop is not
+    /// reported as if the slot had gone back.
+    #[test]
+    fn a_failed_release_at_an_admission_stop_is_an_internal_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: getuid has no preconditions.
+        if unsafe { libc::getuid() } == 0 {
+            return; // The superuser can write in a read-only directory.
+        }
+        let (mut reader, _writer) = install_event_sink();
+        let (root, store, key) = store::tests::seed_fixture();
+        let held = store::tests::seed_fixture_lease(&store, &key);
+        let origin = held.prior.unchanged();
+        let control = store.pool.join(oxide_storage::lease::MANAGED_NAME);
+        std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o500))
+            .expect("read-only control");
+        let result = stop_after_release(store.release(held, origin));
+        std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o700))
+            .expect("restore control");
+        assert!(result.is_err(), "a failed release is not a stop");
+        let records = drain_event_records(&mut reader);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["outcome"], "internal_error");
+        assert_eq!(records[0]["lease"], "held");
+        assert_eq!(records[0]["exit_code"], 1);
         budget::clear();
         std::fs::remove_dir_all(root).expect("remove own fixture");
     }

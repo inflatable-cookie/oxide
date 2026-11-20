@@ -186,6 +186,9 @@ struct Plan {
     /// it still names the same directory before it deletes beneath it.
     root: PathBuf,
     root_identity: (u64, u64),
+    /// Whether the target directory itself is removed. A kept root (a
+    /// profile layout, or a permanent drive's owned root) is counted nowhere.
+    root_removed: bool,
 }
 
 fn is_file(metadata: &Metadata) -> bool {
@@ -319,6 +322,7 @@ fn plan(
     if keep_root || preserve.iter().any(|kept| kept == target) {
         plan.preserved.push(target.to_path_buf());
     } else {
+        plan.root_removed = true;
         plan.entries.push(Planned {
             path: target.to_path_buf(),
             dir: true,
@@ -441,7 +445,9 @@ fn summary(plan: &Plan) -> String {
     format!(
         "{} files, {} directories, {} apparent",
         plan.files,
-        plan.dirs + 1,
+        // The walk counts the directories BENEATH the root; the root itself is
+        // only a removed directory when this plan removes it.
+        plan.dirs + u64::from(plan.root_removed),
         cargo_home::size(plan.bytes)
     )
 }
@@ -599,49 +605,16 @@ fn run_whole(
     // A permanent drive's owned link resolves through its receipt to the
     // selected real root; everything else keeps the real `<workspace>/target`.
     // In the profile layout `target` is real and every owned member link is
-    // kept while its root's payload is cleaned instead.
-    let placement = outputs::clean_placement(workspace)?;
-    let target = placement.as_ref().map_or_else(
-        || workspace.join("target"),
-        |place| place.target().to_path_buf(),
-    );
-    let keep_root = placement
-        .as_ref()
-        .is_some_and(outputs::CleanPlacement::keep_root);
-    // The real target, every owned member link and every real ancestor that
-    // holds a nested member link are kept; each member root's payload is what
-    // a profile clean removes.
-    let preserve: Vec<PathBuf> = placement
-        .as_ref()
-        .map(outputs::CleanPlacement::preserved)
-        .unwrap_or_default();
-    let member_roots: Vec<PathBuf> = placement
-        .as_ref()
-        .map(|place| {
-            place
-                .members()
-                .iter()
-                .map(|(_, root)| root.clone())
-                .collect()
-        })
-        .unwrap_or_default();
+    // kept while its root's payload is cleaned instead. One derivation, used
+    // before the barrier and again under it.
+    let targets = WholeTargets::from_placement(workspace, &outputs::clean_placement(workspace)?);
     // Refusal precedes waiting, deletion and any affinity change.
-    let planned = whole_plans(
-        &target,
-        &member_roots,
-        &preserve,
-        keep_root,
-        include_foreign,
-        settings,
-    )?;
-    let kept = placement
-        .as_ref()
-        .and_then(outputs::CleanPlacement::preserved_note);
+    let planned = targets.plans(include_foreign, settings)?;
     if dry_run {
         if planned.is_empty() {
             eprintln!(
                 "oxide: dry run: {} does not exist; nothing would be removed",
-                target.display()
+                targets.target.display()
             );
             return Ok(0);
         }
@@ -658,7 +631,11 @@ fn run_whole(
         } else {
             ", including foreign entries (--include-foreign)".to_owned()
         };
-        let kept = kept.map(|kept| format!("; {kept}")).unwrap_or_default();
+        let kept = targets
+            .note
+            .as_deref()
+            .map(|kept| format!("; {kept}"))
+            .unwrap_or_default();
         eprintln!(
             "oxide: dry run: a clean would remove the {entries} paths listed ({}{foreign}){kept}; nothing was removed. A clean also drops this checkout's slot affinity; slots stay",
             planned
@@ -680,57 +657,31 @@ fn run_whole(
         None => None,
     };
     // Plan again under the clean barrier: what is removed is what this plan
-    // lists, from the roots the receipt selects now.
+    // lists, from the roots the receipt selects now. The targets the plan used
+    // are the ones the closing message reports.
     let outcome = refuse_unknown_custody_opt(&store, workspace)
         .and_then(|()| outputs::clean_placement(workspace))
         .and_then(|placement| {
-            let target = placement.as_ref().map_or_else(
-                || workspace.join("target"),
-                |place| place.target().to_path_buf(),
-            );
-            let keep_root = placement
-                .as_ref()
-                .is_some_and(outputs::CleanPlacement::keep_root);
-            let preserve: Vec<PathBuf> = placement
-                .as_ref()
-                .map(outputs::CleanPlacement::preserved)
-                .unwrap_or_default();
-            let member_roots: Vec<PathBuf> = placement
-                .as_ref()
-                .map(|place| {
-                    place
-                        .members()
-                        .iter()
-                        .map(|(_, root)| root.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let planned = whole_plans(
-                &target,
-                &member_roots,
-                &preserve,
-                keep_root,
-                include_foreign,
-                settings,
-            )?;
+            let targets = WholeTargets::from_placement(workspace, &placement);
+            let planned = targets.plans(include_foreign, settings)?;
             let mut removed = Vec::new();
             for (root, plan) in planned {
                 remove(&plan)?;
                 removed.push((root, plan));
             }
-            Ok(removed)
+            Ok((targets, removed))
         });
-    let planned = match (outcome, &store, guard) {
-        (Ok(planned), Some(store), Some(guard)) => {
+    let (targets, planned) = match (outcome, &store, guard) {
+        (Ok(done), Some(store), Some(guard)) => {
             let detached = store.finish_clean(guard, workspace)?;
             if detached > 0 {
                 eprintln!(
                     "oxide: dropped this checkout's slot affinity; {detached} slot(s) kept until evicted"
                 );
             }
-            planned
+            done
         }
-        (Ok(planned), _, _) => planned,
+        (Ok(done), _, _) => done,
         (Err(reason), Some(store), Some(guard)) => {
             store.abandon_clean(guard)?;
             return Err(reason);
@@ -738,16 +689,15 @@ fn run_whole(
         (Err(reason), _, _) => return Err(reason),
     };
     let wait = waits.summary_suffix().unwrap_or_default();
-    let kept = outputs::clean_placement(workspace)
-        .ok()
-        .flatten()
-        .as_ref()
-        .and_then(outputs::CleanPlacement::preserved_note);
-    let kept = kept.map(|kept| format!("; {kept}")).unwrap_or_default();
+    let kept = targets
+        .note
+        .as_deref()
+        .map(|kept| format!("; {kept}"))
+        .unwrap_or_default();
     if planned.is_empty() {
         eprintln!(
             "oxide: {} does not exist; nothing removed{wait}{kept}",
-            target.display(),
+            targets.target.display(),
         );
     } else {
         let foreign = if planned.iter().all(|(_, plan)| plan.foreign.is_empty()) {
@@ -765,6 +715,70 @@ fn run_whole(
         );
     }
     Ok(0)
+}
+
+/// The roots one whole clean walks, derived once from a placement and used
+/// both before and under the clean barrier.
+struct WholeTargets {
+    /// The real target whose payload this clean removes.
+    target: PathBuf,
+    /// Whether the target directory itself is kept.
+    keep_root: bool,
+    /// Paths the walk never removes: owned member links and the real
+    /// ancestors that hold them.
+    preserve: Vec<PathBuf>,
+    /// Owned member roots whose payload is cleaned instead of their link.
+    member_roots: Vec<PathBuf>,
+    /// What stays in place, for the closing message.
+    note: Option<String>,
+}
+
+impl WholeTargets {
+    fn from_placement(workspace: &Path, placement: &Option<outputs::CleanPlacement>) -> Self {
+        Self {
+            target: placement.as_ref().map_or_else(
+                || workspace.join("target"),
+                |place| place.target().to_path_buf(),
+            ),
+            keep_root: placement
+                .as_ref()
+                .is_some_and(outputs::CleanPlacement::keep_root),
+            preserve: placement
+                .as_ref()
+                .map(outputs::CleanPlacement::preserved)
+                .unwrap_or_default(),
+            member_roots: placement
+                .as_ref()
+                .map(|place| {
+                    place
+                        .members()
+                        .iter()
+                        .map(|(_, root)| root.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            note: placement
+                .as_ref()
+                .and_then(outputs::CleanPlacement::preserved_note),
+        }
+    }
+
+    /// This clean's complete plan: the target's payload and every member
+    /// root's, each with the paths it keeps.
+    fn plans(
+        &self,
+        include_foreign: bool,
+        settings: &Settings,
+    ) -> Result<Vec<(PathBuf, Plan)>, String> {
+        whole_plans(
+            &self.target,
+            &self.member_roots,
+            &self.preserve,
+            self.keep_root,
+            include_foreign,
+            settings,
+        )
+    }
 }
 
 /// The complete plan of one whole clean before any effect: the checkout's own
@@ -1051,6 +1065,40 @@ mod tests {
         )
         .unwrap();
         std::fs::write(target.join("x86_64-unknown-linux-gnu/CACHEDIR.TAG"), "").unwrap();
+    }
+
+    /// Regression: the summary always added one directory for the target
+    /// itself, even when the plan kept it (a profile layout or a permanent
+    /// drive's owned root), so the count claimed a directory that stayed.
+    #[test]
+    fn the_summary_counts_the_root_only_when_it_is_removed() {
+        let root = scratch("summary-root");
+        let target = root.join("target");
+        cargo_target(&target);
+        let removed = plan(&target, None, false, &[], false).unwrap().unwrap();
+        assert!(removed.root_removed);
+        assert_eq!(
+            summary(&removed),
+            format!(
+                "{} files, {} directories, {} apparent",
+                removed.files,
+                removed.dirs + 1,
+                cargo_home::size(removed.bytes)
+            )
+        );
+        let kept = plan(&target, None, true, &[], false).unwrap().unwrap();
+        assert!(!kept.root_removed);
+        assert!(kept.preserved.contains(&target));
+        assert_eq!(
+            summary(&kept),
+            format!(
+                "{} files, {} directories, {} apparent",
+                kept.files,
+                kept.dirs,
+                cargo_home::size(kept.bytes)
+            )
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

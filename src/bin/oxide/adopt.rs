@@ -12,7 +12,6 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -79,17 +78,17 @@ const GITIGNORE: &str = ".gitignore";
 const GITIGNORE_LIMIT: u64 = 1024 * 1024;
 
 /// The directory argument and every other argument of `cargo init`/`new`.
+/// `--help` is not read here: `main` forwards a help request to Cargo before
+/// this module runs, so there is one place that decides it.
 struct Parsed {
     path: Option<OsString>,
     options: Vec<OsString>,
-    help: bool,
 }
 
 fn parse(args: &[OsString]) -> Parsed {
     let mut parsed = Parsed {
         path: None,
         options: Vec::new(),
-        help: false,
     };
     let mut iter = args.iter();
     while let Some(argument) = iter.next() {
@@ -100,9 +99,6 @@ fn parse(args: &[OsString]) -> Parsed {
             }
             parsed.options.extend(iter.by_ref().cloned());
             break;
-        }
-        if text == "-h" || text == "--help" {
-            parsed.help = true;
         }
         if text.starts_with('-') {
             parsed.options.push(argument.clone());
@@ -121,9 +117,6 @@ fn parse(args: &[OsString]) -> Parsed {
 /// `oxide init [cargo init args] [path]`.
 pub fn run_init(args: &[OsString]) -> Result<u8, String> {
     let parsed = parse(args);
-    if parsed.help {
-        return Err(exec_cargo("init", args));
-    }
     let directory = PathBuf::from(parsed.path.unwrap_or_else(|| OsString::from(".")));
     let manifest = directory.join("Cargo.toml");
     if fs::symlink_metadata(&manifest).is_ok() {
@@ -151,9 +144,6 @@ pub fn run_init(args: &[OsString]) -> Result<u8, String> {
 /// `oxide new <path> [cargo new args]`.
 pub fn run_new(args: &[OsString]) -> Result<u8, String> {
     let parsed = parse(args);
-    if parsed.help {
-        return Err(exec_cargo("new", args));
-    }
     let status = Command::new(CARGO)
         .arg("new")
         .args(args)
@@ -166,11 +156,6 @@ pub fn run_new(args: &[OsString]) -> Result<u8, String> {
         .path
         .ok_or("cargo new succeeded without a path argument")?;
     adopt(&Path::new(&directory).join("Cargo.toml"))
-}
-
-fn exec_cargo(command: &str, args: &[OsString]) -> String {
-    let error = Command::new(CARGO).arg(command).args(args).exec();
-    format!("could not start Cargo: {error}")
 }
 
 fn join_lossy(values: &[OsString]) -> String {
@@ -313,36 +298,12 @@ fn ensure_local_outputs_ignored(workspace: &Path) -> Result<Ignored, String> {
     }
     bytes.extend_from_slice(crate::outputs::GITIGNORE_LINE.as_bytes());
     bytes.push(b'\n');
-    let temporary = workspace.join(format!(".{GITIGNORE}.oxide-{}.tmp", std::process::id()));
-    let written = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .and_then(|mut file| {
-            file.write_all(&bytes)?;
-            file.sync_all()
-        })
-        .and_then(|()| copy_mode(&path, &temporary))
-        .and_then(|()| fs::rename(&temporary, &path));
-    written.map_err(|error| {
-        let _ = fs::remove_file(&temporary);
-        format!("cannot write {}: {error}", path.display())
-    })?;
+    replace_file(&path, &bytes, GITIGNORE)?;
     Ok(if existing.is_empty() {
         Ignored::Created
     } else {
         Ignored::Added
     })
-}
-
-/// Give the rewritten file the permission bits of the file it replaces, so an
-/// edit never widens or narrows access. A new file keeps the default.
-fn copy_mode(path: &Path, temporary: &Path) -> std::io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => fs::set_permissions(temporary, metadata.permissions()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
 }
 
 fn ignores_local_outputs(line: &str) -> bool {
@@ -459,7 +420,7 @@ fn write_block(agents: &Path, existing: Option<Vec<u8>>, block: &str) -> Result<
         Some(before) if find_block(before).ok().flatten().is_some() => Written::Refreshed,
         Some(_) => Written::Added,
     };
-    replace_file(agents, &updated)?;
+    replace_file(agents, &updated, AGENTS)?;
     Ok(outcome)
 }
 
@@ -520,10 +481,12 @@ pub fn find_block(text: &[u8]) -> Result<Option<(usize, usize)>, String> {
     }
 }
 
-/// Replace through a sibling temporary file and a rename, keeping the
-/// original permissions, so a crash never leaves a truncated file.
-fn replace_file(path: &Path, contents: &[u8]) -> Result<(), String> {
-    let directory = path.parent().ok_or("AGENTS.md has no parent directory")?;
+/// Replace `path` through a sibling temporary file and a rename, keeping the
+/// original permissions, so a crash never leaves a truncated file. `name` is
+/// the replaced file's own name, used to build the temporary's name in the
+/// same directory, so two files in one directory never share a temporary.
+fn replace_file(path: &Path, contents: &[u8], name: &str) -> Result<(), String> {
+    let directory = path.parent().ok_or("the file has no parent directory")?;
     // The mode is read from the file itself without following a link, and the
     // rename below replaces the name rather than writing through it.
     let permissions = OpenOptions::new()
@@ -534,7 +497,7 @@ fn replace_file(path: &Path, contents: &[u8]) -> Result<(), String> {
         .ok()
         .filter(|metadata| metadata.file_type().is_file())
         .map(|metadata| metadata.permissions());
-    let temporary = directory.join(format!(".{AGENTS}.oxide-{}.tmp", std::process::id()));
+    let temporary = directory.join(format!(".{name}.oxide-{}.tmp", std::process::id()));
     let written = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -740,8 +703,13 @@ fn report_effigy(workspace: &Path, placement: &Placement) {
 /// A file that is not parseable TOML stays honest: its calling lines are
 /// reported unclassified rather than guessed into a group.
 fn report_effigy_file(file: &Path) -> Vec<String> {
-    let text = match fs::metadata(file) {
-        Ok(metadata) if metadata.len() > EFFIGY_LIMIT => {
+    let bytes = match read_regular(file, EFFIGY_LIMIT) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            println!("  effigy: {} is gone (not scanned)", file.display());
+            return Vec::new();
+        }
+        Err(Unreadable::Oversize) => {
             println!(
                 "  effigy: {} is over {} KiB; not scanned",
                 file.display(),
@@ -749,18 +717,19 @@ fn report_effigy_file(file: &Path) -> Vec<String> {
             );
             return Vec::new();
         }
-        Ok(_) => match fs::read(file) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(error) => {
-                println!("  effigy: {} unreadable ({error})", file.display());
-                return Vec::new();
-            }
-        },
-        Err(error) => {
+        Err(Unreadable::NotRegular) => {
+            println!(
+                "  effigy: {} is not a regular file; not scanned",
+                file.display()
+            );
+            return Vec::new();
+        }
+        Err(Unreadable::Io(error)) => {
             println!("  effigy: {} unreadable ({error})", file.display());
             return Vec::new();
         }
     };
+    let text = String::from_utf8_lossy(&bytes).into_owned();
     match classify_effigy(&text) {
         Ok(scan) => {
             if scan.warnings.is_empty() {
@@ -964,13 +933,16 @@ mod tests {
             parsed.options,
             args(&["--lib", "--name", "demo", "--vcs=none"])
         );
-        assert!(!parsed.help);
         let bare = parse(&[]);
         assert_eq!(bare.path, None);
         assert!(bare.options.is_empty());
         let separated = parse(&args(&["--edition", "2021", "--", "-odd"]));
         assert_eq!(separated.path, Some(OsString::from("-odd")));
-        assert!(parse(&args(&["--help"])).help);
+        // A help request is Cargo's, forwarded before this parse ever runs, so
+        // it is just another Cargo option here.
+        let help = parse(&args(&["--help"]));
+        assert_eq!(help.path, None);
+        assert_eq!(help.options, args(&["--help"]));
     }
 
     /// The outside-Git block, byte for byte as Oxide has always written it.

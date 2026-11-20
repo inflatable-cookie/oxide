@@ -393,7 +393,8 @@ impl Dir {
     }
 
     /// The names in this directory, without `.` and `..`. A read that ends early
-    /// leaves entries behind, so the directory's own removal then refuses.
+    /// or fails leaves entries behind, so the directory's own removal then
+    /// refuses; an ended read is an error, never a short list.
     pub(crate) fn names(&self) -> std::io::Result<Vec<OsString>> {
         // fdopendir takes ownership of its descriptor, so it gets a duplicate.
         let fd = self.0.try_clone()?.into_raw_fd();
@@ -406,11 +407,23 @@ impl Dir {
             return Err(error);
         }
         let mut names = Vec::new();
-        loop {
+        let read = loop {
+            // `readdir` reports both end of directory and failure through
+            // `errno`, so it is cleared before each call and checked after a
+            // null return: an ended read is an error here, never a short list.
+            // SAFETY: the cell belongs to this thread and nothing else here
+            // reads it.
+            unsafe { errno_cell().write(0) };
             // SAFETY: `dir` is open until closedir below.
             let entry = unsafe { libc::readdir(dir) };
             if entry.is_null() {
-                break;
+                // SAFETY: the cell belongs to this thread.
+                let error = unsafe { errno_cell().read() };
+                break if error == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::from_raw_os_error(error))
+                };
             }
             // SAFETY: readdir returned a live entry whose name is NUL-terminated.
             let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
@@ -418,11 +431,23 @@ impl Dir {
             if bytes != b"." && bytes != b".." {
                 names.push(OsStr::from_bytes(bytes).to_owned());
             }
-        }
+        };
         // SAFETY: `dir` is open and not used after this call.
         unsafe { libc::closedir(dir) };
-        Ok(names)
+        read.map(|()| names)
     }
+}
+
+/// This thread's `errno` cell, which `readdir` uses to tell an ended read from
+/// a failed one.
+fn errno_cell() -> *mut libc::c_int {
+    #[cfg(target_os = "macos")]
+    // SAFETY: `__error` returns this thread's own errno cell.
+    let cell = unsafe { libc::__error() };
+    #[cfg(not(target_os = "macos"))]
+    // SAFETY: `__errno_location` returns this thread's own errno cell.
+    let cell = unsafe { libc::__errno_location() };
+    cell
 }
 
 fn c_string(name: &OsStr) -> std::io::Result<std::ffi::CString> {
@@ -466,9 +491,17 @@ fn read_owner(dir: &Dir, label: &std::path::Path) -> Result<String, String> {
         ));
     }
     let mut text = String::new();
-    file.take(MAX_OWNER_BYTES)
+    // One byte past the bound: a marker that grew since its size was read is
+    // refused, never silently accepted as a prefix.
+    file.take(MAX_OWNER_BYTES + 1)
         .read_to_string(&mut text)
         .map_err(|error| format!("cannot read the marker {}: {error}", reported(&path)))?;
+    if text.len() as u64 > MAX_OWNER_BYTES {
+        return Err(format!(
+            "the marker {} is not a bounded file of this user",
+            reported(&path)
+        ));
+    }
     Ok(text)
 }
 

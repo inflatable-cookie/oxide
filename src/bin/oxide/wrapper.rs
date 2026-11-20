@@ -81,16 +81,14 @@ pub enum Inherited {
 pub fn inherited(config_args: &[OsString]) -> Inherited {
     let files = match (std::env::current_dir(), cargo_home::resolve()) {
         (Ok(cwd), Ok(home)) => config_files(&cwd, &home),
-        (Err(error), _) => {
-            return Inherited::Unknown(format!("cannot read the current directory: {error}"))
-        }
-        (_, Err(error)) => return Inherited::Unknown(error),
+        (Err(error), _) => Err(format!("cannot read the current directory: {error}")),
+        (_, Err(error)) => Err(error),
     };
     inherited_from(
         std::env::var_os("RUSTC_WRAPPER").as_deref(),
-        &config_values(config_args),
+        config_values(config_args),
         std::env::var_os("CARGO_BUILD_RUSTC_WRAPPER").as_deref(),
-        &files,
+        files,
         |path| cargo_home::read_config(path),
     )
 }
@@ -102,44 +100,58 @@ pub fn inherited(config_args: &[OsString]) -> Inherited {
 /// directory. `config` wins over `config.toml` when both exist, and Cargo
 /// ignores the `.toml`. The clean safety gate's own helper deliberately reads
 /// both; this one mirrors Cargo for an accurate name.
-pub(crate) fn config_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
+pub(crate) fn config_files(cwd: &Path, home: &Path) -> Result<Vec<PathBuf>, String> {
     let canonical = |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let mut files = Vec::new();
     let mut seen = Vec::new();
     for dir in cwd.ancestors().map(|dir| dir.join(".cargo")) {
-        files.extend(effective_file(&dir));
+        files.extend(effective_file(&dir)?);
         seen.push(canonical(&dir));
     }
     if !seen.contains(&canonical(home)) && !seen.iter().any(|dir| dir == home) {
-        files.extend(effective_file(home));
+        files.extend(effective_file(home)?);
     }
-    files
+    Ok(files)
 }
 
-/// Cargo's choice in one directory: `config` when it opens (a symlink is
-/// followed), else an existing `config.toml`.
-fn effective_file(dir: &Path) -> Option<PathBuf> {
-    let plain = dir.join("config");
-    let toml = dir.join("config.toml");
-    if std::fs::File::open(&plain).is_ok() {
-        Some(plain)
-    } else if toml.exists() {
-        Some(toml)
-    } else {
-        None
+/// Cargo's choice in one directory: `config` when it exists (a symlink is
+/// followed), else an existing `config.toml`. A name Cargo would choose but
+/// could not read as a regular file is an error here: the layer is unknown,
+/// not absent, and a later key could hide behind it.
+fn effective_file(dir: &Path) -> Result<Option<PathBuf>, String> {
+    for name in ["config", "config.toml"] {
+        let path = dir.join(name);
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => return Ok(Some(path)),
+            Ok(_) => {
+                return Err(format!(
+                    "Cargo config {} is not a regular file",
+                    path.display()
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+        }
     }
+    Ok(None)
 }
 
 fn inherited_from(
     environment: Option<&OsStr>,
-    configs: &[String],
+    configs: Result<Vec<String>, String>,
     build_environment: Option<&OsStr>,
-    files: &[PathBuf],
+    files: Result<Vec<PathBuf>, String>,
     read: impl Fn(&Path) -> Result<serde_json::Value, String>,
 ) -> Inherited {
     if let Some(value) = environment {
         return named(value, "RUSTC_WRAPPER");
     }
+    // A layer Oxide cannot read is unknown, never absent: each resolution
+    // failure is only reached at its own precedence.
+    let configs = match configs {
+        Ok(configs) => configs,
+        Err(reason) => return Inherited::Unknown(reason),
+    };
     for config in configs.iter().rev() {
         match basic_toml::from_str::<serde_json::Value>(config) {
             Ok(parsed) => match from_document(&parsed) {
@@ -158,7 +170,11 @@ fn inherited_from(
     if let Some(value) = build_environment {
         return named(value, "CARGO_BUILD_RUSTC_WRAPPER");
     }
-    for file in files {
+    let files = match files {
+        Ok(files) => files,
+        Err(reason) => return Inherited::Unknown(reason),
+    };
+    for file in &files {
         let source = shown(&file.display().to_string());
         let parsed = match read(file) {
             Ok(parsed) => parsed,
@@ -221,8 +237,10 @@ fn program(value: &str, source: &str) -> Inherited {
     }
 }
 
-/// `--config` values before any `--`, in order.
-pub(crate) fn config_values(args: &[OsString]) -> Vec<String> {
+/// `--config` values before any `--`, in order. A value that is not UTF-8 is
+/// reported rather than dropped: Cargo would read it, and a dropped value
+/// would silently remove a layer the caller asked for.
+pub(crate) fn config_values(args: &[OsString]) -> Result<Vec<String>, String> {
     let mut values = Vec::new();
     let mut iter = args.iter();
     while let Some(argument) = iter.next() {
@@ -233,34 +251,24 @@ pub(crate) fn config_values(args: &[OsString]) -> Vec<String> {
             break;
         }
         if text == "--config" {
-            if let Some(value) = iter.next().and_then(|value| value.to_str()) {
-                values.push(value.to_owned());
+            let value = match iter.next() {
+                Some(value) => value,
+                None => break,
+            };
+            match value.to_str() {
+                Some(value) => values.push(value.to_owned()),
+                None => return Err("a --config value is not valid UTF-8".to_owned()),
             }
         } else if let Some(value) = text.strip_prefix("--config=") {
             values.push(value.to_owned());
         }
     }
-    values
+    Ok(values)
 }
 
 /// One line, bounded: control characters escaped, long text cut.
 pub fn shown(text: &str) -> String {
-    let escaped: String = text
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                character.escape_default().collect()
-            } else {
-                character.to_string()
-            }
-        })
-        .collect();
-    if escaped.chars().count() <= MAX_SHOWN {
-        escaped
-    } else {
-        let cut: String = escaped.chars().take(MAX_SHOWN).collect();
-        format!("{cut}…")
-    }
+    crate::config::escape_bounded(text, MAX_SHOWN)
 }
 
 /// The summary-line fragment for a leased command, or nothing when there is
@@ -316,6 +324,7 @@ pub fn status_line(policy: Policy, inherited: &Inherited) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
 
     fn os(value: &str) -> Option<&OsStr> {
         Some(OsStr::new(value))
@@ -365,7 +374,13 @@ mod tests {
         let paths: Vec<PathBuf> = files.iter().map(|(name, _)| PathBuf::from(name)).collect();
         let found = |environment, configs: &[&str], build| {
             let configs: Vec<String> = configs.iter().map(|value| (*value).to_owned()).collect();
-            inherited_from(environment, &configs, build, &paths, reader(files))
+            inherited_from(
+                environment,
+                Ok(configs),
+                build,
+                Ok(paths.clone()),
+                reader(files),
+            )
         };
         assert_eq!(found(None, &[], None), sccache("/home/config.toml"));
         assert_eq!(
@@ -403,7 +418,7 @@ mod tests {
         ];
         let paths: Vec<PathBuf> = files.iter().map(|(name, _)| PathBuf::from(name)).collect();
         assert_eq!(
-            inherited_from(None, &[], None, &paths, reader(files)),
+            inherited_from(None, Ok(Vec::new()), None, Ok(paths.clone()), reader(files)),
             Inherited::Named {
                 program: "near".to_owned(),
                 source: "/w/.cargo/config.toml".to_owned()
@@ -422,23 +437,51 @@ mod tests {
         ];
         for (files, why) in cases {
             assert_eq!(
-                inherited_from(None, &[], None, &[PathBuf::from("/a")], reader(files)),
+                inherited_from(
+                    None,
+                    Ok(Vec::new()),
+                    None,
+                    Ok(vec![PathBuf::from("/a")]),
+                    reader(files)
+                ),
                 Inherited::Unknown(why.to_owned())
             );
         }
         assert_eq!(
             inherited_from(
                 None,
-                &["build.rustc-wrapper".to_owned()],
+                Ok(vec!["build.rustc-wrapper".to_owned()]),
                 None,
-                &[],
+                Ok(Vec::new()),
                 reader(&[])
             ),
             Inherited::Unknown("a --config value Oxide cannot parse".to_owned())
         );
         assert_eq!(
-            inherited_from(None, &[], None, &[], reader(&[])),
+            inherited_from(None, Ok(Vec::new()), None, Ok(Vec::new()), reader(&[])),
             Inherited::None
+        );
+        // A layer that cannot be classified is unknown, never absent, and only
+        // at its own precedence: an earlier source still answers first.
+        assert_eq!(
+            inherited_from(
+                None,
+                Ok(Vec::new()),
+                None,
+                Err("Cargo config /w/.cargo/config is not a regular file".to_owned()),
+                reader(&[])
+            ),
+            Inherited::Unknown("Cargo config /w/.cargo/config is not a regular file".to_owned())
+        );
+        assert_eq!(
+            inherited_from(
+                os("/opt/homebrew/bin/sccache"),
+                Err("a --config value is not valid UTF-8".to_owned()),
+                None,
+                Ok(Vec::new()),
+                reader(&[])
+            ),
+            sccache("RUSTC_WRAPPER")
         );
     }
 
@@ -469,8 +512,8 @@ mod tests {
         write(home.join("config.toml"), "build.rustc-wrapper = \"\"\n");
         write(home.join("config"), "build.rustc-wrapper = \"far\"\n");
         let found = |cwd: &Path| {
-            let files = config_files(cwd, &home);
-            let named = inherited_from(None, &[], None, &files, |path| {
+            let files = config_files(cwd, &home).expect("the layers are classified");
+            let named = inherited_from(None, Ok(Vec::new()), None, Ok(files.clone()), |path| {
                 cargo_home::read_config(path)
             });
             (files, named)
@@ -499,7 +542,7 @@ mod tests {
             }
         );
         // The home is not read twice when an ancestor's `.cargo` is the home.
-        let files = config_files(&cwd, &cwd.join(".cargo"));
+        let files = config_files(&cwd, &cwd.join(".cargo")).expect("the layers are classified");
         assert_eq!(
             files
                 .iter()
@@ -524,7 +567,18 @@ mod tests {
         .iter()
         .map(OsString::from)
         .collect();
-        assert_eq!(config_values(&args), ["a=1", "b=2"]);
+        assert_eq!(config_values(&args).unwrap(), ["a=1", "b=2"]);
+        // A value Cargo would read is reported, never silently dropped.
+        let non_utf8 = vec![
+            OsString::from("check"),
+            OsString::from("--config"),
+            OsString::from(std::ffi::OsStr::from_bytes(b"a=\xff")),
+        ];
+        assert!(config_values(&non_utf8).is_err());
+        assert_eq!(
+            config_values(&[OsString::from("--config")]).unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
