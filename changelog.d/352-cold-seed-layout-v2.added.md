@@ -1,0 +1,1 @@
+Cold-slot seeding supports Cargo 1.100.0's build-directory layout v2. A cold slot clones plain registry library units from an idle same-volume donor under a v2 adapter, and Cargo reuses them as fresh. Layout v1 seeding is unchanged. Donors never mix layouts, and Cargo's layout opt-out is refused.

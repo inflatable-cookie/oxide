@@ -383,6 +383,43 @@ mod tests {
         }
     }
 
+    /// Layout v1 and layout v2 donors never meet: the adapter is part of the
+    /// producer context, so a donor of the other layout is a context mismatch.
+    #[test]
+    fn a_donor_of_the_other_layout_is_a_context_mismatch() {
+        use oxide_storage::lease::seed::{ADAPTER_V1, ADAPTER_V2};
+        let package = crate::seed_lock::eligible(cfg_if_lock().as_bytes())
+            .unwrap()
+            .remove(0);
+        let source = verified_source(package.clone());
+        let allowed = [package];
+        let mut v1_donor = candidate("donor", 1, "tree");
+        v1_donor.catalog.producer.adapter = ADAPTER_V1.into();
+        let mut v1_recipient = producer();
+        v1_recipient.adapter = ADAPTER_V1.into();
+        // Control: the same donor is selected for a recipient of its own layout.
+        assert!(select(
+            &recipient(),
+            &v1_recipient,
+            &allowed,
+            &[source.clone()],
+            &[v1_donor.clone()]
+        )
+        .is_ok());
+        let mut v2_recipient = producer();
+        v2_recipient.adapter = ADAPTER_V2.into();
+        assert_eq!(
+            select(
+                &recipient(),
+                &v2_recipient,
+                &allowed,
+                &[source],
+                &[v1_donor]
+            ),
+            Err(SelectMiss::ContextMismatch)
+        );
+    }
+
     fn recipient() -> SeedRecipient {
         SeedRecipient {
             slot_id: "recipient".into(),

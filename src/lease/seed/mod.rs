@@ -88,11 +88,12 @@ mod join;
 mod walk;
 
 pub use catalog::{
-    digest as catalog_digest, SeedAttemptState, SeedCatalog, SeedFile, SeedFileKind, SeedJoin,
-    SeedPackage, SeedProducer, SeedRejectReason, SeedRejection, SeedRole, SeedSourceKind,
-    SeedSourceRoot, SeedUnit, SEED_CATALOG_MAX_BYTES, SEED_CATALOG_SCHEMA, SEED_MAX_CONFIG_FILES,
-    SEED_MAX_CONTEXT_BYTES, SEED_MAX_CONTEXT_RENDERED_BYTES, SEED_MAX_FILES, SEED_MAX_PACKAGES,
-    SEED_MAX_PLAN_INPUTS, SEED_MAX_REJECTED_UNITS, SEED_MAX_REJECTIONS, SEED_MAX_UNITS_PER_PACKAGE,
+    digest as catalog_digest, layout_of_adapter, SeedAttemptState, SeedCatalog, SeedFile,
+    SeedFileKind, SeedJoin, SeedLayout, SeedPackage, SeedProducer, SeedRejectReason, SeedRejection,
+    SeedRole, SeedSourceKind, SeedSourceRoot, SeedUnit, ADAPTER_V1, ADAPTER_V2,
+    SEED_CATALOG_MAX_BYTES, SEED_CATALOG_SCHEMA, SEED_MAX_CONFIG_FILES, SEED_MAX_CONTEXT_BYTES,
+    SEED_MAX_CONTEXT_RENDERED_BYTES, SEED_MAX_FILES, SEED_MAX_PACKAGES, SEED_MAX_PLAN_INPUTS,
+    SEED_MAX_REJECTED_UNITS, SEED_MAX_REJECTIONS, SEED_MAX_UNITS_PER_PACKAGE, SEED_MAX_UNIT_FILES,
     SEED_MAX_UNIT_INPUTS,
 };
 pub use join::{

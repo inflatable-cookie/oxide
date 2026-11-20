@@ -50,6 +50,29 @@ pub const SEED_MAX_PLAN_INPUTS: usize = 32768;
 pub const SEED_MAX_UNIT_FILES: usize = 16;
 /// One relative path or name component.
 pub const SEED_MAX_NAME_BYTES: usize = 255;
+/// The producer adapter of Cargo 1.97.1's layout v1 (`<profile>/deps`,
+/// `<profile>/.fingerprint`).
+pub const ADAPTER_V1: &str = "cargo-1.97.1/c980f4866/build-dir-v1";
+/// The producer adapter of Cargo 1.100.0's layout v2 (`<profile>/build/<package>/<hex>`).
+pub const ADAPTER_V2: &str = "cargo-1.100.0/3acc79c0c/build-dir-v2";
+
+/// The build-directory layout a catalog's unit shapes were recorded under.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SeedLayout {
+    V1,
+    V2,
+}
+
+/// The layout a producer adapter names. Only [`ADAPTER_V2`] is layout v2;
+/// any other adapter is read as v1, so a unit whose shape is not v1 is refused
+/// by the v1 checks rather than accepted by a guess.
+pub fn layout_of_adapter(adapter: &str) -> SeedLayout {
+    if adapter == ADAPTER_V2 {
+        SeedLayout::V2
+    } else {
+        SeedLayout::V1
+    }
+}
 
 /// A donor catalog for one pool slot generation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -290,6 +313,7 @@ impl SeedCatalog {
             return Err("cold-seed catalog finishes before it started");
         }
         self.producer.validate()?;
+        let layout = layout_of_adapter(&self.producer.adapter);
         if self.packages.len() > SEED_MAX_PACKAGES {
             return Err("cold-seed catalog has too many packages");
         }
@@ -297,7 +321,7 @@ impl SeedCatalog {
         let mut targets = std::collections::BTreeSet::new();
         let mut paths = std::collections::BTreeSet::new();
         for package in &self.packages {
-            package.validate()?;
+            package.validate(layout)?;
             if !targets.insert(package.target.as_str()) {
                 return Err("cold-seed catalog repeats a normalized package name");
             }
@@ -368,7 +392,7 @@ impl SeedProducer {
 }
 
 impl SeedPackage {
-    fn validate(&self) -> Result<(), &'static str> {
+    fn validate(&self, layout: SeedLayout) -> Result<(), &'static str> {
         require_bounded(&self.name, SEED_MAX_REJECTED_NAME_BYTES, "package name")?;
         require_bounded(&self.target, SEED_MAX_REJECTED_NAME_BYTES, "target name")?;
         require_bounded(&self.version, SEED_MAX_TEXT_BYTES, "package version")?;
@@ -381,16 +405,16 @@ impl SeedPackage {
             return Err("cold-seed catalog package has too many units");
         }
         for unit in &self.units {
-            unit.validate()?;
+            unit.validate(layout)?;
             // The unit identity is the package's, never a second claim: a
             // target or a directory name that disagrees with the package is a
             // mixed unit, and a mixed unit is never offered (§3).
             if unit.target != self.target {
                 return Err("cold-seed unit target is not its package target");
             }
-            if fingerprint_layout(&unit.fingerprint_dir)
-                .is_some_and(|(_, literal, _)| literal != self.name)
-            {
+            let named =
+                unit_directory(layout, &unit.fingerprint_dir).map(|(_, literal, _)| literal);
+            if named != Some(self.name.as_str()) {
                 return Err("cold-seed unit directory is not named by its package");
             }
         }
@@ -398,22 +422,46 @@ impl SeedPackage {
     }
 }
 
+/// Where one unit's files live under a layout: the directory holding the
+/// fingerprint triple, and the directory holding its `.d`, artifacts and
+/// (layout v2) debuginfo objects.
+struct UnitHomes {
+    fingerprint: String,
+    outputs: String,
+}
+
+impl UnitHomes {
+    fn new(layout: SeedLayout, dir: &str, profile: &str) -> Self {
+        match layout {
+            SeedLayout::V1 => Self {
+                fingerprint: dir.to_owned(),
+                outputs: format!("{profile}/deps"),
+            },
+            SeedLayout::V2 => Self {
+                fingerprint: format!("{dir}/fingerprint"),
+                outputs: format!("{dir}/out"),
+            },
+        }
+    }
+}
+
 impl SeedUnit {
-    fn validate(&self) -> Result<(), &'static str> {
+    fn validate(&self, layout: SeedLayout) -> Result<(), &'static str> {
         require_path(&self.fingerprint_dir, false)?;
         require_bounded(&self.target, SEED_MAX_REJECTED_NAME_BYTES, "unit target")?;
         self.join.validate()?;
         if self.files.is_empty() || self.files.len() > SEED_MAX_UNIT_FILES {
             return Err("cold-seed unit has an unusable file list");
         }
-        // The profile component of the fingerprint directory is the unit's
-        // output subtree: every offered file lives below it, so one unit can
-        // never name a file of another profile or of the slot root. The
+        // The profile component of the unit directory is the unit's output
+        // subtree: every offered file lives below it, so one unit can never
+        // name a file of another profile or of the slot root. The
         // directory's own shape is part of the pinned layout adapter, so a
         // mixed or unparseable directory is refused rather than guessed at.
-        let Some((profile, _, hex)) = fingerprint_layout(&self.fingerprint_dir) else {
-            return Err("cold-seed unit directory is not <profile>/.fingerprint/<package>-<hex>");
+        let Some((profile, _, hex)) = unit_directory(layout, &self.fingerprint_dir) else {
+            return Err("cold-seed unit directory is not one of the pinned layout's unit shapes");
         };
+        let homes = UnitHomes::new(layout, &self.fingerprint_dir, profile);
         // The joining `.d` is part of the unit's own file list and is the
         // unit's one dep-info record: a catalog that names a join it would not
         // clone is not a complete unit, and the join's own digest is that file
@@ -435,7 +483,8 @@ impl SeedUnit {
         // artifact out by calling it a fingerprint file or an uplift: an
         // artifact is never a fingerprint-directory entry, and a fingerprint
         // file always is one.
-        let fingerprint_prefix = format!("{}/", self.fingerprint_dir);
+        let fingerprint_prefix = format!("{}/", homes.fingerprint);
+        let outputs_prefix = format!("{}/", homes.outputs);
         if !self
             .files
             .iter()
@@ -443,13 +492,13 @@ impl SeedUnit {
         {
             return Err("cold-seed unit offers no artifact");
         }
-        // A v1 library unit's artifacts and `.d` are exactly the pinned
-        // layout: one unit identifier across the fingerprint directory, the
-        // artifact stems and the `.d` stem. A producer that records any other
-        // shape (or a different identifier in one place) is not offering a
-        // unit this layer can clone.
+        // A library unit's artifacts and `.d` are exactly the pinned layout:
+        // one unit identifier across the fingerprint directory, the artifact
+        // stems and the `.d` stem. A producer that records any other shape (or
+        // a different identifier in one place) is not offering a unit this
+        // layer can clone.
         if self.role == SeedRole::Lib {
-            if dep_info[0].path != format!("{profile}/deps/{}-{hex}.d", self.target) {
+            if dep_info[0].path != format!("{}/{}-{hex}.d", homes.outputs, self.target) {
                 return Err("cold-seed unit's .d is not named by its own unit identifier");
             }
             let mut extensions = std::collections::BTreeSet::new();
@@ -465,13 +514,16 @@ impl SeedUnit {
                 if !matches!(extension, "rmeta" | "rlib") {
                     return Err("cold-seed artifact is not an rmeta or rlib output");
                 }
-                if stem != format!("{profile}/deps/lib{}-{hex}", self.target) {
+                if stem != format!("{}/lib{}-{hex}", homes.outputs, self.target) {
                     return Err("cold-seed artifact is not named by its own unit identifier");
                 }
                 if !extensions.insert(extension) {
                     return Err("cold-seed unit repeats an artifact kind");
                 }
             }
+        }
+        if layout == SeedLayout::V2 {
+            self.validate_v2_entries(&homes)?;
         }
         for file in &self.files {
             match file.kind {
@@ -483,6 +535,9 @@ impl SeedUnit {
                 SeedFileKind::Artifact | SeedFileKind::DepInfo => {
                     if file.path.starts_with(&fingerprint_prefix) {
                         return Err("cold-seed artifact is a fingerprint-directory entry");
+                    }
+                    if layout == SeedLayout::V2 && !file.path.starts_with(&outputs_prefix) {
+                        return Err("cold-seed artifact is outside its unit's output directory");
                     }
                 }
                 SeedFileKind::Uplift => {
@@ -506,6 +561,48 @@ impl SeedUnit {
             if file_profile != profile {
                 return Err("cold-seed file is outside the unit's profile directory");
             }
+        }
+        Ok(())
+    }
+
+    /// Layout v2 is library-only and names its fingerprint files exactly: the
+    /// triple is required and any other entry must be one Cargo writes beside
+    /// it. Unknown entries are refused, never copied.
+    fn validate_v2_entries(&self, homes: &UnitHomes) -> Result<(), &'static str> {
+        if self.role != SeedRole::Lib {
+            return Err("cold-seed layout v2 offers library units only");
+        }
+        let target = self.target.as_str();
+        let required = [
+            format!("lib-{target}"),
+            format!("lib-{target}.json"),
+            format!("dep-lib-{target}"),
+        ];
+        let optional = [
+            format!("output-lib-{target}"),
+            "invoked.timestamp".to_owned(),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for file in self
+            .files
+            .iter()
+            .filter(|file| file.kind == SeedFileKind::Fingerprint)
+        {
+            let name = file
+                .path
+                .strip_prefix(&format!("{}/", homes.fingerprint))
+                .ok_or("cold-seed fingerprint file is outside its unit directory")?;
+            if !required
+                .iter()
+                .chain(optional.iter())
+                .any(|known| known == name)
+            {
+                return Err("cold-seed unit holds an unknown fingerprint entry");
+            }
+            seen.insert(name.to_owned());
+        }
+        if !required.iter().all(|name| seen.contains(name)) {
+            return Err("cold-seed unit's fingerprint triple is incomplete");
         }
         Ok(())
     }
@@ -587,15 +684,40 @@ fn fingerprint_layout(dir: &str) -> Option<(&str, &str, &str)> {
         return None;
     }
     let (literal, hex) = name.rsplit_once('-')?;
-    if literal.is_empty()
-        || hex.len() != 16
-        || !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if literal.is_empty() || !is_unit_hex(hex) {
         return None;
     }
     Some((profile, literal, hex))
+}
+
+/// A unit directory's `(profile, literal package name, unit identifier)` under
+/// a layout: `<profile>/.fingerprint/<literal>-<hex>` for v1, and
+/// `<profile>/build/<literal>/<hex>` for v2.
+fn unit_directory(layout: SeedLayout, dir: &str) -> Option<(&str, &str, &str)> {
+    match layout {
+        SeedLayout::V1 => fingerprint_layout(dir),
+        SeedLayout::V2 => {
+            let mut parts = dir.split('/');
+            let profile = parts.next()?;
+            if !matches!(profile, "debug" | "release") || parts.next()? != "build" {
+                return None;
+            }
+            let literal = parts.next()?;
+            let hex = parts.next()?;
+            if parts.next().is_some() || literal.is_empty() || !is_unit_hex(hex) {
+                return None;
+            }
+            Some((profile, literal, hex))
+        }
+    }
+}
+
+/// Sixteen lowercase hexadecimal digits: Cargo's unit identifier.
+fn is_unit_hex(hex: &str) -> bool {
+    hex.len() == 16
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// A recorded join path: an absolute path or a strict relative one.
@@ -637,4 +759,151 @@ pub(super) fn hex(bytes: &[u8]) -> String {
         let _ = write!(text, "{byte:02x}");
     }
     text
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    const HEX: &str = "0123456789abcdef";
+    const DIR: &str = "debug/build/cfg-if/0123456789abcdef";
+
+    fn digest() -> String {
+        "a".repeat(64)
+    }
+
+    fn file(path: &str, kind: SeedFileKind) -> SeedFile {
+        SeedFile {
+            path: path.to_owned(),
+            size: 1,
+            mtime_ms: 1,
+            digest: digest(),
+            kind,
+        }
+    }
+
+    /// A layout v2 library unit as the producer offers it: the fingerprint
+    /// triple, its `invoked.timestamp`, the artifact and the joining `.d`.
+    fn v2_unit() -> SeedUnit {
+        let dep = format!("{DIR}/out/cfg_if-{HEX}.d");
+        SeedUnit {
+            fingerprint_dir: DIR.to_owned(),
+            role: SeedRole::Lib,
+            target: "cfg_if".to_owned(),
+            join: SeedJoin {
+                path: dep.clone(),
+                targets: vec![dep.clone(), format!("{DIR}/out/libcfg_if-{HEX}.rmeta")],
+                inputs: vec!["/registry/cfg-if-1.0.5/src/lib.rs".to_owned()],
+                digest: digest(),
+            },
+            files: vec![
+                file(
+                    &format!("{DIR}/fingerprint/lib-cfg_if"),
+                    SeedFileKind::Fingerprint,
+                ),
+                file(
+                    &format!("{DIR}/fingerprint/lib-cfg_if.json"),
+                    SeedFileKind::Fingerprint,
+                ),
+                file(
+                    &format!("{DIR}/fingerprint/dep-lib-cfg_if"),
+                    SeedFileKind::Fingerprint,
+                ),
+                file(
+                    &format!("{DIR}/fingerprint/invoked.timestamp"),
+                    SeedFileKind::Fingerprint,
+                ),
+                file(
+                    &format!("{DIR}/out/libcfg_if-{HEX}.rmeta"),
+                    SeedFileKind::Artifact,
+                ),
+                file(&dep, SeedFileKind::DepInfo),
+            ],
+        }
+    }
+
+    fn catalog(adapter: &str, unit: SeedUnit) -> SeedCatalog {
+        SeedCatalog {
+            schema: SEED_CATALOG_SCHEMA.to_owned(),
+            store_id: "store".to_owned(),
+            slot_id: "7".to_owned(),
+            incarnation: "incarnation".to_owned(),
+            lease_id: "lease".to_owned(),
+            record_id: 1,
+            mark: 1,
+            started_at_ms: 1,
+            finished_at_ms: 2,
+            attempt: SeedAttemptState::None,
+            producer: SeedProducer {
+                cargo_version: "cargo 1.100.0 (3acc79c0c 2026-11-05)".to_owned(),
+                rustc_digest: digest(),
+                rustc: "rustc".to_owned(),
+                target: "aarch64-apple-darwin".to_owned(),
+                recipe: "quick".to_owned(),
+                backend: "directory-budget-v1".to_owned(),
+                adapter: adapter.to_owned(),
+                context_digest: digest(),
+                config_files: Vec::new(),
+                flags_digest: digest(),
+                cargo_home: "/cargo".to_owned(),
+                command_family: "build".to_owned(),
+                command_class: "build".to_owned(),
+            },
+            packages: vec![SeedPackage {
+                name: "cfg-if".to_owned(),
+                target: "cfg_if".to_owned(),
+                version: "1.0.5".to_owned(),
+                source: "registry+https://github.com/rust-lang/crates.io-index".to_owned(),
+                checksum: Some(digest()),
+                unique: true,
+                leaf: true,
+                source_root: SeedSourceRoot {
+                    kind: SeedSourceKind::Registry,
+                    digest: digest(),
+                },
+                units: vec![unit],
+            }],
+            rejected: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_layout_v2_unit_validates_only_under_the_v2_adapter() {
+        assert_eq!(layout_of_adapter(ADAPTER_V2), SeedLayout::V2);
+        assert_eq!(layout_of_adapter(ADAPTER_V1), SeedLayout::V1);
+        assert!(catalog(ADAPTER_V2, v2_unit()).validate().is_ok());
+        // The same shape is not a v1 unit: layout v1 names `<profile>/deps`.
+        assert!(catalog(ADAPTER_V1, v2_unit()).validate().is_err());
+    }
+
+    #[test]
+    fn layout_v2_refuses_unknown_or_incomplete_unit_entries() {
+        let mut unknown = v2_unit();
+        unknown.files.push(file(
+            &format!("{DIR}/fingerprint/mystery"),
+            SeedFileKind::Fingerprint,
+        ));
+        assert!(catalog(ADAPTER_V2, unknown).validate().is_err());
+
+        let mut incomplete = v2_unit();
+        incomplete
+            .files
+            .retain(|file| !file.path.ends_with("/dep-lib-cfg_if"));
+        assert!(catalog(ADAPTER_V2, incomplete).validate().is_err());
+
+        let mut stray_artifact = v2_unit();
+        stray_artifact.files[4].path = format!("debug/deps/libcfg_if-{HEX}.rmeta");
+        assert!(catalog(ADAPTER_V2, stray_artifact).validate().is_err());
+    }
+
+    #[test]
+    fn layout_v2_refuses_a_mismatched_package_or_role() {
+        let mut other_role = v2_unit();
+        other_role.role = SeedRole::ProcMacro;
+        assert!(catalog(ADAPTER_V2, other_role).validate().is_err());
+
+        let mut renamed = catalog(ADAPTER_V2, v2_unit());
+        renamed.packages[0].name = "cfg_if".to_owned();
+        assert!(renamed.validate().is_err());
+    }
 }

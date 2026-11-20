@@ -1403,7 +1403,7 @@ fn host_limit_counts_internal_and_removable_activity_in_both_routes() {
     fs::remove_dir_all(root).unwrap();
 }
 
-fn lease(store: &Store, key: &SlotKey, label: Option<&str>) -> Result<Lease, Wait> {
+pub(super) fn lease(store: &Store, key: &SlotKey, label: Option<&str>) -> Result<Lease, Wait> {
     // Another test's `Command` spawn briefly duplicates every open
     // descriptor in the forked child before `exec` closes the
     // close-on-exec ones, so this fixture's admission lock can read as

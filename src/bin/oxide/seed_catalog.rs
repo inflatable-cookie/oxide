@@ -8,8 +8,8 @@ use oxide_storage::lease::managed::{
     SeedUnit,
 };
 use oxide_storage::lease::seed::{
-    parse_seed_join, seed_output_rule_proven, MAX_JOIN_BYTES, SEED_MAX_FILES,
-    SEED_MAX_REJECTED_UNITS, SEED_MAX_REJECTIONS, SEED_MAX_UNITS_PER_PACKAGE,
+    parse_seed_join, seed_output_rule_proven, SeedLayout, MAX_JOIN_BYTES, SEED_MAX_FILES,
+    SEED_MAX_REJECTED_UNITS, SEED_MAX_REJECTIONS, SEED_MAX_UNITS_PER_PACKAGE, SEED_MAX_UNIT_FILES,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -248,14 +248,19 @@ impl Producer {
 
     /// Record donor-side candidate unit counts for lock-side rejections.
     /// Ambiguous lock entries sharing one normalized name are grouped so one
-    /// fingerprint directory is never counted twice.
+    /// unit directory is never counted twice.
     pub fn rejections(
         &mut self,
         profile: &str,
         rejected: &[crate::seed_lock::RejectedPackage],
+        layout: SeedLayout,
     ) -> Vec<SeedRejection> {
-        let root = format!("{profile}/.fingerprint");
-        let names = self.names(Path::new(&root));
+        // Layout v1 lists the profile's `.fingerprint` once for the whole
+        // record. Layout v2 counts beneath each package's own directory.
+        let v1_names = match layout {
+            SeedLayout::V1 => self.names(Path::new(&format!("{profile}/.fingerprint"))),
+            SeedLayout::V2 => None,
+        };
         let mut grouped: std::collections::BTreeMap<(String, SeedRejectReason), BTreeSet<String>> =
             std::collections::BTreeMap::new();
         for item in rejected {
@@ -283,65 +288,10 @@ impl Producer {
                 });
                 break;
             }
-            let mut count = Some(0u32);
-            if let Some(names) = &names {
-                for entry in names {
-                    let matches = literals.iter().any(|literal| {
-                        entry
-                            .strip_prefix(&format!("{literal}-"))
-                            .is_some_and(|hash| {
-                                hash.len() == 16
-                                    && hash.bytes().all(|byte| {
-                                        byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-                                    })
-                            })
-                    });
-                    if !matches {
-                        continue;
-                    }
-                    let entries = self.names(Path::new(&format!("{root}/{entry}")));
-                    let Some(entries) = entries else {
-                        count = None;
-                        break;
-                    };
-                    let lib = format!("lib-{name}");
-                    let candidates = [lib.as_str(), "build-script-build"];
-                    let roles: Vec<&str> = candidates
-                        .into_iter()
-                        .filter(|stem| entries.iter().any(|entry| entry == stem))
-                        .collect();
-                    if roles.len() == 1 {
-                        let stem = roles[0];
-                        let triple = [
-                            stem.to_owned(),
-                            format!("{stem}.json"),
-                            format!("dep-{stem}"),
-                        ];
-                        let complete = triple.iter().all(|part| entries.contains(part))
-                            && entries
-                                .iter()
-                                .all(|part| triple.contains(part) || part == "invoked.timestamp");
-                        if !complete {
-                            count = None;
-                            break;
-                        }
-                        count = count.and_then(|value| value.checked_add(1));
-                    } else if roles.is_empty()
-                        && entries.iter().all(|part| {
-                            part == "invoked.timestamp"
-                                || part.starts_with("run-build-script-build-script-build")
-                                || part == "dep-run-build-script-build-script-build"
-                        })
-                    {
-                        // A classified run-only directory is not a compile unit.
-                    } else {
-                        count = None;
-                        break;
-                    }
-                }
-            } else {
-                count = None;
-            }
+            let mut count = match layout {
+                SeedLayout::V1 => self.count_v1(profile, v1_names.as_deref(), &name, &literals),
+                SeedLayout::V2 => self.count_v2(profile, &name, &literals),
+            };
             if let Some(value) = count {
                 total = total.saturating_add(u64::from(value));
                 if total > SEED_MAX_REJECTED_UNITS {
@@ -357,174 +307,400 @@ impl Producer {
         result
     }
 
-    /// Classify each fingerprint directory independently. Unknown entries make
-    /// that directory unusable; a run-only directory is never offered.
-    pub fn units(&mut self, profile: &str, source: &VerifiedSource) -> Option<Vec<SeedUnit>> {
+    /// Layout v1 candidate units under the profile's `.fingerprint` listing.
+    /// `None` means the candidates could not all be classified.
+    fn count_v1(
+        &mut self,
+        profile: &str,
+        names: Option<&[String]>,
+        name: &str,
+        literals: &BTreeSet<String>,
+    ) -> Option<u32> {
+        let names = names?;
+        let root = format!("{profile}/.fingerprint");
+        let mut count = Some(0u32);
+        for entry in names {
+            let matches = literals.iter().any(|literal| {
+                entry
+                    .strip_prefix(&format!("{literal}-"))
+                    .is_some_and(is_unit_hash)
+            });
+            if !matches {
+                continue;
+            }
+            let entries = self.names(Path::new(&format!("{root}/{entry}")))?;
+            let lib = format!("lib-{name}");
+            let candidates = [lib.as_str(), "build-script-build"];
+            let roles: Vec<&str> = candidates
+                .into_iter()
+                .filter(|stem| entries.iter().any(|entry| entry == stem))
+                .collect();
+            if roles.len() == 1 {
+                let stem = roles[0];
+                let triple = [
+                    stem.to_owned(),
+                    format!("{stem}.json"),
+                    format!("dep-{stem}"),
+                ];
+                let complete = triple.iter().all(|part| entries.contains(part))
+                    && entries
+                        .iter()
+                        .all(|part| triple.contains(part) || part == "invoked.timestamp");
+                if !complete {
+                    return None;
+                }
+                count = count.and_then(|value| value.checked_add(1));
+            } else if roles.is_empty() && entries.iter().all(|part| is_run_only_entry(part)) {
+                // A classified run-only directory is not a compile unit.
+            } else {
+                return None;
+            }
+        }
+        count
+    }
+
+    /// Layout v2 candidate units beneath each literal package directory. A
+    /// package with no directory in this profile holds no units. Anything the
+    /// producer cannot classify is unknown, never zero.
+    fn count_v2(&mut self, profile: &str, name: &str, literals: &BTreeSet<String>) -> Option<u32> {
+        let lib = format!("lib-{name}");
+        let stems = [lib.clone(), format!("{lib}.json"), format!("dep-{lib}")];
+        let mut count = 0u32;
+        for literal in literals {
+            let package = format!("{profile}/build/{literal}");
+            if self.open_path(Path::new(&package), true).is_none() {
+                continue;
+            }
+            for hash in self.names(Path::new(&package))? {
+                if !is_unit_hash(&hash) {
+                    return None;
+                }
+                let unit = format!("{package}/{hash}");
+                let entries = self.names(Path::new(&unit))?;
+                let fingerprint = self.names(Path::new(&format!("{unit}/fingerprint")))?;
+                if fingerprint.contains(&lib) {
+                    let complete = stems.iter().all(|stem| fingerprint.contains(stem));
+                    let known = fingerprint.iter().all(|entry| {
+                        stems.contains(entry)
+                            || entry == "invoked.timestamp"
+                            || *entry == format!("output-{lib}")
+                    });
+                    let bounded = entries
+                        .iter()
+                        .all(|entry| entry == "fingerprint" || entry == "out");
+                    if !complete || !known || !bounded {
+                        return None;
+                    }
+                    count = count.checked_add(1)?;
+                } else if !fingerprint.iter().all(|entry| is_run_only_entry(entry)) {
+                    return None;
+                }
+            }
+        }
+        Some(count)
+    }
+
+    /// Classify each library unit of one package independently. Unknown
+    /// entries make that unit unusable, and it is not offered. Layout v1 and
+    /// layout v2 use their own unit shapes and share one join check.
+    pub fn units(
+        &mut self,
+        profile: &str,
+        source: &VerifiedSource,
+        layout: SeedLayout,
+    ) -> Option<Vec<SeedUnit>> {
         if profile != "debug" && profile != "release" {
             return None;
         }
-        // v1 offers only plain registry library compile units. A Git source
+        // Only plain registry library compile units are offered. A Git source
         // is already rejected by the lock filter; this guard is defense in
-        // depth. Proc-macro and build-script packages are never offered, so
-        // a proc macro cannot be reused from a donor and a build-script unit
-        // never enters a plan.
+        // depth. Proc-macro and build-script packages are never offered, so a
+        // proc macro cannot be reused from a donor and a build-script unit never
+        // enters a plan.
         if source.kind != SeedSourceKind::Registry || source.proc_macro {
             return Some(Vec::new());
         }
+        let units = match layout {
+            SeedLayout::V1 => self.units_v1(profile, source)?,
+            SeedLayout::V2 => self.units_v2(profile, source)?,
+        };
+        self.time()?;
+        Some(units)
+    }
+
+    fn units_v1(&mut self, profile: &str, source: &VerifiedSource) -> Option<Vec<SeedUnit>> {
         let fingerprint_root = format!("{profile}/.fingerprint");
         let names = self.names(Path::new(&fingerprint_root))?;
         let prefix = format!("{}-", source.package.name);
+        let target = source.package.name.replace('-', "_");
+        let lib = format!("lib-{target}");
         let mut units = Vec::new();
         for name in names {
             let Some(hash) = name.strip_prefix(&prefix) else {
                 continue;
             };
-            if hash.len() != 16
-                || !hash
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
+            if !is_unit_hash(hash) {
                 continue;
             }
             let dir = format!("{fingerprint_root}/{name}");
             let Some(entries) = self.names(Path::new(&dir)) else {
                 continue;
             };
-            let target = source.package.name.replace('-', "_");
-            let lib = format!("lib-{target}");
             // A build-script compile directory has no `lib-<target>` entry;
             // v1 never classifies it. Only a library unit is considered.
-            if !entries.iter().any(|name| name == &lib) {
+            if !entries.iter().any(|entry| entry == &lib) {
                 continue;
             }
-            let stem = lib.as_str();
-            let expected: BTreeSet<String> = [
-                stem.to_owned(),
-                format!("{stem}.json"),
-                format!("dep-{stem}"),
-            ]
-            .into_iter()
-            .collect();
-            if !expected.iter().all(|name| entries.contains(name)) {
+            let expected: BTreeSet<String> =
+                [lib.clone(), format!("{lib}.json"), format!("dep-{lib}")]
+                    .into_iter()
+                    .collect();
+            if !expected.iter().all(|entry| entries.contains(entry)) {
                 continue;
             }
             if entries
                 .iter()
-                .any(|name| !expected.contains(name) && name != "invoked.timestamp")
+                .any(|entry| !expected.contains(entry) && entry != "invoked.timestamp")
             {
                 continue;
             }
-            let role = SeedRole::Lib;
-            let output_dir = format!("{profile}/deps");
-            let dep = format!("{output_dir}/{target}-{hash}.d");
-            // A library unit's outputs are the `.rmeta` and, when the command
-            // emitted one, the `.rlib`: `cargo check` produces the metadata
-            // only, and a check-built donor is a supported donor (§3, §5.1).
-            // Every artifact that does exist is joined through its own rule.
-            let mut artifacts = Vec::new();
-            for extension in ["rmeta", "rlib"] {
-                let path = format!("{output_dir}/lib{target}-{hash}.{extension}");
-                if self.open_path(Path::new(&path), false).is_some() {
-                    artifacts.push(path);
-                }
-            }
-            if artifacts.is_empty() {
-                continue;
-            }
-            let Some((dep_file, dep_bytes)) = self.read_file(&dep, SeedFileKind::DepInfo, true)
-            else {
-                continue;
+            // v1 keeps a unit's fingerprint triple in its directory and its
+            // outputs in `<profile>/deps`.
+            let shape = UnitShape {
+                dir: dir.clone(),
+                fingerprint: dir,
+                outputs: format!("{profile}/deps"),
+                hash: hash.to_owned(),
             };
-            let Ok(parsed) = parse_seed_join(&dep_bytes) else {
-                continue;
-            };
-            if parsed.inputs.is_empty()
-                || parsed.inputs.iter().any(|input| {
-                    let path = Path::new(input);
-                    !path.is_absolute()
-                        || !path.starts_with(&source.root)
-                        || path
-                            .components()
-                            .any(|part| matches!(part, std::path::Component::ParentDir))
-                })
-            {
-                continue;
+            let fingerprint: Vec<String> = expected.into_iter().collect();
+            if let Some(unit) = self.offer_lib_unit(source, &shape, &fingerprint) {
+                units.push(unit);
             }
-            let inputs: BTreeSet<&str> = parsed.inputs.iter().map(String::as_str).collect();
-            let outputs: BTreeSet<String> = std::iter::once(dep.as_str())
-                .chain(artifacts.iter().map(String::as_str))
-                .flat_map(|path| {
-                    [
-                        path.to_owned(),
-                        self.root.join(path).to_string_lossy().into_owned(),
-                    ]
-                })
-                .collect();
-            if parsed.rules.iter().any(|rule| {
-                rule.targets.len() != 1
-                    || if outputs.contains(&rule.targets[0]) {
-                        rule.inputs.is_empty()
-                            || rule
-                                .inputs
-                                .iter()
-                                .any(|input| !inputs.contains(input.as_str()))
-                    } else {
-                        !rule.inputs.is_empty() || !inputs.contains(rule.targets[0].as_str())
-                    }
-            }) || !seed_output_rule_proven(&parsed, &self.root, &dep, &parsed.inputs)
-                || artifacts.iter().any(|artifact| {
-                    !seed_output_rule_proven(&parsed, &self.root, artifact, &parsed.inputs)
-                })
-            {
-                continue;
-            }
-            let mut files = Vec::new();
-            let mut incomplete = false;
-            for entry in &expected {
-                match self.read_file(&format!("{dir}/{entry}"), SeedFileKind::Fingerprint, false) {
-                    Some((file, _)) => files.push(file),
-                    None => {
-                        incomplete = true;
-                        break;
-                    }
-                }
-            }
-            if incomplete {
-                continue;
-            }
-            for artifact in &artifacts {
-                match self.read_file(artifact, SeedFileKind::Artifact, false) {
-                    Some((file, _)) => files.push(file),
-                    None => {
-                        incomplete = true;
-                        break;
-                    }
-                }
-            }
-            if incomplete {
-                continue;
-            }
-            let digest = dep_file.digest.clone();
-            files.push(dep_file);
-            units.push(SeedUnit {
-                fingerprint_dir: dir,
-                role,
-                target,
-                join: SeedJoin {
-                    path: dep,
-                    targets: parsed.targets,
-                    inputs: parsed.inputs,
-                    digest,
-                },
-                files,
-            });
             if units.len() > SEED_MAX_UNITS_PER_PACKAGE {
                 return None;
             }
         }
-        self.time()?;
         Some(units)
     }
+
+    /// Layout v2 library units, one per `<profile>/build/<package>/<hex>`
+    /// directory. The unit's fingerprint files live in `fingerprint/` and its
+    /// outputs in `out/`. Debuginfo objects are not offered, because Cargo never
+    /// reads them for freshness or linking.
+    fn units_v2(&mut self, profile: &str, source: &VerifiedSource) -> Option<Vec<SeedUnit>> {
+        // A profile that holds layout v1 output is not a v2 producer's to
+        // classify: the Cargo that wrote it is not the one this adapter names.
+        for v1 in [format!("{profile}/deps"), format!("{profile}/.fingerprint")] {
+            if self.open_path(Path::new(&v1), true).is_some() {
+                return None;
+            }
+        }
+        let package = format!("{profile}/build/{}", source.package.name);
+        // No directory for this package in the profile holds no units.
+        if self.open_path(Path::new(&package), true).is_none() {
+            return Some(Vec::new());
+        }
+        let target = source.package.name.replace('-', "_");
+        let lib = format!("lib-{target}");
+        let required = [lib.clone(), format!("{lib}.json"), format!("dep-{lib}")];
+        let optional = [format!("output-{lib}"), "invoked.timestamp".to_owned()];
+        let mut units = Vec::new();
+        for hash in self.names(Path::new(&package))? {
+            if !is_unit_hash(&hash) {
+                continue;
+            }
+            let dir = format!("{package}/{hash}");
+            // A library unit has exactly its `fingerprint/` and `out/`.
+            let Some(entries) = self.names(Path::new(&dir)) else {
+                continue;
+            };
+            if entries
+                .iter()
+                .any(|entry| entry != "fingerprint" && entry != "out")
+            {
+                continue;
+            }
+            let fingerprint_dir = format!("{dir}/fingerprint");
+            let Some(fingerprint) = self.names(Path::new(&fingerprint_dir)) else {
+                continue;
+            };
+            // A build-script or run-only directory has no library triple.
+            if !fingerprint.contains(&lib) {
+                continue;
+            }
+            if !required.iter().all(|entry| fingerprint.contains(entry))
+                || fingerprint
+                    .iter()
+                    .any(|entry| !required.contains(entry) && !optional.contains(entry))
+            {
+                continue;
+            }
+            let outputs_dir = format!("{dir}/out");
+            let Some(outputs) = self.names(Path::new(&outputs_dir)) else {
+                continue;
+            };
+            let dep = format!("{target}-{hash}.d");
+            let rmeta = format!("lib{target}-{hash}.rmeta");
+            let rlib = format!("lib{target}-{hash}.rlib");
+            let object_prefix = format!("{target}-{hash}.");
+            if outputs.iter().any(|entry| {
+                entry != &dep
+                    && entry != &rmeta
+                    && entry != &rlib
+                    && !is_debuginfo_object(entry, &object_prefix)
+            }) || !outputs.contains(&dep)
+            {
+                continue;
+            }
+            let shape = UnitShape {
+                dir,
+                fingerprint: fingerprint_dir,
+                outputs: outputs_dir,
+                hash: hash.clone(),
+            };
+            if let Some(unit) = self.offer_lib_unit(source, &shape, &fingerprint) {
+                units.push(unit);
+            }
+            if units.len() > SEED_MAX_UNITS_PER_PACKAGE {
+                return None;
+            }
+        }
+        Some(units)
+    }
+
+    /// Join one library unit's `.d` to its verified source root and read its
+    /// files. `None` means the unit is not offered: its join is not proven, a
+    /// file cannot be read, or it exceeds a catalog cap.
+    fn offer_lib_unit(
+        &mut self,
+        source: &VerifiedSource,
+        shape: &UnitShape,
+        fingerprint: &[String],
+    ) -> Option<SeedUnit> {
+        let target = source.package.name.replace('-', "_");
+        let dep = format!("{}/{target}-{}.d", shape.outputs, shape.hash);
+        // A library unit's outputs are the `.rmeta` and, when the command
+        // emitted one, the `.rlib`: `cargo check` produces the metadata only,
+        // and a check-built donor is a supported donor (§3, §5.1). Every
+        // artifact that does exist is joined through its own rule.
+        let mut artifacts = Vec::new();
+        for extension in ["rmeta", "rlib"] {
+            let path = format!("{}/lib{target}-{}.{extension}", shape.outputs, shape.hash);
+            if self.open_path(Path::new(&path), false).is_some() {
+                artifacts.push(path);
+            }
+        }
+        if artifacts.is_empty() {
+            return None;
+        }
+        let (dep_file, dep_bytes) = self.read_file(&dep, SeedFileKind::DepInfo, true)?;
+        let parsed = parse_seed_join(&dep_bytes).ok()?;
+        if parsed.inputs.is_empty()
+            || parsed.inputs.iter().any(|input| {
+                let path = Path::new(input);
+                !path.is_absolute()
+                    || !path.starts_with(&source.root)
+                    || path
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::ParentDir))
+            })
+        {
+            return None;
+        }
+        let inputs: BTreeSet<&str> = parsed.inputs.iter().map(String::as_str).collect();
+        let outputs: BTreeSet<String> = std::iter::once(dep.as_str())
+            .chain(artifacts.iter().map(String::as_str))
+            .flat_map(|path| {
+                [
+                    path.to_owned(),
+                    self.root.join(path).to_string_lossy().into_owned(),
+                ]
+            })
+            .collect();
+        if parsed.rules.iter().any(|rule| {
+            rule.targets.len() != 1
+                || if outputs.contains(&rule.targets[0]) {
+                    rule.inputs.is_empty()
+                        || rule
+                            .inputs
+                            .iter()
+                            .any(|input| !inputs.contains(input.as_str()))
+                } else {
+                    !rule.inputs.is_empty() || !inputs.contains(rule.targets[0].as_str())
+                }
+        }) || !seed_output_rule_proven(&parsed, &self.root, &dep, &parsed.inputs)
+            || artifacts.iter().any(|artifact| {
+                !seed_output_rule_proven(&parsed, &self.root, artifact, &parsed.inputs)
+            })
+        {
+            return None;
+        }
+        let mut files = Vec::new();
+        for entry in fingerprint {
+            let (file, _) = self.read_file(
+                &format!("{}/{entry}", shape.fingerprint),
+                SeedFileKind::Fingerprint,
+                false,
+            )?;
+            files.push(file);
+        }
+        for artifact in &artifacts {
+            let (file, _) = self.read_file(artifact, SeedFileKind::Artifact, false)?;
+            files.push(file);
+        }
+        let digest = dep_file.digest.clone();
+        files.push(dep_file);
+        if files.len() > SEED_MAX_UNIT_FILES {
+            return None;
+        }
+        Some(SeedUnit {
+            fingerprint_dir: shape.dir.clone(),
+            role: SeedRole::Lib,
+            target,
+            join: SeedJoin {
+                path: dep,
+                targets: parsed.targets,
+                inputs: parsed.inputs,
+                digest,
+            },
+            files,
+        })
+    }
+}
+
+/// One library unit's paths under a layout.
+struct UnitShape {
+    /// The unit directory, relative to the slot's `build/`: the catalog's
+    /// `fingerprint_dir`.
+    dir: String,
+    /// The directory holding the fingerprint triple.
+    fingerprint: String,
+    /// The directory holding the `.d`, the artifacts and debuginfo objects.
+    outputs: String,
+    /// The 16-hex unit identifier.
+    hash: String,
+}
+
+/// Sixteen lowercase hexadecimal digits: Cargo's unit identifier.
+fn is_unit_hash(text: &str) -> bool {
+    text.len() == 16
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// A rustc debuginfo object of one unit (`<target>-<hex>.<…>.o`). It is not
+/// offered: Cargo never reads it for freshness or linking.
+fn is_debuginfo_object(entry: &str, prefix: &str) -> bool {
+    entry.starts_with(prefix) && entry.ends_with(".o") && entry.len() > prefix.len() + 2
+}
+
+/// An entry of a run-only or build-script directory, which is not a library
+/// compile unit.
+fn is_run_only_entry(entry: &str) -> bool {
+    entry == "invoked.timestamp"
+        || entry.starts_with("run-build-script-build-script-build")
+        || entry.starts_with("dep-run-build-script-build-script-build")
 }
 
 #[cfg(test)]
@@ -617,7 +793,7 @@ mod tests {
         fixture.write(&format!("build/{dep}"), &contents);
         let units = Producer::new(&build)
             .unwrap()
-            .units("debug", &source)
+            .units("debug", &source, SeedLayout::V1)
             .unwrap();
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].files.len(), 5);
@@ -627,7 +803,7 @@ mod tests {
         );
         assert!(Producer::new(&build)
             .unwrap()
-            .units("debug", &source)
+            .units("debug", &source, SeedLayout::V1)
             .unwrap()
             .is_empty());
     }
@@ -661,7 +837,7 @@ mod tests {
         };
         assert!(Producer::new(&build)
             .unwrap()
-            .units("debug", &build_source)
+            .units("debug", &build_source, SeedLayout::V1)
             .unwrap()
             .is_empty());
         // A complete proc-macro library fingerprint is still never offered.
@@ -697,7 +873,7 @@ mod tests {
         };
         assert!(Producer::new(&build)
             .unwrap()
-            .units("debug", &pm_source)
+            .units("debug", &pm_source, SeedLayout::V1)
             .unwrap()
             .is_empty());
     }
@@ -750,7 +926,7 @@ mod tests {
         assert_eq!(
             Producer::new(&build)
                 .unwrap()
-                .units("debug", &source)
+                .units("debug", &source, SeedLayout::V1)
                 .unwrap()
                 .len(),
             1
@@ -762,7 +938,7 @@ mod tests {
         );
         assert!(Producer::new(&build)
             .unwrap()
-            .units("debug", &source)
+            .units("debug", &source, SeedLayout::V1)
             .unwrap()
             .is_empty());
         fs::remove_file(
@@ -779,7 +955,7 @@ mod tests {
         assert_eq!(
             Producer::new(&build)
                 .unwrap()
-                .units("debug", &source)
+                .units("debug", &source, SeedLayout::V1)
                 .unwrap()
                 .len(),
             3
@@ -787,7 +963,7 @@ mod tests {
         write_complete_unit(&fixture, "dddddddddddddddd", &input);
         assert!(Producer::new(&build)
             .unwrap()
-            .units("debug", &source)
+            .units("debug", &source, SeedLayout::V1)
             .is_none());
     }
 
@@ -818,16 +994,221 @@ mod tests {
             fixture.write(&format!("{second}/{name}"), "x");
         }
         let root = fixture.0.join("build");
-        let records = Producer::new(&root)
-            .unwrap()
-            .rejections("debug", &analysis.rejected);
+        let records =
+            Producer::new(&root)
+                .unwrap()
+                .rejections("debug", &analysis.rejected, SeedLayout::V1);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].reason, SeedRejectReason::AmbiguousName);
         assert_eq!(records[0].units, Some(2));
         fixture.write(&format!("{second}/unclassified"), "x");
-        let records = Producer::new(&root)
-            .unwrap()
-            .rejections("debug", &analysis.rejected);
+        let records =
+            Producer::new(&root)
+                .unwrap()
+                .rejections("debug", &analysis.rejected, SeedLayout::V1);
         assert_eq!(records[0].units, None);
+    }
+
+    /// The v2 library source of a synthetic `cfg-if` tree: a verified source
+    /// root, and a build directory the producer walks.
+    fn v2_source(fixture: &Fixture) -> (VerifiedSource, PathBuf) {
+        let lock = format!("version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '{}'\n", "a".repeat(64));
+        let package = crate::seed_lock::eligible(lock.as_bytes())
+            .unwrap()
+            .remove(0);
+        let root = fixture.0.join("source");
+        fixture.write("source/src/lib.rs", "source");
+        let source = VerifiedSource {
+            package,
+            tree_digest: "b".repeat(64),
+            kind: SeedSourceKind::Registry,
+            verification_root: root.clone(),
+            root,
+            proc_macro: false,
+        };
+        (source, fixture.0.join("build"))
+    }
+
+    /// One complete layout v2 `cfg-if` unit: `fingerprint/` with the triple,
+    /// `output-lib` and `invoked.timestamp`, and `out/` with the artifact, the
+    /// `.d` and a rustc debuginfo object the producer must not offer.
+    fn write_v2_unit(fixture: &Fixture, build: &Path, hash: &str, input: &Path) {
+        let dir = format!("debug/build/cfg-if/{hash}");
+        for name in [
+            "lib-cfg_if",
+            "lib-cfg_if.json",
+            "dep-lib-cfg_if",
+            "output-lib-cfg_if",
+            "invoked.timestamp",
+        ] {
+            fixture.write(&format!("build/{dir}/fingerprint/{name}"), "fingerprint");
+        }
+        fixture.write(
+            &format!("build/{dir}/out/libcfg_if-{hash}.rmeta"),
+            "artifact",
+        );
+        fixture.write(
+            &format!("build/{dir}/out/cfg_if-{hash}.cfg_if.aaaa-cgu.0.rcgu.o"),
+            "object",
+        );
+        let dep = build.join(format!("{dir}/out/cfg_if-{hash}.d"));
+        let artifact = build.join(format!("{dir}/out/libcfg_if-{hash}.rmeta"));
+        fixture.write(
+            &format!("build/{dir}/out/cfg_if-{hash}.d"),
+            &format!(
+                "{}: {}\n{}: {}\n{}:\n",
+                dep.display(),
+                input.display(),
+                artifact.display(),
+                input.display(),
+                input.display()
+            ),
+        );
+    }
+
+    #[test]
+    fn layout_v2_offers_a_whole_unit_without_its_debuginfo_objects() {
+        let fixture = Fixture::new();
+        let (source, build) = v2_source(&fixture);
+        let hash = "0123456789abcdef";
+        write_v2_unit(&fixture, &build, hash, &source.root.join("src/lib.rs"));
+        let units = Producer::new(&build)
+            .unwrap()
+            .units("debug", &source, SeedLayout::V2)
+            .expect("layout v2 units");
+        assert_eq!(units.len(), 1, "{units:?}");
+        assert_eq!(
+            units[0].fingerprint_dir,
+            format!("debug/build/cfg-if/{hash}")
+        );
+        let files = &units[0].files;
+        // Five fingerprint files, the artifact and the `.d`; the object is not offered.
+        assert_eq!(files.len(), 7, "{files:?}");
+        assert_eq!(
+            files
+                .iter()
+                .filter(|file| file.kind == SeedFileKind::Fingerprint)
+                .count(),
+            5
+        );
+        assert!(
+            files.iter().all(|file| !file.path.ends_with(".o")),
+            "{files:?}"
+        );
+    }
+
+    #[test]
+    fn layout_v2_refuses_unknown_entries_and_v1_profiles() {
+        let fixture = Fixture::new();
+        let (source, build) = v2_source(&fixture);
+        let hash = "0123456789abcdef";
+        write_v2_unit(&fixture, &build, hash, &source.root.join("src/lib.rs"));
+        // An entry the layout does not write makes the unit unusable, never a copy.
+        fixture.write(&format!("build/debug/build/cfg-if/{hash}/run/output"), "x");
+        let units = Producer::new(&build)
+            .unwrap()
+            .units("debug", &source, SeedLayout::V2)
+            .expect("layout v2 units");
+        assert!(units.is_empty(), "{units:?}");
+        fs::remove_dir_all(build.join(format!("debug/build/cfg-if/{hash}/run"))).unwrap();
+        // A profile that holds layout v1 output is not a v2 producer's to read.
+        fixture.write("build/debug/deps/keep", "x");
+        assert!(Producer::new(&build)
+            .unwrap()
+            .units("debug", &source, SeedLayout::V2)
+            .is_none());
+    }
+
+    #[test]
+    fn layout_v2_counts_candidates_and_never_reports_unknown_as_zero() {
+        let fixture = Fixture::new();
+        let (source, build) = v2_source(&fixture);
+        let hash = "0123456789abcdef";
+        write_v2_unit(&fixture, &build, hash, &source.root.join("src/lib.rs"));
+        let rejected = vec![crate::seed_lock::RejectedPackage {
+            package: source.package.clone(),
+            reason: SeedRejectReason::NonLeaf,
+        }];
+        let records = Producer::new(&build)
+            .unwrap()
+            .rejections("debug", &rejected, SeedLayout::V2);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].units, Some(1));
+        // An entry the producer cannot classify makes the count unknown.
+        fixture.write(&format!("build/debug/build/cfg-if/{hash}/mystery/x"), "x");
+        let records = Producer::new(&build)
+            .unwrap()
+            .rejections("debug", &rejected, SeedLayout::V2);
+        assert_eq!(records[0].units, None);
+    }
+
+    /// Real Cargo 1.100.0 output for a registry leaf: the unit is offered whole,
+    /// its fingerprint triple, artifact and `.d` join, and no debuginfo object.
+    #[test]
+    fn layout_v2_offers_the_unit_real_cargo_1_100_writes() {
+        use crate::cargo_layout::support::{cargo_1_100, toolchain_installed};
+        if !toolchain_installed() {
+            eprintln!("skipped: Cargo 1.100.0 is not installed");
+            return;
+        }
+        let fixture = Fixture::new();
+        fixture.write(
+            "probe/Cargo.toml",
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nitoa = \"=1.0.18\"\n",
+        );
+        fixture.write(
+            "probe/src/lib.rs",
+            "pub fn f() -> usize { itoa::Buffer::new().format(7u32).len() }\n",
+        );
+        let build = fixture.0.join("build");
+        let built = cargo_1_100(&fixture.0.join("probe"))
+            .args(["build", "--offline"])
+            .env("CARGO_BUILD_BUILD_DIR", &build)
+            .env("CARGO_TARGET_DIR", fixture.0.join("target"))
+            .output()
+            .expect("cargo 1.100.0");
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let unit = fs::read_dir(build.join("debug/build/itoa"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .next()
+            .expect("the itoa unit");
+        let hash = unit.file_name().unwrap().to_string_lossy().into_owned();
+        // The registry root is the verified source the `.d` names.
+        let dep = fs::read_to_string(unit.join(format!("out/itoa-{hash}.d"))).unwrap();
+        let root = dep
+            .split_whitespace()
+            .map(Path::new)
+            .find(|path| path.is_absolute() && path.extension().is_some_and(|ext| ext == "rs"))
+            .and_then(|path| path.ancestors().find(|a| a.ends_with("itoa-1.0.18")))
+            .expect("the registry root")
+            .to_path_buf();
+        let lock = "version = 4\n[[package]]\nname = 'itoa'\nversion = '1.0.18'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682'\n";
+        let package = crate::seed_lock::eligible(lock.as_bytes())
+            .unwrap()
+            .remove(0);
+        let source = VerifiedSource {
+            package,
+            tree_digest: "b".repeat(64),
+            kind: SeedSourceKind::Registry,
+            verification_root: root.clone(),
+            root,
+            proc_macro: false,
+        };
+        let units = Producer::new(&build)
+            .unwrap()
+            .units("debug", &source, SeedLayout::V2)
+            .expect("layout v2 units");
+        assert_eq!(units.len(), 1, "{units:?}");
+        assert_eq!(units[0].fingerprint_dir, format!("debug/build/itoa/{hash}"));
+        assert!(units[0].files.iter().all(|file| !file.path.ends_with(".o")));
+        assert!(units[0]
+            .files
+            .iter()
+            .any(|file| file.path.ends_with(".rmeta")));
     }
 }
