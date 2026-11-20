@@ -920,11 +920,19 @@ fn write_activity_file(units_dir: &Path, lease: &Lease, doc: &UnitActivityFile) 
         ));
     }
     reap_old_temps(&dir_fd);
-    let temp = units_dir.join(format!("{}.json.tmp-{}", lease.slot_id, std::process::id()));
+    // Created exclusively under a name unique to this process and call, so a
+    // temp can never be opened over or followed; `reap_old_temps` still matches
+    // the `.json.tmp-` infix.
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = units_dir.join(format!(
+        "{}.json.tmp-{}-{sequence}",
+        lease.slot_id,
+        std::process::id()
+    ));
     let mut file = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&temp)?;

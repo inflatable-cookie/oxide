@@ -351,8 +351,29 @@ impl Store {
     /// no live Oxide owner. [`settle`] decides whether its held lease can be
     /// recovered; each recovery is logged for `oxide status`.
     pub(super) fn recover_settled(&self, state: &mut State) -> Result<(), String> {
+        self.recover_settled_with(state, Self::flush_before_idle)
+    }
+
+    /// [`Store::recover_settled`] with the removable-volume flush supplied, so a
+    /// test can make the flush reload a state that moved or dropped records.
+    /// Candidates are named by record ID, never by position: the flush reloads
+    /// `state`, so any index taken before it can be stale.
+    pub(super) fn recover_settled_with(
+        &self,
+        state: &mut State,
+        flush: impl Fn(&Store, &str, u64) -> Result<bool, String>,
+    ) -> Result<(), String> {
         let mut view: Option<LedgerView> = None;
-        for index in 0..state.records.len() {
+        let candidates: Vec<u64> = state
+            .records
+            .iter()
+            .filter(|record| record.active())
+            .map(|record| record.id)
+            .collect();
+        for id in candidates {
+            let Some(index) = state.records.iter().position(|entry| entry.id == id) else {
+                continue;
+            };
             let record = &state.records[index];
             if !record.active() {
                 continue;
@@ -400,21 +421,18 @@ impl Store {
                     // event is durable before the ledger changes.
                     state.records[index].pending_recovery = Some(recovery.clone());
                     self.save(state)?;
-                    let record_id = state.records[index].id;
-                    let flushed = self.flush_before_idle(&recovery.slot_id, record_id)?;
+                    let flushed = flush(self, &recovery.slot_id, id)?;
                     // The flush saved its receipt (and any retirement);
                     // continue from that state so it is not overwritten.
                     *state = self.load()?;
+                    // The reload is authoritative: it may have moved or dropped
+                    // records (a failed flush retires one), so no index taken
+                    // before it is trusted. This record is re-located by ID for
+                    // both the flushed and the unflushed path (oxide#337, oxide#356).
                     if !flushed {
                         continue;
                     }
-                    // The reload is authoritative: it may have moved or dropped
-                    // records (a failed flush retires one), so the index taken
-                    // before it is not an identity. Re-locate this record by
-                    // ID instead of indexing with the stale position
-                    // (oxide#337).
-                    let Some(index) = state.records.iter().position(|entry| entry.id == record_id)
-                    else {
+                    let Some(index) = state.records.iter().position(|entry| entry.id == id) else {
                         continue;
                     };
                     recover(&self.pool, &recovery.lease_id)

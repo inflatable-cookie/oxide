@@ -10,13 +10,15 @@ use crate::process;
 use oxide_storage::lease::managed::{measure_within, snapshot};
 use oxide_storage::lease::{AccountingScan, LedgerSlot, SlotOccupancy, UnmeasuredSlot};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use super::control_io::{bounded_read, lease_error, probe_lock, Probe};
+use super::control_io::{
+    atomic_write_private, bounded_read, lease_error, probe_lock, read_control_state_if_present,
+    Probe,
+};
 use super::recovery::{boot_session, closed_by_boot, return_path};
 
 /// Which accounting one `oxide status` view shows (oxide#128).
@@ -169,8 +171,6 @@ pub(super) const OBSERVATIONS_SCHEMA: &str = "oxide.status-observations/1";
 pub(crate) const INCOMPLETE_WALK: &str = "not measured (walk incomplete)";
 
 pub(super) const OBSERVATIONS_NAME: &str = "status-observations.json";
-
-pub(super) const OBSERVATIONS_TEMP: &str = "status-observations.json.tmp";
 
 /// The sidecar's whole-file bound and retained observation count. The count
 /// is at least the pool's slot ceiling, so it never lowers real capacity
@@ -640,22 +640,8 @@ impl Store {
         if bytes.len() as u64 > MAX_OBSERVATIONS_BYTES {
             return Err("recorded observations would exceed their byte limit".to_owned());
         }
-        let temp = self.control.join(OBSERVATIONS_TEMP);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temp)
-            .map_err(|error| format!("cannot write recorded observations: {error}"))?;
-        file.write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| format!("cannot write recorded observations: {error}"))?;
-        drop(file);
-        fs::rename(&temp, self.control.join(OBSERVATIONS_NAME))
-            .and_then(|()| File::open(&self.control)?.sync_all())
-            .map_err(|error| format!("cannot replace recorded observations: {error}"))
+        atomic_write_private(&self.control, OBSERVATIONS_NAME, &bytes)
+            .map_err(|error| format!("cannot write recorded observations: {error}"))
     }
 
     /// The recorded (or measured) view of this pool for `oxide status`.
@@ -677,13 +663,9 @@ impl Store {
                 (walked.snapshot, Some(walked.status))
             }
         };
-        let (state, state_error) = if self.control.exists() {
-            match self.load() {
-                Ok(state) => (state, None),
-                Err(error) => (State::default(), Some(error)),
-            }
-        } else {
-            (State::default(), None)
+        let (state, state_error) = match read_control_state_if_present(&self.control) {
+            Ok(state) => (state.unwrap_or_default(), None),
+            Err(error) => (State::default(), Some(error)),
         };
         let observations = if accounting == Accounting::Measured {
             Ok(None)
