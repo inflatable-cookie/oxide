@@ -816,6 +816,8 @@ fn an_owner_marker_refusal_names_the_root_that_carries_it() {
     // An unusable marker is reported against the root too, never against the
     // checkout that asked.
     let mut unusable = marker.clone();
+    unusable.checkout = fixture.checkout.clone();
+    unusable.checkout_id = context_id(&fixture);
     unusable.recipe = "an-unknown-recipe".to_owned();
     fs::write(&path, serde_json::to_vec_pretty(&unusable).unwrap()).unwrap();
     let refused = owned_root(&fixture.checkout, &context_id(&fixture), &root).unwrap_err();
