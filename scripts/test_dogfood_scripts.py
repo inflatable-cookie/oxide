@@ -869,11 +869,11 @@ class PersistedFormatTests(unittest.TestCase):
             ("registry", "src/bin/oxide/prune.rs", "REGISTRY_VERSION", '"oxide.outputs.registry/2"',
              "src/bin/oxide/prune.rs", ("Registry", "RegistryDoc", "Row", "Incomplete"),
              "a4d2e9d58c996c060573ac543a7e84693ae230b1f2972d4569e33b0bffee90c2"),
-            ("output receipt", "src/bin/oxide/outputs.rs", "PROFILE_RECEIPT_VERSION",
-             '"oxide.outputs.transition/3"', "src/bin/oxide/outputs.rs",
+            ("output receipt", "src/bin/oxide/outputs/receipt.rs", "PROFILE_RECEIPT_VERSION",
+             '"oxide.outputs.transition/3"', "src/bin/oxide/outputs/receipt.rs",
              ("Doc", "PlacementDoc", "Selected", "Prepared", "Reservation", "RootKind",
               "LayoutKind", "ReceiptState"),
-             "db688fa32749588e6aebf843ccea3c3bcf5b13db5a607948970b393760a62894"),
+             "4d261a0e20ce2fd734c1ec56d5b1433a3fd0fd0a7f2bf66546a5fac0b0b8e5e9"),
         )
         for label, version_path, constant, version, path, names, digest in cases:
             with self.subTest(format=label):
@@ -885,7 +885,7 @@ class PersistedFormatTests(unittest.TestCase):
                 declarations = []
                 for name in names:
                     matches = list(re.finditer(
-                        rf"^( *)(?:#\[[^\n]+\]\n\1)*(?:pub(?:\(crate\))? )?"
+                        rf"^( *)(?:#\[[^\n]+\]\n\1)*(?:pub(?:\((?:crate|in crate::[a-zA-Z0-9_:]+)\))? )?"
                         rf"(?:struct|enum) {name}\b[^{{]*\{{.*?^\1\}}",
                         source, re.S | re.M,
                     ))
