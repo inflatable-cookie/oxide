@@ -1443,3 +1443,164 @@ fn the_usage_and_refusals_describe_the_current_profile_layout() {
     assert!(refused.contains("oxide outputs detach"), "{refused}");
     assert!(refused.contains("never adopted"), "{refused}");
 }
+
+#[test]
+fn committed_profile_plan_and_status_recognize_profile_member_links() {
+    // 1. Committed local fallback profile checkout while registered volume is absent:
+    //    `plan` reports `noop` (not `refuse`) and `status` reports owned member links.
+    let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+    let (store, context) = fresh_pool(&fixture);
+    let control = store.owner_control().to_path_buf();
+    assert_eq!(
+        adopt_at(&context, || Ok(Some(store.handle_for_tests()))).unwrap(),
+        0
+    );
+    let receipt = read_receipt(&control, &fixture.checkout, &context.checkout_id)
+        .unwrap()
+        .unwrap();
+    let local_root = receipt.selected().unwrap().root.clone();
+
+    let status = output_status_lines(&context).unwrap();
+    for member in ["debug", "release"] {
+        let dest = member_destination(&local_root, member);
+        assert!(
+            status.iter().any(|line| line
+                == &format!("outputs: member {member} owned link to {}", dest.display())),
+            "status did not recognize profile link {member}: {status:?}"
+        );
+    }
+    assert!(
+        status
+            .iter()
+            .all(|line| !line.contains("not this receipt's link")),
+        "{status:?}"
+    );
+
+    let report = plan_report(&context).unwrap();
+    assert_eq!(report.layout, "profile");
+    assert_eq!(report.action, "noop", "{:?}", report.reason);
+    assert!(
+        report
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("the volume is not usable")),
+        "{:?}",
+        report.reason
+    );
+
+    // 2. Make a live volume usable under `fixture.control`:
+    //    a committed local profile checkout plans `relink` to the external root, and a
+    //    committed external profile checkout on that volume plans `noop` and reports
+    //    owned external member links.
+    let ext_fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+    let (mount, _) = register_live_volume(&ext_fixture);
+    let ext_context = ext_fixture.context();
+    let _local_receipt = committed_local_profile(&ext_fixture, &ext_context);
+    let ext_report_from_local = plan_report(&ext_context).unwrap();
+    assert_eq!(ext_report_from_local.layout, "profile");
+    assert_eq!(
+        ext_report_from_local.action, "relink",
+        "{:?}",
+        ext_report_from_local.reason
+    );
+
+    let registration = removable::read_registration(&ext_fixture.control)
+        .unwrap()
+        .unwrap();
+    let ext_selected = external_spec(&registration, &ext_fixture.checkout).selected(1);
+    assert!(ext_selected.root.starts_with(&mount));
+    let nonce = "a".repeat(32);
+    let ext_selected = ext_selected.with_nonce(Some(nonce.clone()));
+    fs::create_dir_all(&ext_selected.root).unwrap();
+    let ext_marker = Marker {
+        version: MARKER_VERSION.to_owned(),
+        checkout: ext_fixture.checkout.clone(),
+        checkout_id: ext_context.checkout_id.clone(),
+        label: "checkout".to_owned(),
+        recipe: RECIPE.to_owned(),
+        kind: RootKind::External,
+        volume_uuid: ext_selected.volume_uuid.clone(),
+        nonce: Some(nonce),
+        checkout_volume_uuid: None,
+        generation: 1,
+        created_ms: 1,
+    };
+    fs::write(
+        ext_selected.root.join(MARKER),
+        serde_json::to_vec_pretty(&ext_marker).unwrap(),
+    )
+    .unwrap();
+    let mut ext_receipt = Receipt::first_with(
+        &ext_fixture.checkout,
+        &ext_context.checkout_id,
+        LayoutKind::Profile,
+    );
+    ext_receipt.state = ReceiptState::Committed;
+    ext_receipt.generation = 1;
+    ext_receipt.roots = vec![ext_selected.clone()];
+    for member in ["debug", "release"] {
+        ext_receipt.place_member(member).selected = Some(ext_selected.clone());
+        let dest = member_destination(&ext_selected.root, member);
+        fs::create_dir_all(&dest).unwrap();
+        let link = link_path(&ext_fixture.checkout, member);
+        let _ = fs::remove_file(&link);
+        symlink(&dest, &link).unwrap();
+    }
+    write_receipt(&ext_fixture.control, &ext_receipt).unwrap();
+
+    let ext_report = plan_report(&ext_context).unwrap();
+    assert_eq!(ext_report.layout, "profile");
+    assert_eq!(ext_report.action, "noop", "{:?}", ext_report.reason);
+    assert!(ext_report.reason.is_none(), "{:?}", ext_report.reason);
+
+    let ext_status = output_status_lines(&ext_context).unwrap();
+    for member in ["debug", "release"] {
+        let dest = member_destination(&ext_selected.root, member);
+        assert!(
+            ext_status.iter().any(|line| line
+                == &format!("outputs: member {member} owned link to {}", dest.display())),
+            "status did not recognize external profile link {member}: {ext_status:?}"
+        );
+    }
+
+    // 3. Remove a member link -> `plan` reports `relink`; place a foreign file -> `refuse`.
+    let debug_link = link_path(&ext_fixture.checkout, "debug");
+    fs::remove_file(&debug_link).unwrap();
+    let missing_member_plan = plan_report(&ext_context).unwrap();
+    assert_eq!(
+        missing_member_plan.action, "relink",
+        "{:?}",
+        missing_member_plan.reason
+    );
+
+    fs::write(&debug_link, b"foreign").unwrap();
+    let foreign_member_plan = plan_report(&ext_context).unwrap();
+    assert_eq!(foreign_member_plan.action, "refuse");
+    assert!(
+        foreign_member_plan
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("debug")),
+        "{:?}",
+        foreign_member_plan.reason
+    );
+
+    // 4. Remove the live volume mount -> `plan` reports `relink` to local fallback.
+    fs::remove_file(&debug_link).unwrap();
+    symlink(member_destination(&ext_selected.root, "debug"), &debug_link).unwrap();
+    fs::remove_dir_all(&mount).unwrap();
+    let absent_vol_plan = plan_report(&ext_context).unwrap();
+    assert_eq!(
+        absent_vol_plan.action, "relink",
+        "{:?}",
+        absent_vol_plan.reason
+    );
+    assert!(
+        absent_vol_plan
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("the volume is not usable")),
+        "{:?}",
+        absent_vol_plan.reason
+    );
+}

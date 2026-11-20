@@ -651,7 +651,7 @@ pub(in crate::outputs) fn owned_root(
     checkout: &Path,
     checkout_id: &str,
     root: &Path,
-) -> Result<(), String> {
+) -> Result<Marker, String> {
     if !safe_absolute(root) {
         return Err(format!("{} is not an absolute path", root.display()));
     }
@@ -661,7 +661,8 @@ pub(in crate::outputs) fn owned_root(
         return Err(format!("{} is not a real directory", root.display()));
     }
     let marker = read_marker(root)?;
-    check_marker(&marker, checkout, checkout_id)
+    check_marker(&marker, checkout, checkout_id)?;
+    Ok(marker)
 }
 
 fn check_marker(marker: &Marker, checkout: &Path, checkout_id: &str) -> Result<(), String> {
@@ -697,9 +698,8 @@ pub(in crate::outputs) fn validate_selected(
     selected: &Selected,
     binding: Option<&Binding>,
     receipt_generation: u64,
-) -> Result<(), String> {
-    owned_root(checkout, checkout_id, &selected.root)?;
-    let marker = read_marker(&selected.root)?;
+) -> Result<Marker, String> {
+    let marker = owned_root(checkout, checkout_id, &selected.root)?;
     if marker.kind != selected.kind || marker.volume_uuid != selected.volume_uuid {
         return Err(format!(
             "{} carries a marker for another root kind or volume",
@@ -723,7 +723,7 @@ pub(in crate::outputs) fn validate_selected(
         }
     }
     validate_root_device(checkout, selected, binding)?;
-    Ok(())
+    Ok(marker)
 }
 
 /// A root must be a real directory on the intended device, and never a mount

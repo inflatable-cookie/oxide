@@ -536,13 +536,9 @@ fn sync_directory(path: &Path) -> Result<(), String> {
 }
 
 fn ensure_private_dir(path: &Path) -> Result<(), String> {
-    match fs::create_dir(path) {
-        Ok(()) => {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
-                format!("cannot set permissions on {}: {error}", path.display())
-            })?;
-        }
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(format!("cannot create {}: {error}", path.display())),
     }
@@ -550,7 +546,6 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
-    use std::os::unix::fs::MetadataExt;
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != uid
@@ -1267,23 +1262,25 @@ struct Imported {
 }
 
 /// Whether Barge protects a root with its durable pin record, at
-/// `<root parent>/.barge/pins/<id>.json`. This mirrors Barge's own `pin_state`:
-/// only `NotFound` means unpinned, and any other inspection error counts as
-/// pinned, because Barge treats that state as unknown and protected. The
-/// layout is Barge-private, so a test pins through Barge and checks this
-/// reader against it. A root without a parent answers `false`, so the caller
-/// pins and surfaces the error.
-fn pin_record_exists(root: &Path, id: &str) -> bool {
+/// `<root parent>/.barge/pins/<id>.json`. Only `NotFound` means unpinned;
+/// any other inspection error fails closed so `pin_selected` never skips
+/// `area.pin(...)` on an unknown state. A root without a parent answers
+/// `Ok(false)` so the caller pins and surfaces the error.
+fn pin_record_exists(root: &Path, id: &str) -> Result<bool, String> {
     let Some(parent) = root.parent() else {
-        return false;
+        return Ok(false);
     };
     let record = parent
         .join(".barge")
         .join("pins")
         .join(format!("{id}.json"));
-    match fs::symlink_metadata(record) {
-        Ok(_) => true,
-        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    match fs::symlink_metadata(&record) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "cannot inspect Barge pin record {}: {error}",
+            record.display()
+        )),
     }
 }
 
@@ -1332,7 +1329,7 @@ fn import_output(
         }
         // This path reads no inventory. Its pin state comes from the pin
         // record's presence alone, which is cheap and never a listing.
-        let pinned = pin_record_exists(&root.path, &id);
+        let pinned = pin_record_exists(&root.path, &id)?;
         return Ok(Imported { area, id, pinned });
     }
     // The Barge marker and account can already own this path even before
@@ -1918,6 +1915,7 @@ pub(crate) fn fresh_output(control: &Path, selected: &Selected) -> Result<barge:
 }
 
 fn record_import(control: &Path, root: &Path, id: &str) -> Result<(), String> {
+    let _guard = store::publication_guard(control)?;
     let Some(mut registry) = read_registry(control)? else {
         return Ok(());
     };
@@ -2034,10 +2032,7 @@ mod plan_identity_tests {
         stale.rows[0].pruned_ms = Some(1);
         write_registry(&fixture.control, &stale).unwrap();
         pin_references(&fixture.control, &receipt, &fixture.registry).unwrap();
-        assert!(pin_record_exists(
-            &fixture.original.path,
-            &fixture.original.id
-        ));
+        assert!(pin_record_exists(&fixture.original.path, &fixture.original.id).unwrap());
     }
 
     #[test]
@@ -2285,26 +2280,118 @@ mod plan_identity_tests {
     fn the_pin_record_reader_agrees_with_barge_pins() {
         let Fixture { _temp, area, .. } = fixture();
         let root = area.create_root("reader").unwrap();
-        assert!(!pin_record_exists(&root.path, &root.id));
+        assert!(!pin_record_exists(&root.path, &root.id).unwrap());
         area.pin(&root.id, "reader pin").unwrap();
-        assert!(pin_record_exists(&root.path, &root.id));
+        assert!(pin_record_exists(&root.path, &root.id).unwrap());
         area.unpin(&root.id).unwrap();
-        assert!(!pin_record_exists(&root.path, &root.id));
+        assert!(!pin_record_exists(&root.path, &root.id).unwrap());
     }
 
-    /// Only `NotFound` reads as unpinned, as in Barge. A record path that cannot
-    /// be inspected for another reason counts as protected, so the skip never
-    /// reaches a pin write on an unknown state.
+    /// Only `NotFound` reads as unpinned. Any other inspection error fails
+    /// closed so `pin_selected` never skips `area.pin(...)` on an unknown state.
     #[test]
-    fn the_pin_record_reader_treats_only_not_found_as_unpinned() {
+    fn the_pin_record_reader_fails_closed_on_non_not_found_errors() {
         let temp = barge::testing::TempDir::new("oxide-pin-reader-errors").unwrap();
         let absent = temp.path().join("absent").join("root");
-        assert!(!pin_record_exists(&absent, "any-id"));
+        assert!(!pin_record_exists(&absent, "any-id").unwrap());
         // A regular file in the parent position makes the record path fail
         // with NotADirectory, which is not NotFound.
         let file = temp.path().join("file");
         fs::write(&file, b"not a folder").unwrap();
-        assert!(pin_record_exists(&file.join("root"), "any-id"));
+        assert!(pin_record_exists(&file.join("root"), "any-id").is_err());
+
+        // End-to-end: a recorded root whose pin-record directory is unreadable
+        // fails closed in `import_output` rather than returning `pinned: true`
+        // and silently skipping `area.pin(...)`.
+        let Fixture {
+            _temp,
+            control,
+            original,
+            registry,
+            ..
+        } = fixture();
+        let checkout = _temp.path().join("checkout");
+        let checkout_id = "a".repeat(64);
+        let selected = Selected {
+            kind: RootKind::Local,
+            root: original.path.clone(),
+            volume_uuid: None,
+            nonce: None,
+            generation: 1,
+        };
+        let pins_dir = original.path.parent().unwrap().join(".barge").join("pins");
+        fs::remove_dir_all(&pins_dir).unwrap();
+        fs::write(&pins_dir, b"not a directory").unwrap();
+        assert!(import_output(
+            &control,
+            Some(&registry),
+            &checkout,
+            &checkout_id,
+            &selected,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn record_import_serializes_with_publication_guard() {
+        let Fixture {
+            _temp,
+            control,
+            original,
+            ..
+        } = fixture();
+        let guard = store::publication_guard(&control).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let control_clone = control.clone();
+        let root_path = original.path.clone();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            record_import(&control_clone, &root_path, "recorded-id").unwrap();
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut registry = ready_registry(&control).unwrap();
+        let mut extra = registry.rows[0].clone();
+        extra.checkout_id = "b".repeat(64);
+        extra.member = "release".to_owned();
+        extra.root = _temp.path().join("outputs/other-root");
+        registry.rows.push(extra.clone());
+        registry.bump().unwrap();
+        write_registry(&control, &registry).unwrap();
+        drop(guard);
+
+        handle.join().unwrap();
+        let updated = ready_registry(&control).unwrap();
+        assert!(
+            updated
+                .rows
+                .iter()
+                .any(|row| row.checkout_id == extra.checkout_id && row.root == extra.root),
+            "concurrent registry update was clobbered by record_import"
+        );
+        assert!(
+            updated
+                .rows
+                .iter()
+                .filter(|row| row.root == original.path)
+                .all(|row| row.barge_id.as_deref() == Some("recorded-id")),
+            "record_import did not record barge_id"
+        );
+    }
+
+    #[test]
+    fn ensure_private_dir_creates_owner_only_and_rejects_broad_permissions() {
+        let temp = barge::testing::TempDir::new("oxide-private-dir").unwrap();
+        let dir = temp.path().join("private");
+        ensure_private_dir(&dir).unwrap();
+        let mode = fs::symlink_metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        ensure_private_dir(&dir).unwrap();
+
+        let broad = temp.path().join("broad");
+        fs::create_dir(&broad).unwrap();
+        fs::set_permissions(&broad, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ensure_private_dir(&broad).is_err());
     }
 
     /// A recorded root reads no inventory, so its pin state must come from its

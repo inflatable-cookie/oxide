@@ -129,6 +129,7 @@ fn validate_clean_selected(
         binding.as_ref(),
         receipt_generation,
     )
+    .map(|_| ())
     .map_err(|reason| format!("clean refused: {reason}"))
 }
 
