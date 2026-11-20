@@ -5,8 +5,7 @@ Shipped behaviour lives in the [contracts](contracts/workflow.md). Research live
 the [Rust DX landscape](rust-dx-landscape.md). Open questions live in
 [questions](questions.md). Plans, briefs and one-off operational rulings live in
 Nucleus, whose decisions record Tom's exact words. This file was condensed on
-2026-10-21. The dated ruling log it held from 2026-10-09 to 2026-10-21 is
-preserved in git at commit `ecf379e`.
+2026-10-21; its dated ruling log is preserved in git history at `ecf379e`.
 
 ## Purpose
 
@@ -84,7 +83,7 @@ An upstream roadmap is never a reason to defer today's relief.
   enters its core (Tom, 2026-10-09). The approved
   [program fallback](#adoption-pattern) is a generic Effigy mechanism, not
   Oxide logic in Effigy.
-- **Nucleus, and later Nucleus,** own tasks, agents, scheduling and admission,
+- **Nucleus** owns tasks, agents, scheduling and admission,
   plus workspace, run and source identity. Oxide never changes Contract 010.
 - **Product architecture** belongs to the appointed Oxide Supervisor; Nucleus
   operations belong to the operations planner.
@@ -138,26 +137,9 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   starts; nested calls never pause or reset an outer budget. Preserve signal
   forwarding and conservative group closure. Consumer adoption and installation
   remain separate gates; this is not an installed capability.
-- **Nested `oxide` joins the outer lease** (approved, not built; design first):
-  a leased command passes its children a lease token that cannot be forged and
-  is scoped to its own process subtree. A nested `oxide` for the same
-  workspace, recipe and toolchain joins that lease: no new slot or permit, and
-  the outer closure and custody apply. One for another workspace gets its own
-  slot but borrows the outer host permit, so nesting cannot deadlock the host
-  limit. A stale or foreign token is ignored and never grants deletion.
-  Today a nested call takes an independent lease. The
-  [proposed design](contracts/nested-lease.md) records the token, ticket,
-  permit, deadlock and idle-exec composition rules; it is design-reviewed but
-  not frozen and changes nothing until a briefed implementation lands.
-- **Idle exec sessions release their host permit** (approved, not built;
-  design first): `oxide exec` keeps its slot for the whole session but holds
-  the host active-build permit only while a compile runs in its group, taking
-  it back before the next compile, so open dev servers such as `tauri dev` do
-  not starve builds. Closure, crash custody and the reserve watchdog are
-  unchanged. Whether a compile can be detected before it starts is a design
-  question. Today an exec session holds its permit throughout. The
-  [proposed design](contracts/idle-exec-sessions.md) records the interception
-  analysis, the supported boundary and the open operator dispositions.
+Nested commands currently take an independent lease. Idle `oxide exec`
+sessions hold their host permit for the full session. The future lease-joining and
+permit-borrowing designs are tracked in Nucleus and are not implemented.
 - **Paused:** the unchanged-source `oxide run` fast path. Its plan is preserved
   in #089's closed task and its committee contract.
 - **Deferred:** remote builds. The executor seam stays local-only.
@@ -262,14 +244,9 @@ operator instruction; the general lean reset is not deletion authority.
   writes to or removes one. Otherwise Oxide owns one short per-command
   directory inside the slot, removed at release after writer closure; a `run`
   program that uses one keeps the lease until its own group closes
-  ([workflow](contracts/workflow.md)). The
-  [proposed idle-session design](contracts/idle-exec-sessions.md) weighs the
-  successor custody alternatives and keeps this guarantee; it selects none of
-  them. It is
-  implemented on the oxide#136 branch but is not installed or qualified: its
-  counted native has not passed and both uncounted diagnostics were attempted
-  and failed. The separate proof and validation tooling
-  default is implemented and qualified by oxide#145 (merged at `0520fc04`,
+  ([workflow](contracts/workflow.md)). Idle exec-session custody design is tracked
+  in Nucleus and is not implemented. The separate proof and validation tooling
+  default was implemented and qualified by oxide#145 (merged at `0520fc04`,
   guard `a6d73326`), which places and monitors proof scratch on the selected
   pool's own volume with a warned `/private/tmp` fallback
   ([placement](contracts/workflow.md)). Internal-
@@ -280,8 +257,8 @@ operator instruction; the general lean reset is not deletion authority.
 - **Leftover output roots** of checkouts that no longer exist are removed
   only by an explicit `oxide outputs prune`, never automatically.
 - Tom's 2026-11-05 selected-root protection ruling and its conservative
-  alignment boundary are owned by the
-  the (superseded) controlled decision comparison, recorded in the [lean adoption contract](contracts/barge-adoption.md).
+  alignment boundary are recorded in the superseded controlled decision
+  comparison and the [lean adoption contract](contracts/barge-adoption.md).
 - **Sharing builds:** slots share warm builds across worktrees, up to 12 per
   project, with least-recently-used idle slots evicted under the byte budget.
 - **Cold slots:** the chosen direction instead of sccache is seeding a cold
@@ -298,25 +275,9 @@ operator instruction; the general lean reset is not deletion authority.
 
   Details live in their Nucleus leads and, once built, in the
   [workflow contract](contracts/workflow.md).
-- **Implemented, native held: cold-slot seeding** (oxide#169): a fresh slot
-  is warmed once from matching plain registry library compile units of an idle
-  donor on the same volume, removable pools included, with Cargo still judging
-  freshness; default-on, with natives held. The
-  [design](contracts/cold-slot-seeding.md) owns the protocol and
-  its retired 24-case native proof (removed in oxide#322).
-- **Implemented, native held** (Tom, 2026-10-25): recorded per-slot accounting
-  replaces whole-payload admission walks. Closed-slot records are bound to
-  generation/incarnation; missing or invalid records require bounded slot
-  walks, and cross-slot hard-link overcount is accepted. A removable pool's
-  cap counts only its own bytes — another tool's data on the same volume never
-  pushes it over the cap — while the volume's free space is a separate reserve
-  signal: above the reserve it admits without eviction, at or below it prunes
-  eligible idle whole slots, and a fixed 10 GiB hard floor decides once nothing
-  is left to prune. Source and unit regressions are in;
-  the focused proof and its elevated natives are held for separate owner
-  activations. The [accounting contract](contracts/local-lease.md)
-  owns the design, the implementation record and its trust limits. This supersedes the earlier cached
-  accounting decline for this scope; its negative reviews remain history.
+- **Cold-slot seeding** is implemented and default-on; its scope and limits are in
+  the [cold-slot seeding contract](contracts/cold-slot-seeding.md). Per-slot
+  accounting and its trust limits are owned by [local lease](contracts/local-lease.md).
 
 ### Adoption pattern
 
@@ -349,171 +310,9 @@ operator instruction; the general lean reset is not deletion authority.
 
 Tom's 2026-11-17 lean reset ("simplify this across all three projects… without all the ceremony") is the current validation policy for all Oxide work: ordinary bounded unit/integration tests on private fixtures and one independent exact-head review. No native-proof, reviewer-native, diagnostic or qualification ladder is required. Installation and live migration remain separate owner/planner actions. Before installing a storage-affecting binary, time one real admission on the live pool (2026-11-18 incident, decision `d9f8839e`). The rulings below are history; their evidence keeps no transferred credit.
 
-Tom decision `ea8ee47f-adc0-4cd3-b420-aaa30642d623` v2 (2026-11-16)
-adopts the reviewed cooperative qualification contract (retired 2026-11-18)
-as the acceptance target for future 309 work and scopes one independently
-reviewed Nucleus-owned route proposal, without implementation or proof runs.
-The earlier `57374e05` v2 decision authorized drafting and review only. Those
-drafting and adoption facts remain accurate at their own time. Tom's later
-decision `5639bd34-635f-49b4-8261-92903d1013b4` v2 (2026-11-16, "Retain and
-count image evidence") records the future image-backing policy in that same
-contract: retain and count image files as evidence, and require positive
-ordinary provider evidence that every mount and attached entity of each exact
-owned image is absent. The earlier literal entire-backing-object absence gate
-is superseded prospectively only. The adoption and the 5639v2 ruling
-establish no route, readiness, qualified provider or proof activation and
-change no existing execution instruction. Existing 309/061/304 briefs and
-dispatch and merge holds remain binding; later activation requires
-prospective amendment.
-
-Tom decision `afae2fc0-f0e2-4ad7-9186-0439d6889715` v2 (2026-11-17)
-scopes the remaining supplier implementation through two bounded source-only
-design PRs, with no implementation, proof run or activation. Oxide's half is
-recorded in the cooperative qualification contract (retired 2026-11-18 with the capture programme):
-all nine required inputs mapped to their actual owner, seam, evidence,
-validation and refusal disposition; the real creation graph and its waits; one
-600-second origin with its clock interface; the qualified census and
-image-attachment providers reused and the unqualified candidates refused; the
-monitored 512 MiB and 22 GiB accounting inventory; and a finite implementation
-breakdown. Effigy's reconciled 038 design records prepare custody, timing and
-exact-selector admission/completion; the contract records its unsupported
-original-clock binding and missing receipt fields. The provisional duration
-handoff is not an agreed interface. A Nucleus-owned exit for a
-retained qualification failure row is a prerequisite before any real proof. The
-Nucleus foundation (Spec 064, merged `2ce2ed9c`, source accepted at
-`9366a1a0`) refuses all nine unsupplied inputs; that refusal is the delivered
-state, not readiness.
-
-Tom decision `49a06e97-ef58-46e4-9cf8-e5ecece6685e` v2 (2026-11-17,
-09:55:46Z) selects the common-clock foundation first: at most one bounded
-source implementation PR in Nucleus and one in Effigy, each through an
-approved Nucleus brief and independent exact-head review. Before authoring, the
-owners must agree the source-supported clock API, domain, units, boot/origin
-identity, original first-effect origin/ceiling and refusal rules. The original
-`CLOCK_UPTIME_RAW` policy stays; no assumed conversion or fresh clock is
-authorized. Author/reviewer limits are 60/30 active minutes per task, focused
-checks total at most 20 minutes plus one final-head covering set at most
-60 minutes, with 2 GiB owned temporary storage; docs checks stay within
-120 seconds and 64 MiB. The retired supplier contract (2026-11-18)
-owns the boundaries: no other supplier implementation, real qualification,
-installation, consumer activation or existing-hold release follows.
-
-Tom decision `984a3b0a-98ae-48f7-994e-65950020ae83` v2 (2026-11-17,
-10:31:04Z) prospectively changes that host source tranche to the continuous
-clock, so sleep consumes the fixed allowance. Nucleus's relayed decision
-`4380ff30-444b-412b-b738-a86677b77474` v2 records the same choice, with no
-second grant. The retired supplier contract (2026-11-18)
-owns its direct-domain, original-origin, immutable-envelope and narrowing-cap
-requirements. This amends 49a06's RAW-domain requirement only for the future
-host tranche. Its two-PR source limits, all earlier clock evidence, Barge's
-guest/host policies and every qualification, installation and consumer gate
-remain unchanged.
-
-Tom decision `1b60743c-d496-485d-a1e9-5e48372d2590` v2 (2026-11-17)
-subsequently selects **Decouple**: "oxide and nucleus should not be tied
-together, nucleus's run mechanics should have no effect on the proof".
-The Nucleus planner also relays Tom's later direction: "Remove it. Let's
-simplify this across all three projects, clean up, just get it working without
-all the ceremony." Effigy's planner relays his selected **Plain run**.
-
-For 309, Nucleus is an ordinary task runner. Proof timing and process handling
-belong to the proof's ordinary Effigy execution, using the existing
-`EFFIGY_RUN_DEADLINE_MS=600000` mechanism. The common-clock work and the
-external envelope, supplier, custody/census certification and capture-delivery
-contracts are no longer prerequisites. The earlier cooperative target (retired 2026-11-18)
-is historical. Keep actual supervisor behavior tests, ordinary source/evidence
-review and honest run outcomes; source/native work follows the selected scoped
-Nucleus brief without further design tranches. Cleanup means obsolete source and
-documentation here, with earlier receipts, failures, charges and retained
-resources preserved. Consumer changes and historical-resource cleanup are not
-implied by this direction.
-
-Tom decision `25a1cefa-66f6-428c-85e3-7e6ee5532f4e` v2 (2026-11-17,
-11:22:38Z) selects **Run it plainly and remove the scaffolding** for the
-existing 309 task. Replace its qualification bootstrap with a small ordinary
-Effigy entrypoint, retire the cross-project machinery and keep supervisor
-behavior tests. The author runs the complete remaining suite with
-`EFFIGY_RUN_DEADLINE_MS=600000`; the retained reviewer judges the exact source
-and actual evidence, then Nucleus merges on PASS and accepted review. For 309
-this replaces the separate diagnostic/counted-author/counted-reviewer ladder;
-there are no further design rounds.
-
-The prospective allowance is 60 active author minutes and 30 reviewer minutes;
-source checks have 600 seconds/512 MiB, docs 120 seconds/64 MiB, and the ordinary
-native run 600 seconds/512 MiB within the author total. Use fresh owned Stash
-scratch and the existing 22 GiB reserve threshold, including the suite's tiny
-process/image fixtures. Earlier charges and failures stay permanent. Source
-and documentation cleanup leaves old retained resources untouched; installation,
-full QA and live consumer changes are excluded. 061/304 wait for actual 309
-PASS/publication and retain their own runtime prerequisites and guest/host bounds.
-
-Tom decision `c6e3e9c8` v2 (2026-11-04) separates capture delivery from
-private launcher qualification for the bounded O2 capture tasks. Their named
-capture-only Cargo selectors cover build and embedded harness behavior; they
-do not qualify launcher isolation, global live-state invariance or current
-export production. Ordinary Rust selectors continue to use Oxide. Direct
-covering requires the separately activated, qualified-guard route in the
-[lean Barge adoption contract](contracts/barge-adoption.md) (the capture-only direct-covering route it recorded is retired).
-
-Tom, 2026-10-20: risk-proportionate verification. AGENTS.md "Validate" holds
-the operating rules.
-
-- **Standard tier:** author checks and native proof, plus an independent source
-  review.
-- **Elevated tier,** for deletion or recycling, crash recovery or writer
-  closure, and removable media: adds an independent reviewer native session.
-- **Bounds:** wall-clock time and scratch budget. Resource figures are
-  reported, not gated.
-- **Proof authoring guidance** (product architect, 2026-10-24; diagnostic
-  requirement strengthened 2026-10-25): briefs that author or correct a native
-  proof script, its fixtures or its oracles declare **HIGH** complexity. Nucleus
-  still selects the models. Before the first counted native, the author must
-  execute a separately activated, **uncounted diagnostic** of the fixed proof.
-  Use its existing safe keep-going mode; if none exists, add a minimal opt-in
-  `--diagnostic` that records oracle failures and continues through
-  dependency-independent safe cases. A source sweep alone no longer satisfies
-  this gate. Apply this before the next counted runs of #136 and #140 and to
-  every future proof.
-  - Keep the counted default fail-fast and preserve the qualified guard,
-    existing wall-clock and scratch bounds, custody and cleanup. Record
-    dependency or taint skips honestly; infrastructure faults, unknown device
-    or writer effects, uncertain custody and an unrecordable receipt abort.
-    Do not invent fixture repair or presume a reaped child proves closure.
-    If no safe diagnostic can fit these constraints, return the concrete
-    design issue to the owner before a counted run.
-  - Every brief also applies the fixed [proof-authoring premise checklist](contracts/workflow.md)
-    to the executable case bodies and helpers, recording each disposition or
-    reason it does not apply. This source sweep complements the execution;
-    it does not replace it.
-  - The diagnostic receipt is explicitly uncounted and never a native PASS,
-    closure claim or substitute for the counted proof. It records all reached,
-    completed, failed, skipped and unexecuted cases, reasons and first fault.
-    Its execution needs its own exact source/input pins, supported route,
-    resource basis and fixed activation window. This guidance grants no
-    automatic run, cap increase, clock reset or reuse of a spent allowance.
-    Earlier counted failures remain counted failures, never retrospectively
-    relabelled as diagnostics. Changed proof inputs need the applicable
-    diagnostic and review before their counted activation.
-- **Mechanical native-evidence gates** (Supervisor, 2026-10-23): every Oxide
-  brief requiring counted native evidence encodes it in Nucleus before
-  promotion. Use `reviewVerdicts: true` with a `reviewPassGate` subject such
-  as `exact_head_native_evidence`, and/or a `mergeHold` pending that evidence.
-  An owner releases the hold only after verifying the required receipts and
-  their exact source heads. Prose alone is insufficient; a source-only review
-  does not satisfy a required native proof. The brief still names the separate
-  activation, count, time and scratch limits.
-- **Operator acceptance fast path:** Tom can accept a task as-is. It is
-  recorded as operator acceptance, never as a review pass. A direct GitHub
-  merge needs explicit scoped authorisation.
-- **Native-proof harness:** native proofs run under the shared proof
-  supervisor (retired under oxide#322). It qualified as #109 (PR #99) on
-  2026-10-21, under the pinned-leader cooperative-closure contract (Tom,
-  "Yes, (2)"), with independent author and reviewer native passes at
-  `018f6e1`.
-  - New tasks use it. They don't need per-task guard exceptions.
-  - The earlier task-specific old-guard exceptions (route C for #110 and #106,
-    route B for #107, and #104's one run) are history, and their disclosed
-    gaps stay with those tasks.
+Earlier qualification, common-clock, supplier, capture, Relax-trial and
+proof-ladder rulings are preserved in git history; their evidence carries no
+transferred credit. Current validation and installation policy is stated above.
 
 ## Authority boundaries
 
@@ -526,65 +325,6 @@ the operating rules.
     denial.
 - **Model routing:** briefs declare task complexity; Nucleus selects the author
   and reviewer models.
-- **Shared recovery simplicity** (Tom, 2026-11-10, decision
-  `1d4a7aee-a8e6-4a75-96f0-b142c4176db2` v2): Oxide and Barge must both
-  become simpler and dependable as integrations grow. Investigate one
-  Barge-owned operation journal with durable caller hooks before extending
-  the two-journal integration. The source-only design and independent review
-  must identify machinery removed from both products and preserve admission,
-  crash recovery and safe repeated finalization. The architecture remains a
-  proposal until the implementation ruling below; existing work and evidence
-  stay preserved.
-- **Single-authority recovery implementation** (Tom, 2026-11-11, decision
-  `1735df31-7cc1-4748-9f8a-0767ee6259ff` v2): implement the independently
-  reviewed Barge stage 4 operation-journal design on disposable fixtures.
-  Barge owns operation progress and durable hook obligations; Oxide keeps
-  eligibility and repeatable domain settlement. Scope the journal integrity,
-  coordinator and caller removals separately, with independent review and
-  bounded Elevated qualification. The selected design includes retained
-  cancellation, atomic settlement entries and fail-fast journal consults
-  under admission, with their refusal and retention costs. Native sessions
-  remain separately owner-activated. This grants no installation, live
-  migration or adoption, retained-resource cleanup or supervisor promotion.
-- **Barge descriptor-listing design** (Tom, 2026-11-10, decision
-  `9e68c8ce-ac61-4190-a31c-b45f99fd6ecd` v2): investigate a bounded shared
-  listing within the existing total descriptor, process and time budgets,
-  through source-only design and independent review. The implementation ruling
-  below is separate.
-- **Barge descriptor-listing implementation** (Tom, 2026-11-10, decision
-  `13834566-5b7f-44be-a655-6444a4eeaa32` v2): implement the reviewed bounded
-  listing design and qualify it on disposable fixtures, preserving the existing
-  total scan ceilings. Scoped implementation, independent review and separately
-  activated Elevated proofs precede the Oxide reconnection. This grants no
-  installation, live adoption or retained-image cleanup.
-- **Relax quick-run trial** (Tom, 2026-11-11, decision
-  `d6a33913-cc2d-460f-bce0-25c424c176d1` v2, "Agreed. OK, shall we dispatch
-  the trial? See if it offers more than the cranelift spike?"): a bounded
-  compatibility/performance trial and recommendation, not product
-  integration or adoption. Oxide owns execution, admission, storage and
-  diagnostics; the trial embeds no compiler, changes no
-  quick/test/debug/release default, installs nothing and keeps the Barge
-  integration independent. Owning research record:
-  [landscape](rust-dx-landscape.md).
-- **Relax compatibility recheck** (Tom, 2026-11-12, decision
-  `7b5a88ce-96cb-4fab-a584-2e5deffa28ce` v2, "Go for it"): a focused,
-  independently reviewed recheck of a NEWER pinned Relax engine on actual
-  float formatting and the unchanged prior Oxide workload, to determine whether
-  the observed ARM64 intrinsic blocker is cleared. The 307 no-go for its own
-  pin stays exactly as recorded. One prepared apparatus PR may land with
-  effect-free readiness; an uncounted diagnostic and then one counted author
-  compatibility qualification each need separate planner activation at an
-  accepted published head, and a source or fit correction needs its own
-  review and activation. Any performance comparison stays conditional on
-  compatibility passing and needs a new measurement activation. The three
-  spent uncounted diagnostics produced a scoped no-go at `6ea9d063`: the
-  float-formatting and CRC32 probes match the Cargo baseline while the
-  unchanged workload panics in Relax's front end, so the counted
-  qualification was not activated and no performance comparison is
-  justified. No product
-  integration, engine fork, installation, default change or consumer adoption
-  is authorized by a pass. Owning research record:
-  [landscape](rust-dx-landscape.md).
 - **Still need Tom's scoped approval:**
   - host installs beyond the planner's receipt-matched `oxide` reinstall;
   - releases, tags and workflow changes;

@@ -4,8 +4,7 @@ These are the production ownership constraints agreed by Tom on 2026-10-09,
 applied to the facilities that remain after the 2026-10-18 retirement. The
 shipped user workflow lives in
 [workflow](contracts/workflow.md); the retained lease library semantics live in
-[local lease](contracts/local-lease.md) and the inventory CLI in
-[storage inventory](contracts/storage-inventory.md).
+[local lease](contracts/local-lease.md).
 
 ## Storage and ownership
 
@@ -38,27 +37,12 @@ owned and preserved. Cargo intermediates are internal and may contain test
 executables; separating output directories alone cannot prove isolation. Cache
 reuse never counts as validation success.
 
-Proposed, not implemented and not current truth: a nested `oxide` inside a
-leased command may join that outer lease instead of taking a second one, and
-a nested command for another workspace may borrow the outer host permit.
-Neither changes exclusive slot ownership, closure, accounting or deletion
-rules; the closure set only grows, and the borrow substitutes only the host
-active-build count. The [nested lease design](contracts/nested-lease.md) owns
-the token, validation, ticket, permit, failure and interaction rules; its
-independent design review passed (comment `6412288358`) and the operator's
-design freeze is pending.
-
-Proposed: effective build context (incremental, debug, split-debuginfo) would
-be a partition input. Its lifetime and diagnostics rules are in the
-[build-context policy](contracts/build-context-policy.md); it is not active.
+Nested commands currently take an independent lease. A future nested-lease
+design is tracked in Nucleus and is not implemented.
 
 Prepare only requested components lazily. No eager copying of all targets and
 no full-copy fallback. Evict idle slots only, within explicit budgets; occupied
 space and actual disk writes must be measured separately.
-
-The read-only [storage inventory](contracts/storage-inventory.md) reports what
-occupies space in one explicitly selected target directory. It grants no
-ownership or eviction authority and never recommends deletion.
 
 ## Current facilities
 
@@ -70,7 +54,6 @@ ownership or eviction authority and never recommends deletion.
   (oxide#102); Nucleus keeps its installed copy until its owner switches.
   UID trust permits a cooperative caller's explicit writer-closed release;
   TTL or holder loss alone does not establish closure.
-- The inventory CLI reads one explicitly selected target directory.
 - The stable Cargo profile proofs remain opt-in and do not change default
   development or consumer profiles.
 

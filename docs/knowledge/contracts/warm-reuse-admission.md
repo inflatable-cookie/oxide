@@ -2,8 +2,7 @@
 
 This contract owns the rule that grants a compatible Normal idle slot without a
 recursive walk of its contents. The ledger, holds and writer-closure rules stay
-in [local lease](local-lease.md). Inventory semantics stay in
-[storage inventory](storage-inventory.md).
+in [local lease](local-lease.md).
 
 **Status: implemented.** The Normal branch is in source. Covering checks are
 `rust:compile`, `rust:compile-release`, `rust:format`, `rust:barge-adoption`, and
@@ -45,8 +44,8 @@ Normal branch, so treat that resampling as absent until a reviewed change adds i
 
 The grant makes no claim about descendants:
 
-- **Mount boundaries.** Not checked before the grant. Inventory's refusal to cross
-  devices and deletion's device checks remain. The grant confers no authority
+- **Mount boundaries.** Not checked before the grant. Deletion's device checks
+  remain. The grant confers no authority
   over an unobserved nested mount.
 - **Symlinks.** Root and parent symlinks refuse. Descendant symlinks are not
   inspected; Cargo keeps its ordinary path behaviour.

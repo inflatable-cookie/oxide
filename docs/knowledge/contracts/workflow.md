@@ -4,8 +4,7 @@ This contract states how `oxide` behaves today. The implementation is
 `src/bin/oxide/`, built on the lease library in `src/lease/`. Storage ownership
 (volumes, roots, holds, pins, eviction and trash) belongs to Barge; see the
 [Barge adoption contract](barge-adoption.md). The lease, ledger and eviction
-rules, and per-slot accounting, are in [local lease](local-lease.md); the
-read-only inventory diagnostic is in [storage inventory](storage-inventory.md). Agent guidance lives in
+rules, and per-slot accounting, are in [local lease](local-lease.md). Agent guidance lives in
 [the oxide skill](../../../skills/oxide/SKILL.md). Release and local install
 policy is in [release](release.md).
 
@@ -35,7 +34,7 @@ into six classes; the exact lists are in [`cli.rs`](../../../src/bin/oxide/cli.r
 | --- | --- | --- |
 | Modelled | `check`, `test`, `clippy`, `build`, `run` | Profile-aware and leased. Slot chosen by identity and freshness. |
 | Building passthrough | `doc`, `bench`, `rustc`, `rustdoc`, `fix`, and every unknown or external subcommand (for example `nextest`, `llvm-cov`) | Cargo's command under a lease, with storage and profile definitions injected. Unknown commands count as building. |
-| Plain passthrough | Non-building built-ins such as `fmt`, `tree`, `metadata`, `add`, `update`, `fetch`, `locate-project`, `help` | Plain Cargo, no lease. |
+| Plain passthrough | Non-building built-ins such as `fmt`, `tree`, `metadata`, `add`, `update`, `fetch`, `locate-project`, `help`, `package`, `publish`, `install` | Plain Cargo, no lease. |
 | Exact passthrough | `deny`, `audit`, `outdated`, `machete` | Oxide replaces itself with the caller's Cargo: same arguments, directory, environment, streams and exit status. No slot, pool, adoption or recipe. |
 | Extended built-ins | `init`, `new`, `clean` | Cargo's command plus Oxide's step. See [adoption](#adoption-oxide-init-and-oxide-new) and [clean](#clean). |
 | Oxide-owned | `status`, `pool`, `outputs`, `exec` | Oxide semantics. `exec` runs a tool that calls Cargo under a lease. |
@@ -952,8 +951,8 @@ These are not current behaviour. Their designs are proposed only.
 - `linux-image-v1` storage, CI cache save and restore, and container or remote
   executors. Linux has no runtime proof of storage behaviour yet.
 - Nested commands joining their outer lease. Today each nested command takes its
-  own lease ([nested lease](nested-lease.md)).
-- Separating an idle exec session's host permit from its slot ([idle exec sessions](idle-exec-sessions.md)).
+  own independent lease; the future design is tracked in Nucleus.
+- Separating an idle exec session's host permit from its slot. Today an exec session holds its host permit throughout; the future design is tracked in Nucleus.
 - Alternative run strategies, such as ahead-of-time or JIT codegen or hot patching.
 - Per-project profile overrides or project files. Oxide reads none.
 - Interception of plain `cargo`, and an adaptive `rustc` wrapper for builds that

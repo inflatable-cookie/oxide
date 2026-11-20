@@ -145,8 +145,7 @@ and test doubles. Production reads, refusals and writes are unchanged.
 ## Validation
 
 Ordinary bounded unit and integration tests run on private temporary directories
-with a fake volume identity. There is no native or isolated diagnostic ladder,
-and no real drive, image, VM, install or live data migration.
+with a fake volume identity. Validation follows the lean policy in [vision](../vision.md#validation-policy): ordinary tests on private fixtures and an independent exact-head review. There is no native or isolated diagnostic ladder, and no real drive, image, VM, install or live data migration.
 
 - `effigy rust:barge-adoption` runs the workspace suite, serially, with one fresh
   fixture directory strictly below the task TMPDIR. It runs under ordinary Effigy
