@@ -66,18 +66,20 @@ def sha256(data):
 class InstallerTests(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp(dir=SCRATCH)).resolve()
+        destination = self.home / ".local/bin/oxide"
+        receipts = self.home / ".local/state/oxide/install"
         (self.home / ".local/bin").mkdir(parents=True)
         os.chmod(self.home / ".local", 0o755)
-        installer.HOME = self.home
-        installer.DESTINATION = self.home / ".local/bin/oxide"
-        installer.RECEIPTS = self.home / ".local/state/oxide/install"
-        self.path = os.environ["PATH"]
-        os.environ["PATH"] = str(self.home / "empty")
+        # Every patched global and the shortened PATH is restored by unittest,
+        # even when a case fails, so one case cannot leak into the next.
+        for patcher in (
+            mock.patch.multiple(installer, HOME=self.home, DESTINATION=destination, RECEIPTS=receipts),
+            mock.patch.dict(os.environ, {"PATH": str(self.home / "empty")}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.built = self.home / "built"
         self.built.write_bytes(b"new oxide")
-
-    def tearDown(self):
-        os.environ["PATH"] = self.path
 
     def receipt(self, data):
         # The first replacement may be of a binary from the old installer.
@@ -735,11 +737,16 @@ class AuthenticatePinTests(unittest.TestCase):
 
     def private_fixture_home(self):
         self.home = Path(tempfile.mkdtemp(dir=SCRATCH)).resolve()
+        destination = self.home / ".local/bin/oxide"
+        receipts = self.home / ".local/state/oxide/install"
         (self.home / ".local/bin").mkdir(parents=True)
         os.chmod(self.home / ".local", 0o755)
-        installer.HOME = self.home
-        installer.DESTINATION = self.home / ".local/bin/oxide"
-        installer.RECEIPTS = self.home / ".local/state/oxide/install"
+        # The patched originals come back with the test that borrowed them.
+        patcher = mock.patch.multiple(
+            installer, HOME=self.home, DESTINATION=destination, RECEIPTS=receipts
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_exact_advertised_tip_and_requested_ancestors_bind(self):
         tip = self.git(self.author, "rev-parse", "main")
@@ -874,6 +881,12 @@ class PersistedFormatTests(unittest.TestCase):
              ("Doc", "PlacementDoc", "Selected", "Prepared", "Reservation", "RootKind",
               "LayoutKind", "ReceiptState"),
              "4d261a0e20ce2fd734c1ec56d5b1433a3fd0fd0a7f2bf66546a5fac0b0b8e5e9"),
+            ("removable registration", "src/bin/oxide/removable.rs", "REGISTRATION_VERSION", "2",
+             "src/bin/oxide/removable.rs", ("Registration",),
+             "c406fa9dba67aeca4c5abf545d7165d6cc7e6e3ba6e460c349b5ccf45b053489"),
+            ("unit activity", "src/bin/oxide/cargo_prune.rs", "UNIT_RECORD_VERSION", "1",
+             "src/bin/oxide/cargo_prune.rs", ("UnitActivityFile", "UnitActivityEntry"),
+             "39736a20697e8b897d73f1fdf65871490de1df3fa4644b2db5e2a534d5d7d2db"),
         )
         for label, version_path, constant, version, path, names, digest in cases:
             with self.subTest(format=label):
@@ -936,6 +949,141 @@ class CanaryCleanupTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "original failure"):
                 installer.exercise(Path("/unused"), {}, scratch, scratch_id, None, arguments,
                                    {"safe": True})
+
+
+class DocumentAndScratchTests(unittest.TestCase):
+    """The format-change canary's read-only contact and scratch validation.
+
+    These exercise the descriptors the live contact is built on: one no-follow
+    open of the scratch directory, one no-follow open of the pool, and every
+    live document read relative to it.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(dir=SCRATCH)).resolve()
+        self.pool = self.root / "pool"
+        (self.pool / "payload").mkdir(parents=True)
+
+    def write_live_pool(self, control=True):
+        (self.pool / "config.json").write_text("{}")
+        (self.pool / "ledger.json").write_text('{"ledger": "live"}')
+        if control:
+            (self.pool / "oxide-managed").mkdir()
+            (self.pool / "oxide-managed/state.json").write_text('{"version": 10}')
+
+    def scratch(self):
+        scratch = self.root / "scratch"
+        scratch.mkdir(mode=0o700)
+        return scratch
+
+    def test_live_documents_are_read_relative_to_the_opened_pool(self):
+        self.write_live_pool()
+        documents = installer.read_live_documents(self.pool)
+        self.assertEqual(sorted(documents), sorted(installer.LIVE_DOCUMENTS))
+        self.assertEqual(documents[installer.LIVE_CONFIG][0], b"{}")
+        self.assertEqual(documents[installer.LIVE_CONTROL][0], b'{"version": 10}')
+
+    def test_a_pool_without_control_state_reads_two_documents(self):
+        self.write_live_pool(control=False)
+        documents = installer.read_live_documents(self.pool)
+        self.assertEqual(sorted(documents), [installer.LIVE_CONFIG, installer.LIVE_LEDGER])
+
+    def test_a_symlinked_live_document_is_refused(self):
+        self.write_live_pool()
+        decoy = self.root / "decoy.json"
+        decoy.write_text('{"ledger": "elsewhere"}')
+        (self.pool / "ledger.json").unlink()
+        (self.pool / "ledger.json").symlink_to(decoy)
+        with self.assertRaises(installer.Refusal):
+            installer.read_live_documents(self.pool)
+
+    def test_a_symlinked_control_directory_is_refused(self):
+        self.write_live_pool(control=False)
+        elsewhere = self.root / "control"
+        elsewhere.mkdir()
+        (elsewhere / "state.json").write_text('{"version": 10}')
+        (self.pool / "oxide-managed").symlink_to(elsewhere)
+        with self.assertRaises(installer.Refusal):
+            installer.read_live_documents(self.pool)
+
+    def test_verify_live_documents_detects_a_changed_document(self):
+        self.write_live_pool()
+        before = installer.read_live_documents(self.pool)
+        self.assertIsNone(installer.verify_live_documents(self.pool, before))
+        (self.pool / "ledger.json").write_text('{"ledger": "changed"}')
+        with self.assertRaises(installer.Refusal):
+            installer.verify_live_documents(self.pool, before)
+
+    def test_verify_scratch_dir_returns_the_opened_identity(self):
+        scratch = self.scratch()
+        self.assertEqual(installer.verify_scratch_dir(scratch), installer.directory_identity(scratch))
+
+    def test_verify_scratch_dir_refuses_a_symlink(self):
+        scratch = self.scratch()
+        alias = self.root / "alias"
+        alias.symlink_to(scratch)
+        with self.assertRaisesRegex(installer.Refusal, "without following links"):
+            installer.verify_scratch_dir(alias)
+
+    def test_verify_scratch_dir_refuses_a_regular_file(self):
+        path = self.root / "file"
+        path.write_text("x")
+        with self.assertRaises(installer.Refusal):
+            installer.verify_scratch_dir(path)
+
+    def test_verify_scratch_dir_refuses_a_group_writable_directory(self):
+        scratch = self.scratch()
+        scratch.chmod(0o770)
+        with self.assertRaisesRegex(installer.Refusal, "privately writable"):
+            installer.verify_scratch_dir(scratch)
+
+    def test_verify_scratch_dir_refuses_another_volume(self):
+        scratch = self.scratch()
+        other = scratch.stat().st_dev + 1
+        with self.assertRaisesRegex(installer.Refusal, "volume"):
+            installer.verify_scratch_dir(scratch, other)
+
+    def test_git_is_bounded_in_time(self):
+        expired = subprocess.TimeoutExpired(["git"], installer.GIT_SECONDS)
+        with mock.patch.object(installer.subprocess, "run", side_effect=expired):
+            with self.assertRaisesRegex(installer.Refusal, "exceeded"):
+                installer.git("ls-remote", "origin", "main")
+
+    def test_a_refused_archive_extraction_reaps_the_writer(self):
+        class Archive:
+            def __init__(self):
+                self.stdout = io.BytesIO()
+                self.terminated = False
+                self.waited = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exception):
+                self.waited = True
+                return False
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self):
+                self.waited = True
+                return 0
+
+        archive = Archive()
+        staging = self.root / "staging"
+        staging.mkdir()
+
+        def refuse(*args, **kwargs):
+            raise subprocess.CalledProcessError(2, "tar")
+
+        with mock.patch.object(installer.subprocess, "Popen", return_value=archive), \
+                mock.patch.object(installer.subprocess, "run", side_effect=refuse):
+            with self.assertRaises(subprocess.CalledProcessError):
+                installer.build("a" * 40, "b" * 32, staging)
+        self.assertTrue(archive.terminated, "the archive writer must be terminated on failure")
+        self.assertTrue(archive.stdout.closed, "the parent's pipe copy must be closed")
+        self.assertTrue(archive.waited)
 
 
 if __name__ == "__main__":

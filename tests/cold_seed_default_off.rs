@@ -1,9 +1,17 @@
-//! Explicit seeding opt-out preserves merge-base identity after default-on qualification.
+//! Explicit cold-seed opt-out: `OXIDE_COLD_SEED=0` on a fresh private pool.
+//!
+//! Self-contained CLI regression. The fixture checkout, pool, HOME and Cargo
+//! home are created here and removed on drop, so the opt-out claim cannot pass
+//! dormant behind an external baseline binary or a selector that no longer
+//! runs. The copy of this fixture that proves default-on qualification lives
+//! in the seeding contract; this one proves only the opt-out.
 
 use std::ffi::{CStr, CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+const OXIDE: &str = env!("CARGO_BIN_EXE_oxide");
 
 fn evidence(label: &str, output: &Output) -> String {
     let head = |bytes: &[u8]| String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned();
@@ -49,293 +57,148 @@ fn scratch_drop_tolerates_a_directory_already_removed() {
     drop(scratch);
 }
 
-/// The oxide binary staged from the merge-base source. Set `OXIDE_SEED_BASELINE_BINARY`
-/// to that build's path (no Effigy selector runs these since oxide#322); a missing or non-file value fails the
-/// test loudly so the default-off identity claim cannot pass dormant.
-fn baseline_binary() -> std::ffi::OsString {
-    let base = std::env::var_os("OXIDE_SEED_BASELINE_BINARY")
-        .expect("OXIDE_SEED_BASELINE_BINARY must name the staged merge-base oxide binary");
-    assert!(
-        std::path::Path::new(&base).is_file(),
-        "staged merge-base oxide binary is absent: {}",
-        std::path::Path::new(&base).display()
-    );
-    base
-}
-
-#[test]
-#[ignore = "needs OXIDE_SEED_BASELINE_BINARY set to a merge-base build"]
-fn status_qualified_modes_match_baseline_without_side_effects() {
-    let real_home = std::env::var_os("HOME").expect("invoking HOME");
-    let rustup_home = std::env::var_os("RUSTUP_HOME")
+/// The invoking rustup home, so a private fixture HOME still resolves the
+/// toolchain this test was compiled with instead of installing another one.
+fn invoking_rustup_home() -> Option<PathBuf> {
+    std::env::var_os("RUSTUP_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(real_home).join(".rustup"));
-    let scratch = Scratch::new();
-    let home = scratch.0.join("home");
-    let cargo_home = scratch.0.join("cargo-home");
-    let pool = scratch.0.join("pool");
-    std::fs::create_dir(&home).unwrap();
-    std::fs::create_dir(&cargo_home).unwrap();
-    let run = |binary: &OsStr, opt: Option<&str>| {
-        let mut command = Command::new(binary);
-        command
-            .arg("status")
-            .env("HOME", &home)
-            .env("CARGO_HOME", &cargo_home)
-            .env("RUSTUP_HOME", &rustup_home)
-            .env("RUSTUP_AUTO_INSTALL", "0")
-            .env("RUSTUP_TOOLCHAIN", "1.100.0")
-            .env("OXIDE_POOL", &pool)
-            .env("OXIDE_CONFIG", scratch.0.join("missing-config"))
-            .env_remove("OXIDE_COLD_SEED");
-        if let Some(value) = opt {
-            command.env("OXIDE_COLD_SEED", value);
-        }
-        command.output().expect("oxide status")
-    };
-    let candidate = OsStr::new(env!("CARGO_BIN_EXE_oxide"));
-    let default = run(candidate, None);
-    let off = run(candidate, Some("0"));
-    let on = run(candidate, Some("1"));
-    let base = run(&baseline_binary(), None);
-    let details = format!(
-        "{}\n{}\n{}\n{}",
-        evidence("candidate unset", &default),
-        evidence("candidate 0", &off),
-        evidence("candidate 1", &on),
-        evidence("baseline unset", &base)
-    );
-    assert!(
-        default.status.success()
-            && off.status.success()
-            && on.status.success()
-            && base.status.success(),
-        "{details}"
-    );
-    // No recorded seed exists in this read-only fixture. Qualified status has
-    // no hold notice, and opt-out suppresses recorded seed information.
-    let old_notice = "seeding skipped: seeding not yet qualified on this Cargo; enabled after the qualification proof";
-    for output in [&default, &off, &on, &base] {
-        assert!(
-            !String::from_utf8_lossy(&output.stdout).contains(old_notice),
-            "{details}"
-        );
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
+        .filter(|path| path.is_dir())
+}
+
+/// The fixture's private identities. The pool lives under the scratch root
+/// this run declares, which is what admits a pool on a non-boot volume.
+struct Fixture {
+    root: PathBuf,
+    home: PathBuf,
+    cargo_home: PathBuf,
+    pool: PathBuf,
+    checkout: PathBuf,
+}
+
+impl Fixture {
+    fn new(scratch: &Scratch) -> Self {
+        let fixture = Self {
+            root: scratch.0.clone(),
+            home: scratch.0.join("home"),
+            cargo_home: scratch.0.join("cargo-home"),
+            pool: scratch.0.join("pool"),
+            checkout: scratch.0.join("checkout"),
+        };
+        std::fs::create_dir(&fixture.home).unwrap();
+        std::fs::create_dir(&fixture.cargo_home).unwrap();
+        std::fs::create_dir_all(fixture.checkout.join("src")).unwrap();
+        std::fs::write(
+            fixture.checkout.join("Cargo.toml"),
+            "[package]\nname = \"seed-off-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.checkout.join("src/main.rs"),
+            "fn main() { println!(\"seed-off\"); }\n",
+        )
+        .unwrap();
+        fixture
     }
-    assert!(
-        !String::from_utf8_lossy(&off.stdout).contains("recorded seed:"),
-        "{details}"
-    );
-    assert_eq!(default.stdout, off.stdout, "{details}");
-    assert_eq!(default.stderr, off.stderr, "{details}");
-    assert_eq!(default.stdout, on.stdout, "{details}");
-    assert_eq!(default.stderr, on.stderr, "{details}");
-    assert_eq!(base.status.code(), off.status.code(), "{details}");
-    assert_eq!(base.stdout, off.stdout, "{details}");
-    assert_eq!(base.stderr, off.stderr, "{details}");
-    assert!(!pool.exists(), "{details}");
-    assert!(
-        std::fs::read_dir(&home)
-            .unwrap_or_else(|error| panic!("home read: {error}\n{details}"))
-            .next()
-            .is_none(),
-        "{details}"
-    );
-    assert!(
-        std::fs::read_dir(&cargo_home)
-            .unwrap_or_else(|error| panic!("cargo home read: {error}\n{details}"))
-            .next()
-            .is_none(),
-        "{details}"
-    );
-    assert!(!home.join(".rustup").exists(), "{details}");
-}
 
-#[test]
-#[ignore = "needs OXIDE_SEED_BASELINE_BINARY set to a merge-base build"]
-fn tiny_build_matches_staged_base_when_seed_is_off() {
-    let base = baseline_binary();
-    let real_home = std::env::var_os("HOME").expect("invoking HOME");
-    let rustup_home = std::env::var_os("RUSTUP_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(real_home).join(".rustup"));
-    let scratch = Scratch::new();
-    let base_home = scratch.0.join("base-home");
-    let candidate_home = scratch.0.join("candidate-home");
-    let cargo_home = scratch.0.join("cargo-home");
-    let pool = scratch.0.join("pool");
-    let checkout = scratch.0.join("checkout");
-    let base_paths = (&base_home, &pool, &checkout);
-    let candidate_paths = (&candidate_home, &pool, &checkout);
-    assert_ne!(base_paths.0, candidate_paths.0);
-    assert_eq!(base_paths.1, candidate_paths.1);
-    assert_eq!(base_paths.2, candidate_paths.2);
-    std::fs::create_dir(&base_home).unwrap();
-    std::fs::create_dir(&candidate_home).unwrap();
-    std::fs::create_dir(&cargo_home).unwrap();
-    std::fs::create_dir_all(checkout.join("src")).unwrap();
-    std::fs::write(
-        checkout.join("Cargo.toml"),
-        "[package]\nname = 'seed-off-fixture'\nversion = '0.1.0'\nedition = '2021'\n",
-    )
-    .unwrap();
-    std::fs::write(
-        checkout.join("src/main.rs"),
-        "fn main() { println!(\"seed-off\"); }\n",
-    )
-    .unwrap();
-    let run = |binary: &OsStr, paths: (&PathBuf, &PathBuf, &PathBuf), prior: Option<&Output>| {
-        let (home, pool, checkout) = paths;
-        let output = Command::new(binary)
-            .args(["build", "--offline"])
-            .current_dir(&checkout)
-            .env("HOME", &home)
-            .env("CARGO_HOME", &cargo_home)
-            .env("RUSTUP_HOME", &rustup_home)
+    /// One `oxide` invocation against the fixture's private pool and identities.
+    fn run(&self, cold_seed: Option<&str>, args: &[&str]) -> Output {
+        let mut command = Command::new(OXIDE);
+        command
+            .current_dir(&self.checkout)
+            .env("HOME", &self.home)
+            .env("CARGO_HOME", &self.cargo_home)
+            // Without this proof control Oxide resolves the account's real
+            // home, and this fixture would reach the live state directory.
+            .env("OXIDE_TEST_HOME_FROM_ENV", "1")
+            .env("OXIDE_CONFIG", self.root.join("missing-config"))
+            .env("OXIDE_POOL", &self.pool)
+            .env("OXIDE_POOL_CREATE", "1")
+            .env("OXIDE_POOL_CAP", "1GiB")
+            .env("OXIDE_SCRATCH_ROOT", &self.root)
             .env("RUSTUP_AUTO_INSTALL", "0")
-            .env("RUSTUP_TOOLCHAIN", "1.100.0")
-            .env("OXIDE_POOL", &pool)
-            .env("OXIDE_CONFIG", scratch.0.join("missing-config"))
-            .env("OXIDE_COLD_SEED", "0")
+            .env("TMPDIR", &self.root)
+            .env("TMP", &self.root)
+            .env("TEMP", &self.root)
+            .env_remove("OXIDE_COLD_SEED")
+            .env_remove("OXIDE_TASK_SCRATCH_ROOT")
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("CARGO_BUILD_BUILD_DIR")
-            .output()
-            .expect("run tiny offline build");
-        let details = match prior {
-            Some(previous) => format!(
-                "{}\n{}",
-                evidence("baseline", previous),
-                evidence("candidate", &output)
-            ),
-            None => evidence("baseline", &output),
-        };
-        assert!(output.status.success(), "{details}");
-        assert!(
-            !String::from_utf8_lossy(&output.stderr).contains("seeding"),
-            "{details}"
-        );
-        let bytes = std::fs::read(checkout.join("target/debug/seed-off-fixture"))
-            .unwrap_or_else(|error| panic!("fixture binary read failed: {error}\n{details}"));
-        assert!(!pool.join("oxide-managed/seeds").exists(), "{details}");
-        assert!(!home.join(".rustup").exists(), "{details}");
-        (output, bytes)
-    };
-    // Scratch host records live under HOME. A fresh second HOME permits a new
-    // binding at the same path, which the byte-identity comparison requires.
-    let old = run(&base, base_paths, None);
-    let details = evidence("baseline", &old.0);
-    assert!(
-        std::fs::read_dir(&candidate_home)
-            .unwrap_or_else(|error| panic!("candidate home read: {error}\n{details}"))
-            .next()
-            .is_none(),
-        "{details}"
-    );
-    std::fs::remove_dir_all(&pool)
-        .unwrap_or_else(|error| panic!("pool cleanup: {error}\n{details}"));
-    assert!(!pool.exists(), "{details}");
-    std::fs::remove_dir_all(checkout.join("target")).unwrap_or_else(|error| {
-        panic!("target cleanup: {error}\n{}", evidence("baseline", &old.0))
-    });
-    let new = run(
-        OsStr::new(env!("CARGO_BIN_EXE_oxide")),
-        candidate_paths,
-        Some(&old.0),
-    );
-    let details = format!(
-        "{}\n{}",
-        evidence("baseline", &old.0),
-        evidence("candidate", &new.0)
-    );
-    assert_eq!(old.0.stdout, new.0.stdout, "{details}");
-    assert_eq!(old.1, new.1, "{details}");
-}
-
-#[test]
-fn scratch_declaration_is_inert_for_internal_status() {
-    let scratch = Scratch::new();
-    let home = scratch.0.join("home");
-    let cargo_home = scratch.0.join("cargo-home");
-    std::fs::create_dir(&home).unwrap();
-    std::fs::create_dir(&cargo_home).unwrap();
-    let run = |declared: bool| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oxide"));
-        cmd.arg("status")
-            .env("HOME", &home)
-            .env("CARGO_HOME", &cargo_home)
-            .env("OXIDE_TEST_HOME_FROM_ENV", "1")
-            .env("OXIDE_POOL", scratch.0.join("pool"))
-            .env("OXIDE_CONFIG", scratch.0.join("missing-config"))
-            .env_remove("OXIDE_SCRATCH_ROOT");
-        if declared {
-            cmd.env("OXIDE_SCRATCH_ROOT", "");
+            .args(args);
+        if let Some(rustup_home) = invoking_rustup_home() {
+            command.env("RUSTUP_HOME", rustup_home);
         }
-        cmd.output().expect("oxide status")
-    };
-    let ordinary = run(false);
-    let declared = run(true);
-    assert!(ordinary.status.success() && declared.status.success());
-    assert_eq!(ordinary.stdout, declared.stdout);
-    assert_eq!(ordinary.stderr, declared.stderr);
-    assert!(!scratch.0.join("pool").exists());
+        if let Some(value) = cold_seed {
+            command.env("OXIDE_COLD_SEED", value);
+        }
+        command.output().expect("run oxide")
+    }
+}
+
+/// The one slot `oxide` leased in the fixture pool.
+fn leased_slot(pool: &Path, details: &str) -> PathBuf {
+    let slots = pool.join("payload/slots");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&slots)
+        .unwrap_or_else(|error| panic!("slot list {}: {error}\n{details}", slots.display()))
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !name.starts_with('.'))
+        })
+        .collect();
+    dirs.sort();
+    assert_eq!(dirs.len(), 1, "expected one leased slot\n{details}");
+    dirs.remove(0)
 }
 
 #[test]
-fn recorded_absent_scratch_status_is_read_only() {
-    use sha2::{Digest, Sha256};
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+fn cold_seed_opt_out_builds_a_fresh_pool_without_seeding() {
     let scratch = Scratch::new();
-    let home = scratch.0.join("home");
-    let cargo_home = scratch.0.join("cargo-home");
-    std::fs::create_dir(&home).unwrap();
-    std::fs::create_dir(&cargo_home).unwrap();
-    let mount = PathBuf::from("/Volumes").join(scratch.0.file_name().unwrap());
-    assert!(!mount.exists());
-    let root = mount.join("root");
-    let pool = root.join("pool");
-    let state = if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/oxide/state")
-    } else {
-        home.join(".local/state/oxide")
-    };
-    let records = state.join("scratch-pools");
-    std::fs::create_dir_all(&records).unwrap();
-    let hash = Sha256::digest(pool.as_os_str().as_bytes());
-    let name = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let record_path = records.join(format!("{name}.json"));
-    let run = || {
-        Command::new(env!("CARGO_BIN_EXE_oxide"))
-            .arg("status")
-            .current_dir(&scratch.0)
-            .env("HOME", &home)
-            .env("CARGO_HOME", &cargo_home)
-            .env("OXIDE_TEST_HOME_FROM_ENV", "1")
-            .env("OXIDE_POOL", &pool)
-            .env("OXIDE_CONFIG", scratch.0.join("missing-config"))
-            .env_remove("OXIDE_SCRATCH_ROOT")
-            .output()
-            .unwrap()
-    };
-    let none = run();
-    assert!(none.status.success());
-    assert!(!String::from_utf8_lossy(&none.stdout).contains("scratch pool"));
-    assert_eq!(std::fs::read_dir(&records).unwrap().count(), 0);
-    let bytes = serde_json::to_vec(&serde_json::json!({"schema":"oxide.scratch-pool-record/1", "pool":pool, "volume_uuid":"test-uuid", "mount_point":mount, "scratch_root":root, "created_ms":1})).unwrap();
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&record_path)
-        .unwrap();
-    file.write_all(&bytes).unwrap();
-    drop(file);
-    let recorded = run();
-    assert!(recorded.status.success());
-    assert!(String::from_utf8_lossy(&recorded.stdout)
-        .contains("unavailable (scratch volume test-uuid absent)"));
-    assert_eq!(std::fs::read(&record_path).unwrap(), bytes);
-    assert_eq!(std::fs::read_dir(&records).unwrap().count(), 1);
-    assert!(!mount.exists());
+    let fixture = Fixture::new(&scratch);
+    let output = fixture.run(Some("0"), &["build", "--offline"]);
+    let details = evidence("oxide build --offline with OXIDE_COLD_SEED=0", &output);
+    assert!(output.status.success(), "{details}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // `seeding` covers both notices the seeding gate can print: the summary of
+    // a completed seed and every skip reason.
+    assert!(
+        !stderr.contains("seeding"),
+        "the explicit opt-out must suppress every seeding notice\n{details}"
+    );
+    // The pool exists because this run named OXIDE_POOL_CREATE=1, and the
+    // build filled the one slot it leased; no part of that came from a seed.
+    let managed = fixture.pool.join("oxide-managed");
+    assert!(managed.is_dir(), "no pool control directory\n{details}");
+    assert!(
+        !managed.join("seeds").exists(),
+        "a seed was planned\n{details}"
+    );
+    let artifacts: Vec<String> = std::fs::read_dir(&managed)
+        .unwrap_or_else(|error| panic!("control list: {error}\n{details}"))
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("seed"))
+        .collect();
+    assert!(
+        artifacts.is_empty(),
+        "seeding artifacts: {artifacts:?}\n{details}"
+    );
+    let slot = leased_slot(&fixture.pool, &details);
+    assert!(
+        slot.join("build").is_dir(),
+        "the slot has no build\n{details}"
+    );
+    // Oxide links the project's owned outputs back into its own target
+    // directory, exactly as plain Cargo would place them.
+    assert!(
+        fixture
+            .checkout
+            .join("target/debug/seed-off-fixture")
+            .is_file(),
+        "the opted-out build produced no binary\n{details}"
+    );
+    assert!(!fixture.home.join(".rustup").exists(), "{details}");
 }

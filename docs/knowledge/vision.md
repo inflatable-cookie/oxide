@@ -220,7 +220,8 @@ operator instruction; the general lean reset is not deletion authority.
   links migrate only by explicit adoption. It never moves existing output,
   and ephemeral mode is unchanged
   ([workflow](contracts/workflow.md)).
-- **Profile layout becomes the default** (built by oxide#160 for S1 and S4b; migration of existing checkouts still gated): automatic first conversion creates profile member links, keeping `target` a real directory so container tools that mount it (Effigy's isolated `target` mounts) keep working, instead of the legacy whole-target link. `oxide exec` now derives a tool's output members from the checkout's committed placement, so no route needs `--output` ([design](contracts/exec-output-inference.md), which records that a member the checkout's committed placement does not cover stays a real local directory and is reported, never guessed); `--output` remains an optional complete override. Existing whole-target checkouts are untouched and migrate only by explicit `oxide outputs adopt`, Acowtancy's primary checkout first — that migration, the design's S2/S3/S5 follow-ons and a real Tauri dogfood are not part of oxide#160.
+- **Profile layout becomes the default** (built by oxide#160 for S1 and S4b; migration of existing checkouts still gated): automatic first conversion creates profile member links, keeping `target` a real directory so container tools that mount it (Effigy's isolated `target` mounts) keep working, instead of the legacy whole-target link. `oxide exec` now derives a tool's output members from the checkout's committed placement, so no route needs `--output` ([design](contracts/exec-output-inference.md), which records that a member the checkout's committed placement does not cover stays a real local directory and is reported, never guessed); `--output` remains an optional complete override. Existing whole-target checkouts are untouched and migrate only by explicit `oxide outputs detach`
+  followed by `oxide outputs adopt`, Acowtancy's primary checkout first — that migration, the design's S2/S3/S5 follow-ons and a real Tauri dogfood are not part of oxide#160.
 - **Owned links at profile directories** (v1, operator accepted): a converted
   checkout keeps `target` itself a real directory and owns only the positively
   identified members `debug`, `release`, `<triple>/debug` and
@@ -250,15 +251,16 @@ operator instruction; the general lean reset is not deletion authority.
   directory inside the slot, removed at release after writer closure; a `run`
   program that uses one keeps the lease until its own group closes
   ([workflow](contracts/workflow.md)). Idle exec-session custody design is tracked
-  in Nucleus and is not implemented. The separate proof and validation tooling
-  default was implemented and qualified by oxide#145 (merged at `0520fc04`,
-  guard `a6d73326`), which places and monitors proof scratch on the selected
-  pool's own volume with a warned `/private/tmp` fallback
-  ([placement](contracts/workflow.md)). Internal-
-  placement proofs may declare an explicit internal root as the owner-accepted
-  narrow exception, with their fixtures beside the pool, never inside it. Both
-  cover Oxide-owned scratch only: CI, Nucleus worktrees, containers and host
-  settings stay as they are.
+  in Nucleus and is not implemented. Proof and validation scratch placement is
+  retired history: oxide#145 (merged at `0520fc04`, guard `a6d73326`) placed and
+  monitored proof scratch on the selected pool's own volume with a warned
+  `/private/tmp` fallback, and oxide#322 removed that proof ladder, its selectors
+  and its shared supervisor, so nothing here now configures, selects or monitors
+  proof scratch. Tests may still declare an explicit internal root as the
+  owner-accepted narrow exception, with their fixtures beside the pool, never
+  inside it. That exception and this temporary-file rule cover Oxide-owned
+  scratch only: CI, Nucleus worktrees, containers and host settings stay as they
+  are.
 - **Leftover output roots** of checkouts that no longer exist are removed
   only by an explicit `oxide outputs prune`, never automatically.
 - Tom's 2026-11-05 selected-root protection ruling and its conservative

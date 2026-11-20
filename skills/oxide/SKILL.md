@@ -305,7 +305,7 @@ calls plain `cargo` is an actionable warning. It never edits Effigy files and
 remembers nothing; switching a selector to `oxide` is the project's choice.
 
 When switching selectors:
-- **Escapes:** keep a `:cargo` escape beside each main one.
+- **Escapes:** none per project, and no `:cargo` sibling beside each main selector. The only escapes are machine-wide and explicit: Effigy's `[programs.oxide] fallback = "cargo"` in `~/.effigy/config.toml` (installed with `force = false`, so it acts only when `oxide` is missing; `force = true` while `oxide` is broken) or `EFFIGY_OXIDE_ESCAPE=cargo`.
 - **CI:** if CI calls the same selectors, run `cargo` when `GITHUB_ACTIONS=true` and `oxide` otherwise, failing loudly when `oxide` is missing.
 - **Stay on `cargo`:**
   - scripts that set their own `CARGO_TARGET_DIR`, because Oxide replaces it;
