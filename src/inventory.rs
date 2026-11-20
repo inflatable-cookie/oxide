@@ -490,179 +490,6 @@ pub(crate) fn inventory_with(
     Ok(walker.finish(filesystem_free))
 }
 
-/// One union walk over several roots (design `one-use-workspaces` §6.4).
-///
-/// The roots are walked as one bounded measurement: one shared `(device,
-/// inode)` set, one shared entry budget, one shared depth limit and one shared
-/// cooperative deadline. A regular file reached through a hard link from two
-/// roots contributes its bytes once. `allocated_bytes` is therefore the union
-/// of the roots, never the sum of independent walks.
-///
-/// Nothing is followed across a link or a mount: each root must be a real
-/// directory on the common device, a duplicate root is refused, and every entry
-/// below a root is walked with the ordinary no-follow, same-device rules. A
-/// partial walk keeps its bounds gaps and is reported incomplete, never as
-/// zero.
-#[derive(Debug)]
-pub struct UnionReport {
-    /// Number of roots the union covered.
-    pub roots: usize,
-    /// Coverage over every root: complete only when no gap was observed.
-    pub coverage: Coverage,
-    /// Entries that vanished while they were observed.
-    pub vanished: u64,
-    /// The limits the union actually used.
-    pub limits: InventoryLimits,
-    pub elapsed_ms: u64,
-    pub entries_visited: u64,
-    pub directories_visited: u64,
-    pub max_depth_reached: usize,
-    /// Names seen, counted once per name (so a cross-root hard link adds an
-    /// extra name).
-    pub files: u64,
-    pub directories: u64,
-    pub symlinks: u64,
-    pub other: u64,
-    /// Apparent bytes over names.
-    pub logical_bytes_by_name: u64,
-    /// Allocated bytes over distinct inodes across every root: the union.
-    pub allocated_bytes: u64,
-}
-
-/// Walk several roots as one bounded union measurement.
-pub fn union_directory(
-    roots: &[PathBuf],
-    limits: InventoryLimits,
-) -> Result<UnionReport, InventoryError> {
-    limits.validate()?;
-    if roots.is_empty() {
-        return Err(InventoryError::InvalidLimits(
-            "a union walk needs at least one root",
-        ));
-    }
-    let started = Instant::now();
-    let deadline = started
-        .checked_add(limits.elapsed_limit())
-        .unwrap_or(started);
-    let mut seen = std::collections::HashSet::new();
-    let mut union = UnionReport {
-        roots: 0,
-        coverage: Coverage {
-            complete: true,
-            gaps: Vec::new(),
-        },
-        vanished: 0,
-        limits,
-        elapsed_ms: 0,
-        entries_visited: 0,
-        directories_visited: 0,
-        max_depth_reached: 0,
-        files: 0,
-        directories: 0,
-        symlinks: 0,
-        other: 0,
-        logical_bytes_by_name: 0,
-        allocated_bytes: 0,
-    };
-    let mut gaps: std::collections::BTreeMap<GapKind, u64> = std::collections::BTreeMap::new();
-    let mut identities: Vec<(u64, u64)> = Vec::new();
-    let mut device: Option<u64> = None;
-    for root in roots {
-        let canonical = fs::canonicalize(root).map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => InventoryError::RootMissing(root.to_path_buf()),
-            _ => InventoryError::RootUnreadable {
-                root: root.to_path_buf(),
-                reason: error.to_string(),
-            },
-        })?;
-        let metadata = fs::metadata(&canonical).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                InventoryError::RootMissing(canonical.clone())
-            } else {
-                InventoryError::RootUnreadable {
-                    root: canonical.clone(),
-                    reason: error.to_string(),
-                }
-            }
-        })?;
-        if !metadata.is_dir() {
-            return Err(InventoryError::RootNotDirectory(canonical));
-        }
-        let identity = (metadata.dev(), metadata.ino());
-        if identities.contains(&identity) {
-            return Err(InventoryError::InvalidLimits(
-                "a union walk refuses the same root twice",
-            ));
-        }
-        if let Some(device) = device {
-            if device != identity.0 {
-                return Err(InventoryError::InvalidLimits(
-                    "a union walk's roots must share one device",
-                ));
-            }
-        }
-        device = Some(identity.0);
-        identities.push(identity);
-        // The entry budget and the deadline are the union's, not this root's.
-        let remaining_entries = limits.max_entries.saturating_sub(union.entries_visited);
-        if remaining_entries == 0 {
-            *gaps.entry(GapKind::EntryLimit).or_insert(0) += 1;
-            continue;
-        }
-        if Instant::now() >= deadline {
-            *gaps.entry(GapKind::ElapsedDeadline).or_insert(0) += 1;
-            continue;
-        }
-        let mut per_root = limits;
-        per_root.max_entries = remaining_entries;
-        // Every root keeps the union's absolute deadline; `started` is the
-        // union's start so a per-root report measures the shared window.
-        let mut walker = Walker::with_seen(
-            &canonical,
-            identity.0,
-            identity.1,
-            per_root,
-            started,
-            &[],
-            Some(&mut seen),
-        );
-        walker.run()?;
-        walker.verify_root()?;
-        let filesystem_free = probe_filesystem_free(&canonical, identity.0);
-        let report = walker.finish(filesystem_free);
-        union.roots += 1;
-        union.vanished = union.vanished.saturating_add(report.vanished);
-        union.entries_visited = union.entries_visited.saturating_add(report.entries_visited);
-        union.directories_visited = union
-            .directories_visited
-            .saturating_add(report.directories_visited);
-        union.max_depth_reached = union.max_depth_reached.max(report.max_depth_reached);
-        union.files = union.files.saturating_add(report.total.files);
-        union.directories = union.directories.saturating_add(report.total.directories);
-        union.symlinks = union.symlinks.saturating_add(report.total.symlinks);
-        union.other = union.other.saturating_add(report.total.other);
-        union.logical_bytes_by_name = union
-            .logical_bytes_by_name
-            .saturating_add(report.total.logical_bytes_by_name);
-        union.allocated_bytes = union
-            .allocated_bytes
-            .saturating_add(report.total.allocated_bytes);
-        for gap in report.coverage.gaps {
-            *gaps.entry(gap.kind).or_insert(0) += gap.occurrences;
-        }
-    }
-    union.coverage = Coverage {
-        complete: gaps.is_empty(),
-        gaps: gaps
-            .into_iter()
-            .map(|(kind, occurrences)| CoverageGap { kind, occurrences })
-            .collect(),
-    };
-    union.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    union.limits = limits;
-    Ok(union)
-}
-
 struct InodeRecord {
     allocated: u64,
     logical: u64,
@@ -700,16 +527,10 @@ struct Walker<'a> {
     stopped: u64,
     limits: InventoryLimits,
     started: Instant,
-    /// The walk's cooperative deadline. A union walk shares one absolute
-    /// deadline across every root, so a slow first root cannot leave a fresh
-    /// bound for the next one.
+    /// The walk's cooperative deadline.
     deadline: Instant,
     root_device: u64,
     root_inode: u64,
-    /// Shared `(device, inode)` set of a union walk: a regular file whose
-    /// inode another root already counted is not counted again, so one hard
-    /// link across roots contributes one inode's bytes.
-    union_seen: Option<&'a mut std::collections::HashSet<(u64, u64)>>,
     deadline_exceeded: bool,
     entries_visited: u64,
     directories_visited: u64,
@@ -735,19 +556,6 @@ impl<'a> Walker<'a> {
         started: Instant,
         stops: &'a [PathBuf],
     ) -> Self {
-        Self::with_seen(root, root_device, root_inode, limits, started, stops, None)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn with_seen(
-        root: &'a Path,
-        root_device: u64,
-        root_inode: u64,
-        limits: InventoryLimits,
-        started: Instant,
-        stops: &'a [PathBuf],
-        union_seen: Option<&'a mut std::collections::HashSet<(u64, u64)>>,
-    ) -> Self {
         let deadline = started
             .checked_add(limits.elapsed_limit())
             .unwrap_or(started);
@@ -761,7 +569,6 @@ impl<'a> Walker<'a> {
             deadline,
             root_device,
             root_inode,
-            union_seen,
             deadline_exceeded: false,
             entries_visited: 0,
             directories_visited: 0,
@@ -1086,14 +893,6 @@ impl<'a> Walker<'a> {
         self.logical_by_name[index] = self.logical_by_name[index].saturating_add(logical);
         let key = (metadata.dev(), metadata.ino());
         let bit = 1u8 << index;
-        if let Some(seen) = self.union_seen.as_deref_mut() {
-            // A union walk counts one hard-linked inode once across all its
-            // roots. The name is still an extra name; only its bytes are
-            // attributed to the root that first observed it.
-            if !seen.insert(key) {
-                return;
-            }
-        }
         match self.inodes.get_mut(&key) {
             Some(record) => record.categories |= bit,
             None => {
@@ -3105,94 +2904,5 @@ mod tests {
             case("root-guard-denied", guard_faults::Fault::Fail(libc::EACCES)),
             InventoryError::RootUnreadable { .. }
         ));
-    }
-    // ---------------------------------------------------------------------
-    // Union walks (`one-use-workspaces` §6.4). The union is one bounded
-    // measurement over several roots, not a sum of independent walks.
-    // ---------------------------------------------------------------------
-
-    fn union_fixture(
-        label: &str,
-        first_bytes: usize,
-        second_bytes: usize,
-    ) -> (Fixture, PathBuf, PathBuf) {
-        let fixture = Fixture::new(label);
-        let first = fixture.path().join("first");
-        let second = fixture.path().join("second");
-        fs::create_dir_all(first.join("build")).unwrap();
-        fs::create_dir_all(second.join("build")).unwrap();
-        fs::write(first.join("build/blob"), vec![b'x'; first_bytes]).unwrap();
-        fs::write(second.join("build/unique"), vec![b'y'; second_bytes]).unwrap();
-        (fixture, first, second)
-    }
-
-    #[test]
-    fn a_union_walk_counts_a_cross_root_hard_link_once() {
-        let (fixture, first, second) = union_fixture("union-link", 64 * 1024, 32 * 1024);
-        fs::hard_link(first.join("build/blob"), second.join("build/linked")).unwrap();
-        let limits = InventoryLimits::default();
-        let one = union_directory(&[first.clone()], limits).unwrap();
-        let two = union_directory(&[second.clone()], limits).unwrap();
-        let union = union_directory(&[first, second], limits).unwrap();
-        assert!(one.allocated_bytes > 0 && two.allocated_bytes > 0);
-        assert_eq!(
-            union.allocated_bytes, two.allocated_bytes,
-            "the union is not one inode set"
-        );
-        assert!(
-            one.allocated_bytes + two.allocated_bytes > union.allocated_bytes,
-            "summing independent walks did not overcount the hard link"
-        );
-        assert_eq!(union.roots, 2);
-        assert!(union.coverage.complete, "{:?}", union.coverage.gaps);
-        let _ = fixture;
-    }
-
-    #[test]
-    fn a_union_walk_refuses_a_duplicate_or_non_directory_root() {
-        let (fixture, first, _second) = union_fixture("union-refuse", 1024, 1024);
-        let file = fixture.file("plain", 8);
-        let duplicate =
-            union_directory(&[first.clone(), first.clone()], InventoryLimits::default());
-        assert!(
-            matches!(duplicate, Err(InventoryError::InvalidLimits(_))),
-            "{duplicate:?}"
-        );
-        let not_directory = union_directory(&[file], InventoryLimits::default());
-        assert!(
-            matches!(not_directory, Err(InventoryError::RootNotDirectory(_))),
-            "{not_directory:?}"
-        );
-        let empty = union_directory(&[], InventoryLimits::default());
-        assert!(matches!(empty, Err(InventoryError::InvalidLimits(_))));
-    }
-
-    #[test]
-    fn a_union_walk_shares_one_entry_budget_across_roots() {
-        let (fixture, first, second) = union_fixture("union-budget", 1024, 1024);
-        for index in 0..8 {
-            fixture.file(&format!("first/build/extra-{index}"), 16);
-            fixture.file(&format!("second/build/extra-{index}"), 16);
-        }
-        let limits = InventoryLimits {
-            max_entries: 4,
-            ..InventoryLimits::default()
-        };
-        let union = union_directory(&[first, second], limits).unwrap();
-        assert!(
-            union.entries_visited <= 4,
-            "the entry budget was not shared: {}",
-            union.entries_visited
-        );
-        assert!(!union.coverage.complete);
-        assert!(
-            union
-                .coverage
-                .gaps
-                .iter()
-                .any(|gap| gap.kind == GapKind::EntryLimit),
-            "an exhausted shared budget is not reported"
-        );
-        let _ = fixture;
     }
 }

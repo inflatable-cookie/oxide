@@ -18,7 +18,6 @@ mod tests;
 pub mod control;
 mod pool;
 pub mod seed;
-mod slice;
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -29,10 +28,6 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 
 pub use pool::{managed, LeaseRequest, SlotLayout};
-pub use slice::{
-    slice_byte_limit, AdmissionClass, MemberPair, MemberSet, OneUseSlice, RestoreOutcome,
-    SliceAdmission, SliceReport, VictimPolicy, ONE_USE_MAX_BYTES, ONE_USE_MAX_SLOTS,
-};
 
 /// Version of the lease JSON, lease receipts and pool config.
 pub const LEASE_VERSION: u32 = 1;
@@ -225,7 +220,6 @@ impl std::fmt::Display for AccountingContext {
 /// Why a command refused. Mapped to a small exit set by [`LeaseError::exit_code`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LeaseError {
-    Usage(&'static str),
     InvalidInput(&'static str),
     Busy,
     WriterUpdated,
@@ -260,14 +254,6 @@ pub enum LeaseError {
         limit: Option<u64>,
         /// Every slot this admission charged conservatively, in slot order.
         unmeasured: Vec<UnmeasuredSlot>,
-    },
-    /// A one-use admission whose measured slice is still full after restore
-    /// (design §6.9): the measured union (or `None` when it could not be
-    /// measured) and the byte bound. Exit code 3, beside `Full` and
-    /// `unknown_accounting`, so a printed message can never claim a pool cap.
-    OneUseBudget {
-        measured: Option<u64>,
-        limit: u64,
     },
     UnsafePath(&'static str),
     HolderConflict,
@@ -312,7 +298,7 @@ impl LeaseError {
     /// backing. 5 unknown lease.
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Usage(_) | Self::InvalidInput(_) | Self::Io(_) | Self::Unsupported(_) => 1,
+            Self::InvalidInput(_) | Self::Io(_) | Self::Unsupported(_) => 1,
             Self::Busy | Self::HolderConflict => 2,
             Self::WriterUpdated => 76,
             Self::Full
@@ -323,7 +309,6 @@ impl LeaseError {
             | Self::UnexpectedEntry { .. }
             | Self::AccountingIncomplete(..)
             | Self::CapacityCharged { .. }
-            | Self::OneUseBudget { .. }
             | Self::LedgerExhausted
             | Self::SlotCeiling(_)
             | Self::LegacyAdoptionPending(_)
@@ -336,7 +321,6 @@ impl LeaseError {
 
     pub fn reason(&self) -> &'static str {
         match self {
-            Self::Usage(_) => "usage",
             Self::InvalidInput(_) => "invalid_input",
             Self::Busy => "busy",
             Self::WriterUpdated => "writer_updated",
@@ -349,7 +333,6 @@ impl LeaseError {
             Self::ControlState(_) => "control_state",
             Self::WriterFenceBusy => "writer_fence_busy",
             Self::CapacityCharged { .. } => "full",
-            Self::OneUseBudget { .. } => "one_use_budget",
             Self::UnsafePath(_) => "unsafe_path",
             Self::HolderConflict => "holder_conflict",
             Self::NotFound => "not_found",
@@ -366,7 +349,7 @@ impl LeaseError {
 impl std::fmt::Display for LeaseError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Usage(message) | Self::InvalidInput(message) | Self::UnsafePath(message) => {
+            Self::InvalidInput(message) | Self::UnsafePath(message) => {
                 formatter.write_str(message)
             }
             Self::Busy => formatter.write_str("compatible slot is held"),
@@ -387,16 +370,6 @@ impl std::fmt::Display for LeaseError {
                     "the {place} holds an unexpected entry \"{entry}\""
                 )
             }
-            Self::OneUseBudget { measured, limit } => match measured {
-                Some(bytes) => write!(
-                    formatter,
-                    "one-use workspace slots are full: measured {bytes} of {limit} bytes with no safely evictable idle one-use slot left"
-                ),
-                None => write!(
-                    formatter,
-                    "one-use workspace slots are full: the member union could not be measured within the {limit}-byte slice bound and no safely evictable idle one-use slot is left"
-                ),
-            },
             Self::AccountingIncomplete(scan, context) => {
                 write!(formatter, "owned accounting is incomplete: {scan}")?;
                 if let Some(context) = context {
@@ -688,9 +661,9 @@ impl From<&SlotStatus> for LedgerSlot {
     }
 }
 
-/// The complete target walk OneUse reuse made under the pool lock before
-/// taking this generation. Normal warm reuse, new slots and held same-holder
-/// replay have no acquisition measurement; release accounting is separate.
+/// The complete target walk a reuse made under the pool lock before taking
+/// this generation. Normal warm reuse, new slots and held same-holder replay
+/// have no acquisition measurement; release accounting is separate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReuseMeasurement {
     pub slot_id: String,
@@ -723,11 +696,6 @@ pub struct Leased {
     /// used bytes as pool usage, and the pool cap stays unverified on this
     /// route. The caller prints it as a warning.
     pub admission_note: Option<String>,
-    /// The one-use slice observation restore made before this admission
-    /// (design §6.1, §6.3). `None` for a normal warm reuse, which measures
-    /// nothing; `Some` for every new-slot admission and every one-use
-    /// admission, including one whose slice was empty (`NotNeeded`).
-    pub slice: Option<SliceReport>,
     /// Slots this admission could not measure completely and charged
     /// conservatively instead (oxide#186). Empty when every walk completed.
     /// Their charge is not reported: only the incomplete outcome is, so a
@@ -1032,8 +1000,9 @@ fn read_private_file_bounded(path: &Path, max: u64) -> Result<Vec<u8>, LeaseErro
 /// preserving every other field, so a locked [`pool::Pool::open`] can raise
 /// the fence before it reconciles a recorded deletion. `src/bin/oxide/store.rs`
 /// owns the same values; its constants alias these so the two writers cannot
-/// drift. A document at version 6 or later carries `CONTROL_ONE_USE_FENCE`;
-/// a document at [`CONTROL_FENCE_VERSION`] takes every fence.
+/// drift. A version-6 document carries `CONTROL_ONE_USE_FENCE`, which later
+/// documents may also carry; a document at [`CONTROL_FENCE_VERSION`] takes
+/// every fence.
 pub const CONTROL_FENCE_VERSION: u32 = 10;
 pub const CONTROL_RECORDED_ACCOUNTING_FENCE: &str = "oxide.accounting/1";
 pub const CONTROL_EVICTION_ACCOUNTING_FENCE: &str = "oxide.eviction-accounting/1";
@@ -1055,8 +1024,8 @@ pub const CONTROL_HOLDING_FENCE: &str = "oxide.holding/1";
 /// its document), so a library fixture has nothing to fence. A state already
 /// at the fence version with every fence is not rewritten. A newer version, an
 /// unknown fence value, a present non-string fence, a version/fence
-/// combination no writer produces (including version 0, a version-6 document
-/// without its one-use fence, and a class-bearing record without that fence)
+/// combination no writer produces (including version 0 and a version-6
+/// document without its one-use fence)
 /// or a non-numeric version refuses: this binary never downgrades or silently
 /// repairs a document a successor wrote. Only a field genuinely absent from an
 /// older document is inserted. The

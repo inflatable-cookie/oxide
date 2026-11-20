@@ -673,15 +673,9 @@ fn run_whole(
     let mut waits = WaitAccounting::default();
     let store = crate::removable::coordinate(Store::open_existing_for_clean(settings)?)?;
     let guard = match &store {
-        // `Recovering` mode never returns `Busy`; only a guarded verb's
-        // `Barrier` mode does, so this arm is unreachable here.
         Some(store) => match store.begin_clean(workspace, &mut waits)? {
             Cleaning::Guard(guard) => Some(guard),
             Cleaning::Interrupted(signal) => return Ok(process::signal_exit_code(signal)),
-            Cleaning::Busy(reason) => return Err(reason),
-            // `Recovering` mode never returns `Retry` either; only a guarded
-            // verb's `Barrier` mode does, through its own attempt loop.
-            Cleaning::Retry(reason) => return Err(reason),
         },
         None => None,
     };
@@ -811,15 +805,9 @@ fn run_selected(args: &[OsString], workspace: &Path, settings: &Settings) -> Res
     let mut waits = WaitAccounting::default();
     let store = crate::removable::coordinate(Store::open_existing_for_clean(settings)?)?;
     let mut guard = match &store {
-        // `Recovering` mode never returns `Busy`; only a guarded verb's
-        // `Barrier` mode does, so this arm is unreachable here.
         Some(store) => match store.begin_clean(workspace, &mut waits)? {
             Cleaning::Guard(guard) => Some(guard),
             Cleaning::Interrupted(signal) => return Ok(process::signal_exit_code(signal)),
-            Cleaning::Busy(reason) => return Err(reason),
-            // `Recovering` mode never returns `Retry` either; only a guarded
-            // verb's `Barrier` mode does, through its own attempt loop.
-            Cleaning::Retry(reason) => return Err(reason),
         },
         None => None,
     };

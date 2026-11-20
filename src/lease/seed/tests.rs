@@ -9,9 +9,7 @@ use super::super::pool::{
     create_injected, lease_injected, release_injected, rewrite_removable_backend_injected,
     tamper_idle_generations_injected,
 };
-use super::super::{
-    AdmissionClass, LeaseError, LeaseGrant, LeaseRequest, Profile, SlotLayout, VictimPolicy,
-};
+use super::super::{LeaseError, LeaseGrant, LeaseRequest, Profile, SlotLayout};
 use super::*;
 use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, OsString};
@@ -412,9 +410,6 @@ impl Rig {
             reserve_bytes: None,
             layout,
             replace_slot: None,
-            class: AdmissionClass::Normal,
-            victims: VictimPolicy::Any,
-            slice: None,
         })
         .expect("lease")
     }
@@ -745,7 +740,6 @@ fn make_donor_in(
             project,
             Some(SlotLayout {
                 folders: vec![folder.to_owned()],
-                same_repository: Vec::new(),
                 profile: "quick".to_owned(),
             }),
         ),

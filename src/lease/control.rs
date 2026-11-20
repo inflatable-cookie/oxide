@@ -33,11 +33,9 @@ pub const LEGACY_MAX_STATE_BYTES: u64 = 256 * 1024;
 /// mutating command.
 /// Version 7 fences eviction accounting (oxide#175) before an Evicting record
 /// retains its closed size.
-/// Version 6 carries the one-use fence (design §5.1, §10.1): a record may
-/// carry a workspace class only under this version and its durable
-/// `oxide.one-use/1` fence, so an older strict parser can never meet a class
-/// field it does not know. It is written **only** when a class-bearing record
-/// is first written, so a normal-only pool stays at version 5 or below.
+/// Version 6 carries the one-use fence. The feature is retired, so nothing
+/// writes it any more; a document that already carries `oxide.one-use/1`
+/// stays readable as an inert value.
 /// Version 5 carries the recorded per-slot accounting fence (oxide#146): the
 /// library ledger's `capacity_policy: 2` refuses an older binary's strict
 /// parse, so this control fence must be durable *before* the first recorded
@@ -59,9 +57,9 @@ pub const WRITER_GENERATION: u32 = 1;
 pub const EVICTION_ACCOUNTING_STATE_VERSION: u32 = 7;
 /// Version 8 is the raised-ceiling fence (oxide#177).
 pub const SLOT_CEILING_STATE_VERSION: u32 = 8;
-/// Version 6 carries the one-use fence. A version-7 or version-8 document may
-/// also carry it, so presence requires at least this version and version 6
-/// requires the fence itself.
+/// Version 6 carried the one-use fence. A later document may also carry it,
+/// so presence requires at least this version and version 6 requires the fence
+/// itself; nothing writes the fence any more.
 pub const ONE_USE_STATE_VERSION: u32 = 6;
 /// Version 5 is the recorded-accounting fence (oxide#146), still written for
 /// a pool that has not opted into one-use workspaces or the raised ceiling.
@@ -78,9 +76,9 @@ pub const LEGACY_STATE_VERSION: u32 = 1;
 
 /// The recorded-accounting fence value; see [`State::recorded_accounting`].
 pub const RECORDED_ACCOUNTING_FENCE: &str = super::CONTROL_RECORDED_ACCOUNTING_FENCE;
-/// The one-use fence value; see [`State::one_use_workspaces`]. A document
-/// carrying it is at version 6 or later, and a document with either
-/// `class` or `class_reason` in any record always carries it.
+/// The one-use fence value; see [`State::one_use_workspaces`]. The feature is
+/// retired: nothing writes the fence any more, and an existing document that
+/// carries it stays readable as an inert value.
 pub const ONE_USE_FENCE: &str = super::CONTROL_ONE_USE_FENCE;
 /// The eviction-accounting fence value (oxide#175); see
 /// [`State::eviction_accounting`]. A document carrying it is at version 7 or
@@ -195,41 +193,6 @@ pub struct Record {
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_ms: Option<u64>,
-    /// This record's workspace class (design §5.1). Class is written once,
-    /// when the record is created, and never relabelled (§5.2).
-    ///
-    /// A **normal** record omits both new fields, so the bytes a version-6
-    /// binary writes for an ordinary slot are exactly the bytes a version-5
-    /// binary wrote and reads (`Record` denies unknown fields, and its
-    /// preflight compares only numeric versions). A `one_use` record is
-    /// therefore always accompanied by the durable fence, which is what tells
-    /// an older reader that this document is beyond it.
-    #[serde(default, skip_serializing_if = "class_is_normal")]
-    pub class: WorkspaceClass,
-    /// Bounded reason this workspace classified one-use (§5.1, §10.5). Only a
-    /// `one_use` record may carry one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub class_reason: Option<String>,
-}
-
-/// A slot record's workspace class (design §5.1).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceClass {
-    /// The protected class (§5.7): every pre-feature record reads as this, and
-    /// a normal slot keeps the project-cap and eviction rules it always had.
-    #[default]
-    Normal,
-    /// A temporary workspace's slot: never counted against the project cap
-    /// (§5.3), never shared with a normal command (§5.4).
-    OneUse,
-}
-
-/// The serializer omission rule of design §5.1: a normal record prints
-/// neither class field, so a superseded reader's strict parse still accepts
-/// the document.
-fn class_is_normal(class: &WorkspaceClass) -> bool {
-    *class == WorkspaceClass::Normal
 }
 
 impl Record {
@@ -376,10 +339,9 @@ pub struct State {
     /// off to a receipt-matching successor instead of refusing the pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_accounting: Option<String>,
-    /// Forward-only one-use fence (design §5.1, §10.1), written durably
-    /// **before** the first state document that carries a class-bearing
-    /// record and never cleared. A normal-only pool written by this binary
-    /// never sets it, so its numeric version does not advance.
+    /// The retired one-use fence. Nothing writes it any more; the field stays
+    /// only so an existing document that carries it keeps parsing, and a
+    /// version-6 document still needs it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub one_use_workspaces: Option<String>,
     /// Forward-only eviction-accounting fence (oxide#175), set durably
@@ -505,72 +467,6 @@ impl State {
     }
 }
 
-/// The bounded presence-aware decode of design §5.1, over the **same** bytes
-/// `load` already read (one parse, no re-serialisation, no payload walk).
-///
-/// `#[serde(default)]` makes an explicit `"class":"normal"` indistinguishable
-/// from an absent field in the typed parse, so the presence of either field
-/// needs its own pass: a document below [`ONE_USE_STATE_VERSION`] that names
-/// `class` or `class_reason` in **any** record object is refused here. With
-/// the one-use fence present, presence is expected and [`validate_state`]
-/// decides.
-///
-/// A document this pass cannot read is left to the typed parse, which reports
-/// the same malformed input with its own diagnostic. Field presence is read
-/// through a small raw schema rather than `serde_json::Value`, so the pass
-/// allocates only the two fields per record it is looking for.
-pub fn reject_class_fields_before_six(bytes: &[u8]) -> Result<(), String> {
-    #[derive(Deserialize)]
-    struct RawDocument {
-        version: Option<u64>,
-        one_use_workspaces: Option<String>,
-        records: Option<Vec<RawRecord>>,
-    }
-    // `Option<_>` cannot tell an absent key from an explicit `null` (serde
-    // maps `null` to `None`), and both are present fields, so the marker
-    // accepts and discards any value while reporting whether the key existed.
-    #[derive(Default)]
-    struct Present(bool);
-
-    impl<'de> Deserialize<'de> for Present {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            serde::de::IgnoredAny::deserialize(deserializer).map(|_| Self(true))
-        }
-    }
-
-    #[derive(Deserialize)]
-    struct RawRecord {
-        #[serde(default)]
-        class: Present,
-        #[serde(default)]
-        class_reason: Present,
-    }
-    let Ok(document) = serde_json::from_slice::<RawDocument>(bytes) else {
-        return Ok(());
-    };
-    let Some(version) = document.version else {
-        return Ok(());
-    };
-    if version >= u64::from(ONE_USE_STATE_VERSION)
-        && document.one_use_workspaces.as_deref() == Some(ONE_USE_FENCE)
-    {
-        return Ok(());
-    }
-    if document.records.is_some_and(|records| {
-        records
-            .iter()
-            .any(|record| record.class.0 || record.class_reason.0)
-    }) {
-        return Err(format!(
-            "Oxide state is invalid: a version-{version} record carries a one-use class field"
-        ));
-    }
-    Ok(())
-}
-
 /// Validate one control-state document. A legacy version-1 document keeps
 /// the legacy read limits (its byte cap is checked by `load`); a version-2
 /// document must satisfy every field cap and compact-object ceiling, so the
@@ -624,25 +520,15 @@ pub fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
         None => {}
         _ => return Err("Oxide state has an invalid eviction accounting fence".to_owned()),
     }
-    // The one-use fence and the one-use numeric version are equivalent at
-    // version 6 (design §5.1, §10.1): a class-bearing record always travels
-    // under both, and an unknown fence value refuses instead of being guessed
-    // at. Later versions may carry it too, so presence requires at least
-    // version 6 and version 6 requires the fence. Presence itself is decided
-    // by `reject_class_fields_before_six`, which the typed parse cannot do.
+    // The one-use fence and its numeric version are equivalent at version 6
+    // and stay readable as an inert value: the retired one-use feature never
+    // wrote one in a shipped build, so an existing document may carry it and
+    // nothing writes it any more. An unknown fence value still refuses instead
+    // of being guessed at.
     match state.one_use_workspaces.as_deref() {
         None => {
             if state.version == ONE_USE_STATE_VERSION {
                 return Err("Oxide state lacks the one_use_workspaces fence".to_owned());
-            }
-            if state
-                .records
-                .iter()
-                .any(|record| record.class != WorkspaceClass::Normal)
-            {
-                return Err(
-                    "Oxide state has a class-bearing record without the one-use fence".to_owned(),
-                );
             }
         }
         Some(fence) if fence == ONE_USE_FENCE => {
@@ -735,24 +621,6 @@ pub fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
         {
             return Err("Oxide record exceeds its field bounds".to_owned());
         }
-        // A class reason belongs to a one-use record alone, and is bounded like
-        // every other diagnostic (design §5.1).
-        match record.class {
-            WorkspaceClass::Normal => {
-                if record.class_reason.is_some() {
-                    return Err("Oxide record has an invalid workspace class".to_owned());
-                }
-            }
-            WorkspaceClass::OneUse => {
-                if record
-                    .class_reason
-                    .as_deref()
-                    .is_some_and(|value| !bounded_text(value, MAX_DIAGNOSTIC_BYTES))
-                {
-                    return Err("Oxide record has an invalid workspace class".to_owned());
-                }
-            }
-        }
         if let Some(holder) = &record.holder {
             if !bounded_text(&holder.lease_holder, MAX_LEASE_HOLDER_BYTES)
                 || holder
@@ -812,21 +680,6 @@ pub fn validate_recovery(recovery: &Recovery) -> Result<(), String> {
 
 pub fn bounded_text(value: &str, max: usize) -> bool {
     !value.is_empty() && value.len() <= max
-}
-
-/// Keep a stored class reason inside the state's diagnostic bound, on a
-/// character boundary. Classification reasons embed a path, and a pathological
-/// one must not turn a lease into a state error: the reason is a bounded
-/// diagnostic, so it is truncated rather than invented or refused.
-pub fn bounded_class_reason(reason: &str) -> String {
-    if reason.len() <= MAX_DIAGNOSTIC_BYTES {
-        return reason.to_owned();
-    }
-    let mut end = MAX_DIAGNOSTIC_BYTES;
-    while !reason.is_char_boundary(end) {
-        end -= 1;
-    }
-    reason[..end].to_owned()
 }
 
 pub fn path_text(path: &Path) -> bool {
@@ -914,15 +767,14 @@ fn reject_non_string_fences(bytes: &[u8]) -> Result<(), String> {
 }
 
 /// Parse and validate one control document exactly as the front door's
-/// `Store::load` does: byte caps, the presence-aware class pass, the typed
-/// parse (which denies unknown fields and requires the typed shape), the
-/// owned-outputs fence rule and [`validate_state`]. The fence uses this same
-/// function to decide what it may touch.
+/// `Store::load` does: byte caps, the typed parse (which denies unknown fields
+/// and requires the typed shape), the owned-outputs fence rule and
+/// [`validate_state`]. The fence uses this same function to decide what it may
+/// touch.
 pub fn parse_state(bytes: &[u8]) -> Result<State, String> {
     if bytes.len() as u64 > MAX_STATE_BYTES {
         return Err("Oxide state exceeds its byte limit".to_owned());
     }
-    reject_class_fields_before_six(bytes)?;
     reject_non_string_fences(bytes)?;
     let state: State = serde_json::from_slice(bytes)
         .map_err(|error| format!("Oxide state is invalid: {error}"))?;

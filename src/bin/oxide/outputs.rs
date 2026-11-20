@@ -1917,10 +1917,6 @@ struct PlanReport {
     marker_upgrade: Option<MarkerUpgradeView>,
     cooperative_holders: Vec<String>,
     next_generation: u64,
-    /// Set only for a guarded one-use workspace: one line stating that final
-    /// outputs are local and no owned root is selected (design §4.5).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    one_use: Option<&'static str>,
 }
 
 /// The root marker upgrade one layout migration would make. The plan never
@@ -2022,19 +2018,7 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
         marker_upgrade: None,
         cooperative_holders: holders,
         next_generation,
-        one_use: None,
     };
-    // A guarded workspace's plan is a local plan: it names no owned root and
-    // never offers adopt or conversion advice (design §4.5).
-    if guarded_workspace(context.control(), &context.workspace).is_some() {
-        report.action = "local";
-        report.one_use = Some(crate::one_use::PLAN_LOCAL);
-        report.reason = Some(
-            "this workspace is one-use (temporary): final outputs stay in its own target directory"
-                .to_owned(),
-        );
-        return Ok(report);
-    }
     if mode != Some(DriveMode::Permanent) {
         report.reason = Some(
             "the registered drive is not in permanent mode, so there is no owned-output policy to apply"
@@ -2370,12 +2354,6 @@ fn output_status_lines(context: &Context) -> Result<Vec<String>, String> {
             }
         }
     }
-    // One bounded line for a guarded one-use checkout (design §4.5, §10.5):
-    // final outputs are local and no owned root is selected. Never a savings
-    // claim.
-    if guarded_workspace(context.control(), &context.workspace).is_some() {
-        lines.push(crate::one_use::STATUS_LOCAL.to_owned());
-    }
     Ok(lines)
 }
 
@@ -2442,25 +2420,17 @@ fn adoption_publishes_a_transition(context: &Context, control: &Path) -> Result<
 }
 
 /// `oxide outputs adopt` against one already-opened context and a **lazy** pool
-/// provider, so the guarded refusal is decided before the pool is opened or
-/// coordinated (design §4.1: nothing at all happens first) and the verb-level
-/// regressions can hand in a provider that fails, proving the refusal wins.
+/// provider, so the verb decides before the pool is opened or coordinated and
+/// the verb-level regressions can hand in a provider that fails.
+///
+/// The shipped order is kept **exactly**, including its error precedence: drive
+/// mode, then the control directory, then the pool. The pool provider is
+/// therefore called last, so the verb reports the same refusal a pre-feature
+/// build reported when more than one precondition is unmet.
 fn adopt_at(
     context: &Context,
     pool: impl FnOnce() -> Result<Option<Store>, String>,
 ) -> Result<u8, String> {
-    // A guarded workspace always refuses `adopt`, whatever the receipt state,
-    // and it refuses here: effect-free, before the drive-mode, pool and
-    // barrier work below, so the verb never enters custody (design §4.1,
-    // §4.5). The state selects only the text.
-    if guarded_workspace(context.control(), &context.workspace).is_some() {
-        return Err(guarded_adopt_refusal(context));
-    }
-    // Otherwise the shipped order is kept **exactly**, including its error
-    // precedence: drive mode, then the control directory, then the pool. The
-    // pool provider is therefore called last, so a dormant build reports the
-    // same refusal a pre-S1 build reported when more than one precondition is
-    // unmet.
     let mode = context.mode()?;
     if mode != Some(DriveMode::Permanent) {
         return Err(format!(
@@ -2483,7 +2453,7 @@ fn adopt_at(
     let mut waits = WaitAccounting::default();
     let guard = barrier(internal, &context.workspace, &mut waits)?;
     let outcome = (|| {
-        // The unsettled intent is read *inside* the guarded closure: the check
+        // The unsettled intent is read *inside* the closure: the check
         // must not leave the checkout's clean mark and waiter lock behind (the
         // barrier is released on every path), and it must still run while no
         // command in this checkout can settle the intent underneath it.
@@ -4452,14 +4422,11 @@ fn detach_command() -> Result<u8, String> {
 }
 
 /// `oxide outputs detach` against one already-opened context and a **lazy**
-/// pool provider, so the guard's effect-free fast precheck runs before the pool
-/// is opened: a guarded workspace refuses a `Prepared` transition, an unsettled
-/// prune intent or a listed root with literally nothing done.
+/// pool provider, so the verb decides before the pool is opened.
 fn detach_at(
     context: &Context,
     pool: impl FnOnce() -> Result<Option<Store>, String>,
 ) -> Result<u8, String> {
-    guarded_command_precheck(context, "outputs detach refused")?;
     let Some(control) = context.control().map(Path::to_path_buf) else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
@@ -4469,24 +4436,8 @@ fn detach_at(
     let internal = &internal;
     process::install_signal_handlers()?;
     let mut waits = WaitAccounting::default();
-    // A guarded workspace takes the same barrier, but through the guarded
-    // order: receipt and migration journal revalidated under the checkout
-    // binding mutex before any mark exists, then a bounded non-blocking
-    // `Barrier`-mode acquisition (design §4.1 steps 3-5, §4.5). A normal
-    // workspace keeps the shipped order byte for byte.
-    let guarded = guarded_workspace(Some(&control), &context.workspace).is_some();
-    let guard = if guarded {
-        guarded_barrier(internal, context, &mut waits)?
-    } else {
-        barrier(internal, &context.workspace, &mut waits)?
-    };
+    let guard = barrier(internal, &context.workspace, &mut waits)?;
     let outcome = (|| {
-        // Belt and braces: a `Prepared` transition that appeared while the
-        // barrier was taken is a custody defect, so the verb stops before its
-        // effects rather than replaying (design §4.1 step 6).
-        if guarded {
-            guarded_prepared_refusal(&context)?;
-        }
         refuse_unknown_custody(&internal, &context.workspace, "detach")?;
         // A pool adopted before the shared output format upgrades behind
         // the forward fence before its first receipt write (a no-op once
@@ -4783,7 +4734,6 @@ pub fn bind_for_command(
     expected: Option<&Plan>,
     pool_fallback: Option<&str>,
     repair_absent_members: bool,
-    guarded: Option<&LocalOutputs<'_>>,
 ) -> Result<OutputBinding, String> {
     let (mut binding, receipt) = bind_for_command_inner(
         store,
@@ -4792,7 +4742,6 @@ pub fn bind_for_command(
         expected,
         pool_fallback,
         repair_absent_members,
-        guarded,
     )?;
     // The running holds come from the very receipt the binding decision used,
     // never from a second read that a peer transition could have replaced.
@@ -4811,8 +4760,8 @@ pub fn bind_for_command(
 }
 
 /// The binding decision and the receipt it was taken on. `None` is returned
-/// only where no receipt took part (a guarded workspace or an unconverted
-/// checkout), so no hold is taken either.
+/// only where no receipt took part (an unconverted checkout), so no hold is
+/// taken either.
 fn bind_for_command_inner(
     store: &Store,
     checkout: &Path,
@@ -4820,21 +4769,12 @@ fn bind_for_command_inner(
     expected: Option<&Plan>,
     pool_fallback: Option<&str>,
     repair_absent_members: bool,
-    guarded: Option<&LocalOutputs<'_>>,
 ) -> Result<(OutputBinding, Option<Receipt>), String> {
     let context = Context::new(
         Some(store.owner_control().to_path_buf()),
         checkout.to_path_buf(),
     )
     .with_pool_fallback(pool_fallback);
-    // A guarded workspace owns no output root, so none of the owned-output
-    // machinery below applies to it: no prune intent, no drive mode, no
-    // receipt transition, no link. The authoritative decision is taken under
-    // the checkout binding mutex in `bind_local_outputs`, and the command
-    // starts with a real local `target`.
-    if let Some(local) = guarded {
-        return Ok((bind_local_outputs(store, &context, expected, local)?, None));
-    }
     if let Some(intent) = crate::prune::unsettled_for(store.owner_control(), &context.checkout_id)?
     {
         return Err(format!(
@@ -4967,9 +4907,7 @@ fn keyed_state_matches(receipt: Option<&Receipt>, expected: Option<&Plan>) -> Re
     keyed_state_refusal(converted, expected)
 }
 
-/// The shipped key mismatch refusal for one already-decided `converted` fact,
-/// so a guarded binding can use the same text with its own notion of a receipt
-/// that selects nothing (design §4.2's `Pruned` row).
+/// The shipped key mismatch refusal for one already-decided `converted` fact.
 fn keyed_state_refusal(converted: bool, expected: Option<&Plan>) -> Result<(), String> {
     if converted == expected.is_some() {
         return Ok(());
@@ -6063,14 +6001,7 @@ pub fn planned_destination(
     checkout: &Path,
     declaration: &crate::layout::Declaration,
     pool_fallback: Option<&str>,
-    guarded: bool,
 ) -> Result<Option<Plan>, String> {
-    // A guarded workspace's final outputs are local: the plan selects no owned
-    // destination, so the slot key is exactly an unconverted checkout's key
-    // (design §4.1). Nothing below is read and no root is proposed.
-    if guarded {
-        return Ok(None);
-    }
     let Some(control) = control else {
         return Ok(None);
     };
@@ -6186,84 +6117,6 @@ pub fn lease_declaration(
             refuse_unknown_layout(control, checkout, &reason)?;
             Ok(crate::layout::Declaration::empty())
         }
-    }
-}
-
-/// The declaration a guarded one-use workspace's leased command uses (design
-/// §4.1, §4.3).
-///
-/// A guarded workspace owns no output root, so it never derives a member set
-/// from a receipt and nothing here reads one or refuses: the set exists only
-/// to name the components §4.3's guard inspects. A command whose layout this
-/// build cannot model — a JSON target specification, or a derived `oxide exec`
-/// with no `--output` — declares no member, and the guard then inspects the
-/// checkout's `target` directory alone; the command still builds locally.
-pub fn guarded_declaration(
-    invocation: &crate::cli::Invocation,
-) -> Result<crate::layout::Declaration, String> {
-    let command = invocation.command.as_str();
-    if command == "exec" || crate::cli::derives_from_receipt(command, &invocation.declared_outputs)
-    {
-        let declared = crate::layout::declared(&invocation.declared_outputs)?;
-        if declared.is_empty() {
-            // An opaque tool names no member, but §4.2 row 2 still has to
-            // refuse a link planted at the Cargo profile outputs a tool writes
-            // through, so the guard inspects them.
-            return Ok(opaque_guarded_members(invocation));
-        }
-        return Ok(declared);
-    }
-    Ok(
-        match crate::layout::classify(
-            command,
-            invocation.profile,
-            invocation.explicit_profile,
-            &invocation.targets,
-        ) {
-            crate::layout::Layout::Declared(declaration) => declaration,
-            // A layout this build cannot model (a JSON target specification)
-            // names no member either, so it gets the same conservative
-            // inspection set instead of an empty one.
-            crate::layout::Layout::Unknown(_) => opaque_guarded_members(invocation),
-        },
-    )
-}
-
-/// The inspection set of a guarded command that names no profile member:
-/// `oxide exec` without `--output` and an external subcommand (design §4.2
-/// row 2, §4.3). The two Cargo profile outputs any Cargo-driven tool can write
-/// are always inspected — a planted `target/debug` or `target/release` link must
-/// refuse even when the command itself declared nothing — plus the triple forms
-/// of any `--target` this command declares. Bounded by the layout's member cap;
-/// a pathological `--target` cannot extend it, so the two profile members still
-/// apply.
-fn opaque_guarded_members(invocation: &crate::cli::Invocation) -> crate::layout::Declaration {
-    let mut names: Vec<String> = vec!["debug".to_owned(), "release".to_owned()];
-    for triple in &invocation.targets {
-        for profile in ["debug", "release"] {
-            if names.len() >= crate::layout::MAX_MEMBERS {
-                break;
-            }
-            let name = format!("{triple}/{profile}");
-            if crate::layout::Member::parse(&name).is_ok() {
-                names.push(name);
-            }
-        }
-    }
-    let parsed = names
-        .iter()
-        .filter_map(|name| crate::layout::Member::parse(name).ok());
-    match crate::layout::Declaration::new(parsed) {
-        Ok(declaration) => declaration,
-        // Two plain profile members are always a valid set, so this fallback
-        // cannot lose the profile inspection; only an overlapping `--target`
-        // spelling is dropped.
-        Err(_) => crate::layout::Declaration::new(
-            ["debug", "release"]
-                .iter()
-                .filter_map(|name| crate::layout::Member::parse(name).ok()),
-        )
-        .unwrap_or_else(|_| crate::layout::Declaration::empty()),
     }
 }
 
@@ -6930,13 +6783,11 @@ fn cancel_command() -> Result<u8, String> {
 }
 
 /// `oxide outputs cancel-reservation` against one already-opened context and a
-/// **lazy** pool provider: the same effect-free fast precheck as `detach`, and
-/// it runs before the pool is opened.
+/// **lazy** pool provider, so the verb decides before the pool is opened.
 fn cancel_at(
     context: &Context,
     pool: impl FnOnce() -> Result<Option<Store>, String>,
 ) -> Result<u8, String> {
-    guarded_command_precheck(context, "outputs cancel-reservation refused")?;
     let Some(control) = context.control().map(Path::to_path_buf) else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
@@ -6946,19 +6797,8 @@ fn cancel_at(
     let internal = &internal;
     process::install_signal_handlers()?;
     let mut waits = WaitAccounting::default();
-    // The same guarded order as `detach`: revalidate the receipt and the
-    // migration journal under the binding mutex before any mark, then a
-    // bounded `Barrier`-mode acquisition (design §4.5).
-    let guarded = guarded_workspace(Some(&control), &context.workspace).is_some();
-    let guard = if guarded {
-        guarded_barrier(internal, context, &mut waits)?
-    } else {
-        barrier(internal, &context.workspace, &mut waits)?
-    };
+    let guard = barrier(internal, &context.workspace, &mut waits)?;
     let outcome = (|| -> Result<Option<Reservation>, String> {
-        if guarded {
-            guarded_prepared_refusal(&context)?;
-        }
         let _binding = internal.lock_binding(&context.workspace)?;
         let mut receipt = read_receipt(&control, &context.workspace, &context.checkout_id)?
             .ok_or("this checkout has no owned-output receipt; nothing to cancel")?;
@@ -7102,99 +6942,8 @@ fn selected_facts(selected: &Selected) -> String {
     )
 }
 
-/// What a guarded leased command needs from the local-output guard: the
-/// member set design §4.3 inspects and the bounded reason its one note
-/// prints.
-pub struct LocalOutputs<'a> {
-    pub members: &'a [String],
-    pub reason: &'a str,
-}
-
-/// The one-use classification of `workspace` when the feature is active and
-/// the workspace is guarded; `None` when the feature is dormant or the
-/// workspace is normal, which is every production command in this slice.
-///
-/// Effect-free: the classification reads the environment and the registered
-/// pool facts only. Dropped-root notes are printed by the leased-command path
-/// alone, so one command reports them once.
-pub(crate) fn guarded_workspace(
-    control: Option<&Path>,
-    workspace: &Path,
-) -> Option<crate::one_use::Classification> {
-    if !crate::one_use::is_active() {
-        return None;
-    }
-    let classification =
-        crate::one_use::classify(workspace, &crate::one_use::Facts::from_control(control));
-    #[cfg(test)]
-    crate::one_use::note_classification();
-    classification.guarded().then_some(classification)
-}
-
-/// Whether this receipt records an unresolved `Prepared` transition, in any
-/// shape: the state itself, a pending layout-migration journal, or a prepared
-/// placement (design §4.1, §4.4).
-fn prepared_like(receipt: &Receipt) -> bool {
-    receipt.state == ReceiptState::Prepared
-        || receipt.transition.is_some()
-        || receipt
-            .links()
-            .iter()
-            .any(|placement| placement.prepared_ref().is_some())
-}
-
-/// The exact guarded `Prepared` refusal for one checkout (design §4.4). Every
-/// guarded verb revalidates through this before any effect, under its own
-/// custody, so a `Prepared` receipt or a pending migration journal is never
-/// replayed and never repaired from a guarded workspace.
-fn guarded_prepared_refusal(context: &Context) -> Result<(), String> {
-    match context.receipt()? {
-        Some(receipt) if prepared_like(&receipt) => {
-            Err(crate::one_use::PREPARED_GUARDED.to_owned())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// The effect-free fast precheck of a guarded output verb (design §4.1 part 1,
-/// §4.5): the checkout's authority state is read, and nothing else happens — no
-/// pool open, no signal handler, no binding mutex, no barrier, no clean mark,
-/// no id. It may refuse early; it never authorises the verb, whose
-/// authoritative revalidation still runs under the binding mutex.
-fn guarded_command_precheck(context: &Context, verb: &str) -> Result<(), String> {
-    if guarded_workspace(context.control(), &context.workspace).is_none() {
-        return Ok(());
-    }
-    unsettled_refusal(context.control(), &context.checkout_id)?;
-    guarded_prepared_refusal(context)?;
-    // The shipped `Pruning` refusal is kept: a guarded workspace never replays
-    // or repairs a listed root either.
-    if let Some(receipt) = context.receipt()? {
-        if receipt.state == ReceiptState::Pruning {
-            return Err(format!("{verb}: {}", pruning_refusal()));
-        }
-    }
-    Ok(())
-}
-
-/// The guarded `adopt` refusal and its precedence (design §4.1, §4.5): a
-/// `Prepared` transition (the state, a prepared placement or a pending
-/// migration journal) selects the exact §4.4 diagnostic; **every** other state
-/// — absent, `Committed`, `Detached`, `Pruned`, `Pruning`, an unsettled prune
-/// intent, a malformed or mismatched receipt — selects the general refusal.
-/// A malformed document is never the reply and never becomes the decision,
-/// because a guarded workspace cannot adopt at all.
-fn guarded_adopt_refusal(context: &Context) -> String {
-    if matches!(context.receipt(), Ok(Some(receipt)) if prepared_like(&receipt)) {
-        crate::one_use::PREPARED_GUARDED.to_owned()
-    } else {
-        crate::one_use::adopt_refusal(&context.workspace)
-    }
-}
-
 /// The one refusal text for a receipt whose listed legacy root is being
-/// pruned, reused by the guard so a guarded command refuses before any effect
-/// exactly as it does today.
+/// pruned.
 fn pruning_refusal() -> String {
     format!(
         "a listed legacy root of this checkout is being pruned; {PRUNE_INTENT_POSITION}; nothing changes"
@@ -7204,220 +6953,6 @@ fn pruning_refusal() -> String {
 /// The one refusal text for this checkout's unsettled prune intent.
 fn unsettled_prune_refusal(intent: &str) -> String {
     format!("prune intent {intent} is unsettled for this checkout; {PRUNE_INTENT_POSITION}")
-}
-
-/// The guarded local-output decision for one leased command (design §4.2),
-/// read-only and effect-free.
-///
-/// `Ok(())` means the command runs with local outputs; `Err` is the exact
-/// refusal text and means nothing was created, linked, reserved or deleted.
-fn local_outputs_decision(
-    context: &Context,
-    members: &[String],
-    prefix: &str,
-) -> Result<(), String> {
-    unsettled_refusal(context.control(), &context.checkout_id)?;
-    if let Some(receipt) = context.receipt()? {
-        if prepared_like(&receipt) {
-            return Err(crate::one_use::PREPARED_GUARDED.to_owned());
-        }
-        match receipt.state {
-            // A committed receipt selects an owned root in every member shape,
-            // so a guarded workspace never builds locally through it.
-            ReceiptState::Committed => {
-                let root = receipt
-                    .selected()
-                    .map_or_else(|| context.link(), |selected| selected.root.clone());
-                return Err(crate::one_use::committed_refusal(&root));
-            }
-            ReceiptState::Pruning => return Err(format!("{prefix}: {}", pruning_refusal())),
-            // `Detached` and `Pruned` own no selection: the live components
-            // below decide, and neither is a repair opportunity.
-            ReceiptState::Prepared | ReceiptState::Detached | ReceiptState::Pruned => {}
-        }
-    }
-    inspect_components(&context.link(), members, prefix)
-}
-
-/// The bounded component inspection of design §4.3: `<workspace>/target` and
-/// every profile member this command declares, each reached through its
-/// parent chain with `symlink_metadata` only. No listing, no recursion, no
-/// link followed, no payload walk.
-fn inspect_components(target: &Path, members: &[String], prefix: &str) -> Result<(), String> {
-    if !inspect_component(target, prefix)? {
-        // An absent target holds nothing below it.
-        return Ok(());
-    }
-    for member in members {
-        let mut path = target.to_path_buf();
-        for component in member.split('/') {
-            path.push(component);
-            if !inspect_component(&path, prefix)? {
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// One inspected component: `Ok(false)` absent, `Ok(true)` a real directory,
-/// and a refusal (or an unreadable-path error) for anything else.
-fn inspect_component(path: &Path, prefix: &str) -> Result<bool, String> {
-    let shown = || path.display().to_string();
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(format!(
-            "{prefix}: cannot inspect {}: {error}; nothing was changed",
-            shown()
-        )),
-        Ok(metadata) => {
-            if is_real_dir(&metadata) {
-                return Ok(true);
-            }
-            let kind = if metadata.file_type().is_symlink() {
-                "a symbolic link".to_owned()
-            } else if metadata.is_file() {
-                "a file".to_owned()
-            } else {
-                "not a real directory".to_owned()
-            };
-            Err(format!(
-                "{prefix}: {} is {kind}; a one-use (temporary) workspace keeps final outputs local and Oxide never follows, adopts or replaces it; nothing was changed",
-                shown()
-            ))
-        }
-    }
-}
-
-/// The guard's effect-free fast precheck for a leased command (design §4.1
-/// part 1). It may refuse early, with literally nothing created, and it never
-/// authorises the command: the authoritative decision is taken again inside
-/// [`bind_for_command`]'s checkout binding mutex.
-pub fn guarded_precheck(
-    control: Option<&Path>,
-    checkout: &Path,
-    members: &[String],
-) -> Result<(), String> {
-    let context = Context::new(control.map(Path::to_path_buf), checkout.to_path_buf());
-    local_outputs_decision(&context, members, "outputs")
-}
-
-/// The guarded binding branch: local outputs only, with the authoritative
-/// revalidation under the checkout binding mutex and no output effect at all
-/// (design §4.1 row 4).
-///
-/// The mutex excludes the one writer that can publish a `Prepared` receipt
-/// under the mutex alone (a peer command's own binding), so a transition that
-/// appeared while this command waited is refused here rather than replayed.
-fn bind_local_outputs(
-    store: &Store,
-    context: &Context,
-    expected: Option<&Plan>,
-    local: &LocalOutputs<'_>,
-) -> Result<OutputBinding, String> {
-    let lock = store.lock_binding(&context.workspace)?;
-    unsettled_refusal(context.control(), &context.checkout_id)?;
-    let receipt = context.receipt()?;
-    if let Some(receipt) = &receipt {
-        if prepared_like(receipt) {
-            return Err(crate::one_use::PREPARED_GUARDED.to_owned());
-        }
-        match receipt.state {
-            ReceiptState::Committed => {
-                let root = receipt
-                    .selected()
-                    .map_or_else(|| context.link(), |selected| selected.root.clone());
-                return Err(crate::one_use::committed_refusal(&root));
-            }
-            ReceiptState::Pruning => return Err(format!("outputs: {}", pruning_refusal())),
-            ReceiptState::Prepared | ReceiptState::Detached | ReceiptState::Pruned => {}
-        }
-    }
-    inspect_components(&context.link(), local.members, "outputs")?;
-    // A slot is keyed for a local target, so a checkout converted while this
-    // command waited still refuses through the shipped key check rather than
-    // binding another destination. A receipt that selects nothing is
-    // unconverted for this purpose (design §4.2); a `Committed`, `Prepared` or
-    // `Pruning` receipt was refused above.
-    let converted = receipt
-        .as_ref()
-        .is_some_and(|receipt| !receipt.selects_nothing());
-    keyed_state_refusal(converted, expected)?;
-    Ok(OutputBinding {
-        outcome: local_outcome(local.reason),
-        _lock: Some(lock),
-        _holds: Vec::new(),
-        ephemeral: false,
-    })
-}
-
-/// The one bounded note a guarded command prints, through the shipped warning
-/// surface (design §4.5). No owned root is selected and no adoption warning is
-/// added.
-fn local_outcome(reason: &str) -> Outcome {
-    Outcome {
-        warnings: vec![format!("one-use workspace: local outputs ({reason})")],
-        note: None,
-        root: None,
-    }
-}
-
-/// The guarded verbs' barrier acquisition (design §4.1 steps 3-5).
-///
-/// The checkout binding mutex is held across **both** the revalidation and the
-/// non-blocking `Barrier` attempt, so no peer command's binding can publish a
-/// `Prepared` receipt in the gap between them; it is released between attempts
-/// and before the poll. Every lock the attempt takes is non-blocking, so this
-/// order can never deadlock with a shipped verb that holds the barrier and then
-/// wants the binding mutex. The attempt budget is
-/// [`crate::store::barrier_attempts`]; expiry is the bounded busy refusal with
-/// nothing written.
-fn guarded_barrier(
-    store: &Store,
-    context: &Context,
-    waits: &mut WaitAccounting,
-) -> Result<CleanGuard, String> {
-    for _ in 0..crate::store::barrier_attempts() {
-        if let Some(signal) = process::received_signal() {
-            return Err(format!(
-                "interrupted by signal {signal} while waiting for this checkout's commands to finish; nothing was changed"
-            ));
-        }
-        let binding = store.lock_binding(&context.workspace)?;
-        let attempt = store.begin_clean_barrier(&context.workspace, waits, || {
-            guarded_prepared_refusal(context)
-        })?;
-        drop(binding);
-        match attempt {
-            Cleaning::Guard(guard) => return Ok(guard),
-            Cleaning::Interrupted(signal) => {
-                return Err(format!(
-                    "interrupted by signal {signal} while waiting for this checkout's commands to finish; nothing was changed"
-                ))
-            }
-            // A dead fact: no attempt can make progress, so refuse now.
-            Cleaning::Busy(reason) => return Err(reason),
-            Cleaning::Retry(_) => std::thread::sleep(BINDING_POLL),
-        }
-    }
-    Err(crate::one_use::BARRIER_BUSY.to_owned())
-}
-
-/// Refuse a guarded command while a prune intent for this checkout is
-/// unsettled: the shipped refusal, kept for the guarded branch (design §4.2's
-/// "refuses through the existing validation/refusal"), because the intent owns
-/// authority over this checkout's roots.
-fn unsettled_refusal(control: Option<&Path>, checkout_id: &str) -> Result<(), String> {
-    let Some(control) = control else {
-        return Ok(());
-    };
-    match crate::prune::unsettled_for(control, checkout_id)? {
-        Some(intent) => Err(format!(
-            "outputs: {}; nothing is built while it is unsettled",
-            unsettled_prune_refusal(&intent)
-        )),
-        None => Ok(()),
-    }
 }
 
 /// Refuse an explicit output command while this checkout has unknown writer
@@ -7450,9 +6985,6 @@ fn barrier(
 ) -> Result<CleanGuard, String> {
     match store.begin_clean(checkout, waits)? {
         Cleaning::Guard(guard) => Ok(guard),
-        // `Recovering` mode never returns `Busy` or `Retry`; only a guarded
-        // verb's `Barrier` mode does, through [`guarded_barrier`]'s own loop.
-        Cleaning::Busy(reason) | Cleaning::Retry(reason) => Err(reason),
         Cleaning::Interrupted(signal) => Err(format!(
             "interrupted by signal {signal} while waiting for this checkout's commands to finish; nothing was changed"
         )),
@@ -9728,10 +9260,6 @@ impl CleanPlacement {
 pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, String> {
     let settings = store::settings()?;
     let control = Store::open_existing_with(&settings)?.map(|store| store.control().to_path_buf());
-    // A guarded workspace keeps clean's refusal but loses its adopt advice
-    // (design §4.4): the guarded diagnostic is the only text, and nothing is
-    // changed. Every normal checkout keeps the shipped wording.
-    let guarded = guarded_workspace(control.as_deref(), workspace).is_some();
     let context = Context::new(control, workspace.to_path_buf());
     let receipt = context.receipt()?;
     let unconverted = receipt.as_ref().is_none_or(Receipt::selects_nothing);
@@ -9744,12 +9272,10 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
     match receipt.state {
         ReceiptState::Detached | ReceiptState::Pruned => Ok(None),
         ReceiptState::Pruning => Err(format!("outputs: {}", pruning_refusal())),
-        ReceiptState::Prepared => Err(if guarded {
-            crate::one_use::PREPARED_GUARDED.to_owned()
-        } else {
+        ReceiptState::Prepared => Err(
             "clean refused: an interrupted owned-output transition is pending; ensure a permanent drive registration, then run `oxide outputs adopt` to replay it before cleaning"
-                .to_owned()
-        }),
+                .to_owned(),
+        ),
         ReceiptState::Committed => {
             // The profile layout is validated BEFORE the whole-target link
             // pre-gate: `target` is a real directory there, never the link the
@@ -10280,7 +9806,7 @@ mod tests {
         ))
         .unwrap_err();
         assert!(status.contains("oxide outputs adopt"), "{status}");
-        let bind = match bind_for_command(&store, &fixture.checkout, 0, None, None, false, None) {
+        let bind = match bind_for_command(&store, &fixture.checkout, 0, None, None, false) {
             Err(reason) => reason,
             Ok(_) => panic!("binding accepted a version-1 receipt"),
         };
@@ -10725,7 +10251,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -10739,15 +10264,10 @@ mod tests {
         assert!(facts.contains(" release"), "{facts}");
         let declared =
             crate::layout::declared(&["debug".to_owned(), "release".to_owned()]).unwrap();
-        let declared_plan = planned_destination(
-            Some(&fixture.control),
-            &fixture.checkout,
-            &declared,
-            None,
-            false,
-        )
-        .unwrap()
-        .unwrap();
+        let declared_plan =
+            planned_destination(Some(&fixture.control), &fixture.checkout, &declared, None)
+                .unwrap()
+                .unwrap();
         assert_eq!(destination_facts(Some(&declared_plan)), facts);
     }
 
@@ -10771,7 +10291,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -10780,15 +10299,10 @@ mod tests {
         assert!(!facts.contains(triple), "{facts}");
         assert_eq!(facts.lines().count(), 2, "{facts}");
         let declared = crate::layout::declared(&[triple.to_owned()]).unwrap();
-        let declared_plan = planned_destination(
-            Some(&fixture.control),
-            &fixture.checkout,
-            &declared,
-            None,
-            false,
-        )
-        .unwrap()
-        .unwrap();
+        let declared_plan =
+            planned_destination(Some(&fixture.control), &fixture.checkout, &declared, None)
+                .unwrap()
+                .unwrap();
         assert!(destination_facts(Some(&declared_plan)).contains(triple));
         // The binding keeps `release` local and reports it once, in the
         // existing grammar.
@@ -10827,8 +10341,7 @@ mod tests {
             Some(&fixture.control),
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
-            None,
-            false,
+            None
         )
         .unwrap()
         .is_none());
@@ -10907,8 +10420,7 @@ mod tests {
             Some(&fixture.control),
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
-            None,
-            false,
+            None
         )
         .unwrap()
         .is_none());
@@ -10930,7 +10442,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -11029,7 +10540,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -11094,7 +10604,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -11168,7 +10677,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -11265,15 +10773,9 @@ mod tests {
         // A declared override is still complete: it names the member the
         // receipt does not place and plans the owned root for it.
         let declared = crate::layout::declared(&["release".to_owned()]).unwrap();
-        let plan = planned_destination(
-            Some(&fixture.control),
-            &fixture.checkout,
-            &declared,
-            None,
-            false,
-        )
-        .unwrap()
-        .unwrap();
+        let plan = planned_destination(Some(&fixture.control), &fixture.checkout, &declared, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(plan.members.len(), 1);
         assert_eq!(plan.selected().map(Selected::root), Some(root.as_path()));
         // A checkout path with a space changes nothing: member names carry no
@@ -11287,8 +10789,7 @@ mod tests {
                     Some(&spaced.control),
                     &spaced.checkout,
                     &exec_declaration(Some(&spaced.control), &spaced.checkout, None).unwrap(),
-                    None,
-                    false,
+                    None
                 )
                 .unwrap()
                 .as_ref()
@@ -11336,7 +10837,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap();
         let facts = destination_facts(plan.as_ref());
@@ -11348,14 +10848,8 @@ mod tests {
         // One derivation, one key: the shipped `exec` path renders the same
         // bytes for the same checkout.
         let exec = exec_declaration(Some(&fixture.control), &fixture.checkout, None).unwrap();
-        let exec_plan = planned_destination(
-            Some(&fixture.control),
-            &fixture.checkout,
-            &exec,
-            None,
-            false,
-        )
-        .unwrap();
+        let exec_plan =
+            planned_destination(Some(&fixture.control), &fixture.checkout, &exec, None).unwrap();
         assert_eq!(destination_facts(exec_plan.as_ref()), facts);
         // The old refusal still exists for a classification this layout cannot
         // model, and it would have refused this profile checkout — which is
@@ -11386,8 +10880,7 @@ mod tests {
             Some(&plain.control),
             &plain.checkout,
             &crate::layout::Declaration::empty(),
-            None,
-            false,
+            None
         )
         .unwrap()
         .is_none());
@@ -11412,7 +10905,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -11423,14 +10915,9 @@ mod tests {
             "{facts}"
         );
         let modelled = declaration_of(&["debug".to_owned()]);
-        let modelled_plan = planned_destination(
-            Some(&fixture.control),
-            &fixture.checkout,
-            &modelled,
-            None,
-            false,
-        )
-        .unwrap();
+        let modelled_plan =
+            planned_destination(Some(&fixture.control), &fixture.checkout, &modelled, None)
+                .unwrap();
         assert_eq!(destination_facts(modelled_plan.as_ref()), facts);
     }
 
@@ -11457,7 +10944,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -11646,7 +11132,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -11857,7 +11342,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -12025,7 +11509,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -12041,7 +11524,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -12052,7 +11534,6 @@ mod tests {
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
             None,
-            false,
         )
         .unwrap_err();
         assert!(refused.contains("declares none"), "{refused}");
@@ -12258,14 +11739,9 @@ mod tests {
                 .unwrap();
         assert!(facts.members().len() == 1);
         facts = crate::layout::Declaration::empty();
-        assert!(planned_destination(
-            Some(&fixture.control),
-            &fixture.checkout,
-            &facts,
-            None,
-            false
-        )
-        .is_err());
+        assert!(
+            planned_destination(Some(&fixture.control), &fixture.checkout, &facts, None).is_err()
+        );
     }
 
     /// The observed defect (oxide#162): a migration that linked the host
@@ -14027,7 +13503,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -14155,7 +13630,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -14236,7 +13710,6 @@ mod tests {
                 &fixture.checkout,
                 &declaration,
                 None,
-                false,
             )
             .unwrap()
             .unwrap();
@@ -14341,7 +13814,7 @@ mod tests {
         let plain = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
         let plain_store = pool_store(&plain.root.join("pool"));
         let binding =
-            bind_for_command(&plain_store, &plain.checkout, 0, None, None, false, None).unwrap();
+            bind_for_command(&plain_store, &plain.checkout, 0, None, None, false).unwrap();
         assert_eq!(binding.outcome.root, None);
         assert!(!plain.checkout.join("target").exists());
         assert!(!receipt_path(plain_store.control(), &context_id(&plain)).exists());
@@ -14404,7 +13877,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -14506,7 +13978,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -14622,7 +14093,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -14692,7 +14162,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -14812,7 +14281,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             Some("the registered volume is away"),
-            false,
         )
         .unwrap()
         .unwrap();
@@ -15018,7 +14486,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -15060,7 +14527,7 @@ mod tests {
 
         let declaration = declared(&["debug", "release"]);
         let plan = |members: &crate::layout::Declaration| {
-            planned_destination(Some(control), &fixture.checkout, members, None, false)
+            planned_destination(Some(control), &fixture.checkout, members, None)
                 .unwrap()
                 .unwrap()
         };
@@ -15080,9 +14547,8 @@ mod tests {
             destination_facts(Some(&keyed))
         );
 
-        let bind = |keyed: &Plan| {
-            bind_for_command(&store, &fixture.checkout, 0, Some(keyed), None, false, None)
-        };
+        let bind =
+            |keyed: &Plan| bind_for_command(&store, &fixture.checkout, 0, Some(keyed), None, false);
         let binding = bind(&keyed).unwrap();
         assert_eq!(
             binding._holds.len(),
@@ -15857,14 +15323,8 @@ mod tests {
         let fixture = Fixture::new();
         let context = fixture.context();
         let empty = crate::layout::Declaration::empty();
-        let planned = planned_destination(
-            Some(&fixture.control),
-            &fixture.checkout,
-            &empty,
-            None,
-            false,
-        )
-        .unwrap();
+        let planned =
+            planned_destination(Some(&fixture.control), &fixture.checkout, &empty, None).unwrap();
         assert!(planned.is_none());
         assert_eq!(destination_facts(None), "");
         let receipt = transition(
@@ -15875,15 +15335,9 @@ mod tests {
             NonceAuthority::Unkeyed,
         )
         .unwrap();
-        let planned = planned_destination(
-            Some(&fixture.control),
-            &fixture.checkout,
-            &empty,
-            None,
-            false,
-        )
-        .unwrap()
-        .unwrap();
+        let planned = planned_destination(Some(&fixture.control), &fixture.checkout, &empty, None)
+            .unwrap()
+            .unwrap();
         let selected = planned.selected().unwrap();
         assert_eq!(selected.kind, RootKind::Local);
         assert_eq!(selected.root, fixture.local().root());
@@ -15901,15 +15355,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(again.generation, 2);
-        let planned = planned_destination(
-            Some(&fixture.control),
-            &fixture.checkout,
-            &empty,
-            None,
-            false,
-        )
-        .unwrap()
-        .unwrap();
+        let planned = planned_destination(Some(&fixture.control), &fixture.checkout, &empty, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(destination_facts(Some(&planned)), first);
     }
 
@@ -16354,7 +15802,6 @@ mod tests {
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -16389,7 +15836,6 @@ mod tests {
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
             None,
-            false,
         )
         .unwrap();
         assert!(planned.is_none(), "{planned:?}");
@@ -16418,7 +15864,6 @@ mod tests {
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
             Some("container mismatch"),
-            false,
         )
         .unwrap()
         .unwrap();
@@ -17015,10 +16460,9 @@ mod tests {
                 .map(|name| crate::layout::Member::parse(name).unwrap()),
         )
         .unwrap();
-        let planned =
-            planned_destination(Some(&control), &fixture.checkout, &declaration, None, false)
-                .unwrap()
-                .unwrap();
+        let planned = planned_destination(Some(&control), &fixture.checkout, &declaration, None)
+            .unwrap()
+            .unwrap();
         assert!(!planned.whole_target);
         for planned_member in &planned.members {
             let selected = planned_member.selected.as_ref().unwrap();
@@ -17027,18 +16471,10 @@ mod tests {
             assert_eq!(selected.nonce(), nonce.as_deref());
         }
 
-        let binding = bind_for_command(
-            &store,
-            &fixture.checkout,
-            0,
-            Some(&planned),
-            None,
-            false,
-            None,
-        )
-        .unwrap_or_else(|reason| {
-            panic!("the next permanent-mode build refused after the cleanup: {reason}")
-        });
+        let binding = bind_for_command(&store, &fixture.checkout, 0, Some(&planned), None, false)
+            .unwrap_or_else(|reason| {
+                panic!("the next permanent-mode build refused after the cleanup: {reason}")
+            });
         assert_eq!(binding.outcome.root.as_deref(), Some(root.as_path()));
         // The replay rolled back first, then the two member transitions each
         // advanced the generation: 1 -> 2 -> 3.
@@ -17124,18 +16560,11 @@ mod tests {
         let store = pool_store(&fixture.root.join("pool"));
         register_at(&fixture, store.owner_control(), DriveMode::Permanent);
         let context = fixture.context();
-        let bind = |label: &str| match bind_for_command(
-            &store,
-            &fixture.checkout,
-            0,
-            None,
-            None,
-            false,
-            None,
-        ) {
-            Ok(_) => Ok(()),
-            Err(reason) => Err(format!("{label}: {reason}")),
-        };
+        let bind =
+            |label: &str| match bind_for_command(&store, &fixture.checkout, 0, None, None, false) {
+                Ok(_) => Ok(()),
+                Err(reason) => Err(format!("{label}: {reason}")),
+            };
         assert!(bind("missing").is_ok());
         fs::create_dir(context.link()).unwrap();
         assert!(bind("real").is_ok());
@@ -17179,7 +16608,6 @@ mod tests {
                 &fixture.checkout,
                 &crate::layout::Declaration::empty(),
                 None,
-                false,
             )
             .unwrap();
             assert!(keyed.is_none());
@@ -17192,15 +16620,7 @@ mod tests {
                 NonceAuthority::Unkeyed,
             )
             .unwrap();
-            match bind_for_command(
-                &store,
-                &fixture.checkout,
-                0,
-                keyed.as_ref(),
-                None,
-                false,
-                None,
-            ) {
+            match bind_for_command(&store, &fixture.checkout, 0, keyed.as_ref(), None, false) {
                 Ok(_) => panic!("{mode:?}: bound an owned root with an unconverted slot key"),
                 Err(reason) => assert!(reason.contains("converted to owned outputs"), "{reason}"),
             }
@@ -17210,19 +16630,10 @@ mod tests {
                 &fixture.checkout,
                 &crate::layout::Declaration::empty(),
                 None,
-                false,
             )
             .unwrap();
             assert!(rekeyed.is_some());
-            match bind_for_command(
-                &store,
-                &fixture.checkout,
-                0,
-                rekeyed.as_ref(),
-                None,
-                false,
-                None,
-            ) {
+            match bind_for_command(&store, &fixture.checkout, 0, rekeyed.as_ref(), None, false) {
                 Ok(binding) => assert_eq!(
                     binding.outcome.root.as_deref(),
                     Some(fixture.local().root())
@@ -17257,19 +16668,10 @@ mod tests {
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
             None,
-            false,
         )
         .unwrap();
-        let binding = bind_for_command(
-            &store,
-            &fixture.checkout,
-            0,
-            keyed.as_ref(),
-            None,
-            false,
-            None,
-        )
-        .unwrap_or_else(|reason| panic!("{reason}"));
+        let binding = bind_for_command(&store, &fixture.checkout, 0, keyed.as_ref(), None, false)
+            .unwrap_or_else(|reason| panic!("{reason}"));
         // The mode switches to permanent and a relinker starts.
         register_at(&fixture, store.owner_control(), DriveMode::Permanent);
         let acquired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -17913,7 +17315,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -17965,7 +17366,6 @@ mod tests {
             &fixture.checkout,
             &declaration,
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -17982,7 +17382,8 @@ mod tests {
     /// member set is classified, and only the exact dangling state refuses. An
     /// unrequested dangling sibling cannot block another member's reservation, a
     /// resolving owned link (the local→external redock) and a new member's
-    /// absent link keep theirs, and a whole-target layout is never guarded here.
+    /// absent link keep theirs, and a whole-target layout is never converted
+    /// here.
     #[test]
     fn the_dangling_publication_guard_is_scoped_to_requested_members() {
         let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
@@ -18322,7 +17723,6 @@ mod tests {
             &fixture.checkout,
             &crate::layout::Declaration::empty(),
             None,
-            false,
         )
         .unwrap()
         .unwrap();
@@ -18344,21 +17744,19 @@ mod tests {
         assert!(result.is_err(), "{result:?}");
     }
 
-    /// A one-use S1 fixture: a checkout and a pool whose control directory is
-    /// the one its receipts live in, so `bind_for_command`'s own context finds
-    /// them. The registry is ready, as every receipt write requires.
-    struct GuardFixture {
+    /// A fixture for the output verbs: a checkout and a pool whose control
+    /// directory is the one its receipts live in, so `bind_for_command`'s own
+    /// context finds them. The registry is ready, as every receipt write
+    /// requires.
+    struct OutputFixture {
         root: PathBuf,
         checkout_root: PathBuf,
         checkout: PathBuf,
         store: Store,
-        _candidates: crate::one_use::CandidateScope,
     }
 
-    impl GuardFixture {
-        /// Separate checkout and payload paths under this run's TMPDIR. Only
-        /// the classifier's candidate input is injected; its path/ownership
-        /// and unsafe-broad decisions still inspect the real private fixture.
+    impl OutputFixture {
+        /// Separate checkout and payload paths under this run's TMPDIR.
         fn new(label: &str) -> Self {
             let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let name = format!("oxide-guard-{label}-{}-{id}", std::process::id());
@@ -18371,13 +17769,11 @@ mod tests {
             let checkout = checkout_root.join("checkout");
             fs::create_dir(&checkout).unwrap();
             let store = pool_store(&root);
-            let candidates = crate::one_use::candidate_scope(&checkout_root);
             Self {
                 root,
                 checkout_root,
                 checkout,
                 store,
-                _candidates: candidates,
             }
         }
 
@@ -18434,157 +17830,18 @@ mod tests {
         }
     }
 
-    impl Drop for GuardFixture {
+    impl Drop for OutputFixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
             let _ = fs::remove_dir_all(&self.checkout_root);
         }
     }
 
-    fn members(names: &[&str]) -> Vec<String> {
-        names.iter().map(|name| (*name).to_owned()).collect()
-    }
-
-    /// The guarded receipt/path table of design §4.2 in every shape, and the
-    /// hierarchy rule of §4.3. Every refusal is checked for its text and for
-    /// leaving the live paths untouched.
-    #[test]
-    fn the_guarded_local_output_table_holds() {
-        let fixture = GuardFixture::new("table");
-        let context = fixture.context();
-        let debug = members(&["debug"]);
-
-        // Absent receipt: absent target and a real (even nonempty) target both
-        // run locally.
-        assert!(local_outputs_decision(&context, &debug, "outputs").is_ok());
-        fs::create_dir(fixture.checkout.join("target")).unwrap();
-        fs::create_dir(fixture.checkout.join("target/debug")).unwrap();
-        fs::write(fixture.checkout.join("target/debug/binary"), b"x").unwrap();
-        assert!(local_outputs_decision(&context, &debug, "outputs").is_ok());
-
-        // A link of any kind refuses and names the path.
-        fs::remove_dir_all(fixture.checkout.join("target/debug")).unwrap();
-        let elsewhere = fixture.root.join("elsewhere");
-        fs::create_dir(&elsewhere).unwrap();
-        symlink(&elsewhere, fixture.checkout.join("target/debug")).unwrap();
-        let refused = local_outputs_decision(&context, &debug, "outputs").unwrap_err();
-        assert!(refused.contains("target/debug"), "{refused}");
-        assert!(refused.contains("symbolic link"), "{refused}");
-        assert!(refused.contains("nothing was changed"), "{refused}");
-        assert!(fixture.checkout.join("target/debug").is_symlink());
-        fs::remove_file(fixture.checkout.join("target/debug")).unwrap();
-
-        // The hierarchy: a linked triple refuses by its own name, so the
-        // profile member below it is never resolved through the link.
-        let triple = fixture.checkout.join("target/x86_64-unknown-linux-gnu");
-        symlink(&elsewhere, &triple).unwrap();
-        let refused = local_outputs_decision(
-            &context,
-            &members(&["x86_64-unknown-linux-gnu/debug"]),
-            "outputs",
-        )
-        .unwrap_err();
-        assert!(
-            refused.contains("x86_64-unknown-linux-gnu"),
-            "the triple itself is the refusing component: {refused}"
-        );
-        fs::remove_file(&triple).unwrap();
-
-        // A detached receipt with real directories runs; the same receipt with
-        // an inserted link refuses: detach is not a repair.
-        let mut detached = Receipt::first_with(
-            &fixture.checkout,
-            &fixture.checkout_id(),
-            LayoutKind::Profile,
-        );
-        detached.links = vec![LinkPlacement {
-            member: "debug".to_owned(),
-            selected: None,
-            prepared: None,
-        }];
-        fixture.write(&detached);
-        assert!(local_outputs_decision(&context, &debug, "outputs").is_ok());
-
-        // A committed receipt refuses in every shape, naming detach.
-        fixture.write(&fixture.committed());
-        let refused = local_outputs_decision(&context, &debug, "outputs").unwrap_err();
-        assert!(refused.contains("committed receipt"), "{refused}");
-        assert!(refused.contains("oxide outputs detach"), "{refused}");
-        assert!(!refused.contains("outputs adopt"), "{refused}");
-
-        // A prepared receipt (any placement or a migration journal) refuses
-        // with the exact §4.4 diagnostic.
-        fixture.write(&fixture.prepared());
-        assert_eq!(
-            local_outputs_decision(&context, &debug, "outputs").unwrap_err(),
-            crate::one_use::PREPARED_GUARDED
-        );
-
-        // A pruned receipt owns no selection, so the live paths decide.
-        let mut pruned = detached.clone();
-        pruned.state = ReceiptState::Pruned;
-        fixture.write(&pruned);
-        assert!(local_outputs_decision(&context, &debug, "outputs").is_ok());
-
-        // A pruning receipt keeps the shipped refusal. Its terminal evidence
-        // is what makes the state consistent.
-        let mut pruning = detached.clone();
-        pruning.state = ReceiptState::Pruning;
-        pruning.pruned = Some(PruneRecord {
-            intent: "prune".to_owned(),
-            outcome: "pending".to_owned(),
-            at_ms: 1,
-        });
-        fixture.write(&pruning);
-        let refused = local_outputs_decision(&context, &debug, "outputs").unwrap_err();
-        assert!(refused.contains("being pruned"), "{refused}");
-    }
-
-    /// The exact `Prepared` diagnostic is the same for every guarded mutation
-    /// site's revalidation, and it is byte-identical on repetition: the state,
-    /// the receipt, the links and `next_id` do not change.
-    #[test]
-    fn repeated_guarded_prepared_refusals_change_nothing() {
-        let fixture = GuardFixture::new("prepared");
-        fixture.write(&fixture.prepared());
-        let receipt_path = receipt_path(&fixture.control(), &fixture.checkout_id());
-        let receipt_bytes = fs::read(&receipt_path).unwrap();
-        let state_before = fixture.state_bytes();
-        let context = fixture.context();
-        let mut digests = Vec::new();
-        for _ in 0..3 {
-            let refused =
-                match guarded_barrier(&fixture.store, &context, &mut WaitAccounting::default()) {
-                    Err(reason) => reason,
-                    Ok(_) => panic!("a prepared receipt refuses the guarded barrier"),
-                };
-            assert_eq!(refused, crate::one_use::PREPARED_GUARDED);
-            assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
-            assert_eq!(fixture.state_bytes(), state_before);
-            digests.push((
-                fs::read(&receipt_path).unwrap(),
-                fixture.state_bytes(),
-                fixture
-                    .store
-                    .owner_control()
-                    .join("waiters")
-                    .read_dir()
-                    .map(|entries| entries.count())
-                    .unwrap_or(0),
-            ));
-        }
-        assert!(digests.windows(2).all(|pair| pair[0] == pair[1]));
-        let context_state = fixture.context();
-        assert!(guarded_prepared_refusal(&context_state).is_err());
-        assert!(guarded_prepared_refusal(&context_state).is_err());
-        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
-    }
-
     /// A bounded durable digest of one fixture's authority state: the control
     /// state bytes, every receipt file, and the checkout's `target` tree with
     /// each entry's kind and (for a link) its exact text. Small trees only;
     /// never a payload walk.
-    fn durable_digest(fixture: &GuardFixture) -> Vec<String> {
+    fn durable_digest(fixture: &OutputFixture) -> Vec<String> {
         let mut entries = Vec::new();
         let state = fixture.control().join("state.json");
         if let Ok(bytes) = fs::read(&state) {
@@ -18632,9 +17889,9 @@ mod tests {
         entries
     }
 
-    /// The pool state's `next_id`, read from its own document (the pre-S1
-    /// durable fact the shipped verbs advance one clean mark at a time).
-    fn next_id(fixture: &GuardFixture) -> Option<u64> {
+    /// The pool state's `next_id`, read from its own document (a durable fact
+    /// the barriered verbs advance one clean mark at a time).
+    fn next_id(fixture: &OutputFixture) -> Option<u64> {
         let bytes = fixture.state_bytes()?;
         let text = String::from_utf8(bytes).ok()?;
         text.split("\"next_id\":")
@@ -18645,35 +17902,29 @@ mod tests {
             .ok()
     }
 
-    /// **Dormant byte identity at the actual command path, with the pre-S1
-    /// behaviour as the reference** (the brief's requirement and gate
-    /// `dormant_byte_identity`).
-    ///
-    /// The subject is the real guarded verb entry points (`detach_at`,
-    /// `cancel_at`, `adopt_at`) and the leased command's binding, entered
-    /// exactly as production enters them, while the one temporary switch is
-    /// off — which is every production binary. The reference is the pre-S1
-    /// answer: the literal shipped texts these verbs and the binding return
-    /// today (they predate this slice; e.g. `bind_ephemeral`'s pending-transition
-    /// refusal), plus the durable state those paths leave behind. The control
-    /// is the same fixture with the switch on, which refuses with the guarded
-    /// diagnostic instead — so the dormant answer is provably *not* the guarded
-    /// one, and the comparison is not two invocations of the same helper.
-    ///
-    /// While dormant nothing is classified at all: the test also asserts that
-    /// the classification counter does not move.
+    /// `oxide outputs adopt` keeps its **error precedence**: drive mode first,
+    /// then the control directory, then the pool. A pool provider that fails
+    /// cannot replace the drive-mode refusal.
     #[test]
-    fn the_dormant_command_path_answers_exactly_as_the_shipped_verbs_do() {
-        assert!(!crate::one_use::is_active());
-        let fixture = GuardFixture::new("dormant-command-path");
-        let start_classifications = crate::one_use::classifications();
+    fn adopt_keeps_its_error_precedence() {
+        let fixture = OutputFixture::new("adopt-precedence");
+        let failing = || -> Result<Option<Store>, String> {
+            Err("the removable registration is unreadable".to_owned())
+        };
+        let refused = adopt_at(&fixture.context(), failing).unwrap_err();
+        assert!(
+            refused.starts_with("outputs adopt needs permanent drive mode (mode is unregistered)"),
+            "the drive-mode refusal wins: {refused}"
+        );
+    }
 
-        // The verbs answer exactly as the release before this slice did, and
-        // their durable effect is exactly that release's: each of the two verbs
-        // that reach the shipped barrier allocates and abandons one clean mark
-        // (so `next_id` advances once per verb), `adopt` refuses before the
-        // barrier, no receipt is written, and the only other write is the
-        // shipped recorded-accounting fence.
+    /// The leased command path keeps the shipped texts and the shipped durable
+    /// effect: `detach` and `cancel-reservation` refuse an absent receipt after
+    /// taking their barrier (one clean mark each), `adopt` refuses before the
+    /// barrier, no receipt is written and only the shipped fence is.
+    #[test]
+    fn the_command_path_answers_with_the_shipped_texts() {
+        let fixture = OutputFixture::new("command-path");
         let detach = detach_at(&fixture.context(), || {
             Ok(Some(fixture.store.handle_for_tests()))
         })
@@ -18695,23 +17946,16 @@ mod tests {
             adopt.starts_with("outputs adopt needs permanent drive mode (mode is unregistered)"),
             "{adopt}"
         );
-        for answer in [&detach, &cancel, &adopt] {
-            assert!(!answer.contains("one-use"), "{answer}");
-            assert!(
-                !answer.contains("prepared output transition unresolved"),
-                "{answer}"
-            );
-        }
         assert_eq!(
             next_id(&fixture),
             Some(3),
-            "one clean mark per shipped verb"
+            "one clean mark per barriered verb"
         );
         let state = fixture.state_bytes().expect("the shipped fence write");
         let text = String::from_utf8_lossy(&state);
-        assert!(!text.contains("\"class\""), "{text}");
         assert!(
-            text.contains("\"recorded_accounting\":\"oxide.accounting/1\""),
+            text.contains("\"recorded_accounting\":\"oxide.accounting/1\"")
+                || text.contains("\"slot_ceiling\""),
             "{text}"
         );
         assert!(text.contains("\"cleans\":[]"), "{text}");
@@ -18724,775 +17968,25 @@ mod tests {
                 .exists(),
             "no receipt was written"
         );
-        // Nothing was classified while dormant, at the actual command path:
-        // the switch is the only gate.
-        assert_eq!(crate::one_use::classifications(), start_classifications);
-        assert!(!crate::one_use::is_active());
-
-        // Control (the other rollout, not the shipped path): with the switch on
-        // the same entries answer as follows. For a checkout with **no**
-        // receipt the guard has nothing of its own to refuse, so `detach` and
-        // `cancel-reservation` answer with the very same shipped texts and take
-        // the same barrier — the guard only changes owned-output states (the
-        // prepared case below). The guarded `adopt` is the exception: it refuses
-        // unconditionally, whatever the receipt state.
-        let guarded_digest_before = durable_digest(&fixture);
-        let guarded_next_before = next_id(&fixture);
-        let guarded = crate::one_use::with_active(|| {
-            assert!(
-                guarded_workspace(Some(&fixture.control()), &fixture.checkout).is_some(),
-                "the fixture's checkout is under a temporary root, so it is guarded"
-            );
-            (
-                detach_at(&fixture.context(), || {
-                    Ok(Some(fixture.store.handle_for_tests()))
-                }),
-                cancel_at(&fixture.context(), || {
-                    Ok(Some(fixture.store.handle_for_tests()))
-                }),
-                adopt_at(&fixture.context(), || Ok(None)).unwrap_err(),
-            )
-        });
-        assert_eq!(
-            guarded.0,
-            Err("this checkout has no owned-output receipt; nothing to detach".to_owned()),
-            "the guard changes no state it has nothing to refuse"
-        );
-        assert_eq!(
-            guarded.1,
-            Err("this checkout has no owned-output receipt; nothing to cancel".to_owned())
-        );
-        assert!(
-            guarded.2.contains("one-use (temporary) workspace"),
-            "{}",
-            guarded.2
-        );
-        // Two more shipped barriers ran, so exactly two more ids were taken;
-        // the guard differs only where it has authority, and no receipt or link
-        // appeared either way.
-        assert_eq!(next_id(&fixture), guarded_next_before.map(|id| id + 2));
-        let guarded_digest = durable_digest(&fixture);
-        assert_eq!(guarded_digest.len(), guarded_digest_before.len());
-        assert!(guarded_digest
-            .iter()
-            .all(|entry| entry.starts_with("state:") || entry.starts_with("receipt ")));
-        // The leased command's binding: a `Prepared` receipt in a checkout
-        // with no registered drive is refused by the shipped code with its own
-        // text, which is what the dormant command must produce.
+        // The binding refuses a `Prepared` receipt with the shipped text and
+        // leaves both the receipt and the tree exactly as they were.
         fixture.write(&fixture.prepared());
         let receipt_path = receipt_path(&fixture.control(), &fixture.checkout_id());
         let receipt_bytes = fs::read(&receipt_path).unwrap();
         let prepared_digest = durable_digest(&fixture);
-        let refused = match bind_for_command(
-            &fixture.store,
-            &fixture.checkout,
-            0,
-            None,
-            None,
-            false,
-            None,
-        ) {
-            Err(reason) => reason,
-            Ok(_) => panic!("the shipped binding refuses a prepared transition"),
-        };
+        let refused =
+            match bind_for_command(&fixture.store, &fixture.checkout, 0, None, None, false) {
+                Err(reason) => reason,
+                Ok(_) => panic!("the binding refuses a prepared transition"),
+            };
         assert_eq!(
             refused,
             "outputs: an interrupted owned-output transition is pending; restore or set a permanent drive registration, then run `oxide outputs adopt` to replay it before building"
         );
         assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
         assert_eq!(durable_digest(&fixture), prepared_digest);
-
-        assert!(!crate::one_use::is_active());
-
-        // Control (the other rollout, not the shipped path): the same fixture
-        // with the switch on is guarded, so the very same entries answer with
-        // the guarded texts and still write nothing.
-        let active = crate::one_use::with_active(|| {
-            assert!(
-                guarded_workspace(Some(&fixture.control()), &fixture.checkout).is_some(),
-                "the fixture's checkout is under a temporary root, so it is guarded"
-            );
-            let refused = detach_at(&fixture.context(), || {
-                Ok(Some(fixture.store.handle_for_tests()))
-            })
-            .unwrap_err();
-            let refused_adopt = adopt_at(&fixture.context(), || Ok(None)).unwrap_err();
-            let refused_bind = match bind_for_command(
-                &fixture.store,
-                &fixture.checkout,
-                0,
-                None,
-                None,
-                false,
-                Some(&LocalOutputs {
-                    members: &[],
-                    reason: "one-use",
-                }),
-            ) {
-                Err(reason) => reason,
-                Ok(_) => panic!("the guarded binding refuses a prepared transition"),
-            };
-            (refused, refused_adopt, refused_bind)
-        });
-        assert_eq!(active.0, crate::one_use::PREPARED_GUARDED);
-        // The fixture still holds the prepared receipt, so the guarded `adopt`
-        // refuses with the same exact §4.4 diagnostic (precedence: a prepared
-        // transition outranks the general adopt refusal).
-        assert_eq!(active.1, crate::one_use::PREPARED_GUARDED);
-        assert_eq!(active.2, crate::one_use::PREPARED_GUARDED);
-        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
-        assert_eq!(durable_digest(&fixture), prepared_digest);
-        // The two rollouts really differ: the dormant answer is the shipped
-        // one and the guarded answer is the guard's, on the same bytes.
-        assert_ne!(refused, active.0);
-        assert!(!crate::one_use::is_active());
     }
 
-    /// A guarded refusal must not create the pool's admission lock: every lock
-    /// a guarded verb touches before it decides is the checkout binding mutex
-    /// (design §4.1 step 4). A pool that has no admission lock is a bounded
-    /// retry, never a creation; with an existing lock the dead and unknown
-    /// refusals leave the control directory and its files exactly as they were.
-    #[test]
-    fn a_guarded_refusal_creates_no_admission_lock() {
-        // No admission lock at all: the verb retries and creates nothing.
-        let fixture = GuardFixture::new("no-admission-lock");
-        fixture.write(&fixture.committed());
-        let admission = fixture.control().join("admission.lock");
-        let _ = fs::remove_file(&admission);
-        crate::store::dead_record_for_tests(&fixture.store, &fixture.checkout, 7);
-        let refused = crate::one_use::with_active(|| {
-            detach_at(&fixture.context(), || {
-                Ok(Some(fixture.store.handle_for_tests()))
-            })
-            .unwrap_err()
-        });
-        assert_eq!(refused, crate::one_use::BARRIER_BUSY);
-        assert!(!admission.exists(), "a refusal created the admission lock");
-
-        // With the pool's existing admission lock, a dead-custody refusal
-        // leaves every file (that lock included) byte-identical.
-        let fixture = GuardFixture::new("existing-admission-lock");
-        fixture.write(&fixture.committed());
-        let admission = fixture.control().join("admission.lock");
-        assert!(admission.is_file(), "a converted pool carries the lock");
-        let admission_before = fs::read(&admission).unwrap();
-        let listing = |dir: &Path| {
-            let mut names: Vec<String> = fs::read_dir(dir)
-                .map(|entries| {
-                    entries
-                        .flatten()
-                        .filter_map(|entry| Some(entry.file_name().to_str()?.to_owned()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            names.sort();
-            names
-        };
-        // The plant itself writes state, so the comparison starts after it.
-        crate::store::dead_record_for_tests(&fixture.store, &fixture.checkout, 7);
-        let control_before = listing(&fixture.control());
-        let refused = crate::one_use::with_active(|| {
-            cancel_at(&fixture.context(), || {
-                Ok(Some(fixture.store.handle_for_tests()))
-            })
-            .unwrap_err()
-        });
-        assert!(refused.contains("clean barrier refused"), "{refused}");
-        assert!(refused.contains("record 7"), "{refused}");
-        assert_eq!(fs::read(&admission).unwrap(), admission_before);
-        let mut control_after = listing(&fixture.control());
-        control_after.sort();
-        let mut expected = control_before.clone();
-        expected.sort();
-        assert_eq!(control_after, expected, "no file was created");
-
-        // Non-vacuity: a clear checkout takes the barrier and completes the
-        // verb through the existing lock.
-        let fixture = GuardFixture::new("existing-admission-lock-clear");
-        fixture.write(&fixture.committed());
-        let _ = crate::one_use::with_active(|| {
-            detach_at(&fixture.context(), || {
-                Ok(Some(fixture.store.handle_for_tests()))
-            })
-        });
-        assert!(fixture.control().join("admission.lock").is_file());
-    }
-
-    /// The shipped (dormant) `adopt` keeps its **error precedence**: drive mode
-    /// first, then the control directory, then the pool. A dormant build must
-    /// report the pre-S1 refusal even when the pool provider also fails, while
-    /// the guarded build refuses before any of them.
-    #[test]
-    fn a_dormant_adopt_keeps_the_shipped_error_precedence() {
-        let fixture = GuardFixture::new("dormant-adopt-precedence");
-        let failing = || -> Result<Option<Store>, String> {
-            Err("the removable registration is unreadable".to_owned())
-        };
-        assert!(!crate::one_use::is_active());
-        let refused = adopt_at(&fixture.context(), failing).unwrap_err();
-        assert!(
-            refused.starts_with("outputs adopt needs permanent drive mode (mode is unregistered)"),
-            "the shipped drive-mode refusal wins: {refused}"
-        );
-        // With the switch on the guarded refusal comes first, whatever the
-        // registry or pool says.
-        let refused = crate::one_use::with_active(|| {
-            adopt_at(&fixture.context(), || -> Result<Option<Store>, String> {
-                Err("the removable registration is unreadable".to_owned())
-            })
-            .unwrap_err()
-        });
-        assert!(
-            refused.contains("one-use (temporary) workspace"),
-            "{refused}"
-        );
-    }
-
-    /// The guarded verbs decide **before** the pool is opened or coordinated:
-    /// a provider that fails (or refuses to run at all) cannot shadow the
-    /// guard's refusal, so an unreadable registration can never replace the
-    /// exact `Prepared` diagnostic or the guarded `adopt` refusal.
-    #[test]
-    fn the_guarded_verbs_refuse_before_the_pool_is_opened() {
-        let fixture = GuardFixture::new("precheck-before-pool");
-        fixture.write(&fixture.prepared());
-        let before = durable_digest(&fixture);
-        let never =
-            || -> Result<Option<Store>, String> { panic!("a guarded verb must not open the pool") };
-        let failing = || -> Result<Option<Store>, String> {
-            Err("the removable registration is unreadable".to_owned())
-        };
-        crate::one_use::with_active(|| {
-            assert_eq!(
-                adopt_at(&fixture.context(), never).unwrap_err(),
-                crate::one_use::PREPARED_GUARDED
-            );
-            assert_eq!(
-                adopt_at(&fixture.context(), failing).unwrap_err(),
-                crate::one_use::PREPARED_GUARDED
-            );
-            assert_eq!(
-                detach_at(&fixture.context(), never).unwrap_err(),
-                crate::one_use::PREPARED_GUARDED
-            );
-            assert_eq!(
-                detach_at(&fixture.context(), failing).unwrap_err(),
-                crate::one_use::PREPARED_GUARDED
-            );
-            assert_eq!(
-                cancel_at(&fixture.context(), never).unwrap_err(),
-                crate::one_use::PREPARED_GUARDED
-            );
-            assert_eq!(
-                cancel_at(&fixture.context(), failing).unwrap_err(),
-                crate::one_use::PREPARED_GUARDED
-            );
-        });
-        assert_eq!(durable_digest(&fixture), before);
-        // The general guarded `adopt` refusal wins over a pool error too.
-        let fixture = GuardFixture::new("precheck-before-pool-general");
-        crate::one_use::with_active(|| {
-            assert!(adopt_at(&fixture.context(), failing)
-                .unwrap_err()
-                .contains("one-use (temporary) workspace"));
-        });
-    }
-
-    /// Verb-level: a guarded `detach` and `cancel-reservation` refuse a
-    /// `Prepared` transition with the exact diagnostic, repeatedly and
-    /// byte-identically including `next_id`, and the refusal happens at the
-    /// effect-free fast precheck — before the binding mutex is even created
-    /// (design §4.1 part 1, §4.4, §4.5).
-    #[test]
-    fn the_guarded_verbs_refuse_a_prepared_transition_before_any_lock() {
-        let fixture = GuardFixture::new("verbs-prepared");
-        fixture.write(&fixture.prepared());
-        let receipt_path = receipt_path(&fixture.control(), &fixture.checkout_id());
-        let receipt_bytes = fs::read(&receipt_path).unwrap();
-        let state_before = fixture.state_bytes();
-        let classify_before = crate::one_use::classifications();
-        let mut traces = Vec::new();
-        crate::one_use::with_active(|| {
-            for _ in 0..3 {
-                let refused = detach_at(&fixture.context(), || {
-                    Ok(Some(fixture.store.handle_for_tests()))
-                })
-                .unwrap_err();
-                assert_eq!(refused, crate::one_use::PREPARED_GUARDED);
-                let refused = cancel_at(&fixture.context(), || {
-                    Ok(Some(fixture.store.handle_for_tests()))
-                })
-                .unwrap_err();
-                assert_eq!(refused, crate::one_use::PREPARED_GUARDED);
-                traces.push((
-                    fs::read(&receipt_path).unwrap(),
-                    fixture.state_bytes(),
-                    fs::read_dir(fixture.control().join("waiters"))
-                        .map(|entries| entries.count())
-                        .unwrap_or(0),
-                ));
-            }
-        });
-        assert!(traces.windows(2).all(|pair| pair[0] == pair[1]));
-        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
-        assert_eq!(fixture.state_bytes(), state_before);
-        // The fast precheck runs before this checkout's binding mutex is even
-        // created (the directory itself is made by `Store::for_tests`).
-        let binding_lock = fixture.control().join("bindings").join(format!(
-            "{}.lock",
-            identity::digest(&fixture.checkout.to_string_lossy())
-        ));
-        assert!(
-            !binding_lock.exists(),
-            "the refusal precedes the checkout binding mutex"
-        );
-        assert!(
-            crate::one_use::classifications() > classify_before,
-            "the guarded verb did classify its workspace"
-        );
-    }
-
-    /// Verb-level: the guarded `detach` covers the busy classifier's rows — a
-    /// dead record, a dead clean mark, a live holder (the bounded busy
-    /// refusal) and unknown custody — and every refusal leaves the receipt,
-    /// the state (`next_id` included) and the `waiters/` listing unchanged.
-    #[test]
-    fn the_guarded_verbs_cover_the_busy_classifier() {
-        // A dead record.
-        let fixture = GuardFixture::new("verbs-dead-record");
-        fixture.write(&fixture.committed());
-        crate::store::dead_record_for_tests(&fixture.store, &fixture.checkout, 7);
-        let stored_receipt = receipt_path(&fixture.control(), &fixture.checkout_id());
-        let receipt_bytes = fs::read(&stored_receipt).unwrap();
-        let state_before = fixture.state_bytes();
-        let refused = crate::one_use::with_active(|| {
-            detach_at(&fixture.context(), || {
-                Ok(Some(fixture.store.handle_for_tests()))
-            })
-            .unwrap_err()
-        });
-        assert!(refused.contains("clean barrier refused"), "{refused}");
-        assert!(refused.contains("record 7"), "{refused}");
-        assert_eq!(fs::read(&stored_receipt).unwrap(), receipt_bytes);
-        assert_eq!(fixture.state_bytes(), state_before);
-
-        // A dead clean mark.
-        let fixture = GuardFixture::new("verbs-dead-mark");
-        fixture.write(&fixture.committed());
-        crate::store::dead_clean_mark_for_tests(&fixture.store, &fixture.checkout, 9);
-        let stored_receipt = receipt_path(&fixture.control(), &fixture.checkout_id());
-        let receipt_bytes = fs::read(&stored_receipt).unwrap();
-        let state_before = fixture.state_bytes();
-        let refused = crate::one_use::with_active(|| {
-            cancel_at(&fixture.context(), || {
-                Ok(Some(fixture.store.handle_for_tests()))
-            })
-            .unwrap_err()
-        });
-        assert!(refused.contains("clean barrier refused"), "{refused}");
-        assert!(refused.contains("clean mark 9"), "{refused}");
-        assert_eq!(fs::read(&stored_receipt).unwrap(), receipt_bytes);
-        assert_eq!(fixture.state_bytes(), state_before);
-
-        // A live holder: retried on the shipped poll, then the bounded busy
-        // refusal, with nothing written.
-        let fixture = GuardFixture::new("verbs-live-holder");
-        fixture.write(&fixture.committed());
-        let _held = crate::store::hold_record_for_tests(&fixture.store, &fixture.checkout, 5);
-        let state_before = fixture.state_bytes();
-        let refused = crate::one_use::with_active(|| {
-            detach_at(&fixture.context(), || {
-                Ok(Some(fixture.store.handle_for_tests()))
-            })
-            .unwrap_err()
-        });
-        assert_eq!(refused, crate::one_use::BARRIER_BUSY);
-        assert_eq!(fixture.state_bytes(), state_before);
-        assert_eq!(
-            fs::read_dir(fixture.control().join("waiters"))
-                .map(|entries| entries.count())
-                .unwrap_or(0),
-            0,
-            "no waiter lock was created"
-        );
-
-        // Unknown custody: an unreadable state document is protected.
-        let fixture = GuardFixture::new("verbs-unknown");
-        fixture.write(&fixture.committed());
-        crate::store::save_default_state_for_tests(&fixture.store);
-        fs::write(fixture.control().join("state.json"), b"{not json").unwrap();
-        let stored_receipt = receipt_path(&fixture.control(), &fixture.checkout_id());
-        let receipt_bytes = fs::read(&stored_receipt).unwrap();
-        let refused = crate::one_use::with_active(|| {
-            detach_at(&fixture.context(), || {
-                Ok(Some(fixture.store.handle_for_tests()))
-            })
-            .unwrap_err()
-        });
-        assert!(refused.contains("clean barrier refused"), "{refused}");
-        assert_eq!(fs::read(&stored_receipt).unwrap(), receipt_bytes);
-        assert_eq!(
-            fs::read(fixture.control().join("state.json")).unwrap(),
-            b"{not json"
-        );
-    }
-
-    /// The guarded branch keeps the shipped unsettled-prune-intent refusal, at
-    /// the fast precheck and under the binding mutex (design §4.2).
-    #[test]
-    fn an_unsettled_prune_intent_refuses_a_guarded_command() {
-        let fixture = GuardFixture::new("unsettled");
-        let id = crate::prune::seed_test_intent(&fixture.control(), &fixture.checkout_id(), false);
-        let members = members(&["debug"]);
-        let before = durable_digest(&fixture);
-        let refused =
-            guarded_precheck(Some(&fixture.control()), &fixture.checkout, &members).unwrap_err();
-        assert!(refused.contains(&id), "{refused}");
-        assert!(refused.contains("unsettled"), "{refused}");
-        let local = LocalOutputs {
-            members: &members,
-            reason: "one-use",
-        };
-        let refused = match bind_for_command(
-            &fixture.store,
-            &fixture.checkout,
-            0,
-            None,
-            None,
-            false,
-            Some(&local),
-        ) {
-            Err(reason) => reason,
-            Ok(_) => panic!("an unsettled prune intent refuses the guarded binding"),
-        };
-        assert!(refused.contains(&id), "{refused}");
-        assert_eq!(durable_digest(&fixture), before);
-    }
-
-    /// A guarded command that names no profile member still has the Cargo
-    /// profile outputs inspected (design §4.2 row 2, §4.3): `oxide exec`
-    /// without `--output` and an external subcommand get `debug` and `release`,
-    /// an explicit `--output` narrows the set to exactly what was declared, and
-    /// a declared `--target` adds its triple forms.
-    #[test]
-    fn an_opaque_guarded_command_inspects_the_cargo_profile_members() {
-        let names = |invocation: &crate::cli::Invocation| -> Vec<String> {
-            guarded_declaration(invocation)
-                .unwrap()
-                .members()
-                .iter()
-                .map(|member| member.name().to_owned())
-                .collect()
-        };
-        let arg = |text: &str| std::ffi::OsString::from(text);
-
-        // exec without --output: both Cargo profile outputs.
-        let exec = crate::cli::parse_exec(&[arg("--"), arg("cargo"), arg("nextest")])
-            .unwrap()
-            .unwrap();
-        assert_eq!(names(&exec), vec!["debug", "release"]);
-
-        // An explicit --output is the whole set.
-        let declared = crate::cli::parse_exec(&[
-            arg("--output"),
-            arg("release"),
-            arg("--"),
-            arg("cargo"),
-            arg("nextest"),
-        ])
-        .unwrap()
-        .unwrap();
-        assert_eq!(names(&declared), vec!["release"]);
-
-        // An external subcommand derives no member, so the same set applies.
-        let external =
-            crate::cli::parse_leased("nextest", &[arg("--target"), arg("aarch64-apple-darwin")])
-                .unwrap();
-        let derived: Vec<String> = names(&external);
-        assert!(
-            derived.contains(&"debug".to_owned()) && derived.contains(&"release".to_owned()),
-            "{derived:?}"
-        );
-        // A declared target adds its triple members beside the plain ones.
-        assert!(
-            derived.contains(&"aarch64-apple-darwin/debug".to_owned())
-                && derived.contains(&"aarch64-apple-darwin/release".to_owned()),
-            "{derived:?}"
-        );
-    }
-
-    /// The §4.2 row-2 regression the review asked for: a one-use workspace with
-    /// **no receipt** and a link planted at `target/debug` or `target/release`
-    /// refuses a guarded `exec` / external subcommand, both at the fast
-    /// precheck and under the binding mutex.
-    #[test]
-    fn an_opaque_guarded_command_refuses_a_planted_profile_link() {
-        let arg = |text: &str| std::ffi::OsString::from(text);
-        let exec = crate::cli::parse_exec(&[arg("--"), arg("cargo"), arg("nextest")])
-            .unwrap()
-            .unwrap();
-        let external = crate::cli::parse_leased("nextest", &[]).unwrap();
-        for (label, invocation) in [("exec", &exec), ("external", &external)] {
-            for member in ["debug", "release"] {
-                let fixture = GuardFixture::new(&format!("opaque-{label}-{member}"));
-                fs::create_dir_all(fixture.checkout.join("target")).unwrap();
-                let elsewhere = fixture.root.join("elsewhere");
-                fs::create_dir_all(&elsewhere).unwrap();
-                let link = fixture.checkout.join("target").join(member);
-                std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
-                let declaration = guarded_declaration(invocation).unwrap();
-                let members: Vec<String> = declaration
-                    .members()
-                    .iter()
-                    .map(|member| member.name().to_owned())
-                    .collect();
-                let refused = crate::one_use::with_active(|| {
-                    guarded_precheck(Some(&fixture.control()), &fixture.checkout, &members)
-                        .unwrap_err()
-                });
-                assert!(refused.contains(member), "{label}/{member}: {refused}");
-                assert!(refused.contains("symbolic link"), "{refused}");
-                assert!(refused.contains("nothing was changed"), "{refused}");
-                // The authoritative revalidation refuses it too, under the
-                // checkout binding mutex.
-                let refused = crate::one_use::with_active(|| {
-                    match bind_for_command(
-                        &fixture.store,
-                        &fixture.checkout,
-                        0,
-                        None,
-                        None,
-                        false,
-                        Some(&LocalOutputs {
-                            members: &members,
-                            reason: "one-use",
-                        }),
-                    ) {
-                        Err(reason) => reason,
-                        Ok(_) => panic!("{label}/{member}: the guarded binding refuses"),
-                    }
-                });
-                assert!(refused.contains(member), "{label}/{member}: {refused}");
-                assert!(link.is_symlink(), "the planted link is untouched");
-                // A real (even nonempty) profile directory is local and runs.
-                fs::remove_file(&link).unwrap();
-                fs::create_dir(&link).unwrap();
-                fs::write(link.join("binary"), b"x").unwrap();
-                crate::one_use::with_active(|| {
-                    assert!(
-                        guarded_precheck(Some(&fixture.control()), &fixture.checkout, &members)
-                            .is_ok(),
-                        "{label}/{member}: a real directory stays local"
-                    );
-                });
-            }
-        }
-    }
-
-    /// The guarded prune-intent check follows the **shipped** definition, and    /// The guarded prune-intent check follows the **shipped** definition, and
-    /// every failure of the registry read is a refusal:
-    ///
-    /// - no registry document at all -> clear (a pool that has never published
-    ///   output authority cannot hold a published intent; this is exactly what
-    ///   `prune::unsettled_for` answers for the shipped verbs);
-    /// - a malformed or unreadable registry -> refusal, never "unset, so
-    ///   clear";
-    /// - a present intent whose phase is terminal **and** whose checkout
-    ///   receipt committed (`settled()`) -> clear, because that is the shipped
-    ///   definition of settled;
-    /// - an unsettled intent -> the shipped refusal naming its ID.
-    #[test]
-    fn the_guarded_prune_intent_check_follows_the_shipped_definition() {
-        let members = members(&["debug"]);
-
-        // No registry document: clear, and nothing is written.
-        let fixture = GuardFixture::new("intent-absent");
-        let before = durable_digest(&fixture);
-        crate::one_use::with_active(|| {
-            assert!(guarded_precheck(Some(&fixture.control()), &fixture.checkout, &members).is_ok())
-        });
-        assert_eq!(durable_digest(&fixture), before);
-
-        // Malformed registry: a refusal, not a silent clear.
-        let fixture = GuardFixture::new("intent-malformed");
-        let registry = fixture.control().join("outputs").join("registry.json");
-        fs::write(&registry, b"{not a registry").unwrap();
-        let refused = crate::one_use::with_active(|| {
-            match guarded_precheck(Some(&fixture.control()), &fixture.checkout, &members) {
-                Err(reason) => reason,
-                Ok(()) => panic!("a malformed registry must refuse"),
-            }
-        });
-        assert!(!refused.is_empty());
-        assert_eq!(fs::read(&registry).unwrap(), b"{not a registry");
-
-        // A settled intent is clear; an unsettled one refuses.
-        let fixture = GuardFixture::new("intent-settled");
-        let id = crate::prune::seed_test_intent(&fixture.control(), &fixture.checkout_id(), true);
-        crate::one_use::with_active(|| {
-            assert!(
-                guarded_precheck(Some(&fixture.control()), &fixture.checkout, &members).is_ok(),
-                "a settled intent is clear"
-            )
-        });
-        assert!(!id.is_empty());
-        let fixture = GuardFixture::new("intent-unsettled");
-        let id = crate::prune::seed_test_intent(&fixture.control(), &fixture.checkout_id(), false);
-        let refused = crate::one_use::with_active(|| {
-            match guarded_precheck(Some(&fixture.control()), &fixture.checkout, &members) {
-                Err(reason) => reason,
-                Ok(()) => panic!("an unsettled intent must refuse"),
-            }
-        });
-        assert!(refused.contains(&id), "{refused}");
-        assert!(refused.contains("unsettled"), "{refused}");
-    }
-
-    /// A `Pruned` receipt selects nothing, so a guarded binding runs locally
-    /// through it (design §4.2's `Pruned` row), writing no receipt or state
-    /// byte.
-    #[test]
-    fn a_pruned_receipt_still_binds_locally() {
-        let fixture = GuardFixture::new("pruned-binding");
-        let mut receipt = Receipt::first_with(
-            &fixture.checkout,
-            &fixture.checkout_id(),
-            LayoutKind::Profile,
-        );
-        receipt.links = vec![LinkPlacement {
-            member: "debug".to_owned(),
-            selected: None,
-            prepared: None,
-        }];
-        receipt.state = ReceiptState::Pruned;
-        receipt.pruned = Some(PruneRecord {
-            intent: "prune".to_owned(),
-            outcome: "deleted".to_owned(),
-            at_ms: 1,
-        });
-        fixture.write(&receipt);
-        let receipt_path = receipt_path(&fixture.control(), &fixture.checkout_id());
-        let receipt_bytes = fs::read(&receipt_path).unwrap();
-        let before = durable_digest(&fixture);
-        let members = members(&["debug"]);
-        let local = LocalOutputs {
-            members: &members,
-            reason: "one-use",
-        };
-        let binding = bind_for_command(
-            &fixture.store,
-            &fixture.checkout,
-            0,
-            None,
-            None,
-            false,
-            Some(&local),
-        )
-        .unwrap();
-        assert_eq!(
-            binding.outcome.warnings,
-            vec!["one-use workspace: local outputs (one-use)".to_owned()]
-        );
-        assert!(binding.outcome.root.is_none());
-        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
-        assert_eq!(durable_digest(&fixture), before);
-    }
-
-    /// A malformed receipt never becomes a guarded `adopt` reply: the verb
-    /// refuses unconditionally, so the general guarded refusal is the answer and
-    /// only a `Prepared` transition selects the exact diagnostic (design §4.1
-    /// precedence, §4.5).
-    #[test]
-    fn a_malformed_receipt_keeps_the_general_guarded_adopt_refusal() {
-        let fixture = GuardFixture::new("malformed-adopt");
-        let path = receipt_path(&fixture.control(), &fixture.checkout_id());
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, b"{not a receipt").unwrap();
-        let context = fixture.context();
-        assert!(
-            context.receipt().is_err(),
-            "the malformed document is refused by the reader"
-        );
-        let refused = guarded_adopt_refusal(&context);
-        assert_eq!(refused, crate::one_use::adopt_refusal(&fixture.checkout));
-        assert!(
-            refused.contains("one-use (temporary) workspace"),
-            "{refused}"
-        );
-        assert!(refused.contains("cannot own an output root"), "{refused}");
-        // A prepared receipt still selects the exact §4.4 diagnostic.
-        fixture.write(&fixture.prepared());
-        assert_eq!(
-            guarded_adopt_refusal(&fixture.context()),
-            crate::one_use::PREPARED_GUARDED
-        );
-    }
-
-    /// The bounded barrier budget: with a live holder the guarded verb retries
-    /// on the shipped poll and then refuses finitely, having written nothing
-    /// (no mark, no id, no `waiters/` file, `next_id` unchanged).
-    #[test]
-    fn the_guarded_barrier_gives_up_after_its_attempt_budget() {
-        let fixture = GuardFixture::new("barrier-budget");
-        let _held = crate::store::hold_record_for_tests(&fixture.store, &fixture.checkout, 5);
-        fixture.write(&fixture.committed());
-        let receipt_path = receipt_path(&fixture.control(), &fixture.checkout_id());
-        let receipt_bytes = fs::read(&receipt_path).unwrap();
-        let state_before = fixture.state_bytes();
-        let context = fixture.context();
-        let refused =
-            match guarded_barrier(&fixture.store, &context, &mut WaitAccounting::default()) {
-                Err(reason) => reason,
-                Ok(_) => panic!("a live holder exhausts the attempt budget"),
-            };
-        assert_eq!(refused, crate::one_use::BARRIER_BUSY);
-        assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
-        assert_eq!(fixture.state_bytes(), state_before);
-        let waiters = fixture.control().join("waiters");
-        let listed = fs::read_dir(&waiters)
-            .map(|entries| entries.count())
-            .unwrap_or(0);
-        assert_eq!(listed, 0, "no waiter lock was created");
-    }
-
-    /// The guarded branch of the shipped verbs that need no live link: a
-    /// prepared receipt refuses at the effect-free `adopt` precheck and in
-    /// `clean`, and a guarded clean never prints adopt advice.
-    #[test]
-    fn prepared_refusals_are_the_exact_diagnostic_without_advice() {
-        let fixture = GuardFixture::new("advice");
-        fixture.write(&fixture.prepared());
-        let context = fixture.context();
-        assert_eq!(
-            guarded_prepared_refusal(&context).unwrap_err(),
-            crate::one_use::PREPARED_GUARDED
-        );
-        assert!(!crate::one_use::PREPARED_GUARDED.contains("adopt"));
-        assert!(!crate::one_use::PREPARED_GUARDED.contains("detach"));
-        // The general adopt text is a different, bounded line that offers no
-        // repair for a prepared transition.
-        let general = crate::one_use::adopt_refusal(&fixture.checkout);
-        assert!(
-            general.contains("one-use (temporary) workspace"),
-            "{general}"
-        );
-        assert!(general.contains("nothing was changed"), "{general}");
-        // The committed refusal names the one safe verb.
-        let committed = crate::one_use::committed_refusal(&fixture.root);
-        assert!(committed.contains("oxide outputs detach"), "{committed}");
-    }
-
-    /// The plan and status wording is bounded and never recommends adopt.
-    #[test]
-    fn the_guarded_plan_and_status_lines_are_bounded() {
-        for line in [crate::one_use::PLAN_LOCAL, crate::one_use::STATUS_LOCAL] {
-            assert!(line.contains("one-use (temporary) workspace"), "{line}");
-            assert!(line.contains("local"), "{line}");
-            assert!(!line.contains("adopt"), "{line}");
-            assert!(line.len() < 200, "{line}");
-        }
-    }
     #[test]
     fn barge_pins_selected_members_and_detach_releases_only_their_pin() {
         // Close-on-exec descriptors are still inherited between fork and exec.
