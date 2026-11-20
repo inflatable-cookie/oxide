@@ -49,6 +49,7 @@ mod tests {
             "program target resolution",
             "freshness finish",
             "seed publication",
+            "stale unit pruning",
             "admission lock",
             "temporary directory removal",
             "removable flush",
