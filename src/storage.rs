@@ -1690,15 +1690,24 @@ mod tests {
         assert!(foreign.join("keep").exists());
     }
 
+    /// Create a pool control directory the way production does: owner-only
+    /// from the create itself, which every `PoolStorage::open` verifies.
+    fn owner_only_control(control: &Path) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::create_dir_all(control).expect("control parent");
+        let managed = control.join("oxide-managed");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&managed)
+            .expect("owner-only control directory");
+        managed
+    }
+
     fn pool_storage(fixture: &Fixture, label: &str) -> PoolStorage {
         let control = fixture._temp.path().join(format!("pool-{label}"));
-        std::fs::create_dir_all(control.join("oxide-managed")).expect("control");
+        let managed = owner_only_control(&control);
         fixture.os.add_volume(&control, Some(UUID), 100 << 30);
-        PoolStorage::open(
-            &control.join("oxide-managed"),
-            &PoolBacking::budget(&control, 1 << 30),
-        )
-        .expect("pool storage")
+        PoolStorage::open(&managed, &PoolBacking::budget(&control, 1 << 30)).expect("pool storage")
     }
 
     #[test]
@@ -1753,10 +1762,10 @@ mod tests {
     fn a_pool_space_policy_reports_its_cap_and_refuses_below_the_floor() {
         let fixture = Fixture::new("storage-pool-space");
         let control = fixture._temp.path().join("pool-space");
-        std::fs::create_dir_all(control.join("oxide-managed")).expect("control");
+        let managed = owner_only_control(&control);
         fixture.os.add_volume(&control, Some(UUID), 1 << 30);
         let pool = PoolStorage::open(
-            &control.join("oxide-managed"),
+            &managed,
             &PoolBacking {
                 mount: control.clone(),
                 folder: "payload/slots".to_owned(),
@@ -1872,13 +1881,10 @@ mod tests {
     fn a_pool_adopts_a_legacy_nested_slot_in_its_project_area() {
         let fixture = Fixture::new("storage-adopt-nested");
         let control = fixture._temp.path().join("pool-nested");
-        std::fs::create_dir_all(control.join("oxide-managed")).expect("control");
+        let managed = owner_only_control(&control);
         fixture.os.add_volume(&control, Some(UUID), 100 << 30);
-        let pool = PoolStorage::open(
-            &control.join("oxide-managed"),
-            &PoolBacking::budget(&control, 1 << 30),
-        )
-        .expect("pool storage");
+        let pool = PoolStorage::open(&managed, &PoolBacking::budget(&control, 1 << 30))
+            .expect("pool storage");
         let base = control.join("payload/slots");
         let nested = base.join("oxide-f88047ec/quick-3");
         std::fs::create_dir_all(&nested).expect("nested slot");
