@@ -77,10 +77,10 @@ const LOCK_REFUSAL: &str = "was passed to prevent this";
 pub(crate) const VERIFIED_CARGO: [&str; 6] = [
     "cargo 1.95.0 (f2d3ce0bd ",
     "cargo 1.96.1 (356927216 ",
-    "cargo 1.97.1 (c980f4866 ",
+    crate::cargo_layout::CARGO_1_97_1,
     "cargo 1.98.1 (797e8a9bc ",
     "cargo 1.99.1 (5f94df478 ",
-    "cargo 1.100.0 (3acc79c0c ",
+    crate::cargo_layout::CARGO_1_100_0,
 ];
 
 /// Why the gate did not vouch for a slot.
@@ -1622,11 +1622,11 @@ fn run_cargo_bounded(
             .recv_timeout(left())
             .map_err(|_| format!("{what} did not finish in time"))
     };
+    // A timed-out or failed child is its own answer: it is never masked by a
+    // later drain failure, and the group it led was already stopped above.
+    let status = status?;
     let out = read_bounded(&out_receiver, "Cargo output");
     let err = read_bounded(&err_receiver, "Cargo error output");
-    // A timed-out or failed child is its own answer: it is never masked by a
-    // later drain failure.
-    let status = status?;
     let stop = |child: &mut std::process::Child| crate::describe::stop_group_and_reap(child);
     let (stdout, overflow) = match out {
         Ok(read) => read.map_err(|error| format!("cannot read Cargo output: {error}"))?,

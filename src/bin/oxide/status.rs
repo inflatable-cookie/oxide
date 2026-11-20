@@ -250,12 +250,11 @@ fn sections(
     } else {
         status.present
     };
+    // When the removable pool is the selected one, the internal pool is only
+    // its fallback: one label, whatever the recorded volume presence says,
+    // because that is the role the internal pool holds in the next build.
     let internal = if selected {
-        if status.present {
-            " (fallback while the removable volume is not usable)"
-        } else {
-            " (fallback while the removable volume is absent)"
-        }
+        " (fallback when the removable volume is unavailable)"
     } else {
         " (selected for the next build)"
     };
@@ -881,7 +880,7 @@ mod tests {
             sections(Some(&verified), None, true),
             vec![
                 Section::RemovableUnread("not used".to_owned()),
-                Section::Internal(" (fallback while the removable volume is not usable)")
+                Section::Internal(" (fallback when the removable volume is unavailable)")
             ]
         );
         let absent = removable_status(Err("recorded pool unreadable".to_owned()), false);

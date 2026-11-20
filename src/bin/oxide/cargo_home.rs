@@ -7,19 +7,25 @@
 //! a closed loopback port, and reports the outcome Cargo's `gc` trace
 //! shows. Routes the proxy cannot contain refuse before Cargo runs.
 
-use crate::{freshness, guidance, identity, process, CARGO, MIB};
+use crate::{cargo_layout, freshness, guidance, identity, process, CARGO, MIB};
 use oxide_storage::inventory::{inventory_directory, InventoryLimits};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
 use std::net::{Ipv4Addr, TcpListener};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Cargo releases whose cleanup trigger and trace text were qualified:
-/// 1.97.1 (oxide#084, Cargo `c980f4866`) and 1.100.0 (oxide#354, Cargo `3acc79c0c`).
-const QUALIFIED_CARGO: [&str; 2] = ["cargo 1.97.1 ", "cargo 1.100.0 "];
+/// 1.97.1 (oxide#084, Cargo `c980f4866`) and 1.100.0 (oxide#354, Cargo
+/// `3acc79c0c`). The trigger and trace are release facts, so this matches the
+/// shared release tags of `cargo_layout` rather than one pinned build.
+const QUALIFIED_CARGO: [&str; 2] = [
+    cargo_layout::CARGO_1_97_1_RELEASE,
+    cargo_layout::CARGO_1_100_0_RELEASE,
+];
 
 fn is_qualified_cargo(version: &str) -> bool {
     QUALIFIED_CARGO
@@ -422,20 +428,80 @@ fn config_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// Why a bounded read of one regular file failed.
+#[derive(Debug)]
+pub(crate) enum FileRead {
+    /// The name holds a link, a directory or another special file.
+    NotRegular,
+    /// The file holds more than the caller's bound.
+    Oversize,
+    Io(std::io::Error),
+}
+
+/// Read one regular file of at most `limit` bytes from ONE descriptor.
+///
+/// The open, the type and size check and the read all use that descriptor, so
+/// a name swapped for a link, a directory or a larger file after a separate
+/// check cannot redirect or grow the read. The read asks for one byte past the
+/// bound, so a file that grew since its size was read is refused rather than
+/// truncated. `O_NONBLOCK` keeps a FIFO from blocking the open; the type check
+/// then refuses it. A final symlink is followed only when `follow` is set
+/// (Cargo follows one for its own config files); otherwise `O_NOFOLLOW`
+/// refuses it. `Ok(None)` means the path does not exist.
+pub(crate) fn read_regular(
+    path: &Path,
+    limit: u64,
+    follow: bool,
+) -> Result<Option<Vec<u8>>, FileRead> {
+    let flags = if follow {
+        libc::O_NONBLOCK
+    } else {
+        libc::O_NOFOLLOW | libc::O_NONBLOCK
+    };
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(FileRead::NotRegular)
+        }
+        Err(error) => return Err(FileRead::Io(error)),
+    };
+    let metadata = file.metadata().map_err(FileRead::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(FileRead::NotRegular);
+    }
+    if metadata.len() > limit {
+        return Err(FileRead::Oversize);
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(FileRead::Io)?;
+    if bytes.len() as u64 > limit {
+        return Err(FileRead::Oversize);
+    }
+    Ok(Some(bytes))
+}
+
 /// Read one config file as Cargo would (following a symlink) and parse it
 /// as TOML 1.0. Unreadable, oversized, non-UTF-8 or unparseable files
 /// refuse; parser text is never shown, since it can quote a value.
 pub(crate) fn read_config(path: &Path) -> Result<serde_json::Value, String> {
     let unreadable = |reason: String| format!("Cargo config file {} {reason}", path.display());
-    let metadata =
-        std::fs::metadata(path).map_err(|error| unreadable(format!("cannot be read ({error})")))?;
-    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
-        return Err(unreadable(
-            "is not a regular file of at most 1 MiB".to_owned(),
-        ));
-    }
-    let bytes =
-        std::fs::read(path).map_err(|error| unreadable(format!("cannot be read ({error})")))?;
+    let bytes = match read_regular(path, MAX_CONFIG_BYTES, true) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Err(unreadable("cannot be read (no such file)".to_owned())),
+        Err(FileRead::NotRegular | FileRead::Oversize) => {
+            return Err(unreadable(
+                "is not a regular file of at most 1 MiB".to_owned(),
+            ))
+        }
+        Err(FileRead::Io(error)) => return Err(unreadable(format!("cannot be read ({error})"))),
+    };
     let text = String::from_utf8(bytes).map_err(|_| unreadable("is not UTF-8".to_owned()))?;
     basic_toml::from_str(&text).map_err(|error| {
         let line = error
@@ -750,23 +816,25 @@ pub fn run_cache_clean(args: &[OsString]) -> Result<u8, String> {
         }
     }
     let lock = workspace.join("Cargo.lock");
-    match std::fs::symlink_metadata(&lock) {
-        Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_LOCK_BYTES => {}
-        Ok(_) => {
-            return Err(refuse(format!(
-                "{} is not a regular file of at most 16 MiB",
-                lock.display()
-            )))
-        }
-        Err(_) => {
+    let text = match read_regular(&lock, MAX_LOCK_BYTES, false) {
+        Ok(Some(bytes)) => match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => return Err(refuse(format!("{} is not UTF-8", lock.display()))),
+        },
+        Ok(None) => {
             return Err(refuse(format!(
                 "{} is missing; without a lockfile Cargo would resolve over the network",
                 lock.display()
             )))
         }
-    }
-    let text = std::fs::read_to_string(&lock)
-        .map_err(|error| format!("cannot read {}: {error}", lock.display()))?;
+        Err(FileRead::NotRegular) | Err(FileRead::Oversize) => {
+            return Err(refuse(format!(
+                "{} is not a regular file of at most 16 MiB",
+                lock.display()
+            )))
+        }
+        Err(FileRead::Io(error)) => return Err(format!("cannot read {}: {error}", lock.display())),
+    };
     if let Some(reason) = refuse_lock(&text) {
         return Err(refuse(reason));
     }

@@ -2,7 +2,7 @@
 use crate::{cargo_home, cli, wrapper};
 use serde_json::Value;
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// An empty discriminator preserves the pre-change recipe-default key.
 /// Unknown settings share their own key, separate from either known value.
@@ -102,7 +102,7 @@ fn resolve_lower(checkout: &Path, invocation: &cli::Invocation) -> Result<bool, 
     }
     let args = &invocation.cargo_args[..];
     let mut cli_docs = Vec::new();
-    for config in wrapper::config_values(args).iter().rev() {
+    for config in wrapper::config_values(args)?.iter().rev() {
         cli_docs
             .push(basic_toml::from_str(config).map_err(|_| "cannot parse --config".to_owned())?);
     }
@@ -111,38 +111,10 @@ fn resolve_lower(checkout: &Path, invocation: &cli::Invocation) -> Result<bool, 
     }
     let cwd = std::env::current_dir().map_err(|_| "cannot read cwd".to_owned())?;
     let home = cargo_home::resolve()?;
-    let files = wrapper::config_files(&cwd, &home);
-    // The wrapper's diagnostic discovery skips files it cannot open. A
-    // skipped layer is not evidence that it cannot affect this key.
-    for dir in cwd
-        .ancestors()
-        .map(|dir| dir.join(".cargo"))
-        .chain(std::iter::once(home))
-    {
-        let plain = dir.join("config");
-        let toml = dir.join("config.toml");
-        for path in [&plain, &toml] {
-            match std::fs::symlink_metadata(path) {
-                Ok(_)
-                    if !names_config(&files, path)
-                        && !(path == &toml && names_config(&files, &plain)) =>
-                {
-                    return Err(format!(
-                        "Cargo config {} cannot be classified",
-                        path.display()
-                    ));
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => {
-                    return Err(format!(
-                        "Cargo config {} cannot be inspected",
-                        path.display()
-                    ))
-                }
-            }
-        }
-    }
+    // `config_files` is the one walk Cargo's own choice of files is read
+    // through: every existing layer it would read is either returned or
+    // refused, so no second inspection pass can find an unclassified one.
+    let files = wrapper::config_files(&cwd, &home)?;
     let mut docs = Vec::new();
     for path in files {
         docs.push(cargo_home::read_config(&path)?);
@@ -186,45 +158,9 @@ fn resolve_lower(checkout: &Path, invocation: &cli::Invocation) -> Result<bool, 
     Ok(base == "dev")
 }
 
-/// Whether `path` is one of `files`, compared canonically. The same Cargo
-/// config reached through an ancestor `.cargo` and `CARGO_HOME` (a link, a
-/// trailing slash, another spelling) is one file, not an unclassified one.
-fn names_config(files: &[PathBuf], path: &Path) -> bool {
-    if files.iter().any(|file| file == path) {
-        return true;
-    }
-    let Ok(canonical) = std::fs::canonicalize(path) else {
-        return false;
-    };
-    files
-        .iter()
-        .any(|file| std::fs::canonicalize(file).is_ok_and(|file| file == canonical))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Regression: a `.cargo/config.toml` reached through a link (an ancestor
-    /// `.cargo` and `CARGO_HOME` naming one directory differently) was refused as
-    /// unclassified, so an ordinary build failed for no config reason.
-    #[test]
-    fn one_config_reached_by_two_spellings_is_one_file() {
-        let root = std::env::temp_dir().join(format!("oxide-names-config-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let real = root.join("real/.cargo");
-        std::fs::create_dir_all(&real).expect("fixture");
-        std::fs::write(real.join("config.toml"), "").expect("config");
-        let link = root.join("link");
-        std::os::unix::fs::symlink(root.join("real"), &link).expect("link");
-        let files = vec![real.join("config.toml")];
-        assert!(names_config(&files, &link.join(".cargo/config.toml")));
-        assert!(!names_config(
-            &files,
-            &root.join("absent/.cargo/config.toml")
-        ));
-        std::fs::remove_dir_all(&root).expect("remove own fixture");
-    }
 
     #[test]
     fn component_preserves_defaults_and_partitions_unknown() {

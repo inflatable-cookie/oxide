@@ -67,8 +67,8 @@ pub(crate) fn producer(
     // that writes layout v1 is refused in `collect`, so a donor and a recipient
     // never mix layouts.
     let (prefix, adapter) = match crate::cargo_layout::default_for(facts.cargo_version) {
-        crate::cargo_layout::Layout::V1 => ("cargo 1.97.1 (c980f4866 ", ADAPTER_V1),
-        crate::cargo_layout::Layout::V2 => ("cargo 1.100.0 (3acc79c0c ", ADAPTER_V2),
+        crate::cargo_layout::Layout::V1 => (crate::cargo_layout::CARGO_1_97_1, ADAPTER_V1),
+        crate::cargo_layout::Layout::V2 => (crate::cargo_layout::CARGO_1_100_0, ADAPTER_V2),
     };
     if !facts.cargo_version.starts_with(prefix) || facts.rustc_version.trim().is_empty() {
         return Err("unsupported Cargo or compiler");

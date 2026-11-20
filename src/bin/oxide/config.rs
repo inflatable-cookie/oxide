@@ -14,6 +14,7 @@
 //! needed, so an explicit `OXIDE_CONFIG` or `OXIDE_POOL` reads no platform
 //! directory variable.
 
+use crate::cargo_home;
 use longhorn_storage_layout::{
     native_platform_directory_fact_from, resolve_storage_root, PlatformDirectoryFact,
     PlatformEnvironment, RootKind, StorageIdentity, StorageLayoutError, StorageLayoutRequest,
@@ -458,25 +459,39 @@ fn shown(value: &std::ffi::OsStr) -> String {
     bounded(&Path::new(value).display().to_string())
 }
 
+/// Our longest one-line mention of a path or other text.
+const BOUNDED_CHARS: usize = 240;
+
 pub(crate) fn bounded(text: &str) -> String {
-    const LIMIT: usize = 240;
-    let escaped: String = text
-        .chars()
-        .flat_map(|c| {
-            let escape = c.is_control();
-            let mut buffer = Vec::new();
-            if escape {
-                buffer.extend(c.escape_default());
-            } else {
-                buffer.push(c);
+    escape_bounded(text, BOUNDED_CHARS)
+}
+
+/// One line, bounded, in one allocation: control characters escaped and the
+/// ESCAPED text cut at `limit` characters with a trailing ellipsis. Every
+/// one-line mention of caller-supplied text goes through this.
+pub(crate) fn escape_bounded(text: &str, limit: usize) -> String {
+    let mut escaped = String::new();
+    let mut written = 0_usize;
+    for character in text.chars() {
+        if written == limit {
+            escaped.push('…');
+            return escaped;
+        }
+        if !character.is_control() {
+            escaped.push(character);
+            written += 1;
+            continue;
+        }
+        for piece in character.escape_default() {
+            if written == limit {
+                escaped.push('…');
+                return escaped;
             }
-            buffer
-        })
-        .collect();
-    match escaped.char_indices().nth(LIMIT) {
-        Some((cut, _)) => format!("{}…", &escaped[..cut]),
-        None => escaped,
+            escaped.push(piece);
+            written += 1;
+        }
     }
+    escaped
 }
 
 /// Where a setting came from.
@@ -1144,12 +1159,11 @@ pub fn inspect(path: &Path) -> Found {
     {
         return Found::LegacyImage;
     }
+    // Opened once, without following a final link: the type, the size and the
+    // bytes all come from the same descriptor, so a name swapped after a
+    // separate check cannot redirect the read.
     let config = path.join("config.json");
-    match fs::symlink_metadata(&config) {
-        Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_CONFIG_BYTES => {}
-        _ => return Found::Unknown,
-    }
-    let Ok(bytes) = fs::read(&config) else {
+    let Ok(Some(bytes)) = cargo_home::read_regular(&config, MAX_CONFIG_BYTES, false) else {
         return Found::Unknown;
     };
     let backend = serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -1186,12 +1200,9 @@ pub fn known_pools(facts: &Facts) -> Vec<PathBuf> {
     let Ok(path) = known_pools_file(facts) else {
         return Vec::new();
     };
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_KNOWN_POOLS_BYTES => {}
-        _ => return Vec::new(),
-    }
-    fs::read(&path)
+    cargo_home::read_regular(&path, MAX_KNOWN_POOLS_BYTES, false)
         .ok()
+        .flatten()
         .and_then(|bytes| serde_json::from_slice::<Vec<PathBuf>>(&bytes).ok())
         .unwrap_or_default()
 }

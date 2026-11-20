@@ -17,9 +17,22 @@ use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// The `cargo -V` release tag of each qualified release, ending at the space
+/// after its version number. A qualification that only pins the release
+/// (Cargo home's cleanup trigger and trace) matches this form.
+pub(crate) const CARGO_1_97_1_RELEASE: &str = "cargo 1.97.1 ";
+pub(crate) const CARGO_1_100_0_RELEASE: &str = "cargo 1.100.0 ";
+
+/// The verified build of each qualified release: the `cargo -V` prefix
+/// including its commit (`1.97.1` c980f4866, `1.100.0` 3acc79c0c). Every
+/// other build of the same release stays unqualified, because the rules read
+/// from its source are only proven for this one.
+pub(crate) const CARGO_1_97_1: &str = "cargo 1.97.1 (c980f4866 ";
+pub(crate) const CARGO_1_100_0: &str = "cargo 1.100.0 (3acc79c0c ";
+
 /// `cargo -V` prefixes of verified releases whose default layout is v2.
 /// Each entry must also be in `VERIFIED_CARGO`.
-const V2_CARGO: [&str; 1] = ["cargo 1.100.0 (3acc79c0c "];
+const V2_CARGO: [&str; 1] = [CARGO_1_100_0];
 
 /// Profile directory names Cargo writes beneath a target directory.
 const PROFILES: [&str; 2] = ["debug", "release"];
@@ -175,7 +188,7 @@ pub(crate) mod support {
     /// The Cargo this module's real-output tests run.
     pub(crate) const TOOLCHAIN: &str = "1.100.0";
     /// The `cargo -V` line of [`TOOLCHAIN`].
-    pub(crate) const TOOLCHAIN_LINE: &str = "cargo 1.100.0 (3acc79c0c ";
+    pub(crate) const TOOLCHAIN_LINE: &str = super::CARGO_1_100_0;
 
     /// A fresh directory under `TMPDIR`, removed on drop. Only this path.
     pub(crate) struct Fixture(pub(crate) PathBuf);
