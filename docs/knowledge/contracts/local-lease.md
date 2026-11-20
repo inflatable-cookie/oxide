@@ -42,7 +42,11 @@ formats keep the existing forward refusal and installed-binary handoff.
 ## Commands
 
 - **Admission** takes an exclusive Barge hold before returning a slot.
-- **Release** records a bounded measurement of the closing slot and updates the
+- **Release** may run bounded stale-unit pruning on a warm Cargo layout-v2 slot
+  while the caller still holds that exclusive Barge hold and after positive
+  writer closure, before taking the pool lock to run the closing measurement
+  walk and mark the slot idle.
+- **Release measurement** records a bounded measurement of the closing slot and updates the
   Rust lease state before the caller drops its hold. That one walk is bounded well
   below the pool-lock wait, so no other command waits behind it.
 - **Recovery** uses cooperative hold availability. Normal process-group exit
@@ -166,6 +170,16 @@ A compatible idle slot keeps its generation and is not scanned before each grant
 Barge validates and holds the root. Cargo's and Oxide's freshness checks decide
 reuse correctness, and a cache hit is never test success. The admission rule is
 owned by [warm-reuse admission](warm-reuse-admission.md).
+
+Under Cargo layout v2, long-lived warm slots prune stale unused unit
+directories (`<profile>/build/<pkg>/<16-hex>/`) once per clean release while
+holding the exclusive Barge hold (before the pool lock is taken for release).
+Pruning never runs without the exclusive hold, never alters `mtime`, never
+follows symlinks or crosses mount boundaries, skips `noatime` filesystems, leaves
+layout v1 slots and unrecognized entries untouched, and caps each pass at 500 ms,
+16,384 units, 50,000 entries, depth 32 and 256 deletions per release (7-day
+staleness threshold, tracked per slot generation in
+`oxide-managed/units/<slot_id>.json`). See [workflow](workflow.md#stale-unit-pruning-layout-v2).
 
 ## Ledger-only views and passive reads
 

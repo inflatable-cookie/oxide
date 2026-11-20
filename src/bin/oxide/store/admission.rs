@@ -338,6 +338,16 @@ impl Lease {
     pub fn lease_id(&self) -> &str {
         &self.lease_id
     }
+
+    /// Whether this lease currently carries its exclusive Barge root hold.
+    pub(crate) fn has_exclusive_hold(&self) -> bool {
+        self._root_hold.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drop_hold_for_tests(&mut self) {
+        self._root_hold.take();
+    }
 }
 
 pub enum Acquired {

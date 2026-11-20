@@ -6,9 +6,9 @@ use crate::identity::{RunPick, SlotKey};
 use crate::store::{Acquired, Backend, Store};
 use crate::watchdog::Watchdog;
 use crate::{
-    budget, capacity, child_temp, cli, cold_seed_active, cold_seed_qualification_notice, freshness,
-    identity, incremental, outputs, process, removable, seed_lock, seed_sources, seed_summary,
-    store, wrapper, CARGO, MIB,
+    budget, capacity, cargo_prune, child_temp, cli, cold_seed_active,
+    cold_seed_qualification_notice, freshness, identity, incremental, outputs, process, removable,
+    seed_lock, seed_sources, seed_summary, store, wrapper, CARGO, MIB,
 };
 use oxide_storage::lease::ReuseMeasurement;
 use std::ffi::OsString;
@@ -96,6 +96,7 @@ struct PreparedPrimary {
     cargo: Command,
     chosen_temp: child_temp::Chosen,
     wrapper_note: Option<String>,
+    prune_session: Option<cargo_prune::Session>,
 }
 
 struct PrimaryExecution {
@@ -120,6 +121,40 @@ struct ProgramCustody<'a> {
     child_temp: &'a child_temp::Chosen,
     production: Option<seed_sources::Production>,
     seed_profile: &'a str,
+    prune_session: Option<cargo_prune::Session>,
+}
+
+impl ProgramCustody<'_> {
+    /// Publish seed catalog (for fresh producing builds), prune stale layout
+    /// v2 units while still holding the slot's exclusive Barge hold, and
+    /// release the lease.
+    fn finish_and_release(
+        self,
+        seed_successful: bool,
+        prune_successful: bool,
+    ) -> Result<store::ReleaseDisposition, String> {
+        if let Some(producing) = self.production {
+            // A catalog failure never changes the command's result or origin.
+            oxide_storage::release_trace::phase("seed publication", || {
+                producing.publish(
+                    self.store,
+                    &self.held,
+                    seed_successful,
+                    self.origin.as_ref(),
+                    self.seed_profile,
+                )
+            });
+        }
+        oxide_storage::release_trace::phase("stale unit pruning", || {
+            let _ = cargo_prune::finish(
+                &self.held,
+                self.store.control(),
+                self.prune_session,
+                prune_successful,
+            );
+        });
+        self.store.release(self.held, self.origin)
+    }
 }
 
 struct SummaryContext<'a> {
@@ -244,6 +279,7 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         child_temp: &primary.chosen_temp,
         production: session.production,
         seed_profile,
+        prune_session: primary.prune_session,
     };
     if let Some((program, report_pre_launch_stop)) =
         resolve_run_program(&prepared, &execution, &output_root, &primary.chosen_temp)
@@ -634,12 +670,14 @@ fn prepare_primary_command(
         prepared.store.release(held, origin)?;
         return Ok(Step::Exit(stop_for_admission()));
     }
+    let prune_session = cargo_prune::prepare(&held);
     Ok(Step::Continue((
         held,
         PreparedPrimary {
             cargo,
             chosen_temp,
             wrapper_note,
+            prune_session,
         },
     )))
 }
@@ -905,31 +943,23 @@ fn finish_released_invocation(
         .watchdog
         .as_ref()
         .filter(|watchdog| watchdog.stopped());
-    if let Some(producing) = custody.production {
-        let successful = execution
-            .outcome
-            .as_ref()
-            .is_ok_and(|(status, _, _)| status.is_some_and(|status| status.success()))
-            && stopped.is_none()
-            && budget::origin().is_none();
-        // A catalog failure never changes the command's result or origin.
-        oxide_storage::release_trace::phase("seed publication", || {
-            producing.publish(
-                custody.store,
-                &custody.held,
-                successful,
-                custody.origin.as_ref(),
-                custody.seed_profile,
-            )
-        });
-    }
-    let disposition = custody.store.release(custody.held, custody.origin)?;
+    let successful = execution
+        .outcome
+        .as_ref()
+        .is_ok_and(|(status, _, _)| status.is_some_and(|status| status.success()))
+        && stopped.is_none()
+        && budget::origin().is_none()
+        && process::received_signal().is_none();
+    let store = custody.store;
+    let execution_started = custody.execution_started;
+    let child_temp = custody.child_temp;
+    let disposition = custody.finish_and_release(successful, successful)?;
     let (status, executable, drained) = execution.outcome?;
     let status = status.ok_or("Cargo ended without a status")?;
     print_summary(summary);
     let mut retired = false;
-    if custody.store.backend == Backend::ApfsVolume {
-        match custody.store.last_flush() {
+    if store.backend == Backend::ApfsVolume {
+        match store.last_flush() {
             Some(flush) if flush.slot_id == summary.slot => match flush.micros {
                 Some(micros) => eprintln!(
                     "oxide: flushed the removable volume before releasing slot {} in {:.1} ms",
@@ -981,7 +1011,7 @@ fn finish_released_invocation(
             budget::Outcome::ChildExit
         },
         Some(status),
-        custody.execution_started,
+        execution_started,
         if drained {
             budget::Drain::Complete
         } else {
@@ -1020,7 +1050,7 @@ fn finish_released_invocation(
             // inherited directory, in the environment `cargo run` gives it.
             let mut command = Command::new(&target.program);
             command.args(&summary.invocation.program_args);
-            custody.child_temp.apply(&mut command);
+            child_temp.apply(&mut command);
             if let Err(error) =
                 identity::apply_run_environment(&mut command, &target.program, &target.manifest)
             {
@@ -1266,20 +1296,14 @@ fn run_owned_program(
         );
         return Ok(1);
     }
-    if let Some(producing) = custody.production {
-        let successful = status.is_some_and(|status| status.success())
-            && stopped.is_none()
-            && budget::origin().is_none();
-        // A catalog failure never changes the command's result or origin.
-        producing.publish(
-            custody.store,
-            &custody.held,
-            successful,
-            custody.origin.as_ref(),
-            custody.seed_profile,
-        );
-    }
-    let disposition = custody.store.release(custody.held, custody.origin)?;
+    let seed_successful = status.is_some_and(|status| status.success())
+        && stopped.is_none()
+        && budget::origin().is_none();
+    // Cargo already succeeded before `run_owned_program` launched the built binary.
+    let prune_successful =
+        stopped.is_none() && budget::origin().is_none() && process::received_signal().is_none();
+    let execution_started = custody.execution_started;
+    let disposition = custody.finish_and_release(seed_successful, prune_successful)?;
     if let Some(origin) = budget::origin() {
         budget::report_stop(origin);
     }
@@ -1297,7 +1321,7 @@ fn run_owned_program(
             budget::Outcome::ChildExit
         },
         status,
-        custody.execution_started,
+        execution_started,
         budget::Drain::Complete,
         release_lease_state(disposition),
         code,
@@ -1981,6 +2005,7 @@ mod tests {
             child_temp: &chosen,
             production: None,
             seed_profile: "debug",
+            prune_session: None,
         };
         // A control directory the caller cannot write makes the release's
         // final state write fail after the child never started.
@@ -2065,6 +2090,7 @@ mod tests {
             child_temp: &chosen,
             production: None,
             seed_profile: "debug",
+            prune_session: None,
         };
         let error = fail_unstarted(custody, "could not start the program".to_owned())
             .expect_err("the spawn failure is still an error");
@@ -2092,6 +2118,7 @@ mod tests {
             child_temp: &chosen,
             production: None,
             seed_profile: "debug",
+            prune_session: None,
         };
         let error = fail_unstarted(custody, "could not start the program".to_owned())
             .expect_err("the spawn failure is still an error");
@@ -2342,6 +2369,7 @@ mod tests {
                 child_temp: &chosen,
                 production: None,
                 seed_profile: "debug",
+                prune_session: None,
             };
             let status = Command::new("/bin/sh")
                 .args(["-c", "exit 0"])
@@ -2388,6 +2416,7 @@ mod tests {
                 child_temp: &chosen,
                 production: None,
                 seed_profile: "debug",
+                prune_session: None,
             };
             let manifest = root.join("Cargo.toml");
             let args = [OsString::from("-c"), OsString::from("exit 0")];

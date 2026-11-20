@@ -11,6 +11,7 @@ mod budget;
 mod capacity;
 mod cargo_home;
 mod cargo_layout;
+mod cargo_prune;
 mod child_temp;
 mod clean;
 mod cli;

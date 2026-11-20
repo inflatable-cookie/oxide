@@ -270,7 +270,9 @@ oxide exec --execution-budget 300s -- npm run tauri build
    checkout's target directory, unless a budget or converted output custody keeps
    the lease through the program. `test` holds the lease through execution. Reuse
    never skips tests.
-6. When the group is empty, record the compile origin, release the lease and print
+6. When the group is empty, record the compile origin, run bounded stale-unit
+   pruning on warm layout-v2 slots after a clean build while still holding the
+   slot's exclusive Barge hold, release the lease and print
    one summary line: profile, strategy, slot, warm or cold, elapsed time, the
    pool's soft budget and backend. `OXIDE_TRACE_RELEASE=1` adds phase lines on
    stderr for closeout diagnosis.
@@ -361,6 +363,42 @@ prefix. Oxide itself is pinned to 1.100.0 in `rust-toolchain.toml`.
   inherited rustc wrapper, and a `PATH` whose `rustc` belongs to another install
   than its `cargo`.
 - A new Cargo release joins the table only after its source facts are rechecked.
+
+### Stale-unit pruning (layout v2)
+
+In Cargo layout v2, each compile or build-script unit lives in its own
+`<profile>/build/<pkg>/<16-hex>/` directory (`fingerprint/`, `out/`, optional
+`run/`). Before releasing a warm slot after a clean build (exit 0, no signal,
+watchdog or budget stop, and positive group closure), Oxide prunes stale unused
+unit directories while still holding the slot's exclusive Barge hold and before
+taking the pool or admission lock for release:
+
+- **Filesystem observation:** before Cargo starts on a warm slot, Oxide checks
+  that the slot's mount does not set `noatime` and runs a single-file
+  `futimens` + `pread` probe to confirm that reading a file with `atime < mtime`
+  updates `atime`. Where confirmed, primary `fingerprint/` files with
+  `atime >= mtime` are armed with `atime = mtime - 1 s` (`UTIME_OMIT` for
+  `mtime`, never altering `mtime`). If `atime` is unavailable or unconfirmed,
+  pruning is skipped.
+- **Keep rule:** any unit whose `fingerprint/` or subtree timestamps show it
+  was written or read during the build (`mtime` or `atime` at or after the
+  pre-Cargo start minus 1 s) is never deleted, and its recorded activity in
+  `<pool>/oxide-managed/units/<slot_id>.json` advances to now. Units used within
+  the 7-day staleness window (`STALE_UNIT_MAX_AGE`) are also kept, and cold
+  slots never delete anything on their initial build.
+- **Conservative shape & boundary checks:** layout v1 members (holding `deps/`
+  or `.fingerprint/`, or lacking v2 units), `<16-hex>` directories missing
+  `fingerprint/` or holding entries outside `{fingerprint, out, run}`, symlinks,
+  foreign-owned entries and cross-mount entries are left completely untouched.
+  A stale unit is unlinked bottom-up descriptor-relative (`openat` with
+  `O_NOFOLLOW`, `fstatat` with `AT_SYMLINK_NOFOLLOW`, `unlinkat`) only after its
+  entire subtree passes verification; an empty `<pkg>` parent directory is
+  removed only if `unlinkat(..., AT_REMOVEDIR)` succeeds.
+- **Bounds:** pre-Cargo arming is capped at 200 ms; post-build pruning is capped
+  at 500 ms (both clamped to any remaining command budget), 16 profile members,
+  4,096 packages per profile, 16,384 units, 50,000 walked entries, depth 32, and
+  at most 256 deleted unit directories per release. Any bound reached stops the
+  pass cleanly without stalling slot release.
 
 ## Crash recovery
 

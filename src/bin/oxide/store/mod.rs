@@ -39,6 +39,8 @@ mod status;
 
 #[cfg(test)]
 mod launch_hold_tests;
+#[cfg(test)]
+mod prune_layout_v2_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod scratch_internal_tests;
 #[cfg(all(test, target_os = "macos"))]
