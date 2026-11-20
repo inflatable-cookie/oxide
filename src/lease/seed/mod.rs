@@ -103,15 +103,15 @@ pub use walk::{WalkGap as SeedWalkGap, WalkLimits as SeedWalkLimits};
 
 use super::pool::{open_seed, open_seed_writer, SeedPoolView, SeedSlotView};
 use super::{
-    current_uid, ensure_private_dir, io_error, random_hex, LeaseError, MANAGED_NAME,
-    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES,
+    current_uid, ensure_private_dir, io_error, persist_private_atomic, LeaseError, PersistStage,
+    MANAGED_NAME, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES,
 };
 use crate::fs_util::open_directory_at;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -1936,40 +1936,24 @@ fn write_sidecar(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
 }
 
 fn write_sidecar_bounded(path: &Path, bytes: &[u8], limit: usize) -> Result<(), LeaseError> {
-    if bytes.len() > limit {
-        return Err(LeaseError::LedgerExhausted);
-    }
-    let parent = path
-        .parent()
-        .ok_or(LeaseError::InvalidInput("sidecar has no parent"))?;
-    let temp = parent.join(format!("{SIDECAR_TEMP_PREFIX}{}", random_hex(8)?));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true).mode(0o600);
-    let mut file = options.open(&temp).map_err(io_error)?;
-    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-        let _ = fs::remove_file(&temp);
-        return Err(io_error(error));
-    }
-    drop(file);
-    // Test-only: a fault here models an interruption with the whole temp written
-    // and the rename not yet done (the temp stays behind, inert).
-    #[cfg(test)]
-    if let Some(error) = tests::catalog_fault(false) {
-        return Err(error);
-    }
-    if let Err(error) = fs::rename(&temp, path) {
-        let _ = fs::remove_file(&temp);
-        return Err(io_error(error));
-    }
-    // Test-only: a fault here models an interruption after the atomic rename,
-    // before the directory fsync (the catalog is whole at its real name).
-    #[cfg(test)]
-    if let Some(error) = tests::catalog_fault(true) {
-        return Err(error);
-    }
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(io_error)
+    persist_private_atomic(
+        path,
+        bytes,
+        SIDECAR_TEMP_PREFIX,
+        limit as u64,
+        sidecar_fault,
+    )
+}
+
+/// Test-only fault points on the catalog write, mapped onto the shared stages.
+#[cfg(test)]
+fn sidecar_fault(stage: PersistStage) -> Option<LeaseError> {
+    tests::catalog_fault(stage == PersistStage::AfterRename)
+}
+
+#[cfg(not(test))]
+fn sidecar_fault(_stage: PersistStage) -> Option<LeaseError> {
+    None
 }
 
 /// A custody failure on a slot path: an ownership, device or symlink fact

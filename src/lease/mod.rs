@@ -834,18 +834,16 @@ fn io_error(error: std::io::Error) -> LeaseError {
     LeaseError::Io(error.to_string())
 }
 
-fn require_absolute(path: &Path, what: &'static str) -> Result<(), LeaseError> {
+fn require_absolute(path: &Path) -> Result<(), LeaseError> {
     if path.is_absolute() {
         Ok(())
     } else {
-        let _ = what;
         Err(LeaseError::InvalidInput("paths must be absolute"))
     }
 }
 
-fn require_bounded_text(value: &str, max: usize, what: &'static str) -> Result<(), LeaseError> {
+fn require_bounded_text(value: &str, max: usize) -> Result<(), LeaseError> {
     if value.is_empty() || value.len() > max {
-        let _ = what;
         return Err(LeaseError::InvalidInput(
             "identity text is empty or too long",
         ));
@@ -862,7 +860,7 @@ fn require_bounded_text(value: &str, max: usize, what: &'static str) -> Result<(
 }
 
 fn canonical_existing_dir(path: &Path, owner_only: bool) -> Result<PathBuf, LeaseError> {
-    require_absolute(path, "path")?;
+    require_absolute(path)?;
     if path.as_os_str().as_bytes().len() > MAX_PATH_BYTES {
         return Err(LeaseError::InvalidInput("path is too long"));
     }
@@ -894,7 +892,7 @@ fn canonical_existing_dir(path: &Path, owner_only: bool) -> Result<PathBuf, Leas
 }
 
 fn ensure_private_dir(path: &Path) -> Result<(), LeaseError> {
-    require_absolute(path, "directory")?;
+    require_absolute(path)?;
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
@@ -933,16 +931,37 @@ fn ensure_private_dir(path: &Path) -> Result<(), LeaseError> {
     Ok(())
 }
 
-fn persist_private_file(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
-    if bytes.len() as u64 > MAX_LEDGER_BYTES {
+/// Where [`persist_private_atomic`] can be made to fail, so a test can model
+/// an interruption: before the rename the temp file stays behind, inert;
+/// after it the new bytes are already at their real name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistStage {
+    BeforeRename,
+    AfterRename,
+}
+
+/// The fault hook for production writes, which never fails.
+fn no_persist_fault(_stage: PersistStage) -> Option<LeaseError> {
+    None
+}
+
+/// Atomic owner-only replacement of a private file: write a sibling temp
+/// named `temp_prefix` plus random hex, fsync it, rename it over `path`, then
+/// fsync the directory. A crash leaves at most that inert temp behind.
+fn persist_private_atomic(
+    path: &Path,
+    bytes: &[u8],
+    temp_prefix: &str,
+    limit: u64,
+    fault: fn(PersistStage) -> Option<LeaseError>,
+) -> Result<(), LeaseError> {
+    if bytes.len() as u64 > limit {
         return Err(LeaseError::LedgerExhausted);
     }
     let parent = path
         .parent()
         .ok_or(LeaseError::InvalidInput("file has no parent"))?;
-    let mut temp_name = String::from("ledger.tmp-");
-    temp_name.push_str(&random_hex(8)?);
-    let temp_path = parent.join(temp_name);
+    let temp_path = parent.join(format!("{temp_prefix}{}", random_hex(8)?));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
     let mut file = options.open(&temp_path).map_err(io_error)?;
@@ -951,13 +970,29 @@ fn persist_private_file(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
         return Err(io_error(error));
     }
     drop(file);
+    if let Some(error) = fault(PersistStage::BeforeRename) {
+        return Err(error);
+    }
     if let Err(error) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(io_error(error));
     }
+    if let Some(error) = fault(PersistStage::AfterRename) {
+        return Err(error);
+    }
     File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(io_error)
+}
+
+fn persist_private_file(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
+    persist_private_atomic(
+        path,
+        bytes,
+        "ledger.tmp-",
+        MAX_LEDGER_BYTES,
+        no_persist_fault,
+    )
 }
 
 fn read_private_file(path: &Path) -> Result<Vec<u8>, LeaseError> {
@@ -1119,7 +1154,13 @@ pub fn fence_admission_writer(control: &Path) -> Result<(), LeaseError> {
     // Prove the bytes the front door will read back are accepted by the same
     // parser before replacing the durable document.
     control::parse_state(&bytes).map_err(LeaseError::ControlState)?;
-    persist_control_state(&control.join("state.json"), &bytes)
+    persist_private_atomic(
+        &control.join("state.json"),
+        &bytes,
+        "state.tmp-",
+        control::MAX_STATE_BYTES,
+        no_persist_fault,
+    )
 }
 
 /// Reserve an existing admission lock for a held eviction that needs to
@@ -1169,30 +1210,6 @@ fn open_control_admission(control: &Path, create: bool) -> Result<File, LeaseErr
         return Err(io_error(error));
     }
     Ok(file)
-}
-
-fn persist_control_state(path: &Path, bytes: &[u8]) -> Result<(), LeaseError> {
-    let parent = path
-        .parent()
-        .ok_or(LeaseError::InvalidInput("control state has no parent"))?;
-    let mut temp_name = String::from("state.tmp-");
-    temp_name.push_str(&random_hex(8)?);
-    let temp_path = parent.join(temp_name);
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true).mode(0o600);
-    let mut file = options.open(&temp_path).map_err(io_error)?;
-    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(io_error(error));
-    }
-    drop(file);
-    if let Err(error) = fs::rename(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(io_error(error));
-    }
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(io_error)
 }
 
 fn random_hex(bytes: usize) -> Result<String, LeaseError> {
