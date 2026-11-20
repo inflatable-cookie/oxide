@@ -1,0 +1,1 @@
+Qualify `oxide clean --cargo-cache` on Cargo 1.100.0 (`3acc79c0c`) alongside Cargo 1.97.1 (`c980f4866`), verify Cargo 1.100.0 `gc` trace and closed-proxy containment facts, add end-to-end regression tests, and update workflow and toolchain docs.

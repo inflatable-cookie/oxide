@@ -2,10 +2,10 @@
 //!
 //! Owning contract: `docs/knowledge/contracts/workflow.md` (Cargo home).
 //! Oxide never deletes in the Cargo home itself. `--cargo-cache` asks
-//! Cargo 1.97.1 for one pass of its own automatic cleanup through
-//! `cargo fetch`, with every HTTP request forced through a closed loopback
-//! port, and reports the outcome Cargo's `gc` trace shows. Routes the proxy
-//! cannot contain refuse before Cargo runs.
+//! a qualified Cargo (1.97.1 or 1.100.0) for one pass of its own automatic
+//! cleanup through `cargo fetch`, with every HTTP request forced through
+//! a closed loopback port, and reports the outcome Cargo's `gc` trace
+//! shows. Routes the proxy cannot contain refuse before Cargo runs.
 
 use crate::{freshness, guidance, identity, process, CARGO, MIB};
 use oxide_storage::inventory::{inventory_directory, InventoryLimits};
@@ -17,9 +17,15 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// The only Cargo whose cleanup trigger and trace text were qualified
-/// (oxide#084, Cargo `c980f4866`).
-const QUALIFIED_CARGO: &str = "cargo 1.97.1 ";
+/// Cargo releases whose cleanup trigger and trace text were qualified:
+/// 1.97.1 (oxide#084, Cargo `c980f4866`) and 1.100.0 (oxide#354, Cargo `3acc79c0c`).
+const QUALIFIED_CARGO: [&str; 2] = ["cargo 1.97.1 ", "cargo 1.100.0 "];
+
+fn is_qualified_cargo(version: &str) -> bool {
+    QUALIFIED_CARGO
+        .iter()
+        .any(|prefix| version.starts_with(prefix))
+}
 /// One `--config` argument each, Cargo's highest-precedence form.
 const ALWAYS: &str = "cache.auto-clean-frequency=\"always\"";
 /// Cargo's `gc` trace plus warnings from its cleanup module.
@@ -714,9 +720,9 @@ pub fn run_cache_clean(args: &[OsString]) -> Result<u8, String> {
     version.arg("-V").env_remove("CARGO_LOG");
     let version = bounded_stdout(version, VERSION_TIMEOUT, VERSION_CAP)?;
     let version = String::from_utf8_lossy(&version);
-    if !version.starts_with(QUALIFIED_CARGO) {
+    if !is_qualified_cargo(&version) {
         return Err(refuse(format!(
-            "{} is not the qualified Cargo 1.97.1, whose cleanup trigger and trace Oxide reads",
+            "{} is not a qualified Cargo release (1.97.1 or 1.100.0), whose cleanup trigger and trace Oxide reads",
             version.trim()
         )));
     }
@@ -1058,7 +1064,12 @@ mod tests {
 
     /// A tiny offline fixture under the scratch temp directory, with an
     /// empty private Cargo home; nothing here may use the network.
-    fn offline_fixture(label: &str, manifest_deps: &str, lock: &str) -> (PathBuf, PathBuf) {
+    fn offline_fixture(
+        label: &str,
+        channel: &str,
+        manifest_deps: &str,
+        lock: &str,
+    ) -> (PathBuf, PathBuf) {
         let root = std::env::temp_dir()
             .canonicalize()
             .unwrap()
@@ -1073,7 +1084,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             package.join("rust-toolchain.toml"),
-            "[toolchain]\nchannel = \"1.97.1\"\n",
+            format!("[toolchain]\nchannel = \"{channel}\"\n"),
         )
         .unwrap();
         std::fs::write(package.join("src/lib.rs"), "").unwrap();
@@ -1082,30 +1093,46 @@ mod tests {
     }
 
     #[test]
+    fn qualified_cargo_gate_allows_only_1_97_1_and_1_100_0() {
+        assert!(is_qualified_cargo("cargo 1.97.1 (c980f4866 2026-06-30)\n"));
+        assert!(is_qualified_cargo("cargo 1.100.0 (3acc79c0c 2026-11-05)\n"));
+        assert!(!is_qualified_cargo("cargo 1.98.1 (797e8a9bc 2026-08-10)"));
+        assert!(!is_qualified_cargo("cargo 1.99.1 (5f94df478 2026-09-17)"));
+        assert!(!is_qualified_cargo("cargo 1.97.10 (x)"));
+        assert!(!is_qualified_cargo("cargo 1.100.1 (x)"));
+        assert!(!is_qualified_cargo(""));
+    }
+
+    #[test]
     fn a_stale_lock_with_an_ssh_dependency_refuses_offline() {
         // The lock names only crates.io; the manifest adds an SSH git
         // dependency the online resolve would fetch.
-        let (root, package) = offline_fixture(
-            "stale",
-            "remote = { git = \"ssh://git@127.0.0.1:9/remote.git\" }\n",
-            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
-        );
-        let refused = offline_resolution(&package, Some(&root.join("home"))).unwrap_err();
-        assert!(
-            refused.contains("cannot resolve this workspace offline"),
-            "{refused}"
-        );
-        let (clean, local) = offline_fixture(
-            "local",
-            "",
-            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
-        );
-        assert_eq!(
-            offline_resolution(&local, Some(&clean.join("home"))),
-            Ok(())
-        );
-        std::fs::remove_dir_all(&root).unwrap();
-        std::fs::remove_dir_all(&clean).unwrap();
+        for (tag, channel) in [("197", "1.97.1"), ("1100", "1.100.0")] {
+            let (root, package) = offline_fixture(
+                &format!("stale-{tag}"),
+                channel,
+                "remote = { git = \"ssh://git@127.0.0.1:9/remote.git\" }\n",
+                "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
+            );
+            let refused = offline_resolution(&package, Some(&root.join("home"))).unwrap_err();
+            assert!(
+                refused.contains("cannot resolve this workspace offline"),
+                "{channel}: {refused}"
+            );
+            let (clean, local) = offline_fixture(
+                &format!("local-{tag}"),
+                channel,
+                "",
+                "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
+            );
+            assert_eq!(
+                offline_resolution(&local, Some(&clean.join("home"))),
+                Ok(()),
+                "{channel}"
+            );
+            std::fs::remove_dir_all(&root).unwrap();
+            std::fs::remove_dir_all(&clean).unwrap();
+        }
     }
 
     #[test]
