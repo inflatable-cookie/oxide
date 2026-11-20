@@ -1111,6 +1111,34 @@ fn exec_stdin() -> Stdio {
     }
 }
 
+/// A child that never started: release the held slot, then always emit the
+/// invocation's one terminal budget event. A failed release never suppresses
+/// that event, and its error is preserved alongside the original failure.
+fn fail_unstarted(custody: ProgramCustody<'_>, error: String) -> Result<u8, String> {
+    let slot = custody.held.slot_id.clone();
+    let released = custody.store.release(custody.held, custody.origin);
+    budget::finished(
+        budget::Outcome::SpawnFailure,
+        None,
+        custody.execution_started,
+        budget::Drain::NotReached,
+        if released.is_ok() {
+            budget::Lease::Released
+        } else {
+            // A release that failed leaves unknown custody: the slot stays
+            // held for a later command to recover, and the event says so.
+            budget::Lease::Held
+        },
+        1,
+    );
+    match released {
+        Ok(()) => Err(error),
+        Err(release) => Err(format!(
+            "{error}; releasing slot {slot} also failed: {release}"
+        )),
+    }
+}
+
 /// Run a converted checkout's program under the held lease, as `oxide exec`
 /// runs a tool: its own process group, the record naming that group (so a
 /// crash leaves the slot held until the group is empty), signals forwarded,
@@ -1134,35 +1162,15 @@ fn run_owned_program(
         eprintln!("oxide: warning: {error}; the program runs without Cargo's full run environment");
     }
     if let Err(error) = custody.store.mark_spawning(&custody.held) {
-        custody.store.release(custody.held, custody.origin)?;
-        // The budgeted invocation still ends with one `finished` event; a
-        // command that fails before its child starts is a spawn failure.
-        budget::finished(
-            budget::Outcome::SpawnFailure,
-            None,
-            custody.execution_started,
-            budget::Drain::NotReached,
-            budget::Lease::Released,
-            1,
-        );
-        return Err(error);
+        return fail_unstarted(custody, error);
     }
     let (mut group, foreground) = match process::start_foreground_group(&mut command) {
         Ok(started) => started,
         Err(error) => {
-            custody.store.release(custody.held, custody.origin)?;
-            budget::finished(
-                budget::Outcome::SpawnFailure,
-                None,
-                custody.execution_started,
-                budget::Drain::NotReached,
-                budget::Lease::Released,
-                1,
-            );
-            return Err(format!(
-                "could not execute {}: {error}",
-                target.program.display()
-            ));
+            return fail_unstarted(
+                custody,
+                format!("could not execute {}: {error}", target.program.display()),
+            )
         }
     };
     budget::program_started();
@@ -1893,6 +1901,98 @@ mod tests {
         assert!(held.build_dir.join("partial").exists());
         store.discard(held).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn event_pipe() -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0_i32; 2];
+        // SAFETY: two valid output slots.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: both descriptors are ours and valid.
+        unsafe {
+            libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    fn drain_event_records(reader: &mut std::fs::File) -> Vec<serde_json::Value> {
+        use std::io::Read;
+        let mut text = String::new();
+        let mut chunk = [0_u8; 1024];
+        for _ in 0..50 {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => text.push_str(&String::from_utf8_lossy(&chunk[..read])),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        text.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    /// Regression: the spawn-failure path released the lease with `?` before
+    /// `budget::finished`, so a failing release ended the invocation with no
+    /// terminal event at all. The event is emitted first, the release error is
+    /// preserved, and the lease is reported held.
+    #[test]
+    fn a_failed_release_still_emits_the_terminal_budget_event() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: getuid has no preconditions.
+        if unsafe { libc::getuid() } == 0 {
+            return; // The superuser can write in a read-only directory.
+        }
+        let (mut reader, writer) = event_pipe();
+        budget::clear();
+        budget::install(budget::Options {
+            admission: None,
+            execution: None,
+            events: Some(writer.as_raw_fd()),
+        })
+        .expect("a clock");
+        let (root, store, key) = store::tests::seed_fixture();
+        let held = store::tests::seed_fixture_lease(&store, &key);
+        let chosen = child_temp::Chosen::Inherited(std::env::temp_dir());
+        let custody = ProgramCustody {
+            store: &store,
+            held,
+            origin: None,
+            execution_started: None,
+            child_temp: &chosen,
+            production: None,
+            seed_profile: "debug",
+        };
+        // A control directory the caller cannot write makes the release's
+        // final state write fail after the child never started.
+        let control = store.pool.join(oxide_storage::lease::MANAGED_NAME);
+        std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o500))
+            .expect("read-only control");
+        let result = fail_unstarted(custody, "could not start the program".to_owned());
+        std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o700))
+            .expect("restore control");
+        let error = result.expect_err("the release failure is preserved");
+        assert!(error.contains("could not start the program"), "{error}");
+        assert!(error.contains("also failed"), "{error}");
+        let records = drain_event_records(&mut reader);
+        assert!(
+            records.iter().any(|record| record["event"] == "finished"
+                && record["outcome"] == "spawn_failure"
+                && record["lease"] == "held"),
+            "{records:?}"
+        );
+        budget::clear();
+        std::fs::remove_dir_all(root).expect("remove own fixture");
     }
 
     #[test]
