@@ -309,7 +309,7 @@ impl Production {
     }
 }
 
-fn verify_pass(
+pub(crate) fn verify_pass(
     cargo_home: &Path,
     packages: &[Package],
     cache: &mut SourceCache,

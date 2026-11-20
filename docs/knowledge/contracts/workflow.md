@@ -337,7 +337,7 @@ prefix. Oxide itself is pinned to 1.100.0 in `rust-toolchain.toml`.
 | Cargo | Default build-dir layout | Stray detection reads | Cold-slot seeding |
 | --- | --- | --- | --- |
 | 1.95.0, 1.96.1, 1.97.1, 1.98.1, 1.99.1 | v1: `<profile>/deps`, `.fingerprint`, `incremental` | `deps/`, `incremental/` | adapter `cargo-1.97.1/c980f4866/build-dir-v1` (1.97.1 only) |
-| 1.100.0 (`3acc79c0c`) | v2: `<profile>/build/<pkg>/<meta>/{out,fingerprint,run}`, `incremental/`, `build/` | `deps/`, `incremental/` and, under a profile that holds v2 units, `build/` | skipped with "Cargo build-dir layout v2 has no seeding adapter" |
+| 1.100.0 (`3acc79c0c`) | v2: `<profile>/build/<pkg>/<meta>/{out,fingerprint,run}`, `incremental/`, `build/` | `deps/`, `incremental/` and, under a profile that holds v2 units, `build/` | adapter `cargo-1.100.0/3acc79c0c/build-dir-v2` (1.100.0 only; the private opt-out is refused) |
 
 - Layout is read from the directories Cargo wrote, not from the version alone.
   Cargo 1.100.0's private opt-out (`__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT`)

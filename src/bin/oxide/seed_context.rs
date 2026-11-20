@@ -28,6 +28,9 @@ const UNSUPPORTED: &[&str] = &[
     "CARGO_BUILD_RUSTC_WRAPPER",
     "RUSTC_WORKSPACE_WRAPPER",
     "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    // Cargo's private opt-out writes layout v1 under 1.100.0. Seeding is
+    // skipped rather than cloning v2 units that this command would not read.
+    "__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT",
 ];
 
 pub(crate) struct Context {
@@ -58,14 +61,16 @@ pub(crate) fn producer(
     context: Context,
 ) -> Result<oxide_storage::lease::managed::SeedProducer, &'static str> {
     use oxide_storage::lease::managed::SeedProducer;
-    const PREFIX: &str = "cargo 1.97.1 (c980f4866 ";
-    const ADAPTER: &str = "cargo-1.97.1/c980f4866/build-dir-v1";
-    // Layout v2 (Cargo 1.100.0) has no adapter: its per-unit directories are
-    // not the layout section 3 describes, so seeding is skipped, not guessed.
-    if crate::cargo_layout::default_for(facts.cargo_version) == crate::cargo_layout::Layout::V2 {
-        return Err("Cargo build-dir layout v2 has no seeding adapter");
-    }
-    if !facts.cargo_version.starts_with(PREFIX) || facts.rustc_version.trim().is_empty() {
+    use oxide_storage::lease::seed::{ADAPTER_V1, ADAPTER_V2};
+    // The producer identity names the layout the verified Cargo writes by
+    // default, and each layout has its own adapter. The 1.100.0 private opt-out
+    // that writes layout v1 is refused in `collect`, so a donor and a recipient
+    // never mix layouts.
+    let (prefix, adapter) = match crate::cargo_layout::default_for(facts.cargo_version) {
+        crate::cargo_layout::Layout::V1 => ("cargo 1.97.1 (c980f4866 ", ADAPTER_V1),
+        crate::cargo_layout::Layout::V2 => ("cargo 1.100.0 (3acc79c0c ", ADAPTER_V2),
+    };
+    if !facts.cargo_version.starts_with(prefix) || facts.rustc_version.trim().is_empty() {
         return Err("unsupported Cargo or compiler");
     }
     let family = match facts.command {
@@ -98,7 +103,7 @@ pub(crate) fn producer(
         target: facts.target.to_owned(),
         recipe: facts.recipe.to_owned(),
         backend: facts.backend.to_owned(),
-        adapter: ADAPTER.to_owned(),
+        adapter: adapter.to_owned(),
         context_digest: context.digest,
         config_files: context.config_files,
         flags_digest: context.flags_digest,
@@ -344,18 +349,41 @@ mod tests {
     }
 
     #[test]
-    fn layout_v2_cargo_is_skipped_with_its_own_reason() {
-        // Verified Cargo 1.100.0 has an adapter-less layout: skipped by name, never seeded.
+    fn verified_cargo_selects_its_layout_adapter() {
+        use oxide_storage::lease::seed::{ADAPTER_V1, ADAPTER_V2};
+        // Verified Cargo 1.100.0 writes layout v2 and names the v2 adapter.
         let input = ProducerFacts {
             cargo_version: "cargo 1.100.0 (3acc79c0c 2026-11-05)",
             ..facts()
         };
-        assert_eq!(
-            producer(input, test_context()).err(),
-            Some("Cargo build-dir layout v2 has no seeding adapter")
-        );
+        let v2 = producer(input, test_context()).expect("layout v2 adapter");
+        assert_eq!(v2.adapter, ADAPTER_V2);
+        assert_eq!(v2.cargo_version, "cargo 1.100.0 (3acc79c0c 2026-11-05)");
         // The adapter for 1.97.1 is unchanged.
-        assert!(producer(facts(), test_context()).is_ok());
+        assert_eq!(
+            producer(facts(), test_context()).unwrap().adapter,
+            ADAPTER_V1
+        );
+        // A 1.100.0 release that is not the verified build is still refused.
+        let other = ProducerFacts {
+            cargo_version: "cargo 1.100.0 (5f94df478 2026-08-27)",
+            ..facts()
+        };
+        assert!(producer(other, test_context()).is_err());
+    }
+
+    #[test]
+    fn collect_refuses_the_layout_v1_opt_out() {
+        let env = [(
+            OsString::from("__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT"),
+            OsString::from("1"),
+        )];
+        let cwd = std::env::temp_dir();
+        let home = std::env::temp_dir();
+        assert_eq!(
+            collect(&cwd, &home, &[], &env).err(),
+            Some("unsupported environment")
+        );
     }
 
     #[test]

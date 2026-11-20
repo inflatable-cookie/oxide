@@ -124,6 +124,25 @@ A unit is offered only when its complete set is present:
 - The 16-hex unit identifier in the fingerprint directory, the artifact stem and
   the `.d` stem must be the same value. Oxide never predicts that hash.
 
+**Layout v2 units.** Under `cargo-1.100.0/3acc79c0c/build-dir-v2` a library unit
+is the directory `<profile>/build/<literal package>/<16hex>/`. It is offered only
+when it holds exactly the entries `fingerprint/` and `out/`, and:
+
+- `fingerprint/` holds the triple `lib-<target>`, `lib-<target>.json` and
+  `dep-lib-<target>`, and may hold `output-lib-<target>` and `invoked.timestamp`.
+  Any other entry makes the unit unusable.
+- `out/` holds the joining `<target>-<hex>.d`, at least one of
+  `lib<target>-<hex>.rmeta` and `.rlib`, and any rustc split-debuginfo objects
+  (`<target>-<hex>.<codegen-unit>-cgu.<index>.rcgu.o`). Any other entry or a
+  file that cannot be verified makes the unit unusable.
+
+Layout v2 clones every file in an eligible library unit with its own digest
+check. The `.d`, `.rmeta` and `.rlib` must satisfy the same join rules as
+layout v1. Rustc leaves the split-debuginfo objects out of its dep-info rules,
+so Oxide checks their names against the unit and verifies them by digest. The
+existing file and byte caps apply to the complete unit. A profile that also
+holds layout v1 output (`deps/` or `.fingerprint/`) is refused.
+
 Several fingerprint directories for one package are per-unit variants. A
 run-only directory is ignored and never copied. A directory that mixes units or
 holds an unclassifiable entry is unusable. Build-script, unit-grouped, custom
@@ -407,25 +426,33 @@ existing rule. A completed seed followed by a successful build is an ordinary
 trusted slot. Nothing is migrated, and a pool that never seeds writes neither
 file.
 
-## 10. Cargo layout adapter
+## 10. Cargo layout adapters
 
-The adapter id is `cargo-1.97.1/c980f4866/build-dir-v1`. It assumes that
-`CARGO_BUILD_BUILD_DIR` is the slot's `build/`, that Cargo creates a profile
-directory beneath it, and that fingerprints and artifacts use the layout in
-section 3.
+Each build-directory layout has one adapter, and the producer identity names
+it. A donor and a recipient must record the same adapter, so a layout v1 donor
+never seeds a layout v2 recipient, or the reverse (section 2).
 
-Any other Cargo version, a build-dir v2 layout, an unverified or rebuilt Cargo,
-or a release without this adapter's qualification means no seeding. Normal Cargo
-is never altered. A new Cargo release needs its own adapter id and qualification.
+| Adapter id | Cargo | Layout | Unit shape |
+| --- | --- | --- | --- |
+| `cargo-1.97.1/c980f4866/build-dir-v1` | 1.97.1 | v1: `<profile>/deps`, `<profile>/.fingerprint` | section 3, layout v1 |
+| `cargo-1.100.0/3acc79c0c/build-dir-v2` | 1.100.0 | v2: `<profile>/build/<package>/<hex>/{fingerprint,out}` | section 3, layout v2 |
 
-Cargo 1.100.0 is a verified release whose default layout is v2 (oxide#334). It has
-no adapter: the producer refuses it before any catalog or planner work, with the
-named reason "Cargo build-dir layout v2 has no seeding adapter", and the command
-builds cold. Seeding does not clone per-unit directories, because the section 3
-identities (the `.fingerprint` triple, `deps/` artifacts and the `.d` join) do not
-carry over to `build/<pkg>/<meta>/`. A v2 adapter needs its own design and
-qualification. A v1 profile reached under the 1.100.0 opt-out is never seeded either,
-because the producer identity is keyed by version.
+Both adapters assume that `CARGO_BUILD_BUILD_DIR` is the slot's `build/`, which
+Oxide always sets.
+
+- The layout is read from what Cargo wrote. A profile holding the other layout's
+  output is refused, not guessed at. Cargo 1.100.0's private opt-out
+  (`__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT`) writes layout v1 there, so a
+  command that sets it is refused in the producer context and builds cold.
+- Any other Cargo version, an unverified or rebuilt Cargo, or a release without
+  an adapter means no seeding. A new Cargo release needs its own adapter id and
+  qualification.
+- Layout v2 was checked against real Cargo 1.100.0 output (section 13). A cloned
+  unit directory is `Fresh` in a different build directory. Cargo rebuilds it when
+  the copied artifact is missing, when the fingerprint hash is altered, or when
+  the dep-info is missing. In the same checks, aging a cloned file's mtime did
+  not make Cargo rebuild a registry unit, so the seed does not rely on mtimes:
+  the fingerprint and the outputs carry the decision.
 
 ## 11. Interfaces with other contracts
 
@@ -459,9 +486,24 @@ because the producer identity is keyed by version.
 
 ## 13. Tests
 
-Under the lean validation policy ([vision](../vision.md#validation-policy)), ordinary unit tests cover the library (`src/lease/seed/tests.rs`), the source
-adapter (`src/seed_source/tests.rs`), the front door (the seed tests in
-`src/bin/oxide/store.rs` and the `seed_*.rs` modules), and the default-on and
-opt-out behaviour (`src/bin/oxide/main.rs`). `tests/cold_seed_default_off.rs`
-compares `status` against a staged baseline binary. It is `#[ignore]` by default
-and needs `OXIDE_SEED_BASELINE_BINARY`.
+Under the lean validation policy ([vision](../vision.md#validation-policy)), the
+ordinary tests are:
+
+- library: `src/lease/seed/tests.rs`, the layout validation in
+  `src/lease/seed/catalog.rs`, and `src/seed_source/tests.rs`;
+- front door: the producer tests for both layouts in
+  `src/bin/oxide/seed_catalog.rs`, the layout-mismatch selection test in
+  `src/bin/oxide/seed_plan.rs`, the adapter and opt-out tests in
+  `src/bin/oxide/seed_context.rs`, and the seed tests in
+  `src/bin/oxide/store/tests.rs`;
+- end to end on macOS, `src/bin/oxide/store/seed_layout_v2_tests.rs`: a real
+  Cargo 1.100.0 donor publishes a catalog and is released idle. The cold
+  recipient receives every file in the registry library unit, including its
+  split-debuginfo objects. Cargo reports it `Fresh`, the binary links and runs,
+  and Cargo rebuilds the unit when the profile changes, an artifact is missing
+  or the fingerprint is altered. The offline test uses an unambiguous registry
+  source in the invoking Cargo cache. It skips when the pinned Cargo or an
+  eligible cached test package is unavailable;
+- default-on and opt-out behaviour (`src/bin/oxide/main.rs`).
+  `tests/cold_seed_default_off.rs` compares `status` against a staged baseline
+  binary. It is `#[ignore]` by default and needs `OXIDE_SEED_BASELINE_BINARY`.

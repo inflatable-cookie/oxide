@@ -137,7 +137,9 @@ impl Store {
         let Some(mut classifier) = crate::seed_catalog::Producer::new(&held.build_dir) else {
             return Ok(());
         };
-        let rejected = classifier.rejections(profile, &lock.rejected);
+        // The producer's adapter names the unit shapes this catalog records.
+        let layout = oxide_storage::lease::seed::layout_of_adapter(&producer.adapter);
+        let rejected = classifier.rejections(profile, &lock.rejected, layout);
         let mut pass = crate::seed_sources::Pass::new(Duration::from_secs(4));
         let mut packages = Vec::new();
         // The catalog is built from the POST-Cargo verified sources. A first
@@ -163,7 +165,7 @@ impl Store {
             if !pass.unchanged_since(&post.verification_root, started) {
                 continue;
             }
-            let Some(units) = classifier.units(profile, post) else {
+            let Some(units) = classifier.units(profile, post, layout) else {
                 return Ok(());
             };
             if units.is_empty() {

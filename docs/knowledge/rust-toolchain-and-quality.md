@@ -18,9 +18,13 @@ releases the freshness gate, stray detection and dep-info decoder support are
 listed in the [Cargo version matrix](contracts/workflow.md#cargo-version-matrix).
 
 Moving the pin changed only Oxide's own build. Oxide still reads other projects'
-Cargo releases independently: cold-slot seeding keeps its 1.97.1 adapter and is
-skipped on a v2 layout, and `clean --cargo-cache` still runs only under Cargo
-1.97.1 until that release is qualified.
+Cargo releases independently. Cold-slot seeding has one adapter per layout: Cargo
+1.97.1 (layout v1) and Cargo 1.100.0 (layout v2), each chosen from the consumer's
+own Cargo. The layout v2 adapter clones complete eligible library units,
+including rustc's split-debuginfo objects. A consumer that sets Cargo's layout
+opt-out builds cold ([cold-slot contract](contracts/cold-slot-seeding.md#10-cargo-layout-adapters)).
+`clean --cargo-cache` still runs only under Cargo 1.97.1 until that release is
+qualified.
 
 The unpublished root package uses Rust edition 2021 and declares
 `rust-version = "1.100.0"`. Its internal name is `oxide-storage`; publication
