@@ -33,6 +33,15 @@ Tom's 2026-11-17 lean reset ([vision](docs/knowledge/vision.md#validation-policy
 - Tom may accept a task as-is. Record that as operator acceptance, keep the independent findings, and close out without another publication-only review loop. A direct GitHub merge needs explicit scoped authorization and is reconciled through Nucleus's external-merge closeout.
 - Installing a storage-affecting binary is a separate planner step after merge. Run the staged live-pool canary on the intended pin before replacing the installed binary, and check for old-binary processes afterwards (2026-11-18 incident, decision `d9f8839e`).
 
+## Quality gate (Hill-climb standing standard)
+
+Verified floor (2026-11-20, commit `12b39824`): **7/10** across all 9 code, test, script, and doc parts (`Lease core` 8, `Seeding` 8, `outputs/` 7, `store/` 7, `Storage boundary` 7, `Front door` 7, `Config & support` 7, `Tests & scripts` 7, `Docs` 7); `Integration` is at **6/10** pending the remaining release/budget-event and `SKILL.md` cleanup.
+
+Rubric (1–10 per part): correctness & safety, clarity, structure, error handling, tests, idiom & simplicity (docs: correctness, clarity, structure, freshness; integration: seams, duplication, contract alignment). Anchors: 8 solid, 7 good with improvements due, 5–6 real debt, below 5 risky.
+
+- Every worker rates the parts it touched (and integration, if cross-part seams changed) in the PR body.
+- Every reviewer checks the same scores at the exact head and sends back any change that lowers an existing score or introduces a new part below **7**.
+
 ## Effigy command map
 
 Ordinary selectors run through the installed `oxide`. If it is broken, use
