@@ -4150,10 +4150,10 @@ fn bound_outcome(
     relinked: bool,
 ) -> Outcome {
     let mut outcome = Outcome::default();
-    // One notice per leased command on a legacy whole-target checkout: the
-    // profile layout is selected only by the explicit migration.
+    // One notice per leased command on a legacy whole-target checkout: switching
+    // to profile member links is explicit via `detach` then `adopt`.
     outcome.warnings.push(
-        "outputs: this checkout uses the whole-target layout; `oxide outputs adopt` migrates it to profile member links (existing outputs are kept)"
+        "outputs: this checkout uses the legacy whole-target layout; run `oxide outputs detach` then `oxide outputs adopt` to switch to profile member links"
             .to_owned(),
     );
     if let Err(reason) = usable {
