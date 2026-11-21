@@ -186,10 +186,13 @@ fn old_unused_v2_units_are_pruned_while_active_units_remain_warm_and_usable() {
     for attempt in 0..3 {
         // Age both the unused units AND the active units + sources to prove
         // an old unused unit is pruned while an equally old active unit
-        // that Cargo reuses as Fresh is kept warm.
+        // that Cargo reuses as Fresh is kept warm. Only surviving units are
+        // re-aged: a previous pass may already have pruned some of them.
         let old = SystemTime::now() - Duration::from_secs(30 * 86_400 * (attempt + 1) as u64);
         for unit in &all_units {
-            backdate_tree(unit, old, old);
+            if unit.exists() {
+                backdate_tree(unit, old, old);
+            }
         }
         backdate_tree(&key.checkout.join("src"), old, old);
         set_times(&key.checkout.join("Cargo.toml"), old, old);
@@ -199,8 +202,8 @@ fn old_unused_v2_units_are_pruned_while_active_units_remain_warm_and_usable() {
         assert!(out3.status.success(), "{stderr3}");
         assert!(stderr3.contains("Fresh probe"), "{stderr3}");
         assert!(!stderr3.contains("Compiling probe"), "{stderr3}");
-        let report3 = finish_with(&third, store.control(), Some(session3), limits());
-        if report3.pruned_units == 2 {
+        let _report3 = finish_with(&third, store.control(), Some(session3), limits());
+        if unused_units.iter().all(|unit| !unit.exists()) {
             break;
         }
         assert!(
