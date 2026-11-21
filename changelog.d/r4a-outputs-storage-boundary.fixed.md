@@ -1,1 +1,0 @@
-Harden owned outputs and the storage boundary: bounded process-group Git probes on one shared deadline, umask-free owner-only directory creation, descriptor-relative member ancestors, no-follow root and registry checks, case-insensitive volume UUID comparison, and first-wins inventory tie-breaking.

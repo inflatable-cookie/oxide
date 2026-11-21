@@ -1,1 +1,0 @@
-- Store recovery no longer reads stale record positions after a removable-volume flush reloads state, custody refuses an unreadable sibling control instead of reading it as clear, and cargo prune writes its temp files exclusively.

@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-21
+
+### Added
+- Public repository preparation: MIT licence, Cargo package metadata, a public README and user guides for getting started, commands and configuration, and removal of the private historical evidence directory.
+
+### Fixed
+- Harden owned outputs and the storage boundary: bounded process-group Git probes on one shared deadline, umask-free owner-only directory creation, descriptor-relative member ancestors, no-follow root and registry checks, case-insensitive volume UUID comparison, and first-wins inventory tie-breaking.
+- - Store recovery no longer reads stale record positions after a removable-volume flush reloads state, custody refuses an unreadable sibling control instead of reading it as clear, and cargo prune writes its temp files exclusively.
+- Harden the front door and support seams: every budgeted release path emits its one terminal budget event with the lease state the release really left and the exact exit code (127/126 for a tool that could not start), `oxide exec --help` prints usage with no budget or descriptor side effects, `status` names the internal pool as the fallback when the removable pool is selected, `clean` counts the target only when it is removed, and config, Cargo home, temporary-marker and `effigy.toml` reads open each file once under a bound instead of checking and reading it twice.
+- Harden the tests, scripts and docs that guard seeding, scratch status and the installer: the cold-seed opt-out regression is now self-contained instead of an ignored baseline comparison, the installer reads live documents and validates scratch through no-follow descriptors with bounded Git, the `rust:barge-adoption` fixture root is reported when a run is interrupted, and the seeding, output-migration and adoption docs match the code.
+
 ## [0.1.0] - 2026-11-20
 
 ### Added
