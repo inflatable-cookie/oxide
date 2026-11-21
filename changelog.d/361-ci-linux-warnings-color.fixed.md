@@ -1,0 +1,1 @@
+Fix the two Linux `-D warnings` dead-code errors with exact `cfg` gates (`PhysicalCoreCount::Available` and `MAX_ANCESTORS`), isolate Cargo stderr test assertions from `CARGO_TERM_COLOR=always` environments, and move the CI and release workflows to `actions/checkout@v7`.

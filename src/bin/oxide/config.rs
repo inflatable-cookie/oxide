@@ -34,6 +34,7 @@ const MAX_ACTIVE_LIMIT: usize = 32;
 const FALLBACK_MAX_ACTIVE: usize = 2;
 /// A larger result is not credible for a local macOS host and is not used
 /// for automatic admission policy.
+#[cfg(any(target_os = "macos", test))]
 const MAX_PHYSICAL_CORES: usize = 1024;
 /// Leaf of the built-in pool under the platform cache. Distinct from the
 /// retired image pool's `pool` leaf, so that one is retired separately.
@@ -207,6 +208,7 @@ impl Default for Directories {
 pub enum PhysicalCoreCount {
     #[default]
     NotQueried,
+    #[cfg(any(target_os = "macos", test))]
     Available(usize),
     Unavailable(String),
 }
@@ -823,6 +825,7 @@ fn resolve_active_build_limit(
         fact => fact,
     };
     match physical_cores {
+        #[cfg(any(target_os = "macos", test))]
         PhysicalCoreCount::Available(cores) if (1..=MAX_PHYSICAL_CORES).contains(cores) => {
             let value = (*cores / 4).clamp(FALLBACK_MAX_ACTIVE, 4);
             Ok(ActiveBuildLimit {
@@ -833,6 +836,7 @@ fn resolve_active_build_limit(
                 )),
             })
         }
+        #[cfg(any(target_os = "macos", test))]
         PhysicalCoreCount::Available(cores) => Ok(fallback(format!(
             "hw.physicalcpu returned invalid count {cores} (expected 1..={MAX_PHYSICAL_CORES})"
         ))),

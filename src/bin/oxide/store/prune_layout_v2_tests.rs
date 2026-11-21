@@ -53,6 +53,7 @@ fn cargo_build(checkout: &Path, build: &Path, features: &[&str], opt_out_v1: boo
     cmd.args(["build", "-v", "--offline"])
         .args(features)
         .env("CARGO_BUILD_BUILD_DIR", build)
+        .env("CARGO_TERM_COLOR", "never")
         .env("CARGO_TARGET_DIR", checkout.join("target"));
     if opt_out_v1 {
         cmd.env("__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT", "1");
