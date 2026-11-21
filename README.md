@@ -18,16 +18,29 @@ Oxide never falls back to plain Cargo for a build it has leased, and it never de
 
 ## Name
 
-Oxide is not affiliated with Oxide Computer Company or its [`oxidecomputer/oxide.rs`](https://github.com/oxidecomputer/oxide.rs) project. This project is not published on crates.io (`publish = false`). It is distributed from its git repository through tagged releases for now, with prebuilt binaries planned later.
+Oxide is not affiliated with Oxide Computer Company or its [`oxidecomputer/oxide.rs`](https://github.com/oxidecomputer/oxide.rs) project. This project is not published on crates.io (`publish = false`). It is distributed from its git repository through tagged releases with prebuilt binary tarballs on [GitHub Releases](https://github.com/inflatable-cookie/oxide/releases) and source builds.
 
 ## Requirements
 
-- **To build Oxide:** Rust 1.100.0. The toolchain is pinned in `rust-toolchain.toml`, so `rustup` selects it automatically inside this repository.
+- **To build Oxide from source:** Rust 1.100.0. The toolchain is pinned in `rust-toolchain.toml`, so `rustup` selects it automatically inside this repository.
 - **Projects Oxide manages:** Cargo 1.95.0 through 1.100.0 are supported. On other Cargo releases Oxide still runs, but cross-checkout reuse is turned off.
 - **Platforms:** macOS is the primary platform. Linux is supported with a directory pool, which needs no removable-drive features.
-- **Network access:** Oxide depends on two git dependencies pinned by revision or tag in `Cargo.toml`: Barge and the Longhorn storage layout. Building needs access to both repositories.
+- **Network access (building from source):** Oxide depends on two git dependencies pinned by revision or tag in `Cargo.toml`: Barge and the Longhorn storage layout. Building from source needs access to both repositories.
 
-## Build from source
+## Install
+
+### Prebuilt binaries
+
+Prebuilt release tarballs (`oxide-<tag>-<target>.tar.gz`, containing `oxide`, `LICENSE` and `README.md`) and `SHA256SUMS.txt` are published on [GitHub Releases](https://github.com/inflatable-cookie/oxide/releases) for:
+
+- `aarch64-apple-darwin` (Apple Silicon macOS)
+- `x86_64-apple-darwin` (Intel macOS)
+- `x86_64-unknown-linux-gnu` (x86_64 Linux)
+- `aarch64-unknown-linux-gnu` (arm64 Linux)
+
+Download the archive for your target along with `SHA256SUMS.txt`, verify the checksum (`shasum -a 256 -c SHA256SUMS.txt --ignore-missing` on macOS or `sha256sum -c --ignore-missing SHA256SUMS.txt` on Linux), and place `oxide` on your `PATH`.
+
+### Build from source
 
 ```sh
 git clone https://github.com/inflatable-cookie/oxide
