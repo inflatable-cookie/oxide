@@ -1,4 +1,0 @@
-86828 86828 86570 Tue Oct 20 12:04:50 2026     /bin/sh /private/tmp/oxide-cli.OdGPci/sc096/bin/cargo check --profile oxide-quick
-86844 86828     1 Tue Oct 20 12:04:50 2026     /opt/homebrew/bin/sccache
-86848 86828 86828 Tue Oct 20 12:04:50 2026     ps -A -o pid=,pgid=,ppid=,lstart=,command=
-86849 86828 86828 Tue Oct 20 12:04:50 2026     awk -v g 86828

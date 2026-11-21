@@ -2,7 +2,17 @@
 
 Oxide aims to make Rust development easy and light: predictable storage, less build churn and a fast, understandable feedback loop. Bounded reusable build storage is its first foothold.
 
-## Start here
+## User guide
+
+Start here if you use Oxide.
+
+- [Getting started](getting-started.md): build Oxide, adopt a project, run everyday commands and opt out again.
+- [Commands](commands.md): command classes, profiles, time budgets, `exec`, `status`, `pool`, `outputs`, `clean` and the Cargo version matrix.
+- [Configuration](configuration.md): config file, pool location and budget, concurrent builds, removable drives, owned outputs and Cargo home cleanup.
+
+## Architecture & contracts
+
+For maintainers and agents. These files record how Oxide is built and what it guarantees.
 
 - [Vision and operator rulings](knowledge/vision.md): scope, authority and validation policy.
 - [Architecture](knowledge/architecture.md): storage invariants and authority boundaries.
@@ -11,7 +21,7 @@ Oxide aims to make Rust development easy and light: predictable storage, less bu
 - [Knowledge map](knowledge/README.md): what each knowledge file owns.
 - [Open questions](knowledge/questions.md): unresolved design decisions.
 
-## Contracts
+Contracts:
 
 - [Barge adoption](knowledge/contracts/barge-adoption.md): storage authority, areas, holds and the transition for existing roots.
 - [Scratch pools](knowledge/contracts/scratch-pools.md): the external validation-volume pool and its refusal rules.
@@ -22,7 +32,7 @@ Oxide aims to make Rust development easy and light: predictable storage, less bu
 - [Stable Cargo profiles](knowledge/contracts/stable-cargo-profiles.md): Oxide's own profile recipes.
 - [Cold-slot seeding](knowledge/contracts/cold-slot-seeding.md): seeding a new slot from an idle donor.
 - [Exec output inference](knowledge/contracts/exec-output-inference.md): `oxide exec` derives a tool's output members from the receipt; derived link creation is not implemented.
-- [Release contract](knowledge/contracts/release.md): publication restrictions.
+- [Release contract](knowledge/contracts/release.md): licence, distribution and publication restrictions.
 
 ## Background
 

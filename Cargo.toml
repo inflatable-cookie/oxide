@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.100.0"
 publish = false
+description = "Bounded, shared Rust build storage and fast build profiles for Cargo projects, backed by Barge"
+license = "MIT"
+repository = "https://github.com/inflatable-cookie/oxide"
+readme = "README.md"
 
 [dependencies]
 # Barge's storage library at the reviewed, merged revision. Pinned by full

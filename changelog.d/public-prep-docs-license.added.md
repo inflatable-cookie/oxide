@@ -1,0 +1,1 @@
+Public repository preparation: MIT licence, Cargo package metadata, a public README and user guides for getting started, commands and configuration, and removal of the private historical evidence directory.

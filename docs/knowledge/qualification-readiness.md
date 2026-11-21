@@ -3,7 +3,7 @@
 Historical findings from the 2026-10-09 to 2026-10-16 qualification work that
 the storage design rests on. They are not a current qualification or an
 execution authority. The machinery that produced them was retired on 2026-10-18.
-Raw receipts are kept under [evidence](evidence/), and they authorise nothing.
+Raw receipts were removed from the tree on 2026-11-20 for public release; git history keeps them, and they authorise nothing.
 [Architecture](architecture.md) owns the storage invariants, [vision](vision.md)
 owns authority, [questions](questions.md) owns open decisions, and
 [workflow](contracts/workflow.md) owns current behaviour.

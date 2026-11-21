@@ -1,5 +1,0 @@
-[2026-10-20T11:04:54Z DEBUG sccache::config] Attempting to read config file at "/private/tmp/oxide-cli.OdGPci/sc096/s/config.toml"
-sccache: Starting the server...
-[2026-10-20T11:04:54Z DEBUG sccache::config] Attempting to read config file at "/private/tmp/oxide-cli.OdGPci/sc096/s/config.toml"
-[2026-10-20T11:04:54Z DEBUG sccache::commands] redirecting stderr into File { file: File { fd: 3, path: "/private/tmp/oxide-cli.OdGPci/sc096/s/l/88007.server", read: false, write: true }, path: "/private/tmp/oxide-cli.OdGPci/sc096/s/l/88007.server" }
-sccache: Listening on address /private/tmp/oxide-cli.OdGPci/sc096/s/r/88007.sock
