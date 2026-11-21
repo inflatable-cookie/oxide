@@ -640,7 +640,7 @@ mod tests {
         let mut permanent = ephemeral.clone();
         permanent["mode"] = "permanent".into();
         let mut unknown_version = permanent.clone();
-        unknown_version["version"] = 3.into();
+        unknown_version["version"] = 4.into();
         let mut missing_mode = legacy.clone();
         missing_mode["version"] = 2.into();
         let mut unknown_mode = permanent.clone();
@@ -649,18 +649,33 @@ mod tests {
         legacy_mode["mode"] = "permanent".into();
         let mut unknown_field = permanent.clone();
         unknown_field["unknown"] = true.into();
-        let mut cases = vec![(b"{malformed".to_vec(), None)];
-        for (registration, mode) in [
-            (legacy, Some("ephemeral")),
-            (ephemeral, Some("ephemeral")),
-            (permanent, Some("permanent")),
-            (unknown_version, None),
-            (missing_mode, None),
-            (unknown_mode, None),
-            (legacy_mode, None),
-            (unknown_field, None),
+        let mut nested = permanent.clone();
+        nested["version"] = 3.into();
+        nested["payload_dir"] = "builds/oxide/pool".into();
+        nested["outputs_dir"] = "builds/oxide/outputs".into();
+        let mut cases = vec![(b"{malformed".to_vec(), None, "", "")];
+        for (registration, mode, payload, outputs) in [
+            (legacy, Some("ephemeral"), "oxide-pool", "oxide-outputs"),
+            (ephemeral, Some("ephemeral"), "oxide-pool", "oxide-outputs"),
+            (permanent, Some("permanent"), "oxide-pool", "oxide-outputs"),
+            (
+                nested,
+                Some("permanent"),
+                "builds/oxide/pool",
+                "builds/oxide/outputs",
+            ),
+            (unknown_version, None, "", ""),
+            (missing_mode, None, "", ""),
+            (unknown_mode, None, "", ""),
+            (legacy_mode, None, "", ""),
+            (unknown_field, None, "", ""),
         ] {
-            cases.push((serde_json::to_vec(&registration).unwrap(), mode));
+            cases.push((
+                serde_json::to_vec(&registration).unwrap(),
+                mode,
+                payload,
+                outputs,
+            ));
         }
         let registration_path = control.join("removable.json");
         let snapshot = || {
@@ -684,7 +699,7 @@ mod tests {
             });
             (fs::read(&registration_path).unwrap(), metadata, entries)
         };
-        for (bytes, mode) in cases {
+        for (bytes, mode, payload, outputs) in cases {
             fs::write(&registration_path, &bytes).unwrap();
             fs::set_permissions(&registration_path, fs::Permissions::from_mode(0o600)).unwrap();
             let before = snapshot();
@@ -702,7 +717,8 @@ mod tests {
                 );
                 assert_eq!(removable["reserve_bytes"], 4096);
                 assert_eq!(removable["unavailable_reason"], "absent");
-                assert_eq!(removable["payload"], format!("{mount}/oxide-pool"));
+                assert_eq!(removable["payload"], format!("{mount}/{payload}"));
+                assert_eq!(removable["outputs"], format!("{mount}/{outputs}"));
                 assert_eq!(
                     removable["suggested_scratch_root"],
                     format!("{mount}/scratch")
@@ -714,6 +730,7 @@ mod tests {
                     "volume_uuid",
                     "reserve_bytes",
                     "payload",
+                    "outputs",
                     "suggested_scratch_root",
                 ] {
                     assert!(removable[field].is_null(), "{field}: {removable}");

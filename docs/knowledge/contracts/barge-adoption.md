@@ -53,8 +53,10 @@ marker and no Barge document except through the library.
 ## Declarations
 
 Each Oxide pool has one private Barge account under `<pool>/oxide-managed/barge/`.
-Its area `oxide/pool` keeps the existing slot parent (`oxide-pool/slots` on a
-drive, `payload/slots` in a pool directory), so adoption moves no path. The soft
+Its area `oxide/pool` keeps the registered slot parent (`<payload_dir>/slots` on a
+drive, where `payload_dir` defaults to `oxide-pool` and may be nested, for example
+`builds/oxide/pool/slots`; `payload/slots` in a pool directory), so adoption moves
+no path. The soft
 cap is the pool budget. A removable pool uses the drive's registered reserve and
 the product floor; a budget pool has no reserve trigger, and its soft cap is the
 admission bound.

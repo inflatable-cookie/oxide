@@ -1229,9 +1229,7 @@ fn output_area_location(
     parent: &Path,
 ) -> Result<(PathBuf, String), String> {
     if selected.kind == RootKind::External {
-        if let Some(registration) =
-            crate::removable::read_registration(&crate::removable::removable_control(control))?
-        {
+        if let Some(registration) = crate::removable::read_registration(control)? {
             let outputs = registration.mount_point.join(registration.outputs_dir());
             if parent == outputs {
                 return Ok((
@@ -2544,5 +2542,84 @@ mod script_regressions {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[cfg(test)]
+mod output_area_tests {
+    use super::*;
+    use crate::removable::{DriveMode, Registration, REGISTRATION_VERSION};
+    use std::os::unix::fs::DirBuilderExt;
+
+    /// Write the registration `register-removable` keeps in the internal
+    /// control directory, with the given outputs directory.
+    fn register(control: &Path, mount: &Path, outputs_dir: &str) {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(control)
+            .unwrap();
+        let registration = Registration {
+            version: REGISTRATION_VERSION,
+            mount_point: mount.to_path_buf(),
+            volume_uuid: "A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned(),
+            container_uuid: "A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned(),
+            reserve_bytes: 1 << 20,
+            cap_bytes: 1 << 20,
+            quota_bytes: None,
+            capacity_bytes: None,
+            registered_ms: 1,
+            mode: DriveMode::Permanent,
+            payload_dir: "builds/oxide/pool".to_owned(),
+            outputs_dir: outputs_dir.to_owned(),
+        };
+        crate::removable::write_registration(control, &registration).unwrap();
+    }
+
+    fn external(root: PathBuf) -> Selected {
+        Selected {
+            kind: RootKind::External,
+            root,
+            volume_uuid: Some("A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned()),
+            nonce: None,
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn nested_registered_outputs_take_the_registration_mount_and_folder() {
+        let temp = barge::testing::TempDir::new("oxide-output-area-nested").unwrap();
+        let control = temp.path().join("control");
+        let mount = temp.path().join("drive");
+        register(&control, &mount, "builds/oxide/outputs");
+        let selected = external(mount.join("builds/oxide/outputs/app-0000"));
+        let parent = selected.root().parent().unwrap().to_path_buf();
+        let (found_mount, folder) = output_area_location(&control, &selected, &parent).unwrap();
+        assert_eq!(found_mount, mount);
+        assert_eq!(folder, "builds/oxide/outputs");
+    }
+
+    #[test]
+    fn default_external_root_keeps_the_single_oxide_outputs_folder() {
+        let temp = barge::testing::TempDir::new("oxide-output-area-default").unwrap();
+        let control = temp.path().join("control");
+        let mount = temp.path().join("drive");
+        let selected = external(mount.join("oxide-outputs/app-0000"));
+        let parent = selected.root().parent().unwrap().to_path_buf();
+        let (found_mount, folder) = output_area_location(&control, &selected, &parent).unwrap();
+        assert_eq!(found_mount, mount);
+        assert_eq!(folder, "oxide-outputs");
+    }
+
+    #[test]
+    fn nested_external_root_outside_the_registration_refuses() {
+        let temp = barge::testing::TempDir::new("oxide-output-area-refuse").unwrap();
+        let control = temp.path().join("control");
+        let mount = temp.path().join("drive");
+        register(&control, &mount, "builds/oxide/outputs");
+        let selected = external(mount.join("elsewhere/nested/app-0000"));
+        let parent = selected.root().parent().unwrap().to_path_buf();
+        let error = output_area_location(&control, &selected, &parent).unwrap_err();
+        assert!(error.contains("registered outputs directory"), "{error}");
     }
 }

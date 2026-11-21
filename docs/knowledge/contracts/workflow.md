@@ -620,8 +620,9 @@ to the registered drive, and Oxide owns the links that point there.
   `<checkout>/target` itself a link; checkouts switch to the profile layout via
   `oxide outputs detach` followed by `oxide outputs adopt`. A member link points
   at its approved subpath only.
-- **Roots and marker.** A root is `<mount>/oxide-outputs/<project>-<checkout id>/`
-  on the registered volume, or the local fallback
+- **Roots and marker.** A root is `<mount>/<outputs_dir>/<project>-<checkout id>/`
+  on the registered volume (`outputs_dir` is `oxide-outputs` unless the
+  registration names a nested directory such as `builds/oxide/outputs`), or the local fallback
   `<checkout>/.oxide-outputs/local/`. Each root carries `.oxide-output.json` (the
   checkout, its id, the project label, the kind, the volume UUID and the creation
   generation). A link is owned only when it points at a real directory with this
@@ -792,7 +793,9 @@ Privacy & Security, Developer Tools. It states that the cause is inferred.
   Fields:
   - `removable` is `null` when no drive is registered. `mount_point`, `volume_uuid`,
     `mode`, `reserve_bytes`, `pending_reconciliation_slots` and
-    `pending_reconciliation_slot_ids` describe a registered one.
+    `pending_reconciliation_slot_ids` describe a registered one. `payload` and
+    `outputs` are the registration's payload and outputs directories under the
+    mount point, `null` when no registration can be read.
   - `available` is passive eligibility. It needs the mount to hold the registered
     volume's root, the UUID to match, the volume to be writable and outside the
     boot container, the payload to exist, and the config and ledger to read

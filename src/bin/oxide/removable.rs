@@ -448,12 +448,17 @@ fn roll_back_registration(
     // The initializer does not report which mkdir operations it performed or
     // bind their identities to us. Absence observed before it ran is not proof
     // that an entry now at that path belongs to this attempt.
+    // A nested payload directory may leave each intermediate parent behind
+    // as well, so every prefix of it under the mount is reported.
+    let mut candidates = vec![pool.to_path_buf()];
+    let mut prefix = mount.to_path_buf();
+    for component in payload_dir.split('/') {
+        prefix.push(component);
+        candidates.push(prefix.clone());
+    }
+    candidates.push(mount.join(payload_dir).join(SLOTS_FOLDER));
     let mut retained = Vec::new();
-    for path in [
-        pool.to_path_buf(),
-        mount.join(payload_dir),
-        mount.join(payload_dir).join(SLOTS_FOLDER),
-    ] {
+    for path in candidates {
         if fs::symlink_metadata(&path).is_ok() {
             retained.push(path.display().to_string());
         }
@@ -617,7 +622,10 @@ fn path_str(path: &Path) -> Result<&str, String> {
         .ok_or_else(|| "the mount point must be valid UTF-8".to_owned())
 }
 
-fn write_registration(control: &Path, registration: &Registration) -> Result<(), String> {
+pub(crate) fn write_registration(
+    control: &Path,
+    registration: &Registration,
+) -> Result<(), String> {
     let temp_name = format!(
         "{REGISTRATION}.tmp.{}.{}.{}",
         std::process::id(),
@@ -1843,5 +1851,93 @@ mod layout_tests {
                 "{error}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod nested_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn nested_registration(mount: &Path) -> Registration {
+        Registration {
+            version: REGISTRATION_VERSION,
+            mount_point: mount.to_path_buf(),
+            volume_uuid: "A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned(),
+            container_uuid: "A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned(),
+            reserve_bytes: 20 << 30,
+            cap_bytes: 1 << 20,
+            quota_bytes: None,
+            capacity_bytes: None,
+            registered_ms: 17,
+            mode: DriveMode::Permanent,
+            payload_dir: "builds/oxide/pool".to_owned(),
+            outputs_dir: "builds/oxide/outputs".to_owned(),
+        }
+    }
+
+    #[test]
+    fn nested_payload_declares_and_locates_its_slots_under_the_nested_directory() {
+        let temp = barge::testing::TempDir::new("oxide-removable-nested").unwrap();
+        let mount = temp.path().join("drive");
+        fs::create_dir(&mount).unwrap();
+        let registration = nested_registration(&mount);
+        let os = barge::FakeOs::with_volume(&mount, &registration.volume_uuid, 100 << 30);
+        let storage = Storage::open_with(
+            temp.path().join("state"),
+            Arc::new(os.clone()),
+            Arc::new(barge::ManualClock::new(1)),
+        )
+        .unwrap();
+        storage
+            .register_volume(
+                "pool",
+                &mount,
+                Some(&registration.volume_uuid),
+                "",
+                registration.reserve_bytes,
+                oxide_storage::storage::reserve_floor(registration.reserve_bytes),
+            )
+            .unwrap();
+        let area = declare_registered_area(&storage, &registration)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            require_location(&area).unwrap(),
+            mount.join("builds/oxide/pool/slots")
+        );
+    }
+
+    #[test]
+    fn failed_nested_registration_reports_every_intermediate_parent() {
+        let temp = barge::testing::TempDir::new("oxide-removable-residue").unwrap();
+        let mount = temp.path().join("drive");
+        fs::create_dir_all(mount.join("builds/oxide/pool/slots")).unwrap();
+        let pool = temp.path().join("pool");
+        let created = Created::note(&mount, "builds/oxide/pool");
+        let message = roll_back_registration(
+            &pool,
+            &mount,
+            "builds/oxide/pool",
+            &created,
+            "boom".to_owned(),
+        );
+        let retained: Vec<String> = message
+            .rsplit("untouched: ")
+            .next()
+            .unwrap()
+            .split(", ")
+            .map(str::to_owned)
+            .collect();
+        let expected: Vec<String> = [
+            "builds",
+            "builds/oxide",
+            "builds/oxide/pool",
+            "builds/oxide/pool/slots",
+        ]
+        .iter()
+        .map(|relative| mount.join(relative).display().to_string())
+        .collect();
+        assert_eq!(retained, expected, "{message}");
     }
 }
