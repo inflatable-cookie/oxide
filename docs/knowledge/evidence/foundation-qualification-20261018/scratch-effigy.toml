@@ -1,5 +1,0 @@
-# Task-owned scratch manifest for the single oxide#074 foundation
-# qualification session. Heavy admission owns the APFS pool and the builds.
-[tasks.foundation-qual]
-admission = "heavy"
-run = "/usr/bin/python3 -I /Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-f1f3b1dc-abf7-41bc-b0d7-481724f7d9ce/docs/knowledge/evidence/foundation-qualification-20261018/recipe.py /private/var/tmp/oxide-foundation-qual-20261018.5uv9sx /Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-f1f3b1dc-abf7-41bc-b0d7-481724f7d9ce/docs/knowledge/evidence/foundation-qualification-20261018 7626375 1792356980090771000"

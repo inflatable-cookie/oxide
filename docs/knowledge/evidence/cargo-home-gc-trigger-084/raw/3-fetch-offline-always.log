@@ -1,9 +1,0 @@
-   0.004922625s TRACE gc: saving last-use data
-   0.004993291s TRACE gc: insert registry_index RegistryIndex { encoded_registry_name: "index.crates.io-1949cf8c6b5b557f" } 1792358423
-   0.005031625s TRACE gc: last-use save complete
-   0.005367833s TRACE gc: saving last-use data
-   0.005375333s TRACE gc: insert registry_index RegistryIndex { encoded_registry_name: "index.crates.io-1949cf8c6b5b557f" } 1792358423
-   0.005385666s TRACE gc: insert registry crate RegistryCrate { encoded_registry_name: "index.crates.io-1949cf8c6b5b557f", crate_filename: "cfg-if-1.0.0.crate", size: 7934 } 1792358423
-   0.005410875s TRACE gc: insert registry src RegistrySrc { encoded_registry_name: "index.crates.io-1949cf8c6b5b557f", package_dir: "cfg-if-1.0.0", size: None } 1792358423
-   0.005428625s TRACE gc: last-use save complete
-   0.005433916s TRACE gc: running offline, auto gc disabled

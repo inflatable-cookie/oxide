@@ -1,7 +1,0 @@
-# oxide#101 TEMPORARY evidence apparatus, removed before delivery: sccache
-# 0.18.0 client-side mode and a stable per-index build-dir alias on private
-# /private/tmp fixtures (private HOME, CARGO_HOME, sccache cache/socket/config).
-# Not a shipped harness, benchmark or QA alias.
-[tasks."rust:sccache-client-alias"]
-admission = "heavy"
-run = "python3 scripts/probe-sccache-client-alias.py"

@@ -12,7 +12,7 @@ Open for useful cross-path reuse. The mapped-root and logical-path route is reti
 
 ## Q-005 — What names are safe to publish?
 
-Open. Review executable, crate and distribution names against the existing Oxide Computer Company SDK and CLI before publication. Owner: [release](contracts/release.md).
+Settled by Tom's 2026-11-20 ruling: the public GitHub repository and binary keep the name `oxide`, the package stays `publish = false` and is not published to crates.io, and distribution is by git tag for now with prebuilt binaries later. The [README](../../README.md#name) states that Oxide is not affiliated with Oxide Computer Company or `oxidecomputer/oxide.rs`. Owner: [release](contracts/release.md).
 
 ## Q-006 — What experience and budgets define light Rust development?
 
@@ -36,7 +36,7 @@ Open. The consumer boundary and core-test work are tracked in Nucleus. Open gate
 
 ## Q-017 — Can sccache sharing preserve Oxide's slot writer closure?
 
-Open, with a no-go for the current shared-daemon route. The normal detached sccache daemon runs outside Oxide's process group, so closure cannot be established ([evidence](evidence/sccache-096/README.md)). A serial foreground server per build over one cache may be source-attributable, but its closure after cancellation or crash and its concurrency are unproven. Cache keys also depend on slot paths. Compatibility is unknown, the benefit is insufficient, and no production wrapper is enabled. A future attempt needs a cancellation and crash closure proof, a crash-safe cache lock, concurrency handling and a cache key independent of slot and checkout paths.
+Open, with a no-go for the current shared-daemon route. The normal detached sccache daemon runs outside Oxide's process group, so closure cannot be established (the sccache-096 receipts were removed from the tree on 2026-11-20 and survive in git history). A serial foreground server per build over one cache may be source-attributable, but its closure after cancellation or crash and its concurrency are unproven. Cache keys also depend on slot paths. Compatibility is unknown, the benefit is insufficient, and no production wrapper is enabled. A future attempt needs a cancellation and crash closure proof, a crash-safe cache lock, concurrency handling and a cache key independent of slot and checkout paths.
 
 ## Q-018 — How do per-command admission and execution budgets behave after freeze?
 

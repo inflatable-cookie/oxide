@@ -1,10 +1,17 @@
 # Release contract
 
-No release, executable, crate, supported toolchain range or distribution procedure is defined. Publication is not authorized.
+## Operator ruling (2026-11-20)
 
-Before a first publication, Tom must approve executable/crate/distribution naming, supported toolchain policy, packaging and a repository-owned release procedure. The selected repository name does not settle public product naming: Oxide Computer Company already has a Rust SDK/CLI at <https://github.com/oxidecomputer/oxide.rs>.
+Tom ruled how Oxide goes public:
 
-Release preparation/execution, tags and workflow changes require explicit scoped authority. An approved implementation brief does not grant release authority. Establish the procedure and required validation evidence before any release action.
+- The repository is public on GitHub as `inflatable-cookie/oxide`, under the MIT licence in `LICENSE` (copyright inflatable-cookie).
+- The name `oxide` is kept for the repository and the binary. The package stays `publish = false` and is not published to crates.io.
+- Releases are git tags for now. Prebuilt binaries come later.
+- The README states that Oxide is not affiliated with Oxide Computer Company or `oxidecomputer/oxide.rs`.
+
+Supported toolchains are stated in the README: Rust 1.100.0 builds Oxide, and consumer projects are supported on Cargo 1.95.0 through 1.100.0.
+
+Creating a tag, bumping the version in `Cargo.toml` and changing release workflows still need explicit scoped authority. An approved implementation brief does not grant that authority. There is no repository-owned release procedure or prebuilt-binary packaging yet.
 
 ## Local installation
 

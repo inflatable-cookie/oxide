@@ -1,9 +1,0 @@
-
-╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ EFFIGY  /Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-341406bf-4738-465d-ab73-3bd16f894063 │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── v0.14.1+local.3113774 ╯
-
-waiting for QA capacity, position 1
-[error] Task failed
-  capacity_timeout: heavy run 9d24715e34cacca7cd6cadec3c9418051cf944a0add1be9406ed9c3f950c2d13 was never launched because capacity did not free in time; this is a capacity timeout, not a validation failure
-exit=1

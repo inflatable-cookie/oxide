@@ -1,5 +1,0 @@
-[manifest]
-minimum_effigy_version = "0.14.0"
-[tasks.measurement]
-admission = "heavy"
-run = "exec /Applications/Xcode.app/Contents/Developer/usr/bin/python3 /private/tmp/oxide-075-cranelift.q8a2kl_b/measure.py"
