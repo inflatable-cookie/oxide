@@ -2,9 +2,11 @@
 
 This guide takes you from a fresh checkout of Oxide to a Cargo project that builds through the shared pool. For every option, see [commands](commands.md). For machine settings, see [configuration](configuration.md).
 
-## 1. Build Oxide
+## 1. Install Oxide
 
-You need Rust 1.100.0. The repository pins it in `rust-toolchain.toml`, so `rustup` selects it for you inside the checkout.
+You can install a prebuilt release tarball (`oxide-<tag>-<target>.tar.gz` for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, or `aarch64-unknown-linux-gnu`) from [GitHub Releases](https://github.com/inflatable-cookie/oxide/releases): verify its SHA-256 checksum against the accompanying `SHA256SUMS.txt`, extract `oxide` into a directory on your `PATH`, and run `oxide --version`.
+
+To build from source instead, you need Rust 1.100.0. The repository pins it in `rust-toolchain.toml`, so `rustup` selects it for you inside the checkout.
 
 ```sh
 git clone https://github.com/inflatable-cookie/oxide

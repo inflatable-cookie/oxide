@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read pinned Rust toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel=$(python3 -c 'import pathlib, re; text = pathlib.Path("rust-toolchain.toml").read_text(encoding="utf-8"); m = re.search(r"^channel\s*=\s*\"([^\"]+)\"", text, re.M); assert m, "channel missing in rust-toolchain.toml"; print(m.group(1))')
+          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: rustfmt
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace targets
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Build release binary
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo build --release --locked --bin oxide
+
+      - name: Check changelog fragments
+        run: python3 scripts/changelog.py check
+
+      - name: Run changelog script self-test
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: bash scripts/changelog.test.sh
+
+      - name: Run dogfood script tests
+        env:
+          OXIDE_TASK_SCRATCH_ROOT: ${{ runner.temp }}
+        run: python3 -m unittest discover -s scripts -p 'test_dogfood_scripts.py'
+
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read pinned Rust toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel=$(python3 -c 'import pathlib, re; text = pathlib.Path("rust-toolchain.toml").read_text(encoding="utf-8"); m = re.search(r"^channel\s*=\s*\"([^\"]+)\"", text, re.M); assert m, "channel missing in rust-toolchain.toml"; print(m.group(1))')
+          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+
+      - name: Install Cargo 1.97.1 for compatibility tests
+        shell: bash
+        run: rustup toolchain install 1.97.1 --profile minimal --no-self-update
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch=$(mktemp -d "${RUNNER_TEMP}/oxide-test.XXXXXX")
+          chmod 700 "$scratch"
+          scratch=$(cd "$scratch" && pwd -P)
+          trap 'rm -rf -- "$scratch"' EXIT
+          export TMPDIR="$scratch"
+          export TMP="$scratch"
+          export TEMP="$scratch"
+          export OXIDE_TASK_SCRATCH_ROOT="$scratch"
+          export OXIDE_TEST_INTERNAL_ROOT="$scratch"
+          cargo test --workspace --locked -- --test-threads=1
+
+  # Linux lib/bin/integration suites are not run here yet: `src/lease/seed/tests.rs`
+  # asserts cloning outcomes that `src/lease/seed/mod.rs` marks unsupported outside
+  # macOS, and integration suites require macOS scratch/launch assumptions.
+  check-linux:
+    name: Check & Build (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read pinned Rust toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel=$(python3 -c 'import pathlib, re; text = pathlib.Path("rust-toolchain.toml").read_text(encoding="utf-8"); m = re.search(r"^channel\s*=\s*\"([^\"]+)\"", text, re.M); assert m, "channel missing in rust-toolchain.toml"; print(m.group(1))')
+          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace targets
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Build release binary
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo build --release --locked --bin oxide
