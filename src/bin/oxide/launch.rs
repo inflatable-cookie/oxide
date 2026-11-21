@@ -30,6 +30,7 @@ const MAX_COPY_BYTES: u64 = 64 * 1024 * 1024;
 const COPY_CHUNK: usize = 1024 * 1024;
 const RUNS: usize = 5;
 const POLL: Duration = Duration::from_micros(250);
+#[cfg(target_os = "macos")]
 const MAX_ANCESTORS: usize = 64;
 
 /// Raw timings in microseconds.

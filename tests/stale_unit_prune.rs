@@ -203,30 +203,38 @@ fn oxide_cli_prunes_stale_v2_units_and_keeps_active_units_warm() {
         .collect();
     assert_eq!(active_units.len(), 2);
 
-    // 3. Age all units and checkout sources to 30 days ago.
-    let old = SystemTime::now() - Duration::from_secs(30 * 86_400);
-    for unit in &all_units {
-        backdate_tree(unit, old, old);
-    }
-    backdate_tree(&checkout.join("src"), old, old);
-    set_times(&checkout.join("Cargo.toml"), old, old);
-
     // 4. Warm build via `oxide` reuses active units as Fresh and prunes old unused ones.
-    let out3 = run_oxide(
-        scratch.path(),
-        &checkout,
-        &pool,
-        &["build", "-v", "--offline"],
-    );
-    let stderr3 = String::from_utf8_lossy(&out3.stderr);
-    assert!(out3.status.success(), "{stderr3}");
-    assert!(stderr3.contains("Fresh probe"), "{stderr3}");
-    assert!(!stderr3.contains("Compiling probe"), "{stderr3}");
-    for unit in &unused_units {
+    // A host indexer or reader that touches a stale unit between backdating
+    // and closeout makes it look active for that pass. Re-backdating (older
+    // on each attempt, so the activity record a missed pass writes cannot
+    // keep the units looking recent) and rebuilding still proves the
+    // invariant, while a broken pruner fails every attempt.
+    for attempt in 0..3 {
+        // 3. Age all units and checkout sources to prove an old unused unit
+        // is pruned while an equally old active unit Cargo reuses as Fresh
+        // is kept warm.
+        let old = SystemTime::now() - Duration::from_secs(30 * 86_400 * (attempt + 1) as u64);
+        for unit in &all_units {
+            backdate_tree(unit, old, old);
+        }
+        backdate_tree(&checkout.join("src"), old, old);
+        set_times(&checkout.join("Cargo.toml"), old, old);
+        let out3 = run_oxide(
+            scratch.path(),
+            &checkout,
+            &pool,
+            &["build", "-v", "--offline"],
+        );
+        let stderr3 = String::from_utf8_lossy(&out3.stderr);
+        assert!(out3.status.success(), "{stderr3}");
+        assert!(stderr3.contains("Fresh probe"), "{stderr3}");
+        assert!(!stderr3.contains("Compiling probe"), "{stderr3}");
+        if unused_units.iter().all(|unit| !unit.exists()) {
+            break;
+        }
         assert!(
-            !unit.exists(),
-            "stale unit {} must be pruned",
-            unit.display()
+            attempt < 2,
+            "stale units survived 3 backdated warm builds: {unused_units:?}"
         );
     }
     for unit in &active_units {

@@ -228,6 +228,7 @@ pub(crate) mod support {
         command
             .current_dir(dir)
             .env("RUSTUP_TOOLCHAIN", TOOLCHAIN)
+            .env("CARGO_TERM_COLOR", "never")
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("CARGO_BUILD_BUILD_DIR")
             .env_remove("RUSTC_WRAPPER")

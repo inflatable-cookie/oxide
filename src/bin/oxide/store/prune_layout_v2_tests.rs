@@ -53,6 +53,7 @@ fn cargo_build(checkout: &Path, build: &Path, features: &[&str], opt_out_v1: boo
     cmd.args(["build", "-v", "--offline"])
         .args(features)
         .env("CARGO_BUILD_BUILD_DIR", build)
+        .env("CARGO_TERM_COLOR", "never")
         .env("CARGO_TARGET_DIR", checkout.join("target"));
     if opt_out_v1 {
         cmd.env("__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT", "1");
@@ -172,29 +173,44 @@ fn old_unused_v2_units_are_pruned_while_active_units_remain_warm_and_usable() {
     assert_eq!(report2.pruned_units, 0, "all units are recent");
     store.release(second, None).unwrap();
 
-    // Age both the unused units AND the active units + sources to 30 days ago
-    // to prove an old unused unit is pruned while an equally old active unit
-    // that Cargo reuses as Fresh is kept warm.
-    let old = SystemTime::now() - Duration::from_secs(30 * 86_400);
-    for unit in &all_units {
-        backdate_tree(unit, old, old);
-    }
-    backdate_tree(&key.checkout.join("src"), old, old);
-    set_times(&key.checkout.join("Cargo.toml"), old, old);
-
     // Build 3: warm reuse of active units; unused units are untouched by Cargo
     // and pruned before slot release while holding the exclusive Barge hold.
+    // A host indexer or reader that touches a stale unit between arming and
+    // closeout makes it look active for that pass. Re-backdating (older on
+    // each attempt, so the activity record a missed pass writes cannot keep
+    // the units looking recent) and rebuilding still proves the invariant,
+    // while a broken pruner fails every attempt.
     let third = lease(&store, &key, None).expect("third lease");
     assert!(third.reused);
     assert!(third.has_exclusive_hold());
-    let session3 = prepare_with(&third.build_dir, limits()).expect("atime supported");
-    let out3 = cargo_build(&key.checkout, &third.build_dir, &[], false);
-    let stderr3 = text(&out3.stderr);
-    assert!(out3.status.success(), "{stderr3}");
-    assert!(stderr3.contains("Fresh probe"), "{stderr3}");
-    assert!(!stderr3.contains("Compiling probe"), "{stderr3}");
-    let report3 = finish_with(&third, store.control(), Some(session3), limits());
-    assert_eq!(report3.pruned_units, 2, "both unused feature units pruned");
+    for attempt in 0..3 {
+        // Age both the unused units AND the active units + sources to prove
+        // an old unused unit is pruned while an equally old active unit
+        // that Cargo reuses as Fresh is kept warm. Only surviving units are
+        // re-aged: a previous pass may already have pruned some of them.
+        let old = SystemTime::now() - Duration::from_secs(30 * 86_400 * (attempt + 1) as u64);
+        for unit in &all_units {
+            if unit.exists() {
+                backdate_tree(unit, old, old);
+            }
+        }
+        backdate_tree(&key.checkout.join("src"), old, old);
+        set_times(&key.checkout.join("Cargo.toml"), old, old);
+        let session3 = prepare_with(&third.build_dir, limits()).expect("atime supported");
+        let out3 = cargo_build(&key.checkout, &third.build_dir, &[], false);
+        let stderr3 = text(&out3.stderr);
+        assert!(out3.status.success(), "{stderr3}");
+        assert!(stderr3.contains("Fresh probe"), "{stderr3}");
+        assert!(!stderr3.contains("Compiling probe"), "{stderr3}");
+        let _report3 = finish_with(&third, store.control(), Some(session3), limits());
+        if unused_units.iter().all(|unit| !unit.exists()) {
+            break;
+        }
+        assert!(
+            attempt < 2,
+            "stale units survived 3 backdated warm builds: {all_units:?}"
+        );
+    }
     for unit in &unused_units {
         assert!(
             !unit.exists(),

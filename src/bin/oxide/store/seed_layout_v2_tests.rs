@@ -48,6 +48,7 @@ fn cargo_build(checkout: &Path, build: &Path) -> Output {
     cargo_1_100(checkout)
         .args(["build", "-v", "--offline"])
         .env("CARGO_BUILD_BUILD_DIR", build)
+        .env("CARGO_TERM_COLOR", "never")
         .env("CARGO_TARGET_DIR", checkout.join("target"))
         .output()
         .expect("cargo 1.100.0")
