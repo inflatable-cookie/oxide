@@ -1201,25 +1201,58 @@ fn output_area_config(
         .root()
         .parent()
         .ok_or("an output root has no parent")?;
-    let mount = parent.parent().ok_or("an output area has no mount")?;
-    let folder = parent
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or("an output area folder is not UTF-8")?;
+    let (mount, folder) = output_area_location(control, selected, parent)?;
     let location = sha256_hex(parent.as_os_str().as_encoded_bytes());
     let account = control.join("output-storage").join(location);
-    let uuid = if oxide_storage::storage::is_drive_mount_point(mount) {
+    let uuid = if oxide_storage::storage::is_drive_mount_point(&mount) {
         selected.volume_uuid.clone()
     } else {
         None
     };
     Ok((
         account,
-        AreaConfig::new("outputs", mount, "outputs")
+        AreaConfig::new("outputs", &mount, "outputs")
             .uuid(uuid)
             .folder(folder)
             .floor_bytes(0),
     ))
+}
+
+/// The mount point and the area folder an output root's parent names. An
+/// external root sits under the registered outputs directory, which may be
+/// nested (oxide#362): the folder is that relative path and the mount is the
+/// registration's. A root outside the registration keeps only the default
+/// single `oxide-outputs` folder, and anything else refuses.
+fn output_area_location(
+    control: &Path,
+    selected: &Selected,
+    parent: &Path,
+) -> Result<(PathBuf, String), String> {
+    if selected.kind == RootKind::External {
+        if let Some(registration) =
+            crate::removable::read_registration(&crate::removable::removable_control(control))?
+        {
+            let outputs = registration.mount_point.join(registration.outputs_dir());
+            if parent == outputs {
+                return Ok((
+                    registration.mount_point.clone(),
+                    registration.outputs_dir().to_owned(),
+                ));
+            }
+        }
+    }
+    let mount = parent.parent().ok_or("an output area has no mount")?;
+    let folder = parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("an output area folder is not UTF-8")?;
+    if selected.kind == RootKind::External && folder != crate::outputs::EXTERNAL_DIR {
+        return Err(format!(
+            "output root {} is not under the registered outputs directory",
+            selected.root().display()
+        ));
+    }
+    Ok((mount.to_path_buf(), folder.to_owned()))
 }
 
 fn output_area(control: &Path, selected: &Selected) -> Result<barge::Area, String> {

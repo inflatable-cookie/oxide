@@ -30,10 +30,12 @@ use std::process::Command;
 pub(crate) const REGISTRATION: &str = "removable.json";
 /// The removable pool's internal root (config, ledger, lock, Oxide state).
 pub const POOL_DIR: &str = "removable";
-/// The payload directory directly under the volume's mount root.
+/// The payload directory directly under the volume's mount root: the default
+/// for a registration, which records its own relative path (oxide#362).
 pub const PAYLOAD_DIR: &str = "oxide-pool";
 const LEGACY_REGISTRATION_VERSION: u32 = 1;
-pub(crate) const REGISTRATION_VERSION: u32 = 2;
+const V2_REGISTRATION_VERSION: u32 = 2;
+pub(crate) const REGISTRATION_VERSION: u32 = 3;
 pub(crate) const MAX_REGISTRATION_BYTES: u64 = 16 * 1024;
 pub const MAX_PLIST_BYTES: usize = 4 * 1024 * 1024;
 
@@ -85,6 +87,24 @@ pub struct Registration {
     pub capacity_bytes: Option<u64>,
     pub registered_ms: u64,
     pub mode: DriveMode,
+    /// The payload directory under the volume root: a clean relative path of
+    /// at most [`volume::MAX_RELATIVE_DEPTH`] names, never nested in or equal
+    /// to `outputs_dir`.
+    pub payload_dir: String,
+    /// The output roots directory under the volume root, same shape rules.
+    pub outputs_dir: String,
+}
+
+impl Registration {
+    /// The payload directory under the volume root.
+    pub fn payload_dir(&self) -> &str {
+        &self.payload_dir
+    }
+
+    /// The output roots directory under the volume root.
+    pub fn outputs_dir(&self) -> &str {
+        &self.outputs_dir
+    }
 }
 
 #[derive(Deserialize)]
@@ -114,15 +134,52 @@ impl From<LegacyRegistration> for Registration {
             capacity_bytes: registration.capacity_bytes,
             registered_ms: registration.registered_ms,
             mode: DriveMode::Ephemeral,
+            payload_dir: PAYLOAD_DIR.to_owned(),
+            outputs_dir: crate::outputs::EXTERNAL_DIR.to_owned(),
         }
     }
 }
 
+/// Version 2: the version 3 fields without the directory layout, which reads
+/// as the defaults.
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum StoredRegistration {
-    Legacy(LegacyRegistration),
-    Current(Registration),
+#[serde(deny_unknown_fields)]
+struct V2Registration {
+    version: u32,
+    mount_point: PathBuf,
+    volume_uuid: String,
+    container_uuid: String,
+    reserve_bytes: u64,
+    cap_bytes: u64,
+    quota_bytes: Option<u64>,
+    capacity_bytes: Option<u64>,
+    registered_ms: u64,
+    mode: DriveMode,
+}
+
+impl From<V2Registration> for Registration {
+    fn from(registration: V2Registration) -> Self {
+        Self {
+            version: registration.version,
+            mount_point: registration.mount_point,
+            volume_uuid: registration.volume_uuid,
+            container_uuid: registration.container_uuid,
+            reserve_bytes: registration.reserve_bytes,
+            cap_bytes: registration.cap_bytes,
+            quota_bytes: registration.quota_bytes,
+            capacity_bytes: registration.capacity_bytes,
+            registered_ms: registration.registered_ms,
+            mode: registration.mode,
+            payload_dir: PAYLOAD_DIR.to_owned(),
+            outputs_dir: crate::outputs::EXTERNAL_DIR.to_owned(),
+        }
+    }
+}
+
+/// Only the version is read before the strict shape of that version.
+#[derive(Deserialize)]
+struct VersionProbe {
+    version: u32,
 }
 
 /// Which pool a build uses, and why.
@@ -141,7 +198,7 @@ pub struct Selected {
 }
 
 const USAGE: &str = "\
-usage: oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ephemeral|permanent]
+usage: oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ephemeral|permanent] [--payload-dir <rel>] [--outputs-dir <rel>]
        oxide pool set-mode <ephemeral|permanent>
        oxide pool recover-interrupted <slot>
        oxide pool release-quarantined <slot> [--dry-run] --confirm-writers-stopped
@@ -153,6 +210,13 @@ KB, MB, GB, TB, KiB, MiB, GiB or TiB. --reserve is the free space Barge keeps
 on the volume: below it, admission prunes idle roots to make room, and the
 floor refuses admission only when that space cannot be recovered. --cap is
 Oxide's admission budget on the volume. Both are required.
+
+--payload-dir and --outputs-dir name the pool's payload and the output roots
+directories under the volume root, as clean relative paths of up to 8 names
+(for example builds/oxide/pool and builds/oxide/outputs). The defaults are
+oxide-pool and oxide-outputs. They must differ and neither may contain the
+other. The layout is fixed at registration; moving an existing pool is not yet
+supported.
 
 set-mode updates the existing removable registration only. Permanent mode
 warns when a build falls back to the internal pool; ephemeral mode keeps the
@@ -183,11 +247,21 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
             let mut reserve = None;
             let mut cap = None;
             let mut mode = None;
+            let mut payload_dir = None;
+            let mut outputs_dir = None;
             let mut rest = rest.iter();
             while let Some(arg) = rest.next() {
                 match *arg {
                     "--reserve" => reserve = Some(*rest.next().ok_or("--reserve needs a size")?),
                     "--cap" => cap = Some(*rest.next().ok_or("--cap needs a size")?),
+                    "--payload-dir" => {
+                        payload_dir =
+                            Some(*rest.next().ok_or("--payload-dir needs a relative path")?)
+                    }
+                    "--outputs-dir" => {
+                        outputs_dir =
+                            Some(*rest.next().ok_or("--outputs-dir needs a relative path")?)
+                    }
                     "--mode" => {
                         mode = Some(DriveMode::parse(
                             rest.next().ok_or("--mode needs ephemeral or permanent")?,
@@ -205,11 +279,16 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
             };
             let reserve = size("--reserve", reserve)?;
             let cap = size("--cap", cap)?;
+            let payload_dir = payload_dir.unwrap_or(PAYLOAD_DIR);
+            let outputs_dir = outputs_dir.unwrap_or(crate::outputs::EXTERNAL_DIR);
+            validate_layout_paths(payload_dir, outputs_dir)?;
             register(
                 Path::new(mount),
                 reserve,
                 cap,
                 mode.unwrap_or(DriveMode::Ephemeral),
+                payload_dir,
+                outputs_dir,
             )
         }
         ["set-mode", mode] => set_mode(DriveMode::parse(mode)?),
@@ -222,7 +301,9 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
                 Some(_) if !internal_holds(&internal, slot)? => Store::open_removable(
                     &internal.control().join(POOL_DIR),
                     registration(&internal)?
-                        .map(|registration| registration.mount_point.join(PAYLOAD_DIR))
+                        .map(|registration| {
+                            registration.mount_point.join(registration.payload_dir())
+                        })
                         .ok_or("the registration disappeared")?,
                     internal.max_active(),
                 )?,
@@ -242,7 +323,14 @@ fn size(flag: &str, value: &str) -> Result<u64, String> {
         .map_err(|error| error.replace("OXIDE_POOL_CAP", flag))
 }
 
-fn register(mount: &Path, reserve: u64, cap: u64, mode: DriveMode) -> Result<u8, String> {
+fn register(
+    mount: &Path,
+    reserve: u64,
+    cap: u64,
+    mode: DriveMode,
+    payload_dir: &str,
+    outputs_dir: &str,
+) -> Result<u8, String> {
     if !cfg!(target_os = "macos") {
         return Err("the removable apfs-volume-v1 backend is macOS-only".to_owned());
     }
@@ -274,8 +362,8 @@ fn register(mount: &Path, reserve: u64, cap: u64, mode: DriveMode) -> Result<u8,
     // registration is refused, not repaired, if it changed.
     let facts = binding.verify()?;
     let pool = control.join(POOL_DIR);
-    let created = Created::note(binding.mount_point());
-    let established = init_volume_pool(&pool, &binding, PAYLOAD_DIR, cap)
+    let created = Created::note(binding.mount_point(), payload_dir);
+    let established = init_volume_pool(&pool, &binding, payload_dir, cap)
         .map_err(|error| format!("cannot create the removable pool: {error}"))
         .and_then(|_| {
             let registration = Registration {
@@ -289,6 +377,8 @@ fn register(mount: &Path, reserve: u64, cap: u64, mode: DriveMode) -> Result<u8,
                 capacity_bytes: facts.capacity_bytes,
                 registered_ms: process::now_ms(),
                 mode,
+                payload_dir: payload_dir.to_owned(),
+                outputs_dir: outputs_dir.to_owned(),
             };
             registered_area(&removable_control(&control), &registration)?;
             write_registration(&control, &registration)?;
@@ -302,19 +392,21 @@ fn register(mount: &Path, reserve: u64, cap: u64, mode: DriveMode) -> Result<u8,
             return Err(roll_back_registration(
                 &pool,
                 binding.mount_point(),
+                payload_dir,
                 &created,
                 error,
             ))
         }
     };
     println!(
-        "registered removable pool on {} (volume {}, container {}): reserve {} MiB, admission cap {} MiB; payload {}/{PAYLOAD_DIR}",
+        "registered removable pool on {} (volume {}, container {}): reserve {} MiB, admission cap {} MiB; payload {}, outputs {}",
         registration.mount_point.display(),
         registration.volume_uuid,
         registration.container_uuid,
         reserve / MIB,
         cap / MIB,
-        registration.mount_point.display()
+        registration.mount_point.join(payload_dir).display(),
+        registration.mount_point.join(outputs_dir).display(),
     );
     Ok(0)
 }
@@ -331,8 +423,8 @@ struct Created {
 }
 
 impl Created {
-    fn note(mount: &Path) -> Self {
-        let payload = mount.join(PAYLOAD_DIR);
+    fn note(mount: &Path, payload_dir: &str) -> Self {
+        let payload = mount.join(payload_dir);
         let absent = |path: &Path| {
             fs::symlink_metadata(path)
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
@@ -346,15 +438,21 @@ impl Created {
 
 /// Preserve paths whose creation by this attempt cannot be established.
 /// Return the original error with the retained paths for inspection.
-fn roll_back_registration(pool: &Path, mount: &Path, created: &Created, error: String) -> String {
+fn roll_back_registration(
+    pool: &Path,
+    mount: &Path,
+    payload_dir: &str,
+    created: &Created,
+    error: String,
+) -> String {
     // The initializer does not report which mkdir operations it performed or
     // bind their identities to us. Absence observed before it ran is not proof
     // that an entry now at that path belongs to this attempt.
     let mut retained = Vec::new();
     for path in [
         pool.to_path_buf(),
-        mount.join(PAYLOAD_DIR),
-        mount.join(PAYLOAD_DIR).join(SLOTS_FOLDER),
+        mount.join(payload_dir),
+        mount.join(payload_dir).join(SLOTS_FOLDER),
     ] {
         if fs::symlink_metadata(&path).is_ok() {
             retained.push(path.display().to_string());
@@ -732,22 +830,41 @@ pub(crate) fn read_registration_at(directory: &File) -> Result<Option<Registrati
     parse_registration(&bytes).map(Some)
 }
 
+/// Parse a stored registration of any readable version. Each version has its
+/// own strict shape; v1 and v2 read with the default directory layout.
 fn parse_registration(bytes: &[u8]) -> Result<Registration, String> {
-    let stored: StoredRegistration = serde_json::from_slice(bytes)
+    let invalid =
+        |error: serde_json::Error| format!("the removable registration is invalid: {error}");
+    let probe: VersionProbe = serde_json::from_slice(bytes).map_err(invalid)?;
+    let registration = match probe.version {
+        LEGACY_REGISTRATION_VERSION => serde_json::from_slice::<LegacyRegistration>(bytes)
+            .map(Registration::from)
+            .map_err(invalid)?,
+        V2_REGISTRATION_VERSION => serde_json::from_slice::<V2Registration>(bytes)
+            .map(Registration::from)
+            .map_err(invalid)?,
+        REGISTRATION_VERSION => serde_json::from_slice::<Registration>(bytes).map_err(invalid)?,
+        _ => return Err("the removable registration has an unsupported version".to_owned()),
+    };
+    validate_layout_paths(&registration.payload_dir, &registration.outputs_dir)
         .map_err(|error| format!("the removable registration is invalid: {error}"))?;
-    match stored {
-        StoredRegistration::Legacy(registration)
-            if registration.version == LEGACY_REGISTRATION_VERSION =>
-        {
-            Ok(registration.into())
-        }
-        StoredRegistration::Current(registration)
-            if registration.version == REGISTRATION_VERSION =>
-        {
-            Ok(registration)
-        }
-        _ => Err("the removable registration has an unsupported version".to_owned()),
+    Ok(registration)
+}
+
+/// The payload and outputs directories must be two clean relative paths,
+/// neither equal to nor nested in the other, so no output root can sit inside
+/// the pool's payload or the reverse.
+pub(crate) fn validate_layout_paths(payload_dir: &str, outputs_dir: &str) -> Result<(), String> {
+    let payload = volume::relative_components(payload_dir)
+        .map_err(|error| format!("the payload directory: {error}"))?;
+    let outputs = volume::relative_components(outputs_dir)
+        .map_err(|error| format!("the outputs directory: {error}"))?;
+    if payload.starts_with(&outputs) || outputs.starts_with(&payload) {
+        return Err(format!(
+            "the payload directory {payload_dir} and the outputs directory {outputs_dir} must not be equal or nested in each other"
+        ));
     }
+    Ok(())
 }
 
 /// A removable registration (or its pool state) under another pool Oxide
@@ -895,7 +1012,7 @@ pub fn select(internal: Store) -> Result<Selected, String> {
     verify_location(&area, &registration)?;
     let store = Store::open_removable(
         &internal.control().join(POOL_DIR),
-        registration.mount_point.join(PAYLOAD_DIR),
+        registration.mount_point.join(registration.payload_dir()),
         internal.max_active(),
     )?;
     Ok(Selected {
@@ -964,7 +1081,7 @@ fn declare_registered_area(
     }
     let config = AreaConfig::new("pool", &registration.mount_point, "pool")
         .uuid(Some(registration.volume_uuid.clone()))
-        .folder(format!("{PAYLOAD_DIR}/slots"))
+        .folder(format!("{}/{SLOTS_FOLDER}", registration.payload_dir()))
         .soft_cap_bytes(Some(registration.cap_bytes))
         .reserve_bytes(registration.reserve_bytes)
         .floor_bytes(oxide_storage::storage::reserve_floor(
@@ -1262,6 +1379,8 @@ mod tests {
 
     fn registration(mode: DriveMode) -> Registration {
         Registration {
+            payload_dir: "oxide-pool".to_owned(),
+            outputs_dir: "oxide-outputs".to_owned(),
             version: REGISTRATION_VERSION,
             mount_point: PathBuf::from("/Volumes/OxideDriveModeTest"),
             volume_uuid: "A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned(),
@@ -1361,7 +1480,7 @@ mod tests {
         assert!(parse_registration(&serde_json::to_vec(&unknown_mode).unwrap()).is_err());
 
         let mut unknown_version = current.clone();
-        unknown_version["version"] = serde_json::Value::Number(3.into());
+        unknown_version["version"] = serde_json::Value::Number(4.into());
         let error = parse_registration(&serde_json::to_vec(&unknown_version).unwrap()).unwrap_err();
         assert!(error.contains("unsupported version"), "{error}");
 
@@ -1379,7 +1498,7 @@ mod tests {
     }
 
     #[test]
-    fn writing_a_legacy_record_publishes_v2_with_explicit_mode() {
+    fn writing_a_legacy_record_publishes_current_version_with_explicit_mode() {
         let control = TestControl::new();
         let legacy = parse_registration(&legacy_registration_bytes()).unwrap();
         write_registration(&control.0, &legacy).unwrap();
@@ -1388,7 +1507,11 @@ mod tests {
         let persisted: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(persisted["version"], REGISTRATION_VERSION);
         assert_eq!(persisted["mode"], "ephemeral");
-        assert_eq!(read_registration(&control.0).unwrap().unwrap().version, 2);
+        assert_eq!(persisted["payload_dir"], PAYLOAD_DIR);
+        assert_eq!(persisted["outputs_dir"], crate::outputs::EXTERNAL_DIR);
+        let reread = read_registration(&control.0).unwrap().unwrap();
+        assert_eq!(reread.version, REGISTRATION_VERSION);
+        assert_eq!(reread.payload_dir(), PAYLOAD_DIR);
     }
 
     #[test]
@@ -1576,7 +1699,7 @@ mod tests {
             slots: true,
         };
 
-        let error = roll_back_registration(&pool, &mount, &created, "boom".to_owned());
+        let error = roll_back_registration(&pool, &mount, PAYLOAD_DIR, &created, "boom".to_owned());
 
         assert!(error.contains("left unverified paths untouched"));
         assert!(pool.exists());
@@ -1589,7 +1712,7 @@ mod tests {
         let temp = barge::testing::TempDir::new("oxide-removable-unknown").unwrap();
         let loop_path = temp.path().join("loop");
         std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
-        let created = Created::note(&loop_path);
+        let created = Created::note(&loop_path, PAYLOAD_DIR);
         assert!(!created.payload && !created.slots);
     }
 
@@ -1606,12 +1729,119 @@ mod tests {
             slots: false,
         };
 
-        roll_back_registration(&pool, &mount, &created, "boom".to_owned());
+        roll_back_registration(&pool, &mount, PAYLOAD_DIR, &created, "boom".to_owned());
 
         assert!(pool.exists());
         assert_eq!(
             fs::read(mount.join("oxide-pool/slots/keep")).unwrap(),
             b"operator data"
         );
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    const VOLUME: &str = "A6AC3ED7-33EA-46B4-8082-7254CF291ED2";
+
+    fn common(version: u32) -> String {
+        format!(
+            r#""version":{version},"mount_point":"/Volumes/OxideLayout","volume_uuid":"{VOLUME}","container_uuid":"{VOLUME}","reserve_bytes":1048576,"cap_bytes":1048576,"quota_bytes":null,"capacity_bytes":null,"registered_ms":17"#
+        )
+    }
+
+    fn v3(payload: &str, outputs: &str) -> Vec<u8> {
+        format!(
+            r#"{{{},"mode":"permanent","payload_dir":"{payload}","outputs_dir":"{outputs}"}}"#,
+            common(3)
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn v1_and_v2_registrations_read_with_the_default_layout() {
+        let v1 = format!(r#"{{{}}}"#, common(1));
+        let v1 = parse_registration(v1.as_bytes()).unwrap();
+        assert_eq!(v1.mode, DriveMode::Ephemeral);
+        assert_eq!(v1.payload_dir(), PAYLOAD_DIR);
+        assert_eq!(v1.outputs_dir(), crate::outputs::EXTERNAL_DIR);
+
+        let v2 = format!(r#"{{{},"mode":"permanent"}}"#, common(2));
+        let v2 = parse_registration(v2.as_bytes()).unwrap();
+        assert_eq!(v2.mode, DriveMode::Permanent);
+        assert_eq!(v2.payload_dir(), "oxide-pool");
+        assert_eq!(v2.outputs_dir(), "oxide-outputs");
+
+        let refused = format!(r#"{{{},"mode":"permanent","payload_dir":"x"}}"#, common(2));
+        assert!(parse_registration(refused.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn v3_registration_carries_nested_paths() {
+        let parsed = parse_registration(&v3("builds/oxide/pool", "builds/oxide/outputs")).unwrap();
+        assert_eq!(parsed.payload_dir(), "builds/oxide/pool");
+        assert_eq!(parsed.outputs_dir(), "builds/oxide/outputs");
+        assert_eq!(parsed.version, REGISTRATION_VERSION);
+        let bytes = serde_json::to_vec(&parsed).unwrap();
+        let again = parse_registration(&bytes).unwrap();
+        assert_eq!(again.payload_dir(), parsed.payload_dir());
+        assert_eq!(again.outputs_dir(), parsed.outputs_dir());
+    }
+
+    #[test]
+    fn v3_layout_must_be_clean_disjoint_and_present() {
+        for (payload, outputs) in [
+            ("../escape", "oxide-outputs"),
+            ("/abs", "oxide-outputs"),
+            ("a//b", "oxide-outputs"),
+            ("builds/oxide/pool", "builds/oxide/pool"),
+            ("builds/oxide", "builds/oxide/outputs"),
+            ("builds/oxide/pool", "builds/oxide"),
+        ] {
+            assert!(
+                parse_registration(&v3(payload, outputs)).is_err(),
+                "{payload} / {outputs} must refuse"
+            );
+        }
+        let missing = format!(r#"{{{},"mode":"permanent"}}"#, common(3));
+        assert!(parse_registration(missing.as_bytes()).is_err());
+        assert!(parse_registration(br#"{"version":4}"#).is_err());
+        // Siblings that share a textual prefix are disjoint components.
+        assert!(validate_layout_paths("builds/oxide/pool", "builds/oxide/pool2").is_ok());
+    }
+
+    #[test]
+    fn register_refuses_an_unsafe_layout_before_any_effect() {
+        for arguments in [
+            [
+                "--payload-dir",
+                "../escape",
+                "--outputs-dir",
+                "oxide-outputs",
+            ],
+            ["--payload-dir", "oxide-pool", "--outputs-dir", "/abs"],
+            [
+                "--payload-dir",
+                "builds/oxide",
+                "--outputs-dir",
+                "builds/oxide/outputs",
+            ],
+        ] {
+            let mut args: Vec<OsString> = vec![
+                "register-removable".into(),
+                "/Volumes/OxideLayoutNotMounted".into(),
+                "--reserve".into(),
+                "1MiB".into(),
+                "--cap".into(),
+                "1MiB".into(),
+            ];
+            args.extend(arguments.iter().map(OsString::from));
+            let error = run(&args).unwrap_err();
+            assert!(
+                error.contains("payload directory") || error.contains("outputs directory"),
+                "{error}"
+            );
+        }
     }
 }

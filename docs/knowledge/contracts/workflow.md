@@ -566,11 +566,20 @@ paths. The summary says `temp: inherited <path>` or `temp: oxide <path>`.
 
 ## Removable build volume
 
-- **Registration:** `oxide pool register-removable <mount> --reserve <size> --cap <size> [--mode ephemeral|permanent]`.
+- **Registration:** `oxide pool register-removable <mount> --reserve <size> --cap <size> [--mode ephemeral|permanent] [--payload-dir <rel>] [--outputs-dir <rel>]`.
   The default mode is `ephemeral`. `oxide pool set-mode <ephemeral|permanent>` may
   run while the drive is absent. The registration file is Oxide's user policy
-  (mount, UUID, mode, reserve, budget). It is imported into the pool's Barge
-  account. A different UUID or path refuses.
+  (mount, UUID, mode, reserve, budget, payload and outputs directories). It is
+  imported into the pool's Barge account. A different UUID or path refuses.
+- **Layout:** the payload directory (`payload_dir`, default `oxide-pool`) and the
+  outputs directory (`outputs_dir`, default `oxide-outputs`) are clean relative
+  paths under the volume root, up to 8 names deep, which may be nested such as
+  `builds/oxide/pool` and `builds/oxide/outputs`. They must differ and neither may
+  contain the other. Each component is walked through the verified volume
+  descriptor with no-follow and same-device checks. Registration version 3 records
+  both fields. Versions 1 and 2 read with the defaults and keep working unchanged;
+  the next write publishes version 3 with those defaults. The layout is fixed at
+  registration: moving an existing pool or outputs directory is not supported yet.
 - **Selection:** when a build starts, the drive is selected only if it is mounted,
   its registered UUID matches and it is writable. Selection does not repeat the
   boot-container or APFS-role checks; registration and `describe` run those, and
@@ -592,9 +601,10 @@ paths. The summary says `temp: inherited <path>` or `temp: oxide <path>`.
   slot.
 - **Previous registrations:** a registration under another pool's control root is
   never moved, adopted or removed. `register-removable` refuses while one exists
-  or while the `oxide-pool` payload directory is not empty.
+  or while the payload directory is not empty.
 - **Describe:** `oxide pool describe --json` (see [status](#status-and-inspection))
-  reports the registration without writing anything.
+  reports the registration without writing anything, including the `payload` and
+  `outputs` paths on the volume.
 
 ## Final outputs
 

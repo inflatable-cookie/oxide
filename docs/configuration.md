@@ -82,12 +82,13 @@ On macOS, Oxide checks whether the pool is excluded from Time Machine before a b
 On macOS, an APFS volume on a removable drive can hold the pool, so the internal disk does less writing.
 
 ```sh
-oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ephemeral|permanent]
+oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ephemeral|permanent] [--payload-dir <rel>] [--outputs-dir <rel>]
 oxide pool set-mode permanent
 oxide pool describe --json
 ```
 
 - **Registration** records the volume's mount point and UUID, the mode, the free-space reserve and the budget. A different UUID or path is refused. Only one drive can be registered.
+- **Layout.** The pool's payload and the output roots live under the volume root, at `oxide-pool` and `oxide-outputs` by default. Pass `--payload-dir` and `--outputs-dir` to nest them, for example `--payload-dir builds/oxide/pool --outputs-dir builds/oxide/outputs`. Each is a clean relative path of at most 8 names (no `.`, `..`, empty names, or leading `/`), and the two must differ and neither may contain the other. Missing directories are created on the volume through its verified root. The layout is fixed at registration; moving an existing registration's directories is not supported yet. Existing registrations keep their default layout.
 - **Modes.** `ephemeral` (the default) keeps final outputs in the project's `target/` on the internal disk. `permanent` moves them to the drive (see [owned outputs](#owned-outputs)). Both modes use the same checks.
 - **Selection.** A build uses the drive only when it is mounted, its UUID matches and it is writable. When the drive is absent, Oxide falls back to the internal pool and prints a warning. A different drive under the same mount point is refused.
 - **Free space.** Space below the reserve starts pruning. It does not block a build unless pruning cannot recover enough.
@@ -98,7 +99,7 @@ oxide pool describe --json
 
 In `permanent` mode, Oxide places a checkout's final binaries on the registered drive and links them into the project. Oxide owns those links and only follows links that point at its own marked directories.
 
-- **Roots** live at `<mount-point>/oxide-outputs/<project>-<checkout id>/`. If the drive is unavailable, outputs stay in `<checkout>/.oxide-outputs/local/`.
+- **Roots** live at `<mount-point>/<outputs-dir>/<project>-<checkout id>/`, where `<outputs-dir>` is `oxide-outputs` unless the registration names another directory. If the drive is unavailable, outputs stay in `<checkout>/.oxide-outputs/local/`.
 - **Git rules.** Before the first link is published, Git must ignore the member paths (`target/debug`, `target/release`, and their triple variants). A rule such as `/target` covers them. A tracked or negated path does not. Oxide never rewrites `.gitignore`. If the rules are missing, an explicit adoption refuses and names the fix. Automatic conversion leaves the checkout unconverted and prints one notice.
 - **Automatic conversion.** A fresh checkout with no existing `target/` converts itself on its first build, when the permanent drive is usable. Existing output is never moved.
 - **Commands.** `oxide outputs status` and `oxide outputs plan` are read-only. `oxide outputs adopt` converts a checkout explicitly. `oxide outputs detach` restores a real, empty `target/` and keeps every output that is already on the drive. `oxide outputs prune` removes old output roots. Use `--dry-run` first, then apply the exact plan with `--plan <file> --plan-sha256 <hex>`.

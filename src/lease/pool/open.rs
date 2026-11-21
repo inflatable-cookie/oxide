@@ -80,8 +80,7 @@ pub(super) fn recorded_volume(
     {
         return Err(LeaseError::BackingMismatch);
     }
-    let name = volume.payload_dir.as_str();
-    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+    if crate::volume::relative_components(&volume.payload_dir).is_err() {
         return Err(LeaseError::BackingMismatch);
     }
     Ok(RecordedVolume {
@@ -255,7 +254,7 @@ pub(super) fn open_volume_payload(
     let binding = Binding::open(&volume.mount_point, Some(&volume.volume_uuid))
         .map_err(|_| LeaseError::BackingMismatch)?;
     let payload_fd = binding
-        .dir_at(binding.fd(), &volume.payload_dir, false)
+        .dir_path_at(&volume.payload_dir, false)
         .map_err(|_| LeaseError::BackingMismatch)?;
     let root = volume.mount_point.join(&volume.payload_dir);
     let payload = canonical_existing_dir(&root, true).map_err(|_| LeaseError::BackingMismatch)?;

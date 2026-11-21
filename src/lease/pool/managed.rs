@@ -50,7 +50,7 @@ pub fn init_volume_pool(
         return Err(LeaseError::InvalidInput("pool already initialized"));
     }
     let payload = binding
-        .dir_at(binding.fd(), payload_dir, true)
+        .dir_path_at(payload_dir, true)
         .map_err(LeaseError::Io)?;
     let root = binding.mount_point().join(payload_dir);
     let entries = std::fs::read_dir(&root)
