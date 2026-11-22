@@ -284,6 +284,12 @@ pub struct Flush {
 pub struct Ticket {
     pub id: u64,
     pub pid: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub blocked: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A running `oxide clean`; commands for the same checkout wait while it

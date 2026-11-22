@@ -570,8 +570,13 @@ fn print_pool(
                 )
             },
         );
+        let blocked = if waiter.blocked {
+            ", blocked on checkout/slot (not blocking other checkouts)"
+        } else {
+            ""
+        };
         println!(
-            "  recorded lease-ticket waiter PID {}, {age} (may be stale)",
+            "  recorded lease-ticket waiter PID {}, {age}{blocked} (may be stale)",
             waiter.pid
         );
     }
@@ -579,44 +584,7 @@ fn print_pool(
         println!("  cleaning {}", checkout.display());
     }
     for slot in &report.slots {
-        let state = if report.pending_reconciliation.contains(&slot.slot_id) {
-            "recorded deletion pending reconciliation (not idle or held)".to_owned()
-        } else {
-            match (slot.state, &slot.interrupted) {
-                (SlotOccupancy::Held, _) if slot.retired.is_some() => format!(
-                    "retired and held, never reused ({})",
-                    slot.retired.as_deref().unwrap_or_default()
-                ),
-                (SlotOccupancy::Held, Some(interrupted)) => {
-                    let holder = interrupted
-                        .holder_pid
-                        .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
-                    let path = match interrupted.path {
-                        store::Return::NeverStarted => {
-                            "Cargo never started; the next command recovers it".to_owned()
-                        }
-                        store::Return::GroupEmpty(group) => {
-                            format!("Cargo group {group}; recovered once the group is empty")
-                        }
-                        store::Return::GroupUnrecorded => {
-                            "Cargo group not recorded; `oxide pool recover-interrupted <slot>` releases it"
-                                .to_owned()
-                        }
-                        store::Return::NotOwn => {
-                            "lease not provably this command's; `oxide pool recover-interrupted <slot>` releases it"
-                                .to_owned()
-                        }
-                    };
-                    let command = slot.holder.as_deref().unwrap_or("command");
-                    format!("held by an interrupted {command} (oxide pid {holder}, {path})")
-                }
-                (SlotOccupancy::Held, None) => match &slot.holder {
-                    Some(command) => format!("held by {command}"),
-                    None => "held".to_owned(),
-                },
-                _ => "idle".to_owned(),
-            }
-        };
+        let state = slot_state_text(slot, &report.pending_reconciliation);
         let owner = match (&slot.checkout, slot.managed) {
             (Some(checkout), _) => checkout.display().to_string(),
             (None, true) => "no checkout affinity".to_owned(),
@@ -665,6 +633,52 @@ fn print_pool(
         );
     }
     Ok(())
+}
+
+/// Render the slot's occupancy phrase for `oxide status`, surfacing a
+/// Barge-held ledger-idle slot honestly instead of labelling it plain `idle`.
+fn slot_state_text(slot: &store::SlotView, pending_reconciliation: &[String]) -> String {
+    if pending_reconciliation.contains(&slot.slot_id) {
+        return "recorded deletion pending reconciliation (not idle or held)".to_owned();
+    }
+    match (slot.state, &slot.interrupted) {
+        (SlotOccupancy::Held, _) if slot.retired.is_some() => format!(
+            "retired and held, never reused ({})",
+            slot.retired.as_deref().unwrap_or_default()
+        ),
+        (SlotOccupancy::Held, Some(interrupted)) => {
+            let holder = interrupted
+                .holder_pid
+                .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
+            let path = match interrupted.path {
+                store::Return::NeverStarted => {
+                    "Cargo never started; the next command recovers it".to_owned()
+                }
+                store::Return::GroupEmpty(group) => {
+                    format!("Cargo group {group}; recovered once the group is empty")
+                }
+                store::Return::GroupUnrecorded => {
+                    "Cargo group not recorded; `oxide pool recover-interrupted <slot>` releases it"
+                        .to_owned()
+                }
+                store::Return::NotOwn => {
+                    "lease not provably this command's; `oxide pool recover-interrupted <slot>` releases it"
+                        .to_owned()
+                }
+            };
+            let command = slot.holder.as_deref().unwrap_or("command");
+            format!("held by an interrupted {command} (oxide pid {holder}, {path})")
+        }
+        (SlotOccupancy::Held, None) => match &slot.holder {
+            Some(command) => format!("held by {command}"),
+            None => "held".to_owned(),
+        },
+        (SlotOccupancy::Idle, _) if slot.barge_held => {
+            "ledger-idle (Barge hold still held by another process; not reusable or evictable)"
+                .to_owned()
+        }
+        _ => "idle".to_owned(),
+    }
 }
 
 /// One slot under its pool's header: ID, state, profile, project label,
@@ -929,8 +943,23 @@ mod tests {
             interrupted: None,
             retired: None,
             holder: None,
+            barge_held: false,
             size: store::SlotSize::NotMeasured("not measured".to_owned()),
         }
+    }
+
+    #[test]
+    fn barge_held_idle_slot_status_does_not_say_plain_idle() {
+        let mut slot = view("3", Some("longhorn-quick-3"), "/work/longhorn");
+        slot.barge_held = true;
+        let state = slot_state_text(&slot, &[]);
+        assert!(
+            state.contains("Barge hold still held by another process"),
+            "{state}"
+        );
+        assert!(state.contains("not reusable or evictable"), "{state}");
+        let line = slot_line(&slot, &state, "/work/longhorn");
+        assert!(!line.contains(" slot 3 idle "), "{line}");
     }
 
     /// A slot whose last walk stopped partial is rendered as

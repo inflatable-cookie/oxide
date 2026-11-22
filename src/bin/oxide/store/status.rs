@@ -276,6 +276,7 @@ pub struct Report {
 pub(crate) struct Waiter {
     pub(crate) pid: u32,
     pub(crate) age: Option<WaitAge>,
+    pub(crate) blocked: bool,
 }
 
 #[derive(Debug)]
@@ -426,6 +427,9 @@ pub struct SlotView {
     pub retired: Option<String>,
     /// The holding command's label (`exec <program>`), while held.
     pub holder: Option<String>,
+    /// True when Barge reports that this slot's root hold is currently held by
+    /// another process (for example, an orphaned child on a ledger-idle slot).
+    pub barge_held: bool,
     /// This slot's size for this view: a live walk, a recorded observation
     /// or an honest not-measured phrase.
     pub size: SlotSize,
@@ -672,6 +676,8 @@ impl Store {
         } else {
             read_observations(&self.control)
         };
+        let barge_held =
+            oxide_storage::lease::managed::barge_held_slots(&self.pool).unwrap_or_default();
         let now = process::now_ms();
         let boot = boot_session();
         let slots = snapshot
@@ -720,6 +726,7 @@ impl Store {
                         .filter(|_| slot.state == SlotOccupancy::Held)
                         .and_then(|record| record.holder.as_ref())
                         .and_then(|holder| holder.command.clone()),
+                    barge_held: barge_held.contains(&slot.slot_id),
                     size: match &measured {
                         Some(status) => status
                             .slots
@@ -780,6 +787,7 @@ impl Store {
             .map(|ticket| Waiter {
                 pid: ticket.pid,
                 age: ticket_age(&self.ticket_path(ticket.id), now_time),
+                blocked: ticket.blocked,
             })
             .collect();
         Ok(Report {

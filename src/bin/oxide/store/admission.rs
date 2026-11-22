@@ -13,10 +13,11 @@ use crate::identity::{self, SlotKey};
 use crate::process;
 use oxide_storage::lease::managed::lease_measured;
 use oxide_storage::lease::{
-    LeaseError, LeaseRequest, LedgerView, Profile as LeaseProfile, ReuseMeasurement, SlotLayout,
-    SlotOccupancy,
+    LeaseError, LeaseRequest, LedgerSlot, LedgerView, Profile as LeaseProfile, ReuseMeasurement,
+    SlotLayout, SlotOccupancy,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -62,6 +63,7 @@ pub(super) enum Wait {
     #[cfg(test)]
     ProjectCap,
     Uncertain,
+    BargeHeld(Option<String>),
     Capacity(Option<String>),
 }
 
@@ -75,6 +77,7 @@ impl Wait {
             #[cfg(test)]
             Self::ProjectCap => WaitCategory::ProjectCap,
             Self::Uncertain => WaitCategory::Uncertain,
+            Self::BargeHeld(_) => WaitCategory::BargeHeld,
             Self::Capacity(_) => WaitCategory::Capacity,
         }
     }
@@ -94,6 +97,12 @@ impl Wait {
             Self::Uncertain => {
                 "a slot held by an interrupted command whose Cargo may still run".to_owned()
             }
+            Self::BargeHeld(Some(slot_id)) => {
+                format!("slot {slot_id}'s Barge hold (still held by another process)")
+            }
+            Self::BargeHeld(None) => {
+                "a slot's Barge hold (still held by another process)".to_owned()
+            }
             Self::Capacity(None) => "pool capacity held by running builds".to_owned(),
             Self::Capacity(Some(diagnosis)) => format!("pool capacity ({diagnosis})"),
         }
@@ -108,17 +117,19 @@ pub(super) enum WaitCategory {
     Clean,
     ProjectCap,
     Uncertain,
+    BargeHeld,
     Capacity,
 }
 
 impl WaitCategory {
-    pub(super) const ALL: [Self; 7] = [
+    pub(super) const ALL: [Self; 8] = [
         Self::Queue,
         Self::HostLimit,
         Self::Checkout,
         Self::Clean,
         Self::ProjectCap,
         Self::Uncertain,
+        Self::BargeHeld,
         Self::Capacity,
     ];
 
@@ -130,7 +141,8 @@ impl WaitCategory {
             Self::Clean => 3,
             Self::ProjectCap => 4,
             Self::Uncertain => 5,
-            Self::Capacity => 6,
+            Self::BargeHeld => 6,
+            Self::Capacity => 7,
         }
     }
 
@@ -142,6 +154,7 @@ impl WaitCategory {
             Self::Clean => "clean",
             Self::ProjectCap => "project cap",
             Self::Uncertain => "uncertain slot",
+            Self::BargeHeld => "barge hold",
             Self::Capacity => "capacity",
         }
     }
@@ -370,6 +383,9 @@ pub(super) struct SlotChoice {
     lock: Option<File>,
     /// A record of this checkout exists but is busy.
     busy: bool,
+    /// A ledger-idle slot of this checkout was skipped because its Barge hold
+    /// is still held by another process.
+    barge_held: Option<String>,
     /// The checkout an adopted shared slot came from, restored on refusal.
     shared_from: Option<PathBuf>,
     /// The adopted shared slot's trusted origin.
@@ -378,6 +394,41 @@ pub(super) struct SlotChoice {
     replace: Option<(u64, String)>,
     /// The reason this attempt must wait instead of leasing.
     wait: Option<Wait>,
+}
+
+pub(super) struct OwnSlotProbe {
+    existing: Option<usize>,
+    lock: Option<File>,
+    busy: bool,
+    barge_held_slot: Option<String>,
+}
+
+/// Lazy cache of Barge-held slot IDs for one `choose_slot` pass, fetched at
+/// most once and only when an idle owned slot's Barge hold must be checked.
+pub(super) struct BargeHolds<'a> {
+    pool: &'a Path,
+    held: Option<BTreeSet<String>>,
+}
+
+impl<'a> BargeHolds<'a> {
+    fn new(pool: &'a Path) -> Self {
+        Self { pool, held: None }
+    }
+
+    fn is_held(&mut self, slot_id: &str) -> Result<bool, String> {
+        if self.held.is_none() {
+            let held = oxide_storage::lease::managed::barge_held_slots(self.pool)
+                .map_err(|error| lease_error("cannot inspect pool slot holds", &error))?;
+            self.held = Some(held);
+        }
+        Ok(self.held.as_ref().is_some_and(|set| set.contains(slot_id)))
+    }
+}
+
+fn set_ticket_blocked(state: &mut State, ticket_id: u64, blocked: bool) {
+    if let Some(entry) = state.tickets.iter_mut().find(|entry| entry.id == ticket_id) {
+        entry.blocked = blocked;
+    }
 }
 
 /// What the project cap allows a record that owns no slot of this project.
@@ -506,6 +557,7 @@ impl Store {
         let view = self.ledger()?;
         let mut choice = self.choose_slot(&mut state, key, share, &view)?;
         if let Some(wait) = choice.wait.take() {
+            set_ticket_blocked(&mut state, ticket, true);
             self.save(&state)?;
             return Ok(Err(wait));
         }
@@ -548,7 +600,7 @@ impl Store {
                 }
                 (leased.grant, leased.measured, leased.unmeasured, root_hold)
             }
-            Err(error) => return self.record_refusal(&mut state, index, &choice, error),
+            Err(error) => return self.record_refusal(&mut state, index, ticket, &choice, error),
         };
         state.records[index].lease_id = Some(grant.lease_id.clone());
         self.save(&state)?;
@@ -596,6 +648,11 @@ impl Store {
 
     /// The reason this attempt must wait, after dead tickets are dropped and
     /// earlier leftovers settled. `Ok(None)` continues with the selection.
+    ///
+    /// Strict FIFO ordering is preserved among unblocked waiters competing for
+    /// `HostLimit`, while tickets blocked only on a per-checkout or per-slot
+    /// condition do not head-of-line block unrelated checkouts when
+    /// `active < max_active`.
     pub(super) fn waiting_reason(
         &self,
         state: &mut State,
@@ -609,8 +666,12 @@ impl Store {
             .iter()
             .position(|entry| entry.id == ticket)
             .ok_or("Oxide wait ticket was lost")?;
-        if position != 0 {
-            return Ok(Some(Wait::Queue(position + 1)));
+        let unblocked_ahead = state.tickets[..position]
+            .iter()
+            .filter(|entry| !entry.blocked)
+            .count();
+        if unblocked_ahead > 0 {
+            return Ok(Some(Wait::Queue(unblocked_ahead + 1)));
         }
         if cleaning
             || state
@@ -618,6 +679,7 @@ impl Store {
                 .iter()
                 .any(|clean| clean.checkout == key.checkout)
         {
+            state.tickets[position].blocked = true;
             return Ok(Some(Wait::Clean));
         }
         self.recover_settled(state)?;
@@ -633,6 +695,7 @@ impl Store {
         if active >= max_active {
             return Ok(Some(Wait::HostLimit(active)));
         }
+        state.tickets[position].blocked = false;
         Ok(None)
     }
 
@@ -647,8 +710,12 @@ impl Store {
         view: &LedgerView,
     ) -> Result<SlotChoice, String> {
         self.forget_stale_records(state, key, view);
-        let (existing, mut lock, busy) = self.find_own_slot(state, key, view)?;
-        let mut existing = existing;
+        let mut barge_holds = BargeHolds::new(&self.pool);
+        let own = self.find_own_slot(state, key, view, &mut barge_holds)?;
+        let mut existing = own.existing;
+        let mut lock = own.lock;
+        let busy = own.busy;
+        let barge_held = own.barge_held_slot;
         let mut shared_from = None;
         let mut shared_origin = None;
         // A project-cap replacement the library performs as part of the
@@ -657,7 +724,7 @@ impl Store {
         let shared = if share
             && !existing.is_some_and(|index| self.record_has_slot(&state.records[index], view))
         {
-            self.shared_candidate(state, key, view)?
+            self.shared_candidate(state, key, view, &mut barge_holds)?
         } else {
             None
         };
@@ -676,7 +743,15 @@ impl Store {
             lock = Some(file);
             existing = Some(index);
         } else if !existing.is_some_and(|index| self.record_has_slot(&state.records[index], view)) {
-            match self.project_cap_replacement(state, key, view, existing, busy) {
+            match self.project_cap_replacement(
+                state,
+                key,
+                view,
+                existing,
+                busy,
+                barge_held.as_deref(),
+                &mut barge_holds,
+            ) {
                 Ok(ProjectCap::Room) => {}
                 Ok(ProjectCap::Replace(id, slot_id)) => replace = Some((id, slot_id)),
                 Ok(ProjectCap::Wait(wait)) => {
@@ -684,6 +759,7 @@ impl Store {
                         existing,
                         lock,
                         busy,
+                        barge_held,
                         shared_from,
                         shared_origin,
                         replace,
@@ -702,6 +778,7 @@ impl Store {
             existing,
             lock,
             busy,
+            barge_held,
             shared_from,
             shared_origin,
             replace,
@@ -709,15 +786,24 @@ impl Store {
         })
     }
 
+    /// The ledger slot owned by this record's private project, if any.
+    pub(super) fn record_slot<'a>(
+        &self,
+        record: &Record,
+        view: &'a LedgerView,
+    ) -> Option<&'a LedgerSlot> {
+        let project = self.affinity_dir(record.id);
+        view.slots.iter().find(|slot| slot.project == project)
+    }
+
     /// Whether the ledger holds a slot for this record's private project.
     pub(super) fn record_has_slot(&self, record: &Record, view: &LedgerView) -> bool {
-        let project = self.affinity_dir(record.id);
-        view.slots.iter().any(|slot| slot.project == project)
+        self.record_slot(record, view).is_some()
     }
 
     /// Decide what this project's slot cap allows a record that owns no slot
-    /// of it. A record that is held, retired or uncertain (a live or
-    /// unattributable lock) is never a candidate for replacement.
+    /// of it. A record that is held, retired, Barge-held or uncertain (a live
+    /// or unattributable lock) is never a candidate for replacement.
     pub(super) fn project_cap_replacement(
         &self,
         state: &State,
@@ -725,6 +811,8 @@ impl Store {
         view: &LedgerView,
         existing: Option<usize>,
         busy: bool,
+        own_barge_held: Option<&str>,
+        barge_holds: &mut BargeHolds<'_>,
     ) -> Result<ProjectCap, String> {
         let project_slots = state
             .records
@@ -772,24 +860,33 @@ impl Store {
                 )
         });
         let chosen = existing.map(|index| state.records[index].id);
+        let mut barge_held_victim: Option<String> = None;
         candidates.sort();
         for (_, _, id, slot_id) in candidates {
             if Some(id) == chosen {
                 continue;
             }
-            // Only an idle record whose lock is free can be replaced; the
-            // library rechecks its identity, ownership, occupancy and
-            // complete accounting under the pool lock.
+            // Only an idle record whose lock and Barge hold are both free can
+            // be replaced; the library rechecks its identity, ownership,
+            // occupancy and complete accounting under the pool lock.
             let Probe::Free(_victim) = probe_lock(&self.lock_path(id), false)? else {
                 continue;
             };
+            if barge_holds.is_held(&slot_id)? {
+                barge_held_victim.get_or_insert(slot_id);
+                continue;
+            }
             return Ok(ProjectCap::Replace(id, slot_id));
         }
-        // Wait only for a specific held compatible slot of this checkout.
-        // With no such slot and no safely evictable idle one, refuse honestly
-        // instead of promising a deletion that a safety gate forbids.
+        // Wait only for a specific held compatible slot of this checkout, or for
+        // a Barge-held slot whose hold is kept by another process. With no such
+        // slot and no safely evictable idle one, refuse honestly instead of
+        // promising a deletion that a safety gate forbids.
         if busy || compatible_busy {
             return Ok(ProjectCap::Wait(Wait::Checkout));
+        }
+        if let Some(slot_id) = own_barge_held.map(str::to_owned).or(barge_held_victim) {
+            return Ok(ProjectCap::Wait(Wait::BargeHeld(Some(slot_id))));
         }
         Err(format!(
             "the project already holds {PROJECT_SLOT_CAP} slots and none is a safely evictable idle whole slot; no compatible slot can be reused. Wait for one to become idle or free one with `oxide clean` in another checkout, then retry"
@@ -926,6 +1023,7 @@ impl Store {
         &self,
         state: &mut State,
         index: usize,
+        ticket: u64,
         choice: &SlotChoice,
         error: LeaseError,
     ) -> Result<Result<Lease, Wait>, String> {
@@ -933,17 +1031,18 @@ impl Store {
         if let Some(shared_from) = choice.shared_from.clone() {
             state.records[index].checkout = Some(shared_from);
         }
-        self.save(state)?;
-        match error {
-            LeaseError::Busy => Ok(Err(Wait::Uncertain)),
+        let wait = match error {
+            LeaseError::BargeHeld(slot_id) => Wait::BargeHeld(Some(slot_id.to_string())),
+            LeaseError::Busy => Wait::Uncertain,
             // Wait only for a specific held compatible slot of this
             // checkout. Nothing promises that an unrelated build's
             // completion frees a count or byte ceiling.
-            LeaseError::Full | LeaseError::LedgerExhausted if choice.busy => {
-                Ok(Err(Wait::Capacity(None)))
-            }
-            LeaseError::SlotCeiling(diagnosis) if choice.busy => {
-                Ok(Err(Wait::Capacity(Some(diagnosis))))
+            LeaseError::Full | LeaseError::LedgerExhausted if choice.busy => Wait::Capacity(None),
+            LeaseError::SlotCeiling(diagnosis) if choice.busy => Wait::Capacity(Some(diagnosis)),
+            LeaseError::Full | LeaseError::LedgerExhausted | LeaseError::SlotCeiling(_)
+                if choice.barge_held.is_some() =>
+            {
+                Wait::BargeHeld(choice.barge_held.clone())
             }
             // The refusal names the slots a partial walk charged
             // conservatively and keeps; record the incomplete outcome so
@@ -952,10 +1051,17 @@ impl Store {
             // its reason or its exit code.
             LeaseError::CapacityCharged { ref unmeasured, .. } => {
                 self.record_incomplete_walks(None, unmeasured);
-                Err(lease_error("cannot lease a slot", &error))
+                self.save(state)?;
+                return Err(lease_error("cannot lease a slot", &error));
             }
-            error => Err(lease_error("cannot lease a slot", &error)),
-        }
+            error => {
+                self.save(state)?;
+                return Err(lease_error("cannot lease a slot", &error));
+            }
+        };
+        set_ticket_blocked(state, ticket, true);
+        self.save(state)?;
+        Ok(Err(wait))
     }
 
     pub(super) fn find_own_slot(
@@ -963,19 +1069,22 @@ impl Store {
         state: &State,
         key: &SlotKey,
         view: &LedgerView,
-    ) -> Result<(Option<usize>, Option<File>, bool), String> {
+        barge_holds: &mut BargeHolds<'_>,
+    ) -> Result<OwnSlotProbe, String> {
         let matches = |record: &Record| {
             record.phase != Phase::Retired
                 && record.checkout.as_deref() == Some(key.checkout.as_path())
                 && record.compatibility == key.compatibility
         };
         // Second-slot rule: this checkout may hold several records of one
-        // key. Take an idle one whose lock is free, one with a slot first,
-        // then the most recently used. A busy one (a live command, an
-        // interrupted one whose group may still run, or a lock still held)
-        // is never reused, released, evicted or relabelled here; the
-        // command takes another idle compatible slot or a new one through
-        // the normal admission below, and waits only when neither exists.
+        // key. Take an idle one whose lock and Barge hold are both free, one
+        // with a slot first, then the most recently used. A busy one (a live
+        // command, an interrupted one whose group may still run, a lock still
+        // held, or an idle-in-ledger slot whose Barge hold is still held by
+        // another process) is never reused, released, evicted or relabelled
+        // here; the command takes another idle compatible slot or a new one
+        // through the normal admission below, and waits only when neither
+        // exists.
         let mut own: Vec<usize> = (0..state.records.len())
             .filter(|&index| matches(&state.records[index]))
             .collect();
@@ -986,6 +1095,7 @@ impl Store {
         let mut existing = None;
         let mut lock = None;
         let mut busy = false;
+        let mut barge_held_slot: Option<String> = None;
         for index in own {
             if state.records[index].phase != Phase::Idle {
                 busy = true;
@@ -993,6 +1103,12 @@ impl Store {
             }
             match probe_lock(&self.lock_path(state.records[index].id), true)? {
                 Probe::Free(file) => {
+                    if let Some(slot) = self.record_slot(&state.records[index], view) {
+                        if barge_holds.is_held(&slot.slot_id)? {
+                            barge_held_slot.get_or_insert_with(|| slot.slot_id.clone());
+                            continue;
+                        }
+                    }
                     existing = Some(index);
                     lock = Some(file);
                     break;
@@ -1000,7 +1116,12 @@ impl Store {
                 Probe::Held | Probe::Missing => busy = true,
             }
         }
-        Ok((existing, lock, busy))
+        Ok(OwnSlotProbe {
+            existing,
+            lock,
+            busy,
+            barge_held_slot,
+        })
     }
 
     /// Forget idle records that no longer own a slot or match this key.
@@ -1064,8 +1185,9 @@ impl Store {
         state: &State,
         key: &SlotKey,
         view: &LedgerView,
+        barge_holds: &mut BargeHolds<'_>,
     ) -> Result<Option<(u64, File, Built)>, String> {
-        let mut candidates: Vec<&Record> = state
+        let mut candidates: Vec<(&Record, &str)> = state
             .records
             .iter()
             .filter(|record| {
@@ -1077,18 +1199,22 @@ impl Store {
                         .as_ref()
                         .is_some_and(|checkout| *checkout != key.checkout)
             })
-            .filter(|record| {
+            .filter_map(|record| {
                 let project = self.affinity_dir(record.id);
                 view.slots
                     .iter()
-                    .any(|slot| slot.project == project && slot.state == SlotOccupancy::Idle)
+                    .find(|slot| slot.project == project && slot.state == SlotOccupancy::Idle)
+                    .map(|slot| (record, slot.slot_id.as_str()))
             })
             .collect();
-        candidates.sort_by_key(|record| std::cmp::Reverse(record.last_used));
-        for record in candidates {
+        candidates.sort_by_key(|(record, _)| std::cmp::Reverse(record.last_used));
+        for (record, slot_id) in candidates {
             let Some(origin @ Built::Content(_)) = self.trusted_origin(record) else {
                 continue;
             };
+            if barge_holds.is_held(slot_id)? {
+                continue;
+            }
             if let Probe::Free(file) = probe_lock(&self.lock_path(record.id), true)? {
                 return Ok(Some((record.id, file, origin)));
             }
@@ -1149,6 +1275,7 @@ impl Store {
         state.tickets.push(Ticket {
             id,
             pid: std::process::id(),
+            blocked: false,
         });
         self.save(&state)?;
         Ok((id, file))

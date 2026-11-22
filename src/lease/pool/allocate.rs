@@ -134,6 +134,17 @@ pub(in crate::lease) fn check_ample_reserve(pool: &Path, account: &Path) -> Resu
     opened.evict_for_reserve(None)
 }
 
+/// Result of probing idle compatible owned slots for a `(project, profile)` pair.
+enum IdleCompatible {
+    Ready {
+        slot_id: u64,
+        incarnation: u64,
+        hold: Box<barge::Hold>,
+    },
+    BargeHeld(u64),
+    None,
+}
+
 impl Pool {
     pub(super) fn lease(&mut self, request: &LeaseRequest) -> Result<Leased, LeaseError> {
         self.pending_hold = None;
@@ -190,8 +201,8 @@ impl Pool {
                 return Err(LeaseError::Busy);
             }
         }
-        let candidate = self.idle_compatible(&project, request.profile);
-        if candidate.is_none() {
+        let candidate = self.takeable_idle_compatible(&project, request.profile)?;
+        if matches!(candidate, IdleCompatible::None) {
             if let Some(legacy) = self.ledger.slots.iter().find(|slot| {
                 slot.is_idle()
                     && !slot.owned
@@ -206,17 +217,26 @@ impl Pool {
                 });
             }
         }
+        let reuse_id = match &candidate {
+            IdleCompatible::Ready { slot_id, .. } => Some(*slot_id),
+            IdleCompatible::BargeHeld(slot_id) => return Err(LeaseError::BargeHeld(*slot_id)),
+            IdleCompatible::None => None,
+        };
         if self
             .storage
             .as_ref()
             .is_some_and(crate::storage::PoolStorage::is_removable)
         {
-            admission_cost::in_phase(Phase::Reserve, || {
-                self.evict_for_reserve(candidate.map(|(id, _)| id))
-            })?;
+            admission_cost::in_phase(Phase::Reserve, || self.evict_for_reserve(reuse_id))?;
         }
-        if let Some((idle, incarnation)) = candidate {
-            let grant = self.take_idle(idle, incarnation, project, workspace, request)?;
+        if let IdleCompatible::Ready {
+            slot_id,
+            incarnation,
+            hold,
+        } = candidate
+        {
+            let grant =
+                self.take_idle_with_hold(slot_id, incarnation, *hold, project, workspace, request)?;
             return Ok(Leased {
                 grant,
                 hold: None,
@@ -237,43 +257,55 @@ impl Pool {
         })
     }
 
-    /// The idle compatible slot this admission would reuse, if any.
-    fn idle_compatible(&self, project: &Path, profile: Profile) -> Option<(u64, u64)> {
-        self.ledger
-            .slots
-            .iter()
-            .find(|slot| {
-                slot.is_idle()
-                    && slot.owned
-                    && slot.root.is_some()
-                    && slot.project == project
-                    && slot.profile == profile
-            })
-            .map(|slot| (slot.id, slot.incarnation))
+    /// Find an idle compatible owned slot whose Barge hold is not currently held
+    /// by another process, skipping any Barge-held slots so a lingering child's
+    /// inherited hold does not mask a reusable sibling slot.
+    fn takeable_idle_compatible(
+        &self,
+        project: &Path,
+        profile: Profile,
+    ) -> Result<IdleCompatible, LeaseError> {
+        let mut barge_held = None;
+        for slot in &self.ledger.slots {
+            if !(slot.is_idle() && slot.owned && slot.project == project && slot.profile == profile)
+            {
+                continue;
+            }
+            let Some(root) = slot.root.as_deref() else {
+                continue;
+            };
+            let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
+            match storage
+                .try_hold_in(slot.area_folder(), root)
+                .map_err(LeaseError::Barge)?
+            {
+                Some(hold) => {
+                    return Ok(IdleCompatible::Ready {
+                        slot_id: slot.id,
+                        incarnation: slot.incarnation,
+                        hold: Box::new(hold),
+                    });
+                }
+                None => {
+                    barge_held.get_or_insert(slot.id);
+                }
+            }
+        }
+        Ok(match barge_held {
+            Some(slot_id) => IdleCompatible::BargeHeld(slot_id),
+            None => IdleCompatible::None,
+        })
     }
 
-    fn take_idle(
+    fn take_idle_with_hold(
         &mut self,
         slot_id: u64,
         incarnation: u64,
+        hold: barge::Hold,
         project: PathBuf,
         workspace: PathBuf,
         request: &LeaseRequest,
     ) -> Result<LeaseGrant, LeaseError> {
-        // A Barge-owned slot is idle exactly when its exclusive hold can be
-        // taken. `try_hold` never waits, so a live holder — including a child
-        // that kept the inherited descriptor — makes this row unusable now.
-        let Some(slot) = self.slot(slot_id) else {
-            return Err(LeaseError::UnknownAccounting);
-        };
-        let Some(root) = slot.root.as_deref().filter(|_| slot.owned) else {
-            return Err(LeaseError::Busy);
-        };
-        let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
-        let hold = storage
-            .try_hold_in(slot.area_folder(), root)
-            .map_err(LeaseError::Barge)?
-            .ok_or(LeaseError::Busy)?;
         self.pending_hold = Some(hold);
         let lease_id = self.mint_lease_id(slot_id, incarnation)?;
         {
