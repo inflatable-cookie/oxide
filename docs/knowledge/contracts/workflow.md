@@ -202,7 +202,9 @@ digest and the receipt digest are reported under separate labels.
 2. Another idle compatible slot, after the [freshness gate](#cross-checkout-freshness)
    reconciles it.
 3. A new slot, within the caps and the soft budget.
-4. Otherwise wait in FIFO order, or evict an idle slot of the project.
+4. Otherwise wait in FIFO order among unblocked commands (commands blocked on a
+   per-checkout or per-slot wait step aside so unrelated checkouts do not
+   head-of-line block), or evict an idle slot of the project.
 
 - **Second-slot rule:** a busy slot of the same key in the same checkout — or a
   ledger-idle slot whose Barge root hold is still held by another process (for

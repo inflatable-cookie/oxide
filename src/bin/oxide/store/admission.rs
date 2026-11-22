@@ -63,7 +63,7 @@ pub(super) enum Wait {
     #[cfg(test)]
     ProjectCap,
     Uncertain,
-    BargeHeld(Option<String>),
+    BargeHeld(String),
     Capacity(Option<String>),
 }
 
@@ -84,7 +84,9 @@ impl Wait {
 
     pub(super) fn describe(&self, max_active: usize) -> String {
         match self {
-            Self::Queue(position) => format!("earlier oxide commands (position {position})"),
+            Self::Queue(position) => {
+                format!("earlier unblocked oxide commands (position {position})")
+            }
             Self::HostLimit(active) => {
                 format!("a build slot ({active} of {max_active} host-wide in use)")
             }
@@ -97,11 +99,8 @@ impl Wait {
             Self::Uncertain => {
                 "a slot held by an interrupted command whose Cargo may still run".to_owned()
             }
-            Self::BargeHeld(Some(slot_id)) => {
+            Self::BargeHeld(slot_id) => {
                 format!("slot {slot_id}'s Barge hold (still held by another process)")
-            }
-            Self::BargeHeld(None) => {
-                "a slot's Barge hold (still held by another process)".to_owned()
             }
             Self::Capacity(None) => "pool capacity held by running builds".to_owned(),
             Self::Capacity(Some(diagnosis)) => format!("pool capacity ({diagnosis})"),
@@ -425,12 +424,6 @@ impl<'a> BargeHolds<'a> {
     }
 }
 
-fn set_ticket_blocked(state: &mut State, ticket_id: u64, blocked: bool) {
-    if let Some(entry) = state.tickets.iter_mut().find(|entry| entry.id == ticket_id) {
-        entry.blocked = blocked;
-    }
-}
-
 /// What the project cap allows a record that owns no slot of this project.
 pub(super) enum ProjectCap {
     /// The project holds fewer slots than its cap: no replacement is needed.
@@ -557,7 +550,7 @@ impl Store {
         let view = self.ledger()?;
         let mut choice = self.choose_slot(&mut state, key, share, &view)?;
         if let Some(wait) = choice.wait.take() {
-            set_ticket_blocked(&mut state, ticket, true);
+            self.set_ticket_blocked(ticket, true)?;
             self.save(&state)?;
             return Ok(Err(wait));
         }
@@ -666,10 +659,12 @@ impl Store {
             .iter()
             .position(|entry| entry.id == ticket)
             .ok_or("Oxide wait ticket was lost")?;
-        let unblocked_ahead = state.tickets[..position]
-            .iter()
-            .filter(|entry| !entry.blocked)
-            .count();
+        let mut unblocked_ahead = 0usize;
+        for entry in &state.tickets[..position] {
+            if !self.is_ticket_blocked(entry.id)? {
+                unblocked_ahead += 1;
+            }
+        }
         if unblocked_ahead > 0 {
             return Ok(Some(Wait::Queue(unblocked_ahead + 1)));
         }
@@ -679,7 +674,7 @@ impl Store {
                 .iter()
                 .any(|clean| clean.checkout == key.checkout)
         {
-            state.tickets[position].blocked = true;
+            self.set_ticket_blocked(ticket, true)?;
             return Ok(Some(Wait::Clean));
         }
         self.recover_settled(state)?;
@@ -695,7 +690,7 @@ impl Store {
         if active >= max_active {
             return Ok(Some(Wait::HostLimit(active)));
         }
-        state.tickets[position].blocked = false;
+        self.set_ticket_blocked(ticket, false)?;
         Ok(None)
     }
 
@@ -886,7 +881,7 @@ impl Store {
             return Ok(ProjectCap::Wait(Wait::Checkout));
         }
         if let Some(slot_id) = own_barge_held.map(str::to_owned).or(barge_held_victim) {
-            return Ok(ProjectCap::Wait(Wait::BargeHeld(Some(slot_id))));
+            return Ok(ProjectCap::Wait(Wait::BargeHeld(slot_id)));
         }
         Err(format!(
             "the project already holds {PROJECT_SLOT_CAP} slots and none is a safely evictable idle whole slot; no compatible slot can be reused. Wait for one to become idle or free one with `oxide clean` in another checkout, then retry"
@@ -1032,17 +1027,23 @@ impl Store {
             state.records[index].checkout = Some(shared_from);
         }
         let wait = match error {
-            LeaseError::BargeHeld(slot_id) => Wait::BargeHeld(Some(slot_id.to_string())),
+            LeaseError::BargeHeld(slot_id) => Wait::BargeHeld(slot_id.to_string()),
             LeaseError::Busy => Wait::Uncertain,
             // Wait only for a specific held compatible slot of this
             // checkout. Nothing promises that an unrelated build's
             // completion frees a count or byte ceiling.
-            LeaseError::Full | LeaseError::LedgerExhausted if choice.busy => Wait::Capacity(None),
-            LeaseError::SlotCeiling(diagnosis) if choice.busy => Wait::Capacity(Some(diagnosis)),
-            LeaseError::Full | LeaseError::LedgerExhausted | LeaseError::SlotCeiling(_)
-                if choice.barge_held.is_some() =>
-            {
-                Wait::BargeHeld(choice.barge_held.clone())
+            LeaseError::Full | LeaseError::LedgerExhausted | LeaseError::SlotCeiling(_) => {
+                if choice.busy {
+                    match error {
+                        LeaseError::SlotCeiling(diagnosis) => Wait::Capacity(Some(diagnosis)),
+                        _ => Wait::Capacity(None),
+                    }
+                } else if let Some(slot_id) = &choice.barge_held {
+                    Wait::BargeHeld(slot_id.clone())
+                } else {
+                    self.save(state)?;
+                    return Err(lease_error("cannot lease a slot", &error));
+                }
             }
             // The refusal names the slots a partial walk charged
             // conservatively and keeps; record the incomplete outcome so
@@ -1059,7 +1060,7 @@ impl Store {
                 return Err(lease_error("cannot lease a slot", &error));
             }
         };
-        set_ticket_blocked(state, ticket, true);
+        self.set_ticket_blocked(ticket, true)?;
         self.save(state)?;
         Ok(Err(wait))
     }
@@ -1272,10 +1273,10 @@ impl Store {
         let Probe::Free(file) = probe_lock(&self.ticket_path(id), true)? else {
             return Err("a new Oxide wait ticket is unexpectedly held".to_owned());
         };
+        self.set_ticket_blocked(id, false)?;
         state.tickets.push(Ticket {
             id,
             pid: std::process::id(),
-            blocked: false,
         });
         self.save(&state)?;
         Ok((id, file))
@@ -1286,6 +1287,7 @@ impl Store {
         let mut state = self.load()?;
         state.tickets.retain(|ticket| ticket.id != id);
         self.save(&state)?;
+        self.set_ticket_blocked(id, false)?;
         match fs::remove_file(self.ticket_path(id)) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
             _ => Ok(()),
@@ -1301,8 +1303,11 @@ impl Store {
                 Probe::Held => live.push(ticket),
                 Probe::Free(_) => {
                     let _ = fs::remove_file(path);
+                    let _ = self.set_ticket_blocked(ticket.id, false);
                 }
-                Probe::Missing => {}
+                Probe::Missing => {
+                    let _ = self.set_ticket_blocked(ticket.id, false);
+                }
             }
         }
         state.tickets = live;

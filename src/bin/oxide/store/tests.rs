@@ -2517,11 +2517,7 @@ fn worst_escaped_control_state_roundtrips_through_save_and_load() {
         state.records.push(escaped_record(id));
     }
     for id in 1..=MAX_TICKETS as u64 {
-        state.tickets.push(Ticket {
-            id,
-            pid: u32::MAX,
-            blocked: false,
-        });
+        state.tickets.push(Ticket { id, pid: u32::MAX });
     }
     for id in 1..=MAX_CLEANS as u64 {
         state.cleans.push(Clean {
@@ -2590,11 +2586,7 @@ fn worst_valid_control_state_fits_its_object_and_byte_caps() {
         state.records.push(worst_record(id));
     }
     for id in 1..=MAX_TICKETS as u64 {
-        state.tickets.push(Ticket {
-            id,
-            pid: u32::MAX,
-            blocked: true,
-        });
+        state.tickets.push(Ticket { id, pid: u32::MAX });
     }
     for id in 1..=MAX_CLEANS as u64 {
         state.cleans.push(Clean {
@@ -3946,7 +3938,7 @@ fn per_checkout_blocked_waiter_does_not_hol_block_unrelated_checkouts_while_fifo
     let state = store.load().unwrap();
     assert_eq!(state.tickets.len(), 1);
     assert_eq!(state.tickets[0].id, ticket_a);
-    assert!(state.tickets[0].blocked);
+    assert!(store.is_ticket_blocked(ticket_a).unwrap());
 
     // Status marks the blocked ticket as not blocking other checkouts.
     let report = store.report(Accounting::Recorded, 1).unwrap();
@@ -3986,6 +3978,11 @@ fn per_checkout_blocked_waiter_does_not_hol_block_unrelated_checkouts_while_fifo
         .err()
         .expect("ticket_b3 waits in queue");
     assert!(matches!(wait_b3, Wait::Queue(2)), "{wait_b3:?}");
+    let queue_text = wait_b3.describe(2);
+    assert!(
+        queue_text.contains("earlier unblocked oxide commands (position 2)"),
+        "{queue_text}"
+    );
 
     // Even if one active build finishes (active drops to 1 < max_active = 2),
     // ticket_b3 still waits in Queue(2) behind unblocked ticket_c (strict FIFO among unblocked).
@@ -4023,6 +4020,12 @@ fn per_checkout_blocked_waiter_does_not_hol_block_unrelated_checkouts_while_fifo
         .ok()
         .expect("ticket_a acquires once its clean barrier clears");
     store.remove_ticket(ticket_a).unwrap();
+    assert!(!store.is_ticket_blocked(ticket_a).unwrap());
+    assert_eq!(
+        fs::read_dir(store.control.join("waiters")).unwrap().count(),
+        1,
+        "only ticket_b3 lock remains after ticket_a removal"
+    );
 
     store.remove_ticket(ticket_b3).unwrap();
     store.release(lease_a, None).unwrap();
@@ -4066,10 +4069,10 @@ fn acquire_does_not_hol_block_unrelated_checkout_behind_barge_held_waiter() {
         .err()
         .expect("ticket_a waits on BargeHeld");
     assert!(
-        matches!(wait_a, Wait::BargeHeld(Some(_))),
+        matches!(wait_a, Wait::BargeHeld(_)),
         "expected BargeHeld wait at cap, got {wait_a:?}"
     );
-    assert!(store.load().unwrap().tickets[0].blocked);
+    assert!(store.is_ticket_blocked(ticket_a).unwrap());
 
     // Unrelated checkout B calls `acquire()` and succeeds immediately without waiting on ticket A!
     let mut waits_b = WaitAccounting::default();
@@ -4087,6 +4090,12 @@ fn acquire_does_not_hol_block_unrelated_checkout_behind_barge_held_waiter() {
 
     store.release(lease_b, None).unwrap();
     store.remove_ticket(ticket_a).unwrap();
+    assert!(!store.is_ticket_blocked(ticket_a).unwrap());
+    assert_eq!(
+        fs::read_dir(store.control.join("waiters")).unwrap().count(),
+        0,
+        "no waiter files remain after ticket_a removal"
+    );
     drop(external_holds);
     fs::remove_dir_all(root).unwrap();
 }
@@ -4176,7 +4185,7 @@ fn barge_held_idle_slot_recovers_via_second_slot_and_surfaces_in_status() {
         .err()
         .expect("project cap with all slots Barge-held waits");
     match &wait {
-        Wait::BargeHeld(Some(slot_id)) => {
+        Wait::BargeHeld(slot_id) => {
             let reason = wait.describe(16);
             assert!(
                 reason.contains(slot_id) && reason.contains("Barge hold"),

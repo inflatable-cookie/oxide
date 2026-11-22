@@ -676,8 +676,15 @@ impl Store {
         } else {
             read_observations(&self.control)
         };
-        let barge_held =
-            oxide_storage::lease::managed::barge_held_slots(&self.pool).unwrap_or_default();
+        let barge_held = if snapshot
+            .slots
+            .iter()
+            .any(|slot| slot.state == SlotOccupancy::Idle)
+        {
+            oxide_storage::lease::managed::barge_held_slots(&self.pool).unwrap_or_default()
+        } else {
+            std::collections::BTreeSet::new()
+        };
         let now = process::now_ms();
         let boot = boot_session();
         let slots = snapshot
@@ -726,7 +733,9 @@ impl Store {
                         .filter(|_| slot.state == SlotOccupancy::Held)
                         .and_then(|record| record.holder.as_ref())
                         .and_then(|holder| holder.command.clone()),
-                    barge_held: barge_held.contains(&slot.slot_id),
+                    barge_held: slot.state == SlotOccupancy::Idle
+                        && record.is_some()
+                        && barge_held.contains(&slot.slot_id),
                     size: match &measured {
                         Some(status) => status
                             .slots
@@ -787,7 +796,7 @@ impl Store {
             .map(|ticket| Waiter {
                 pid: ticket.pid,
                 age: ticket_age(&self.ticket_path(ticket.id), now_time),
-                blocked: ticket.blocked,
+                blocked: self.is_ticket_blocked(ticket.id).unwrap_or(false),
             })
             .collect();
         Ok(Report {
