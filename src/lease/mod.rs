@@ -222,6 +222,8 @@ impl std::fmt::Display for AccountingContext {
 pub enum LeaseError {
     InvalidInput(&'static str),
     Busy,
+    /// An idle compatible slot's Barge root hold is still held by another process.
+    BargeHeld(u64),
     WriterUpdated,
     Full,
     UnknownAccounting,
@@ -299,7 +301,7 @@ impl LeaseError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::InvalidInput(_) | Self::Io(_) | Self::Unsupported(_) => 1,
-            Self::Busy | Self::HolderConflict => 2,
+            Self::Busy | Self::BargeHeld(_) | Self::HolderConflict => 2,
             Self::WriterUpdated => 76,
             Self::Full
             | Self::UnknownAccounting
@@ -323,6 +325,7 @@ impl LeaseError {
         match self {
             Self::InvalidInput(_) => "invalid_input",
             Self::Busy => "busy",
+            Self::BargeHeld(_) => "barge_held",
             Self::WriterUpdated => "writer_updated",
             Self::Full => "full",
             Self::UnknownAccounting
@@ -353,6 +356,10 @@ impl std::fmt::Display for LeaseError {
                 formatter.write_str(message)
             }
             Self::Busy => formatter.write_str("compatible slot is held"),
+            Self::BargeHeld(slot) => write!(
+                formatter,
+                "slot {slot}'s Barge hold is still held by another process"
+            ),
             Self::WriterUpdated => formatter
                 .write_str("oxide was updated while this command waited; rerun it"),
             Self::Full => formatter.write_str("pool cap cannot admit a new slot"),

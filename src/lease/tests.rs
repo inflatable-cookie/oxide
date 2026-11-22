@@ -1868,3 +1868,65 @@ fn a_barge_custody_failure_keeps_its_detail_and_class() {
         "{error}"
     );
 }
+
+#[test]
+fn idle_reuse_skips_barge_held_slot_and_surfaces_barge_held_when_none_is_free() {
+    let fixture = Fixture::new("barge-held-idle");
+    let pool = fixture.pool();
+    let project = fixture.dir("project");
+    let other_project = fixture.dir("other-project");
+    let workspace = fixture.dir("workspace");
+
+    // Create two idle slots and bind both to the same `(project, profile)`.
+    let first = managed::lease(request(&pool, &project, &workspace, "first")).unwrap();
+    let first_id = first.grant.slot_id.clone();
+    managed::release(&pool, &first.grant.lease_id).unwrap();
+    drop(first);
+
+    let second = managed::lease(request(&pool, &other_project, &workspace, "second")).unwrap();
+    let second_id = second.grant.slot_id.clone();
+    managed::release(&pool, &second.grant.lease_id).unwrap();
+    drop(second);
+    assert_ne!(first_id, second_id);
+
+    update_ledger(&pool, |ledger| {
+        ledger["slots"][1]["project"] = project.display().to_string().into();
+    });
+
+    // Hold the first slot's Barge root externally while both slots are Idle in the ledger.
+    let storage = fixture_storage(&pool);
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).unwrap()).unwrap();
+    let first_root = ledger["slots"][0]["root"].as_str().unwrap().to_owned();
+    let second_root = ledger["slots"][1]["root"].as_str().unwrap().to_owned();
+    let external_hold_first = storage.try_hold(&first_root).unwrap().expect("free first");
+
+    let (held_set, walks) = count_pool_walks(|| managed::barge_held_slots(&pool).unwrap());
+    assert!(
+        walks.is_empty(),
+        "barge_held_slots walks no slots: {walks:?}"
+    );
+    assert!(held_set.contains(&first_id));
+    assert!(!held_set.contains(&second_id));
+
+    // Reusing for the same project skips the Barge-held first slot and takes the second.
+    let reused = managed::lease(request(&pool, &project, &workspace, "third")).unwrap();
+    assert_eq!(reused.grant.slot_id, second_id);
+
+    // Hold the second slot's Barge root too after releasing it: now all idle
+    // compatible slots for this project are Barge-held, so lease returns BargeHeld.
+    managed::release(&pool, &reused.grant.lease_id).unwrap();
+    drop(reused);
+    let external_hold_second = storage
+        .try_hold(&second_root)
+        .unwrap()
+        .expect("free second");
+    let err = managed::lease(request(&pool, &project, &workspace, "fourth")).unwrap_err();
+    assert_eq!(err, LeaseError::BargeHeld(1), "{err:?}");
+    assert_eq!(err.reason(), "barge_held");
+    assert_eq!(err.exit_code(), 2);
+    assert!(err.to_string().contains("Barge hold"), "{err}");
+
+    drop(external_hold_first);
+    drop(external_hold_second);
+}

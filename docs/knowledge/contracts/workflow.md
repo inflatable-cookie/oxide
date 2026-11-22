@@ -202,26 +202,36 @@ digest and the receipt digest are reported under separate labels.
 2. Another idle compatible slot, after the [freshness gate](#cross-checkout-freshness)
    reconciles it.
 3. A new slot, within the caps and the soft budget.
-4. Otherwise wait in FIFO order, or evict an idle slot of the project.
+4. Otherwise wait in FIFO order among unblocked commands (commands blocked on a
+   per-checkout or per-slot wait step aside so unrelated checkouts do not
+   head-of-line block), or evict an idle slot of the project.
 
-- **Second-slot rule:** a busy slot of the same key in the same checkout is never
+- **Second-slot rule:** a busy slot of the same key in the same checkout — or a
+  ledger-idle slot whose Barge root hold is still held by another process (for
+  example, a lingering child that kept the inherited descriptor) — is never
   reused, released, evicted or relabelled. The command takes another idle
   compatible slot or a new one. Two slots of one checkout share
   `<workspace>/target`, and the latest final artifact wins.
 - **Caps:** a project holds at most 12 slots (`PROJECT_SLOT_CAP`). At the cap, an
-  idle slot of that project is evicted whole. The pool holds at most 256 slots
-  (`MAX_SLOTS`).
+  idle unheld slot of that project is evicted whole. The pool holds at most 256
+  slots (`MAX_SLOTS`).
 - **Host-wide active builds:** `OXIDE_MAX_ACTIVE`, or `[pool] max_active` in the
   config file, sets an integer from 1 to 32. Without either, macOS uses
   `min(4, max(2, floor(physical_cores / 4)))` from `hw.physicalcpu`. Other
   platforms, and any failed or implausible query, use 2. The count covers
   commands in both the internal and the removable pool. Lowering the limit leaves
   running commands alone.
-- **Waiting:** FIFO. A waiting command prints `oxide: waiting for …`. A changed
-  reason is printed up to eight times, then one notice says later changes are
-  omitted. Ctrl-C cancels with exit 130. Do not kill a waiting command or fall
-  back to `cargo`. Wait totals use a monotonic clock and are attributed to the
-  last exclusive reason. They are approximate observations.
+- **Waiting:** unblocked waiters competing for the host-wide active-build limit
+  wait in strict FIFO order. Waiters blocked only on a per-checkout or per-slot
+  condition (a checkout clean barrier, project cap, uncertain interrupted slot,
+  Barge-held slot, or capacity with a busy checkout slot) keep their ticket
+  without head-of-line blocking unrelated checkouts behind them when active
+  builds are below the host limit. A waiting command prints `oxide: waiting for …`
+  (naming the Barge-held slot when waiting on another process's Barge hold). A
+  changed reason is printed up to eight times, then one notice says later changes
+  are omitted. Ctrl-C cancels with exit 130. Do not kill a waiting command or
+  fall back to `cargo`. Wait totals use a monotonic clock and are attributed to
+  the last exclusive reason. They are approximate observations.
 - A command that waited prints `oxide: waited …; slot ready` after its final
   freshness check, before Cargo or the tool starts.
 
@@ -765,10 +775,12 @@ Privacy & Security, Developer Tools. It states that the cause is inferred.
 
 - `oxide status` is read-only. It takes no pool lock, reconciles nothing and walks
   no payload. It reports recorded facts: pool and slot membership, each slot's
-  recorded directory and holder, waiting commands, clean marks, the selected pool
-  and fallback reason, the configured mode, the latest use and each slot's last
-  recorded size with its age. A slot marked for deletion shows as pending
-  reconciliation, not as idle.
+  recorded directory and holder, waiting commands (noting waiters blocked only on
+  a checkout or slot), clean marks, the selected pool and fallback reason, the
+  configured mode, the latest use and each slot's last recorded size with its
+  age. A slot marked for deletion shows as pending reconciliation, not as idle,
+  and a ledger-idle slot whose Barge hold is still held by another process is
+  reported as Barge-held (not reusable or evictable) when observable.
 - `oxide status --measure` runs the bounded walks (the whole payload, each slot,
   the checkout's stray-output scan and the Cargo home) under one 60-second budget.
   It still writes nothing. A pending deletion makes coverage unknown.
