@@ -48,7 +48,10 @@ Open, narrowed. The receipt-derived member set is implemented: [exec output infe
 
 ## Q-020 — How should nested Oxide lease joining and permit borrowing work?
 
-Settled by Tom's 2026-11-23 ruling (implementation tracked in Nucleus lane `oxide-nested-lease-joining`): implement both nested lease joining and idle `oxide exec` host-permit borrowing over a parent-owned local Unix domain socket broker with a per-session random token (`0700` socket dir, same-UID peer credential checks), clamp nested budgets to `min(inner, outer_remaining_execution_ms)` via the broker handshake (Q-018), and deliver macOS first followed by Linux parity. Leave this entry until the contract and implementation land.
+Settled by [Tom's 2026-11-23 ruling](vision.md#product-workflow-direction).
+The [session-broker contract](contracts/session-broker.md) defines the transport
+for nested lease joining, inner-deadline inheritance (Q-018) and idle
+`oxide exec` permit borrowing.
 
 ## Q-022 — Can a held zombie establish its group's lifetime?
 

@@ -36,12 +36,10 @@ owned and preserved. Cargo intermediates are internal and may contain test
 executables; separating output directories alone cannot prove isolation. Cache
 reuse never counts as validation success.
 
-Nested commands currently take an independent lease. Tom's 2026-11-23 Q-020
-ruling selects a parent-owned local Unix domain socket broker with a
-per-session token, same-UID peer checks, tightest-deadline capping
-(`min(inner, outer_remaining_execution_ms)`), and idle `oxide exec` permit
-borrowing (macOS first, then Linux parity); implementation is tracked in
-Nucleus (`oxide-nested-lease-joining`).
+Nested commands currently take an independent lease. The macOS
+[session broker](contracts/session-broker.md) provides the local transport
+for joining a parent's session and borrowing a host permit. Lease custody
+and host-permit admission stay with the parent command.
 
 Prepare only requested components lazily. No eager copying of all targets and
 no full-copy fallback. Evict idle slots only, within explicit budgets; occupied
