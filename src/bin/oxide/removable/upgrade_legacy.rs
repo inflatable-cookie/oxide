@@ -4,7 +4,7 @@ mod directories;
 mod slots;
 
 use super::relocation::{checked_area, unheld_listing, Media};
-use super::{read_registration, Registration, POOL_DIR, SLOTS_FOLDER};
+use super::{positively_missing, read_registration, Registration, POOL_DIR, SLOTS_FOLDER};
 use crate::prune::{self, LegacyOutputAction};
 use crate::store::{self, Store};
 use barge::{Area, Listing};
@@ -154,7 +154,7 @@ pub(super) fn upgrade(
         "outputs",
         &old,
     )?;
-    let output_dir = if !prune::positively_missing(&outputs_path)? {
+    let output_dir = if !positively_missing(&outputs_path)? {
         Some(Directory::new(
             outputs_path.clone(),
             media.directory(old.outputs_dir())?,

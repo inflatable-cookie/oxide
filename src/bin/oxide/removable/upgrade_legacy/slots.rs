@@ -1,9 +1,9 @@
 //! Retire recorded dead legacy slots and dismantle the resulting empty areas.
 
 use super::super::relocation::{check_area_location, checked_area, unheld_listing, Media};
-use super::super::Registration;
+use super::super::{legacy_workspace_missing, Registration};
 use super::check_inventory;
-use super::directories::{at, workspace_missing, Directory};
+use super::directories::{at, Directory};
 use crate::store::Store;
 use barge::{Area, Listing};
 use oxide_storage::lease::managed::{PayloadRelocation, QuietSlot};
@@ -258,7 +258,7 @@ impl SlotPlan {
                 return Err(at(&project.path, "legacy project changed since planning"));
             }
             for slot in &project.slots {
-                if !workspace_missing(&slot.workspace)? {
+                if !legacy_workspace_missing(&slot.workspace)? {
                     return Err(at(&slot.workspace, "legacy slot workspace reappeared"));
                 }
                 if let Some(dir) = &dir {
@@ -408,7 +408,7 @@ fn plan_project(
                 "more than one ledger slot names this directory",
             ));
         }
-        if !workspace_missing(slot.workspace)? {
+        if !legacy_workspace_missing(slot.workspace)? {
             return Err(at(
                 &child_path,
                 format!(

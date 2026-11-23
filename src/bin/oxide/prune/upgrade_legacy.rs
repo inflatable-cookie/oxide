@@ -5,9 +5,9 @@ use super::{
     REGISTRY_FILE,
 };
 use crate::outputs::{self, FileEdit};
+use crate::removable::{legacy_workspace_missing, positively_missing};
 use barge::Listing;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -192,12 +192,6 @@ fn validate_row(row: &Row, uuid: &str) -> Result<(), String> {
             .as_deref()
             .is_some_and(|value| value.eq_ignore_ascii_case(uuid))
         || row.cancelling.is_some()
-        || !row.checkout.components().all(|part| {
-            matches!(
-                part,
-                std::path::Component::RootDir | std::path::Component::Normal(_)
-            )
-        })
     {
         return Err(format!(
             "{} has an incompatible legacy output registry row",
@@ -224,11 +218,10 @@ fn adoption_id(path: &Path, rows: &[&Row]) -> Result<String, String> {
 }
 
 fn checkout_exists(row: &Row) -> Result<bool, String> {
-    if !positively_missing(&row.checkout)? {
+    if !legacy_workspace_missing(&row.checkout)? {
         return Ok(true);
     }
-    // A recorded checkout drive being absent is insufficient evidence that
-    // the checkout was deleted. Verify the closest surviving ancestor's UUID.
+    // If the registry knows the original volume, also refuse a replacement.
     if let Some(expected) = &row.checkout_volume_uuid {
         for parent in row.checkout.ancestors().skip(1) {
             if !positively_missing(parent)? {
@@ -244,12 +237,4 @@ fn checkout_exists(row: &Row) -> Result<bool, String> {
         }
     }
     Ok(false)
-}
-
-pub(crate) fn positively_missing(path: &Path) -> Result<bool, String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(false),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
-        Err(error) => Err(format!("cannot inspect {}: {error}", path.display())),
-    }
 }

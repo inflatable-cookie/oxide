@@ -15,15 +15,15 @@ use crate::store::{self, Backend, Store};
 use crate::MIB;
 use barge::Os;
 use oxide_storage::lease::managed::init_volume_pool;
-use oxide_storage::storage::{AreaConfig, Storage};
+use oxide_storage::storage::{is_drive_mount_point, AreaConfig, OxideOs, Storage};
 use oxide_storage::volume::{self, Binding};
 use serde::{Deserialize, Serialize};
 use std::ffi::{CString, OsString};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 mod relocation;
@@ -626,6 +626,45 @@ fn plist(args: &[&str]) -> Result<serde_json::Value, String> {
 fn path_str(path: &Path) -> Result<&str, String> {
     path.to_str()
         .ok_or_else(|| "the mount point must be valid UTF-8".to_owned())
+}
+
+pub(crate) fn positively_missing(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(format!("cannot inspect {}: {error}", path.display())),
+    }
+}
+
+/// A missing workspace on an absent drive is not evidence of deletion.
+pub(crate) fn legacy_workspace_missing(path: &Path) -> Result<bool, String> {
+    if !path.is_absolute()
+        || !path
+            .components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(format!("{}: workspace path is unsafe", path.display()));
+    }
+    if !positively_missing(path)? {
+        return Ok(false);
+    }
+    if let Some(mount) = path
+        .ancestors()
+        .find(|ancestor| is_drive_mount_point(ancestor))
+    {
+        if OxideOs
+            .volume_identity(mount)
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            return Err(format!(
+                "{}: cannot establish that the workspace volume {} is present",
+                path.display(),
+                mount.display()
+            ));
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) fn write_registration(

@@ -608,10 +608,14 @@ paths. The summary says `temp: inherited <path>` or `temp: oxide <path>`.
   for each unmarked output. A live checkout keeps its output at the same path
   with a Barge identity and pin protection for any selection. Only roots whose
   recorded checkouts are all missing are removed, with an atomic registry
-  update. A dead nested slot is removed before its store and ledger records
-  are retired. Empty legacy project declarations and recognized markerless
-  slot trash are removed under the same quiet window. The preview reports the
-  same counts and paths without modifying files.
+  update. A missing checkout on an absent drive blocks cleanup even if the
+  registry lacks its volume UUID. The upgrade also clears dead legacy rows
+  beneath the outputs area whose roots are already missing and have no
+  recorded Barge identity or retirement. This lets a retry finish if removal
+  completed before registry publication. A dead nested slot is removed before
+  its store and ledger records are retired. Empty legacy project declarations
+  and recognized markerless slot trash are removed under the same quiet
+  window. The preview reports the same counts and paths without modifying files.
 - **Selection:** when a build starts, the drive is selected only if it is mounted,
   its registered UUID matches and it is writable. Selection does not repeat the
   boot-container or APFS-role checks; registration and `describe` run those, and

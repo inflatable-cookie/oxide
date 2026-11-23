@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 mod relocation;
 mod upgrade_legacy;
-pub(crate) use upgrade_legacy::{plan_legacy_outputs, positively_missing, LegacyOutputAction};
+pub(crate) use upgrade_legacy::{plan_legacy_outputs, LegacyOutputAction};
 
 pub(crate) use relocation::{output_accounts, plan_registry_relocation};
 

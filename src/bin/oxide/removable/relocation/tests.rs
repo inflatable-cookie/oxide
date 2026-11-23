@@ -904,6 +904,117 @@ fn upgrade_legacy_adopts_and_cleans_then_relocation_succeeds() {
 }
 
 #[test]
+fn upgrade_legacy_refuses_an_absent_checkout_drive_without_a_recorded_uuid() {
+    for root_missing in [false, true] {
+        let fixture = upgrade_ready_fixture();
+        legacy_output_fixture(&fixture);
+        let empty = fixture.mount.join("oxide-pool/slots/empty");
+        private_tree(&empty);
+        // Name an absent mount without creating anything under /Volumes.
+        let mount = Path::new("/Volumes").join(fixture._temp.path().file_name().unwrap());
+        assert!(!mount.try_exists().unwrap());
+        let checkout = mount.join("checkout");
+        let directory = fixture.internal.control().join("outputs");
+        let registry_path = directory.join("registry.json");
+        let mut registry = read_json(&registry_path);
+        let row = &mut registry["rows"][1];
+        assert!(row.get("checkout_volume_uuid").is_none());
+        row["checkout"] = json!(checkout);
+        write_json(&directory, "registry.json", &registry);
+        let before = fs::read(&registry_path).unwrap();
+        if root_missing {
+            fs::remove_dir_all(&fixture.unused_output.path).unwrap();
+        }
+
+        for dry_run in [true, false] {
+            let error = upgrade_fixture(&fixture, dry_run).unwrap_err();
+            assert!(
+                error.contains(checkout.to_string_lossy().as_ref()),
+                "{error}"
+            );
+            assert!(
+                error.contains("cannot establish that the workspace volume"),
+                "{error}"
+            );
+            assert_eq!(fs::read(&registry_path).unwrap(), before);
+            assert!(empty.is_dir());
+            assert!(!fixture
+                .output
+                .path
+                .join(oxide_storage::storage::ROOT_MARKER)
+                .exists());
+            assert_eq!(fixture.unused_output.path.exists(), !root_missing);
+        }
+        if !root_missing {
+            assert_eq!(
+                fs::read(fixture.unused_output.path.join("stale-artifact")).unwrap(),
+                b"dead"
+            );
+        }
+    }
+}
+
+#[test]
+fn upgrade_legacy_resumes_after_dead_output_removal_before_registry_publish() {
+    let fixture = upgrade_ready_fixture();
+    let directory = fixture.internal.control().join("outputs");
+    let registry_path = directory.join("registry.json");
+    let mut registry = read_json(&registry_path);
+    let surviving = registry["rows"][0].clone();
+    let interrupted = &mut registry["rows"][1];
+    interrupted.as_object_mut().unwrap().remove("barge_id");
+    interrupted["checkout"] = json!(fixture.checkout.with_file_name("deleted-checkout"));
+    let mut retained = interrupted.clone();
+    retained["root"] = json!(fixture
+        .unused_output
+        .path
+        .with_file_name("missing-recorded-root"));
+    retained["barge_id"] = json!("previous-root-id");
+    registry["rows"]
+        .as_array_mut()
+        .unwrap()
+        .push(retained.clone());
+    write_json(&directory, "registry.json", &registry);
+    let before = fs::read(&registry_path).unwrap();
+    // Simulate interruption after removal of the markerless output directory.
+    fs::remove_file(
+        fixture
+            .unused_output
+            .path
+            .join(oxide_storage::storage::ROOT_MARKER),
+    )
+    .unwrap();
+    fs::remove_dir_all(&fixture.unused_output.path).unwrap();
+
+    let preview = upgrade_fixture(&fixture, true).unwrap();
+    assert_eq!(
+        preview.forget_missing_outputs.paths,
+        [fixture.unused_output.path.clone()]
+    );
+    assert_eq!(preview.remove_dead_outputs.count, 0);
+    assert_eq!(fs::read(&registry_path).unwrap(), before);
+
+    let applied = upgrade_fixture(&fixture, false).unwrap();
+    assert_eq!(
+        applied.forget_missing_outputs.paths,
+        preview.forget_missing_outputs.paths
+    );
+    assert_eq!(applied.remove_dead_outputs.count, 0);
+    let after = read_json(&registry_path);
+    assert_eq!(after["revision"], 2);
+    assert_eq!(after["rows"], json!([surviving, retained]));
+    assert!(fixture.output.path.join("debug/output-sentinel").is_file());
+    assert_eq!(
+        upgrade_fixture(&fixture, false)
+            .unwrap()
+            .forget_missing_outputs
+            .count,
+        0
+    );
+    assert_eq!(read_json(&registry_path), after);
+}
+
+#[test]
 fn upgrade_legacy_refuses_unknown_entries_before_any_payload_mutation() {
     let fixture = upgrade_ready_fixture();
     legacy_output_fixture(&fixture);

@@ -200,39 +200,3 @@ fn lock(file: File, path: &Path) -> Result<File, String> {
 pub(super) fn at(path: &Path, error: impl std::fmt::Display) -> String {
     format!("{}: {error}", path.display())
 }
-
-/// A missing workspace on an absent drive is not evidence of deletion.
-pub(super) fn workspace_missing(path: &Path) -> Result<bool, String> {
-    if !path.is_absolute()
-        || !path.components().all(|part| {
-            matches!(
-                part,
-                std::path::Component::Normal(_) | std::path::Component::RootDir
-            )
-        })
-    {
-        return Err(at(path, "workspace path is unsafe"));
-    }
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(false),
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            if let Ok(relative) = path.strip_prefix("/Volumes") {
-                if let Some(name) = relative.iter().next() {
-                    let mount = Path::new("/Volumes").join(name);
-                    if oxide_storage::storage::is_drive_mount_point(&mount)
-                        && barge::Os::volume_identity(&oxide_storage::storage::OxideOs, &mount)
-                            .map_err(|error| at(&mount, error))?
-                            .is_none()
-                    {
-                        return Err(at(
-                            path,
-                            "cannot establish that the workspace volume is present",
-                        ));
-                    }
-                }
-            }
-            Ok(true)
-        }
-        Err(error) => Err(at(path, error)),
-    }
-}
