@@ -26,11 +26,7 @@ const DEP: &str = "debug/deps/cfg_if-aaaaaaaaaaaaaaaa.d";
 const ARTIFACT: &str = "debug/deps/libcfg_if-aaaaaaaaaaaaaaaa.rmeta";
 const SOURCE_A: &str = "/fixture/src/lib.rs";
 const SOURCE_B: &str = "/fixture/src/other.rs";
-/// A second complete layout-v1 library unit, so the clone loop meets exactly
-/// one unit-directory boundary.
-const FINGERPRINT_B: &str = "debug/.fingerprint/itoa-bbbbbbbbbbbbbbbb";
-const DEP_B: &str = "debug/deps/itoa-bbbbbbbbbbbbbbbb.d";
-const ARTIFACT_B: &str = "debug/deps/libitoa-bbbbbbbbbbbbbbbb.rmeta";
+const REGISTRY: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
 thread_local! {
     static WALK_LIMITS: Cell<Option<SeedWalkLimits>> = const { Cell::new(None) };
@@ -41,6 +37,8 @@ thread_local! {
     static TAMPER_LEDGER: Cell<bool> = const { Cell::new(false) };
     static VERIFY_DELAY_MS: Cell<Option<u64>> = const { Cell::new(None) };
     static CLONE_DELAY_AT: Cell<Option<(usize, u64)>> = const { Cell::new(None) };
+    static CLONE_VERIFY_HOLD_AT: Cell<Option<(usize, u64)>> = const { Cell::new(None) };
+    static OVERWRITE_CLONE: Cell<Option<usize>> = const { Cell::new(None) };
     static REMOVE_CREATED_DIRECTORY: Cell<bool> = const { Cell::new(false) };
     static UNREADABLE_CLONE: Cell<Option<usize>> = const { Cell::new(None) };
     static HARDLINK_CLONE: Cell<bool> = const { Cell::new(false) };
@@ -104,6 +102,8 @@ fn reset_hooks() {
     TAMPER_LEDGER.with(|cell| cell.set(false));
     VERIFY_DELAY_MS.with(|cell| cell.set(None));
     CLONE_DELAY_AT.with(|cell| cell.set(None));
+    CLONE_VERIFY_HOLD_AT.with(|cell| cell.set(None));
+    OVERWRITE_CLONE.with(|cell| cell.set(None));
     REMOVE_CREATED_DIRECTORY.with(|cell| cell.set(false));
     UNREADABLE_CLONE.with(|cell| cell.set(None));
     HARDLINK_CLONE.with(|cell| cell.set(false));
@@ -133,13 +133,32 @@ pub(super) fn inject(point: TestPoint<'_>) {
             }
         }
         TestPoint::AfterClone { index, path } => {
+            use std::io::Write as _;
             if TAMPER_CLONE.with(Cell::get) == Some(index) {
+                // A different length, so the clone's own metadata already
+                // disagrees with the catalog.
                 let mut file = OpenOptions::new()
                     .append(true)
                     .open(path)
                     .expect("open tampered clone");
-                use std::io::Write as _;
                 file.write_all(b"tampered").expect("tamper clone");
+            }
+            if OVERWRITE_CLONE.with(Cell::get) == Some(index) {
+                // The same length, so only the digest disagrees.
+                let bytes = fs::read(path).expect("read overwritten clone");
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .expect("open overwritten clone");
+                file.write_all(&vec![b'x'; bytes.len()])
+                    .expect("overwrite clone");
+            }
+            // A hold between a clone and its verification, so the cooperative
+            // budget can expire with the clone's metadata already observable.
+            if let Some((at, ms)) = CLONE_VERIFY_HOLD_AT.with(Cell::get) {
+                if at == index {
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
             }
         }
         TestPoint::DuringClone { index, path } => {
@@ -572,7 +591,8 @@ fn dep_info_for(dep: &str, artifact: &str) -> String {
 }
 
 fn dep_info_text() -> String {
-    dep_info_for(DEP, ARTIFACT)
+    let paths = cfg_if_paths(SeedLayout::V1);
+    dep_info_for(&paths.dep, &paths.artifact)
 }
 
 fn dep_targets_for(dep: &str, artifact: &str) -> Vec<String> {
@@ -585,7 +605,8 @@ fn dep_targets_for(dep: &str, artifact: &str) -> Vec<String> {
 }
 
 fn dep_targets() -> Vec<String> {
-    dep_targets_for(DEP, ARTIFACT)
+    let paths = cfg_if_paths(SeedLayout::V1);
+    dep_targets_for(&paths.dep, &paths.artifact)
 }
 
 fn dep_inputs() -> Vec<String> {
@@ -593,70 +614,115 @@ fn dep_inputs() -> Vec<String> {
 }
 
 fn file_kind(path: &str) -> SeedFileKind {
-    if path == DEP || path == DEP_B {
+    if path.ends_with(".d") {
         SeedFileKind::DepInfo
-    } else if path == ARTIFACT || path == ARTIFACT_B {
+    } else if path.ends_with(".rmeta") || path.ends_with(".rlib") {
         SeedFileKind::Artifact
     } else {
         SeedFileKind::Fingerprint
     }
 }
 
-/// One layout-v1 library unit's five files: the fingerprint triple, its rmeta
-/// artifact and its `.d`.
-fn unit_files(
-    fingerprint: &str,
-    target: &str,
-    artifact: &str,
-    dep: &str,
-    join: &str,
-) -> Vec<(String, String)> {
+/// One fixture unit's layout-specific paths: the directory its catalog records,
+/// the directory holding its fingerprint triple, its artifact and its joining
+/// `.d`.
+#[derive(Debug, Eq, PartialEq)]
+struct UnitPaths {
+    fingerprint_dir: String,
+    fingerprint_files: String,
+    artifact: String,
+    dep: String,
+}
+
+/// The paths one unit takes under a layout. Layout v1 keeps every fingerprint
+/// triple and every output in two shared profile directories; layout v2 gives
+/// the unit its own `fingerprint/` and `out/` directories.
+fn unit_paths(layout: SeedLayout, package: &str, target: &str, hex: &str) -> UnitPaths {
+    match layout {
+        SeedLayout::V1 => {
+            let dir = format!("debug/.fingerprint/{package}-{hex}");
+            UnitPaths {
+                artifact: format!("debug/deps/lib{target}-{hex}.rmeta"),
+                dep: format!("debug/deps/{target}-{hex}.d"),
+                fingerprint_files: dir.clone(),
+                fingerprint_dir: dir,
+            }
+        }
+        SeedLayout::V2 => {
+            let dir = format!("debug/build/{package}/{hex}");
+            UnitPaths {
+                artifact: format!("{dir}/out/lib{target}-{hex}.rmeta"),
+                dep: format!("{dir}/out/{target}-{hex}.d"),
+                fingerprint_files: format!("{dir}/fingerprint"),
+                fingerprint_dir: dir,
+            }
+        }
+    }
+}
+
+fn cfg_if_paths(layout: SeedLayout) -> UnitPaths {
+    unit_paths(layout, "cfg-if", "cfg_if", "aaaaaaaaaaaaaaaa")
+}
+
+fn itoa_paths(layout: SeedLayout) -> UnitPaths {
+    unit_paths(layout, "itoa", "itoa", "bbbbbbbbbbbbbbbb")
+}
+
+/// One unit's files: its fingerprint triple, its artifact and a `.d` holding
+/// exactly `join`.
+fn unit_files_joining(paths: &UnitPaths, target: &str, join: String) -> Vec<(String, String)> {
     vec![
         (
-            format!("{fingerprint}/lib-{target}"),
+            format!("{}/lib-{target}", paths.fingerprint_files),
             "fingerprint".to_owned(),
         ),
-        (format!("{fingerprint}/lib-{target}.json"), "{}".to_owned()),
-        (format!("{fingerprint}/dep-lib-{target}"), String::new()),
-        (artifact.to_owned(), "rmeta-fixture".to_owned()),
-        (dep.to_owned(), join.to_owned()),
+        (
+            format!("{}/lib-{target}.json", paths.fingerprint_files),
+            "{}".to_owned(),
+        ),
+        (
+            format!("{}/dep-lib-{target}", paths.fingerprint_files),
+            String::new(),
+        ),
+        (paths.artifact.clone(), "rmeta-fixture".to_owned()),
+        (paths.dep.clone(), join),
     ]
 }
 
+/// One unit's files with the ordinary rustc join.
+fn unit_files(paths: &UnitPaths, target: &str) -> Vec<(String, String)> {
+    unit_files_joining(paths, target, dep_info_for(&paths.dep, &paths.artifact))
+}
+
 fn files_with_dep(dep: &str) -> Vec<(String, String)> {
-    unit_files(FINGERPRINT, "cfg_if", ARTIFACT, DEP, dep)
+    unit_files_joining(&cfg_if_paths(SeedLayout::V1), "cfg_if", dep.to_owned())
 }
 
 fn default_files() -> Vec<(String, String)> {
     files_with_dep(&dep_info_text())
 }
 
-/// Two complete library units: `cfg_if`, then a second `itoa` unit.
-fn two_unit_files() -> Vec<(String, String)> {
-    let mut files = default_files();
-    files.extend(unit_files(
-        FINGERPRINT_B,
-        "itoa",
-        ARTIFACT_B,
-        DEP_B,
-        &dep_info_for(DEP_B, ARTIFACT_B),
-    ));
-    files
+/// Two complete library units under `layout` — `cfg_if`, then `itoa` — and the
+/// file index of the one unit-directory boundary between them.
+fn two_unit_split(layout: SeedLayout) -> (Vec<(String, String)>, usize) {
+    let mut files = unit_files(&cfg_if_paths(layout), "cfg_if");
+    let boundary = files.len();
+    files.extend(unit_files(&itoa_paths(layout), "itoa"));
+    (files, boundary)
 }
 
-/// The catalog for [`two_unit_files`]: one package per unit.
-fn two_unit_catalog(grant: &LeaseGrant, record_id: u64, files: &[(String, String)]) -> SeedCatalog {
-    let boundary = default_files().len();
-    let mut catalog = catalog_with_join(
-        grant,
-        record_id,
-        &files[..boundary],
-        &dep_targets(),
-        &dep_inputs(),
-        &dep_info_text(),
-    );
-    let join = dep_info_for(DEP_B, ARTIFACT_B);
-    let entries: Vec<SeedFile> = files[boundary..]
+/// One catalog package holding one fixture unit.
+fn unit_package(
+    paths: &UnitPaths,
+    package: &str,
+    version: &str,
+    target: &str,
+    files: &[(String, String)],
+    targets: &[String],
+    inputs: &[String],
+    join: &str,
+) -> SeedPackage {
+    let entries: Vec<SeedFile> = files
         .iter()
         .map(|(path, content)| SeedFile {
             path: path.clone(),
@@ -666,11 +732,11 @@ fn two_unit_catalog(grant: &LeaseGrant, record_id: u64, files: &[(String, String
             kind: file_kind(path),
         })
         .collect();
-    catalog.packages.push(SeedPackage {
-        name: "itoa".to_owned(),
-        target: "itoa".to_owned(),
-        version: "1.0.18".to_owned(),
-        source: "registry+https://github.com/rust-lang/crates.io-index".to_owned(),
+    SeedPackage {
+        name: package.to_owned(),
+        target: target.to_owned(),
+        version: version.to_owned(),
+        source: REGISTRY.to_owned(),
         checksum: Some("a".repeat(64)),
         unique: true,
         leaf: true,
@@ -679,18 +745,81 @@ fn two_unit_catalog(grant: &LeaseGrant, record_id: u64, files: &[(String, String
             digest: "b".repeat(64),
         },
         units: vec![SeedUnit {
-            fingerprint_dir: FINGERPRINT_B.to_owned(),
+            fingerprint_dir: paths.fingerprint_dir.clone(),
             role: SeedRole::Lib,
-            target: "itoa".to_owned(),
+            target: target.to_owned(),
             join: SeedJoin {
-                path: DEP_B.to_owned(),
-                targets: dep_targets_for(DEP_B, ARTIFACT_B),
-                inputs: dep_inputs(),
-                digest: sha(&join),
+                path: paths.dep.clone(),
+                targets: targets.to_vec(),
+                inputs: inputs.to_vec(),
+                digest: sha(join),
             },
             files: entries,
         }],
-    });
+    }
+}
+
+/// A catalog for one donor generation holding `packages` from the fixture
+/// producer.
+fn catalog_of(record_id: u64, grant: &LeaseGrant, packages: Vec<SeedPackage>) -> SeedCatalog {
+    SeedCatalog {
+        schema: SEED_CATALOG_SCHEMA.to_owned(),
+        store_id: grant.store_id.clone(),
+        slot_id: grant.slot_id.clone(),
+        incarnation: grant.incarnation.clone(),
+        lease_id: grant.lease_id.clone(),
+        record_id,
+        mark: 1,
+        started_at_ms: 1,
+        finished_at_ms: 2,
+        attempt: SeedAttemptState::None,
+        producer: producer(),
+        packages,
+        rejected: Vec::new(),
+    }
+}
+
+/// The catalog for [`two_unit_split`] under `layout`: one package per unit.
+fn two_unit_catalog(
+    layout: SeedLayout,
+    grant: &LeaseGrant,
+    record_id: u64,
+    files: &[(String, String)],
+) -> SeedCatalog {
+    let (_, boundary) = two_unit_split(layout);
+    let first = cfg_if_paths(layout);
+    let second = itoa_paths(layout);
+    let mut catalog = catalog_of(
+        record_id,
+        grant,
+        vec![
+            unit_package(
+                &first,
+                "cfg-if",
+                "1.0.0",
+                "cfg_if",
+                &files[..boundary],
+                &dep_targets_for(&first.dep, &first.artifact),
+                &dep_inputs(),
+                &dep_info_for(&first.dep, &first.artifact),
+            ),
+            unit_package(
+                &second,
+                "itoa",
+                "1.0.18",
+                "itoa",
+                &files[boundary..],
+                &dep_targets_for(&second.dep, &second.artifact),
+                &dep_inputs(),
+                &dep_info_for(&second.dep, &second.artifact),
+            ),
+        ],
+    );
+    if layout == SeedLayout::V2 {
+        // A whole-unit-directory catalog only validates under the adapter that
+        // produced that shape.
+        catalog.producer.adapter = ADAPTER_V2.to_owned();
+    }
     catalog
 }
 
@@ -737,55 +866,20 @@ fn catalog_with_join(
     inputs: &[String],
     dep: &str,
 ) -> SeedCatalog {
-    let entries: Vec<SeedFile> = files
-        .iter()
-        .map(|(path, content)| SeedFile {
-            path: path.clone(),
-            size: content.len() as u64,
-            mtime_ms: 0,
-            digest: sha(content),
-            kind: file_kind(path),
-        })
-        .collect();
-    SeedCatalog {
-        schema: SEED_CATALOG_SCHEMA.to_owned(),
-        store_id: grant.store_id.clone(),
-        slot_id: grant.slot_id.clone(),
-        incarnation: grant.incarnation.clone(),
-        lease_id: grant.lease_id.clone(),
+    catalog_of(
         record_id,
-        mark: 1,
-        started_at_ms: 1,
-        finished_at_ms: 2,
-        attempt: SeedAttemptState::None,
-        producer: producer(),
-        packages: vec![SeedPackage {
-            name: "cfg-if".to_owned(),
-            target: "cfg_if".to_owned(),
-            version: "1.0.0".to_owned(),
-            source: "registry+https://github.com/rust-lang/crates.io-index".to_owned(),
-            checksum: Some("a".repeat(64)),
-            unique: true,
-            leaf: true,
-            source_root: SeedSourceRoot {
-                kind: SeedSourceKind::Registry,
-                digest: "b".repeat(64),
-            },
-            units: vec![SeedUnit {
-                fingerprint_dir: FINGERPRINT.to_owned(),
-                role: SeedRole::Lib,
-                target: "cfg_if".to_owned(),
-                join: SeedJoin {
-                    path: DEP.to_owned(),
-                    targets: targets.to_vec(),
-                    inputs: inputs.to_vec(),
-                    digest: sha(dep),
-                },
-                files: entries,
-            }],
-        }],
-        rejected: Vec::new(),
-    }
+        grant,
+        vec![unit_package(
+            &cfg_if_paths(SeedLayout::V1),
+            "cfg-if",
+            "1.0.0",
+            "cfg_if",
+            files,
+            targets,
+            inputs,
+            dep,
+        )],
+    )
 }
 
 /// One released donor slot with a published catalog, its own record lock and
@@ -867,14 +961,27 @@ fn make_donor_catalog(
     }
 }
 
-/// A released two-unit donor, and a request that plans both units.
-fn two_unit_donor(rig: &Rig, label: &str, recipient: &SeedRecipient) -> (Donor, SeedRequest) {
-    let donor = make_donor_catalog(rig, label, None, two_unit_files(), two_unit_catalog);
-    let mut request = donor.request(recipient);
-    request.units.push(SeedUnitRef {
-        fingerprint_dir: FINGERPRINT_B.to_owned(),
-        role: SeedRole::Lib,
+/// A released two-unit donor under `layout`, and a request that plans both
+/// units.
+fn two_unit_donor(
+    rig: &Rig,
+    label: &str,
+    recipient: &SeedRecipient,
+    layout: SeedLayout,
+) -> (Donor, SeedRequest) {
+    let (files, _) = two_unit_split(layout);
+    let donor = make_donor_catalog(rig, label, None, files, |grant, record_id, files| {
+        two_unit_catalog(layout, grant, record_id, files)
     });
+    let mut request = donor.request(recipient);
+    // Plan both units by this layout's own directories, in their clone order.
+    request.units = [cfg_if_paths(layout), itoa_paths(layout)]
+        .into_iter()
+        .map(|paths| SeedUnitRef {
+            fingerprint_dir: paths.fingerprint_dir,
+            role: SeedRole::Lib,
+        })
+        .collect();
     (donor, request)
 }
 
@@ -1802,17 +1909,19 @@ fn seed_skips_on_the_work_deadline_before_the_first_write() {
     assert!(tree(&grant.env.cargo_build_build_dir).is_empty());
 }
 
-#[test]
-fn the_work_budget_publishes_the_verified_prefix_at_a_unit_boundary() {
+/// The cooperative work budget stops the clone loop at a complete
+/// unit-directory boundary: the units whose every clone verified publish, and
+/// nothing after that index was ever written.
+fn assert_the_work_budget_publishes_the_verified_prefix(layout: SeedLayout, label: &str) {
     reset_hooks();
-    let rig = Rig::new("deadline-boundary");
+    let rig = Rig::new(label);
     let (grant, recipient) = lease_recipient(&rig, "a");
-    let (donor, mut request) = two_unit_donor(&rig, "a", &recipient);
+    let (donor, mut request) = two_unit_donor(&rig, "a", &recipient, layout);
+    let (files, boundary) = two_unit_split(layout);
     // A generous-enough budget that the pre-clone revalidation cannot
     // plausibly exhaust it, then a delay after the first unit's last verified
     // clone: the loop meets the deadline at the second unit's first file,
     // which is a complete unit-directory boundary.
-    let boundary = default_files().len();
     request.work_budget_ms = Some(1_000);
     CLONE_DELAY_AT.with(|cell| cell.set(Some((boundary - 1, 1_200))));
     let outcome = seed(&rig.pool, &request).expect("the work budget never fails a build");
@@ -1825,7 +1934,7 @@ fn the_work_budget_publishes_the_verified_prefix_at_a_unit_boundary() {
     assert_eq!(receipt.files, boundary as u64);
     assert_eq!(
         receipt.logical_bytes,
-        donor.files[..boundary]
+        files[..boundary]
             .iter()
             .map(|(_, content)| content.len() as u64)
             .sum::<u64>()
@@ -1838,27 +1947,38 @@ fn the_work_budget_publishes_the_verified_prefix_at_a_unit_boundary() {
     // The whole first unit is cloned and verified; the second was never
     // started, so Cargo finds no half-written unit directory.
     let build = &grant.env.cargo_build_build_dir;
-    for (relative, content) in &donor.files[..boundary] {
+    for (relative, content) in &files[..boundary] {
         assert_eq!(
             &fs::read(build.join(relative)).expect("cloned file"),
             content.as_bytes()
         );
     }
-    assert!(!build.join(FINGERPRINT_B).exists());
-    for (relative, _) in &donor.files[boundary..] {
+    for (relative, _) in &files[boundary..] {
         assert!(!build.join(relative).exists(), "{relative} was cloned");
     }
+    // The fixture really is this layout: a v2 donor records whole-unit
+    // directories under the v2 adapter, not two profile-wide directories.
+    assert_eq!(
+        donor.catalog.producer.adapter == ADAPTER_V2,
+        layout == SeedLayout::V2
+    );
+    assert_eq!(
+        donor.catalog.packages[0].units[0].fingerprint_dir,
+        cfg_if_paths(layout).fingerprint_dir
+    );
 }
 
-#[test]
-fn the_work_budget_abandons_a_partly_written_unit_without_failing_the_build() {
+/// The cooperative work budget expires with one unit only partly written: the
+/// attempt is abandoned, never refused, and the partial unit is retained
+/// untrusted for the ordinary release.
+fn assert_the_work_budget_abandons_a_partly_written_unit(layout: SeedLayout, label: &str) {
     reset_hooks();
-    let rig = Rig::new("deadline-part-unit");
+    let rig = Rig::new(label);
     let (grant, recipient) = lease_recipient(&rig, "a");
-    let (donor, mut request) = two_unit_donor(&rig, "a", &recipient);
+    let (_, mut request) = two_unit_donor(&rig, "a", &recipient, layout);
+    let (files, boundary) = two_unit_split(layout);
     // The delay lands after the second unit's first verified clone, so the
     // deadline expires with that unit directory only partly written.
-    let boundary = default_files().len();
     request.work_budget_ms = Some(1_000);
     CLONE_DELAY_AT.with(|cell| cell.set(Some((boundary, 1_200))));
     let outcome = seed(&rig.pool, &request).expect("the work budget never fails a build");
@@ -1868,11 +1988,69 @@ fn the_work_budget_abandons_a_partly_written_unit_without_failing_the_build() {
     assert_eq!(abandon.reason, SeedAbandonReason::WorkDeadline);
     assert!(abandon.observation.is_none());
     assert_eq!(abandon.reason.as_str(), "deadline");
-    // Nothing is published and the partly written unit is retained untrusted
-    // for the ordinary release, exactly as a failed walk leaves it.
+    // Nothing is published and the partly written unit is retained untrusted:
+    // the first unit is complete, the second holds only its first file.
     let build = &grant.env.cargo_build_build_dir;
-    assert!(build.join(&donor.files[boundary].0).exists());
-    assert!(!build.join(&donor.files[boundary + 1].0).exists());
+    for (relative, _) in &files[..boundary] {
+        assert!(build.join(relative).exists(), "{relative} is missing");
+    }
+    assert!(build.join(&files[boundary].0).exists());
+    assert!(!build.join(&files[boundary + 1].0).exists());
+}
+
+#[test]
+fn the_work_budget_publishes_the_verified_prefix_at_a_unit_boundary() {
+    assert_the_work_budget_publishes_the_verified_prefix(SeedLayout::V1, "deadline-boundary");
+}
+
+#[test]
+fn the_work_budget_publishes_a_layout_v2_prefix_at_a_unit_boundary() {
+    // A whole-unit-directory donor: each unit is its own
+    // `debug/build/<package>/<hex>/` directory, so the boundary the loop stops
+    // at is the boundary between two self-contained directories.
+    assert_the_work_budget_publishes_the_verified_prefix(SeedLayout::V2, "deadline-boundary-v2");
+}
+
+#[test]
+fn the_work_budget_abandons_a_partly_written_unit_without_failing_the_build() {
+    assert_the_work_budget_abandons_a_partly_written_unit(SeedLayout::V1, "deadline-part-unit");
+}
+
+#[test]
+fn the_work_budget_abandons_a_partly_written_layout_v2_unit_without_failing_the_build() {
+    assert_the_work_budget_abandons_a_partly_written_unit(SeedLayout::V2, "deadline-part-unit-v2");
+}
+
+#[test]
+fn the_work_budget_refuses_a_clone_whose_metadata_is_already_wrong() {
+    reset_hooks();
+    let rig = Rig::new("deadline-metadata");
+    let donor = make_donor(&rig, "a");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let mut request = donor.request(&recipient);
+    request.work_budget_ms = Some(1_000);
+    // The clone's metadata already disagrees with the catalog (it is a
+    // different length) and the budget expires before its digest can be read.
+    // The observable safety fault still refuses: a deadline never downgrades
+    // it to a cold fallback.
+    TAMPER_CLONE.with(|cell| cell.set(Some(1)));
+    CLONE_VERIFY_HOLD_AT.with(|cell| cell.set(Some((1, 1_200))));
+    let refused = seed(&rig.pool, &request);
+    assert!(
+        matches!(refused, Err(LeaseError::UnsafePath(_))),
+        "{refused:?}"
+    );
+    // Nothing is published, and the untrusted generation is retained as any
+    // refusal leaves it.
+    assert!(grant
+        .env
+        .cargo_build_build_dir
+        .join(&donor.files[0].0)
+        .exists());
+    assert!(rig
+        .sidecars()
+        .iter()
+        .all(|name| !name.starts_with(&format!("{}.", grant.slot_id))));
 }
 
 #[test]
@@ -1979,7 +2157,8 @@ fn seed_refuses_a_clone_whose_bytes_do_not_match_and_retains_the_partial_slot() 
     let (grant, recipient) = lease_recipient(&rig, "a");
     let before_sidecars = rig.sidecars();
     let before_ledger = rig.ledger_bytes();
-    TAMPER_CLONE.with(|cell| cell.set(Some(1)));
+    // The same length, so only the digest disagrees with the catalog.
+    OVERWRITE_CLONE.with(|cell| cell.set(Some(1)));
     let refused = seed(&rig.pool, &donor.request(&recipient));
     assert!(matches!(refused, Err(LeaseError::UnsafePath(_))));
     // Everything already cloned is retained: nothing is deleted or repaired,
@@ -2061,8 +2240,9 @@ fn seed_refuses_when_the_first_clone_is_created_but_untrusted() {
     let rig = Rig::new("first-clone-untrusted");
     let donor = make_donor(&rig, "a");
     let (grant, recipient) = lease_recipient(&rig, "a");
-    // The first clone is created and then fails its digest: the point of no
-    // return has been crossed, so the fault refuses and retains.
+    // The first clone is created and its own metadata already disagrees with
+    // the catalog (a different length): the point of no return has been
+    // crossed, so the fault refuses and retains.
     TAMPER_CLONE.with(|cell| cell.set(Some(0)));
     let refused = seed(&rig.pool, &donor.request(&recipient));
     assert!(matches!(refused, Err(LeaseError::UnsafePath(_))));

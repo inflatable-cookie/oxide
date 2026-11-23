@@ -368,9 +368,13 @@ publishes the verified prefix, leaving the rest of the plan to build cold.
 Expiry inside a unit abandons seeding only, because that recipient then holds a
 unit whose clone set no write completed: nothing is published, it is released
 without a trusted origin and never repaired, and the command cold-builds in a
-newly admitted slot. Once every clone this attempt makes has verified, the work
-budget has nothing left to stop; the post-clone walk keeps its own separate
-bound. The pool's space budget stays soft, as it is for Cargo.
+newly admitted slot. A clone's own recorded facts — an owned regular file of the
+catalog's size on the payload device — are checked from its metadata **before**
+its bytes are hashed, so an expiry never downgrades a clone that was already
+observably wrong: that fault still refuses (section 7). Once every clone this
+attempt makes has verified, the work budget has nothing left to stop; the
+post-clone walk keeps its own separate bound. The pool's space budget stays
+soft, as it is for Cargo.
 
 | Item | Bound |
 | --- | --- |

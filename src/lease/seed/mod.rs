@@ -1218,6 +1218,23 @@ pub fn seed_monitored(
             Ok(metadata) => metadata,
             Err(error) => return pre_write(wrote_any, io_error(error)),
         };
+        // Every safety fact the clone's own metadata records is checked before
+        // a byte is hashed: a foreign owner, a wrong device, a non-regular
+        // entry or a size that disagrees with the catalog refuses even when the
+        // cooperative work budget expires mid-hash (§7). A deadline never
+        // downgrades a fault that was already observable.
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG
+            || metadata.st_uid != current_uid()
+            || metadata.st_dev as u64 != payload_device
+            || metadata.st_size.max(0) as u64 != file.size
+        {
+            return pre_write(
+                wrote_any,
+                LeaseError::UnsafePath(
+                    "a seeded clone is not an owned regular file of the recorded size",
+                ),
+            );
+        }
         let digest = match hash_fd(cloned.as_fd(), deadline, monitor) {
             Ok(digest) => digest,
             // A clone exists and its digest is unverified: this unit directory
@@ -1233,12 +1250,7 @@ pub fn seed_monitored(
                 )
             }
         };
-        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG
-            || metadata.st_uid != current_uid()
-            || metadata.st_dev as u64 != payload_device
-            || metadata.st_size.max(0) as u64 != file.size
-            || digest != file.digest
-        {
+        if digest != file.digest {
             return pre_write(
                 wrote_any,
                 LeaseError::UnsafePath("a seeded clone does not match its recorded digest"),
