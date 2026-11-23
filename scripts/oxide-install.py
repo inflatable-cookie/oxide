@@ -532,6 +532,51 @@ def verify_scratch_dir(path, expected_dev=None):
     return info.st_dev, info.st_ino
 
 
+def _removable_payload_on_volume(payload, mount, device):
+    """Check a registered removable payload names a path on the mounted volume.
+
+    Flat (`<mount>/oxide-pool`) and nested (`<mount>/builds/oxide/pool`)
+    layouts are both valid: the payload must be absolute, strictly beneath
+    `mount`, and free of `..` components, and its canonical location must
+    stay on the mount's device strictly beneath `mount` (so a symlink
+    escaping the volume is refused). The payload exists on a live
+    registered pool, so anything present at the payload path — including a
+    dangling symlink — must resolve strictly; only a truly absent path
+    falls back to its nearest existing ancestor's canonical location.
+    Unresolvable links fail closed.
+    """
+    if not payload.is_absolute() or payload == mount or not payload.is_relative_to(mount):
+        return False
+    if ".." in payload.parts:
+        return False
+    if os.path.lexists(payload):
+        try:
+            resolved = payload.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return False
+        if resolved == mount or not resolved.is_relative_to(mount):
+            return False
+        try:
+            return resolved.stat().st_dev == device
+        except OSError:
+            return False
+    anchor = payload.parent
+    while not os.path.lexists(anchor):
+        if anchor == anchor.parent:
+            return False
+        anchor = anchor.parent
+    try:
+        resolved = anchor.resolve(strict=True) / payload.relative_to(anchor)
+    except (OSError, RuntimeError):
+        return False
+    if resolved == mount or not resolved.is_relative_to(mount):
+        return False
+    try:
+        return anchor.stat().st_dev == device
+    except OSError:
+        return False
+
+
 def canary_scratch(description, override):
     if description["schema"] != "oxide.pool.describe/1":
         raise Refusal("the staged binary returned an unknown pool description")
@@ -549,7 +594,8 @@ def canary_scratch(description, override):
         device = mount.stat().st_dev
         if (not mount.is_absolute() or mount.resolve(strict=True) != mount
                 or device == mount.parent.stat().st_dev
-                or scratch != mount / "scratch" or payload.parent != mount):
+                or scratch != mount / "scratch"
+                or not _removable_payload_on_volume(payload, mount, device)):
             raise Refusal("removable scratch does not name the registered mounted volume")
     elif description["selected"] == "internal" and (
         removable is None or removable.get("unavailable_reason") == "absent"
