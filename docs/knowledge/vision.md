@@ -137,8 +137,9 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   never pause or reset an outer budget. Signal forwarding and conservative
   group closure are preserved. Consumer adoption and installation remain
   separate gates.
-Nested commands currently take an independent lease, and idle `oxide exec`
-sessions hold their host permit for the full session. Tom's 2026-11-23 ruling
+Nested commands on macOS join the outer host permit and keep independent slot
+custody. Idle `oxide exec` sessions still hold their host permit for the full
+session. Tom's 2026-11-23 ruling
 settled the Q-020 / Q-018 direction: build both nested lease joining and idle
 `oxide exec` permit borrowing over a parent-owned local Unix domain socket
 broker with a per-session random token (`0700` socket dir, same-UID peer

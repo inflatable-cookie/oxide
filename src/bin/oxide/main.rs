@@ -232,36 +232,14 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
                 .to_owned(),
         );
     }
-    // `exec` is parsed once, before any budget is installed: a usage request
-    // (`oxide exec --help`, or `oxide exec` with no `--`) prints Oxide's usage
-    // and ends before an event descriptor, clock or hand-off check exists, and
-    // nothing below parses the arguments again.
-    let exec = if class == Class::Exec {
-        match cli::parse_exec(rest)? {
-            Some(invocation) => Some(invocation),
-            None => {
-                print!("{}", cli::EXEC_USAGE);
-                return Ok(0);
-            }
-        }
-    } else {
-        None
-    };
-    let budgeted = leased && budget::reserved_prefix(rest);
-    if budgeted {
-        // Syntax and descriptor shape first, then the one monotonic owner:
-        // both precede the hand-off check, `run` selection and all other
-        // preparation (oxide#140 freeze 1).
-        let (options, _rest) = budget::scan(rest)?;
-        budget::install(options)?;
-    }
     // One pre-effect hand-off check (oxide#122), after help, version, list and
-    // toolchain handling and before any arm opens a store. Plain passthrough
-    // and `status --launch-check` do no work of their own.
-    let no_effect = class == Class::Plain
+    // toolchain handling. Leased commands do this in the runner once their
+    // budgets and session membership are known.
+    let no_effect = leased
+        || class == Class::Plain
         || (class == Class::Status && matches!(rest, [flag] if flag == "--launch-check"));
     if !no_effect {
-        if let Some(code) = handoff::preflight(budgeted) {
+        if let Some(code) = handoff::preflight(false) {
             return Ok(code);
         }
     }
@@ -273,11 +251,16 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
         Class::Clean => clean::run(rest),
         Class::Init => adopt::run_init(rest),
         Class::New => adopt::run_new(rest),
-        Class::Exec => match exec {
+        Class::Exec => match cli::parse_exec(rest)? {
             Some(invocation) => runner::run_invocation(invocation),
-            None => unreachable!("a usage-only exec returned above"),
+            None => {
+                print!("{}", cli::EXEC_USAGE);
+                Ok(0)
+            }
         },
-        Class::Modelled | Class::Building => runner::run_leased(command, rest),
+        Class::Modelled | Class::Building => {
+            runner::run_invocation(cli::parse_leased(command, rest)?)
+        }
     }
 }
 

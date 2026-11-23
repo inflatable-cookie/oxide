@@ -11,6 +11,7 @@ use crate::cli::Profile;
 use crate::freshness::{Built, Prior};
 use crate::identity::{self, SlotKey};
 use crate::process;
+use crate::session_broker::JoinedSession;
 use oxide_storage::lease::managed::lease_measured;
 use oxide_storage::lease::{
     LeaseError, LeaseRequest, LedgerSlot, LedgerView, Profile as LeaseProfile, ReuseMeasurement,
@@ -335,6 +336,9 @@ pub struct Lease {
     pub(super) lease_id: String,
     pub(super) record: u64,
     _lock: File,
+    // Keep the inherited permit marker locked while this process owns the
+    // slot. A crash closes it, making any unsettled record count again.
+    _inherited_permit: Option<File>,
     /// The cooperative hold on the slot's Barge root, kept for as long as the
     /// command uses it. A child that kept the inherited descriptor keeps the
     /// root held after this lease is dropped.
@@ -444,21 +448,45 @@ pub(super) struct ClaimedRecord {
     lease_holder: String,
 }
 
+pub(super) fn permit_path(control: &std::path::Path, record: u64) -> PathBuf {
+    control
+        .join("locks")
+        .join(format!("{record}.inherited-permit"))
+}
+
+pub(super) fn host_permit_count(
+    control: &std::path::Path,
+    records: &[Record],
+) -> Result<usize, String> {
+    let mut count = 0;
+    for record in records.iter().filter(|record| record.active()) {
+        if !matches!(
+            probe_lock(&permit_path(control, record.id), false)?,
+            Probe::Held
+        ) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 impl Store {
     /// Lease this checkout's slot, waiting in FIFO order. Ctrl-C while waiting
     /// cancels without touching any slot.
     /// `share` allows taking another checkout's idle compatible slot.
     /// `label` names the holder in `oxide status` (`exec <program>`).
-    pub fn acquire(
+    pub(crate) fn acquire(
         &self,
         key: &SlotKey,
         profile: Profile,
         share: bool,
         label: Option<&str>,
         waits: &mut WaitAccounting,
+        joined: Option<&JoinedSession>,
     ) -> Result<Acquired, String> {
         let max_active = self.max_active;
-        let ticket = self.register_ticket()?;
+        let independent_limit = joined.is_none().then_some(max_active);
+        let ticket = self.register_waiter(joined.is_some())?;
         loop {
             // End the polling interval before doing any admission work. A
             // slow attempt that finally grants must count as work, even
@@ -472,7 +500,11 @@ impl Store {
                 self.remove_ticket(ticket.0)?;
                 return Ok(Acquired::Interrupted(signal));
             }
-            let attempt = self.attempt(ticket.0, key, profile, max_active, share, label);
+            let attempt = joined
+                .map_or(Ok(()), JoinedSession::check_live)
+                .and_then(|()| {
+                    self.attempt(ticket.0, key, profile, independent_limit, share, label)
+                });
             match attempt {
                 // A failed attempt still ends this command's wait: the ticket
                 // must not outlive it, or every later command queues behind a
@@ -494,7 +526,7 @@ impl Store {
                 }
                 Ok(Err(wait)) => {
                     waits.observe(&wait, max_active, Instant::now());
-                    std::thread::sleep(WAIT_POLL);
+                    std::thread::sleep(crate::budget::clamp(WAIT_POLL));
                 }
             }
         }
@@ -534,7 +566,7 @@ impl Store {
         ticket: u64,
         key: &SlotKey,
         profile: Profile,
-        max_active: usize,
+        independent_limit: Option<usize>,
         share: bool,
         label: Option<&str>,
     ) -> Result<Result<Lease, Wait>, String> {
@@ -543,7 +575,9 @@ impl Store {
         let _admission = self.admission()?;
         let mut state = self.load()?;
         self.drop_dead_tickets(&mut state)?;
-        if let Some(wait) = self.waiting_reason(&mut state, ticket, key, max_active, cleaning)? {
+        if let Some(wait) =
+            self.waiting_reason(&mut state, ticket, key, independent_limit, cleaning)?
+        {
             self.save(&state)?;
             return Ok(Err(wait));
         }
@@ -555,6 +589,17 @@ impl Store {
             return Ok(Err(wait));
         }
         let claimed = self.claim_record(&mut state, key, profile, ticket, label, &mut choice)?;
+        let inherited_permit = if independent_limit.is_none() {
+            let Probe::Free(marker) =
+                probe_lock(&permit_path(&self.control, claimed.record), true)?
+            else {
+                return Err("the record's inherited permit marker is unexpectedly held".to_owned());
+            };
+            Some(marker)
+        } else {
+            None
+        };
+        self.save(&state)?;
         let folders = self.slot_folders(&state, key, &view);
         let request =
             self.lease_request(key, profile, &claimed, folders, choice.replace.as_ref())?;
@@ -635,6 +680,7 @@ impl Store {
             lease_id: grant.lease_id,
             record: claimed.record,
             _lock: claimed.lock,
+            _inherited_permit: inherited_permit,
             _root_hold: root_hold,
         }))
     }
@@ -651,7 +697,7 @@ impl Store {
         state: &mut State,
         ticket: u64,
         key: &SlotKey,
-        max_active: usize,
+        independent_limit: Option<usize>,
         cleaning: bool,
     ) -> Result<Option<Wait>, String> {
         let position = state
@@ -659,14 +705,16 @@ impl Store {
             .iter()
             .position(|entry| entry.id == ticket)
             .ok_or("Oxide wait ticket was lost")?;
-        let mut unblocked_ahead = 0usize;
-        for entry in &state.tickets[..position] {
-            if !self.is_ticket_blocked(entry.id)? {
-                unblocked_ahead += 1;
+        if independent_limit.is_some() {
+            let mut unblocked_ahead = 0usize;
+            for entry in &state.tickets[..position] {
+                if !self.is_ticket_blocked(entry.id)? {
+                    unblocked_ahead += 1;
+                }
             }
-        }
-        if unblocked_ahead > 0 {
-            return Ok(Some(Wait::Queue(unblocked_ahead + 1)));
+            if unblocked_ahead > 0 {
+                return Ok(Some(Wait::Queue(unblocked_ahead + 1)));
+            }
         }
         if cleaning
             || state
@@ -681,16 +729,14 @@ impl Store {
         if self.backend == Backend::ApfsVolume {
             self.discard_lost(state)?;
         }
-        let active = state
-            .records
-            .iter()
-            .filter(|record| record.active())
-            .count()
-            + self.sibling_active()?;
-        if active >= max_active {
-            return Ok(Some(Wait::HostLimit(active)));
+        if let Some(limit) = independent_limit {
+            let active =
+                host_permit_count(&self.control, &state.records)? + self.sibling_active()?;
+            if active >= limit {
+                return Ok(Some(Wait::HostLimit(active)));
+            }
+            self.set_ticket_blocked(ticket, false)?;
         }
-        self.set_ticket_blocked(ticket, false)?;
         Ok(None)
     }
 
@@ -960,7 +1006,6 @@ impl Store {
         if let Some(origin) = &recorded {
             self.write_origin(record, state.records[index].last_used, Some(origin.clone()))?;
         }
-        self.save(state)?;
         Ok(ClaimedRecord {
             record,
             lock,
@@ -1260,7 +1305,12 @@ impl Store {
             .map_err(|error| format!("cannot write a slot origin: {error}"))
     }
 
+    #[cfg(test)]
     pub(super) fn register_ticket(&self) -> Result<(u64, File), String> {
+        self.register_waiter(false)
+    }
+
+    fn register_waiter(&self, already_admitted: bool) -> Result<(u64, File), String> {
         let _admission = self.admission()?;
         if self.backend == super::Backend::ApfsVolume && self.sibling.is_some() {
             let registration = crate::removable::read_registration(self.owner_control())?
@@ -1282,7 +1332,8 @@ impl Store {
         let Probe::Free(file) = probe_lock(&self.ticket_path(id), true)? else {
             return Err("a new Oxide wait ticket is unexpectedly held".to_owned());
         };
-        self.set_ticket_blocked(id, false)?;
+        // A joiner may wait for storage, but it does not queue for a host permit.
+        self.set_ticket_blocked(id, already_admitted)?;
         state.tickets.push(Ticket {
             id,
             pid: std::process::id(),

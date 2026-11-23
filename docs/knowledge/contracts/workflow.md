@@ -220,7 +220,10 @@ digest and the receipt digest are reported under separate labels.
   `min(4, max(2, floor(physical_cores / 4)))` from `hw.physicalcpu`. Other
   platforms, and any failed or implausible query, use 2. The count covers
   commands in both the internal and the removable pool. Lowering the limit leaves
-  running commands alone.
+  running commands alone. On macOS a nested leased Oxide command joins the
+  outer command's permit through its [session broker](session-broker.md).
+  It skips the host-permit queue and follows the same slot, checkout and
+  output custody rules. The joined slot counts against storage caps as usual.
 - **Waiting:** unblocked waiters competing for the host-wide active-build limit
   wait in strict FIFO order. Waiters blocked only on a per-checkout or per-slot
   condition (a checkout clean barrier, project cap, uncertain interrupted slot,
@@ -259,9 +262,11 @@ oxide exec --execution-budget 300s -- npm run tauri build
   window.
 - `--budget-events <fd>` writes newline JSON records to a non-blocking pipe. A
   lost stream makes the run unknown, never a typed success.
-- A nested `oxide` consumes the outer window and inherits no deadline of its own.
-  Budgets do not cover kernel-blocking operations, a `setsid` escapee, or sleep
-  time on macOS.
+- On macOS a nested leased command uses the tighter of its own budget and the
+  outer execution time still available at each phase. Admission consumes
+  that same outer interval. An exhausted interval refuses before slot
+  acquisition with exit 124. Budgets do not cover kernel-blocking operations,
+  a `setsid` escapee, or sleep time on macOS.
 - Accepted durations are whole milliseconds or seconds (`30s`, `1500ms`), at
   most seven days. Invalid or duplicate options refuse before any effect.
 
@@ -275,11 +280,13 @@ oxide exec --execution-budget 300s -- npm run tauri build
 4. Run Cargo as the leader of a new process group, with the build directory on
    the slot, the target directory at `<checkout>/target`, the recipe variables,
    `RUSTC_WRAPPER=""` (see [inherited wrapper](#inherited-rustc-wrapper)),
-   and the temporary-directory choice.
+   and the temporary-directory choice. On macOS the child also receives the
+   session broker endpoint and token.
 5. `run` releases the lease after the build and executes the binary from the
    checkout's target directory, unless a budget or converted output custody keeps
-   the lease through the program. `test` holds the lease through execution. Reuse
-   never skips tests.
+   the lease through the program. A joined `run` also keeps its membership
+   and lease through the program. `test` holds the lease through execution.
+   Reuse never skips tests.
 6. When the group is empty, record the compile origin, run bounded stale-unit
    pruning on warm layout-v2 slots after a clean build while still holding the
    slot's exclusive Barge hold, release the lease and print

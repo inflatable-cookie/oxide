@@ -1,17 +1,24 @@
 # Session broker
 
-Oxide has a macOS session transport for nested lease membership and host-permit
-borrowing. The command entry points still take independent leases and hold
-their existing permits. See [architecture](../architecture.md) for ownership
-and [workflow](workflow.md) for the command budgets.
+On macOS, a leased command hosts a session broker for nested Oxide commands.
+Each joined command takes its own exclusive slot under the outer command's
+host permit. Idle `oxide exec` permit borrowing is a protocol capability for a
+later slice. See [architecture](../architecture.md) for ownership and
+[workflow](workflow.md) for the command budgets.
 
 ## Endpoint and authentication
 
 The outer process binds a Unix domain socket inside a fresh, per-session
-directory with mode `0700`. It uses a caller-selected temporary root with
-trusted ancestors and checks the socket's absolute pathname before creating the
-directory. macOS has 104 bytes in `sun_path` including the terminating NUL,
-which leaves at most 103 bytes for the path. An overlong path fails binding.
+directory with mode `0700` under the leased child's [chosen temporary root](workflow.md#child-temporary-files).
+Before creating it, Oxide checks the canonical path from `/` down. Each
+directory must be owned by the current user or root on a volume that enforces
+ownership. A directory writable by its group or by others must be sticky.
+Any ACL grant refuses the path. These checks protect the pathname used for
+binding and cleanup from replacement by another user.
+
+Oxide also checks the socket's absolute pathname before creation. macOS has 104 bytes in `sun_path`
+including the terminating NUL, which leaves at most 103 bytes for the path.
+An overlong path refuses the launch.
 
 The broker supplies two variables for the outer command to pass to its children.
 
@@ -27,6 +34,12 @@ length. The socket directory and peer check limit access to the local UID.
 The token binds a connection to the advertised session within that trust
 boundary. On other platforms, including Linux, peer verification fails closed
 with an unsupported-platform error.
+
+A leased invocation given either variable requires both and authenticates
+before opening the pool. A missing, invalid, unreachable or refusing broker
+ends the invocation. Help, passthrough and read-only commands leave the broker
+alone. A joined command hosts its own broker for its leased children so a
+deeper invocation inherits the tighter deadline too.
 
 ## Protocol version 1
 
@@ -46,16 +59,20 @@ The session ID is an opaque string. Member and borrow IDs are unsigned integers
 scoped to that session. A join with `inherited` uses the outer permit.
 `borrow_required` tells the member to obtain a separate grant before using a
 permit. The parent's permit controller grants or denies a borrow and receives
-its return when the grant ends.
+its return when the grant ends. The current command path grants inherited
+membership and denies borrow requests. A command refuses `borrow_required`
+until borrowing is available.
 
 The broker starts accepting handshakes once the parent publishes the outer
 execution deadline, or explicitly marks execution unbounded. The deadline is
 set once. `remaining_execution_ms` is sampled against that monotonic deadline
 when the response is sent. It is an unsigned integer rounded down, with zero
 meaning no usable time remains and JSON `null` meaning unbounded. Nested
-admission and execution must each use the tighter of their own budget and the
-remaining outer window. The outer process-group kill remains the hard
-backstop.
+admission and execution each use the tighter of their own budget and the
+remaining outer window. The client anchors the reported interval before the
+handshake, then retains that absolute cap through admission and execution.
+Zero refuses before pool or slot admission with exit 124. The outer
+process-group kill remains the hard backstop.
 
 ## Close and crash
 
@@ -64,6 +81,8 @@ automatically. Connection cleanup gives no authority to release a storage hold
 or assume a process group has stopped writing. On normal shutdown the broker
 stops accepting, shuts down all client sockets, drains connection cleanup, and
 removes the socket and its private directory. An already-connected child
-treats EOF or connection loss as the end of its outer session. A process death
+treats EOF or connection loss as the end of its outer session. Oxide refuses
+further slot admission and stops any group it is supervising through its normal
+bounded closure path. A process death
 closes the sockets through the OS and may leave the private directory on disk.
 Each new session creates its own directory.

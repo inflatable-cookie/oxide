@@ -212,6 +212,59 @@ fn refuses_an_overlong_socket_path_before_creating_a_directory() {
     assert_eq!(result.err().unwrap().kind(), io::ErrorKind::InvalidInput);
 }
 
+#[test]
+fn refuses_a_private_root_beneath_a_writable_nonsticky_ancestor() {
+    let fixture = SocketDirectory::create(&scratch_root()).unwrap();
+    let shared = fixture.path.join("shared");
+    let root = shared.join("temp");
+    fs::create_dir_all(&root).unwrap();
+    fs::set_permissions(&root, Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&shared, Permissions::from_mode(0o770)).unwrap();
+
+    let result = SessionBroker::bind(&root, PermitMode::Inherited, DenyBorrowing);
+    let error = result
+        .err()
+        .expect("the writable ancestor should refuse binding");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains(&shared.display().to_string()));
+    assert!(fs::read_dir(&root).unwrap().next().is_none());
+
+    // A sticky parent protects entries owned by the trusted user.
+    fs::set_permissions(&shared, Permissions::from_mode(0o1770)).unwrap();
+    let broker = SessionBroker::bind(&root, PermitMode::Inherited, DenyBorrowing).unwrap();
+    drop(broker);
+    fs::remove_dir(root).unwrap();
+    fs::remove_dir(shared).unwrap();
+}
+
+#[test]
+fn refuses_an_ancestor_with_an_acl_grant() {
+    let fixture = SocketDirectory::create(&scratch_root()).unwrap();
+    let root = fixture.path.join("temp");
+    fs::create_dir(&root).unwrap();
+    let output = Command::new("/bin/chmod")
+        .args(["+a", "everyone allow delete_child"])
+        .arg(&fixture.path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::metadata(&fixture.path).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+
+    let result = SessionBroker::bind(&root, PermitMode::Inherited, DenyBorrowing);
+    let error = result.err().expect("the ACL grant should refuse binding");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains("ACL grants access"));
+    assert!(fs::read_dir(&root).unwrap().next().is_none());
+    fs::remove_dir(root).unwrap();
+}
+
 struct OnePermit {
     borrowed: Arc<std::sync::Mutex<Option<u64>>>,
 }

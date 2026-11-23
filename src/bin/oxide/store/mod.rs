@@ -673,16 +673,15 @@ impl Store {
             .map_err(|error| format!("the other pool's record state is unreadable: {error}"))
     }
 
-    /// The number of active command records in the other pool. An unreadable
+    /// The number of independent active permits in the other pool. An unreadable
     /// state is an error, so the caller refuses rather than admitting over it.
     fn sibling_active(&self) -> Result<usize, String> {
-        Ok(self.checked_sibling_state()?.map_or(0, |state| {
-            state
-                .records
-                .iter()
-                .filter(|record| record.active())
-                .count()
-        }))
+        match (self.sibling.as_ref(), self.checked_sibling_state()?) {
+            (Some(sibling), Some(state)) => {
+                admission::host_permit_count(&sibling.control, &state.records)
+            }
+            _ => Ok(0),
+        }
     }
 
     /// Whether the other pool holds an active command for `checkout`
@@ -701,6 +700,7 @@ impl Store {
         state.records.retain(|record| record.id != id);
         let _ = fs::remove_dir(self.affinity_dir(id));
         let _ = fs::remove_file(self.lock_path(id));
+        let _ = fs::remove_file(admission::permit_path(&self.control, id));
         let _ = fs::remove_file(self.origin_path(id));
     }
 

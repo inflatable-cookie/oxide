@@ -36,10 +36,12 @@ owned and preserved. Cargo intermediates are internal and may contain test
 executables; separating output directories alone cannot prove isolation. Cache
 reuse never counts as validation success.
 
-Nested commands currently take an independent lease. The macOS
-[session broker](contracts/session-broker.md) provides the local transport
-for joining a parent's session and borrowing a host permit. Lease custody
-and host-permit admission stay with the parent command.
+On macOS the [session broker](contracts/session-broker.md) lets nested commands
+use their parent's host permit. Each nested command holds its own exclusive
+slot. Host admission counts the parent's permit once while the nested command
+holds a private, locked permit marker beside its own record lock. A crashed
+joiner's marker unlocks, so its unsettled record counts conservatively until
+recovery. The control document is unchanged.
 
 Prepare only requested components lazily. No eager copying of all targets and
 no full-copy fallback. Evict idle slots only, within explicit budgets; occupied

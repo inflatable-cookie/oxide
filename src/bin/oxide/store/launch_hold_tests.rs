@@ -57,7 +57,7 @@ fn the_real_launch_keeps_the_lease_hold_until_the_child_exits() {
     };
     let (ticket, _file) = store.register_ticket().unwrap();
     let outcome = store
-        .attempt(ticket, &key, Profile::Quick, 16, false, None)
+        .attempt(ticket, &key, Profile::Quick, Some(16), false, None)
         .unwrap();
     store.remove_ticket(ticket).unwrap();
     let lease = match outcome {
