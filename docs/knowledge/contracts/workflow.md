@@ -926,12 +926,15 @@ Oxide's own repository is the only adopter that installs the binary.
   - *`--format-change`* (optionally with `--scratch-root DIR`): for a build that
     changes the persisted format. Oxide reads the live `config.json`, `ledger.json`
     and `oxide-managed/state.json` read-only and copies them into a scratch pool
-    layout. The staged binary then runs status, a new-slot check (which performs the
-    upgrade) and a warm rerun, all against the copy. It prints the control-state
-    version before and after the upgrade and refuses if the upgraded version is not
-    the staged one, if the live state is newer than the staged build, or if any live
-    document's bytes or file identity changed during the run. Its PASS satisfies
-    `--require-canary` for the pin.
+    layout. The copy always lives on the internal pool's volume (`DIR`, or the
+    pool's sibling `scratch/` by default), never on a registered removable
+    volume's scratch directory, because an explicit internal pool on an external
+    volume is refused. The staged binary then runs status, a new-slot check (which
+    performs the upgrade) and a warm rerun, all against the copy. It prints the
+    control-state version before and after the upgrade and refuses if the upgraded
+    version is not the staged one, if the live state is newer than the staged build,
+    or if any live document's bytes or file identity changed during the run. Its PASS
+    satisfies `--require-canary` for the pin.
 - **Required canary.** `--require-canary` on install or reinstall requires a PASS
   receipt for the same pin, less than one hour old. It is checked before the build
   and again under the install lock before the swap.

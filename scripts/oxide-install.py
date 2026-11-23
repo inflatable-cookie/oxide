@@ -565,6 +565,28 @@ def canary_scratch(description, override):
     return pool, payload, scratch, verify_scratch_dir(scratch, device)
 
 
+def format_canary_scratch(description, override):
+    """Scratch for `--format-change`: always on the internal pool's volume.
+
+    The copy is an explicit internal pool (`OXIDE_POOL`), so it must live on
+    the internal pool's volume even when a removable pool is registered: the
+    staged binary refuses an explicit internal pool on an external volume.
+    An explicit `--scratch-root` is honored here (unlike the live canary's
+    removable refusal) because only a copy of the live documents is exercised.
+    """
+    if description["schema"] != "oxide.pool.describe/1":
+        raise Refusal("the staged binary returned an unknown pool description")
+    pool = Path(description["internal"]["pool"]).resolve(strict=True)
+    if not (pool / "config.json").is_file():
+        raise Refusal(f"no existing live pool at {pool}")
+    scratch = override or pool.parent / "scratch"
+    if not scratch.is_absolute() or scratch.resolve(strict=True) != scratch or scratch == scratch.parent:
+        raise Refusal(f"scratch must be an existing canonical directory: {scratch}")
+    if scratch == pool or pool in scratch.parents or scratch in pool.parents:
+        raise Refusal(f"scratch must be outside the pool and must not contain it: {scratch}")
+    return pool, scratch, verify_scratch_dir(scratch, os.stat(pool).st_dev)
+
+
 def directory_identity(path):
     info = path.lstat()
     if not stat.S_ISDIR(info.st_mode):
@@ -867,7 +889,7 @@ def run_format_canary(built, arguments, capabilities):
     environment = canary_environment()
     described = subprocess.run([str(built), "pool", "describe", "--json"], env=environment,
                                check=True, stdout=subprocess.PIPE, text=True, timeout=60)
-    pool, _, scratch, scratch_id = canary_scratch(json.loads(described.stdout), arguments.scratch_root)
+    pool, scratch, scratch_id = format_canary_scratch(json.loads(described.stdout), arguments.scratch_root)
     before = read_live_documents(pool)
     staged = capabilities["control_state_version"]
     live_version = state_version(before[LIVE_CONTROL][0]) if LIVE_CONTROL in before else None
