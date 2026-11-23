@@ -37,6 +37,13 @@
 //! - **After it, every other fault refuses and retains**: no deletion, no
 //!   retry, no second lease. (`Err`.)
 //!
+//! The cooperative work budget is the one post-write stop that never fails a
+//! build, because an optional cache-warming optimisation must not abort the
+//! user's command. At a complete unit-directory boundary it ends the clone
+//! loop and publishes the verified prefix; inside a unit it abandons exactly
+//! as a failed walk does, since that recipient then holds a unit no clone set
+//! completed and Cargo must never read a half-written unit directory (§8).
+//!
 //! The first **recipient write** — creating the `build/` directory, creating a
 //! destination directory, or `clonefile` itself — is the point of no return:
 //! before any write a benign fault abandons and the same slot builds cold; from
@@ -236,13 +243,34 @@ pub enum SeedOutcome {
 pub struct SeedReceipt {
     pub donor_slot: String,
     pub donor_incarnation: String,
+    /// The units this seed published: the plan's units, or the verified
+    /// prefix when the cooperative work budget stopped the clone loop at a
+    /// unit boundary (§8).
     pub units: u64,
+    /// The planned units. `units` is smaller when the work budget stopped the
+    /// seed early.
+    pub planned_units: u64,
     pub files: u64,
     pub logical_bytes: u64,
     pub catalog_digest: String,
     /// The `observed-while-held` fact the caller records with the attempt.
     pub observation: SeedObservation,
     pub elapsed_ms: u64,
+}
+
+impl SeedReceipt {
+    /// The diagnostic line for a seed the cooperative work budget stopped at a
+    /// unit boundary: the summary above covers fewer units than the plan
+    /// carried, and the rest of the plan builds cold (§8).
+    pub fn truncation_note(&self) -> Option<String> {
+        (self.units < self.planned_units).then(|| {
+            format!(
+                "oxide: seeding stopped at the work budget after {} of {} units; \
+                 the remaining units build cold",
+                self.units, self.planned_units
+            )
+        })
+    }
 }
 
 /// A cold skip: nothing was written to the recipient.
@@ -313,12 +341,38 @@ impl SeedSkipReason {
     }
 }
 
-/// A seeding attempt abandoned because the post-clone recipient walk was not
-/// complete and ownership-clean. Nothing was published; the caller releases
-/// the untrusted recipient and cold-builds under ordinary admission.
+/// A seeding attempt abandoned after its first recipient write. Nothing was
+/// published; the caller releases the untrusted recipient and cold-builds
+/// under ordinary admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SeedAbandon {
-    pub observation: SeedObservation,
+    pub reason: SeedAbandonReason,
+    /// The post-clone walk's fact, present only when the walk ran. A
+    /// [`SeedAbandonReason::WorkDeadline`] abandonment stops before the walk:
+    /// the recipient holds a unit no clone set completed, so it is never read
+    /// as a seed and its walk would say nothing a caller may use.
+    pub observation: Option<SeedObservation>,
+}
+
+/// Why a written attempt was abandoned instead of published (§7).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SeedAbandonReason {
+    /// The post-clone recipient walk was not complete and ownership-clean.
+    WalkIncomplete,
+    /// The cooperative work budget expired while a unit directory was only
+    /// partly written. This is never a build failure: the caller releases the
+    /// recipient untrusted and the command cold-builds in a new slot.
+    WorkDeadline,
+}
+
+impl SeedAbandonReason {
+    /// The bounded token a caller prints after `seeding skipped: `.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WalkIncomplete => "recipient walk incomplete",
+            Self::WorkDeadline => "deadline",
+        }
+    }
 }
 
 /// The generation-bound `observed-while-held` walk fact. Never a closed
@@ -1053,10 +1107,15 @@ pub fn seed_monitored(
     // itself. Before any write a fault is a skip and the same slot still builds
     // cold; from the first write onward every fault — an unsafe path, `EEXIST`
     // at a destination, a clone or digest error, the work deadline — refuses
-    // and retains. The one exception is the post-clone recipient walk, which
-    // abandons seeding only (the caller releases the untrusted recipient and
-    // cold-builds in a newly admitted slot).
+    // and retains. The two exceptions abandon seeding alone: the post-clone
+    // recipient walk, and the cooperative work budget (§8).
     let mut wrote_any = false;
+    // The first file index of each planned unit. A unit directory is written
+    // whole or not at all, so the clone loop may stop on the work budget only
+    // at one of these indexes: every file before it belongs to a unit whose
+    // every clone verified.
+    let unit_starts = plan.unit_starts();
+    let mut stopped_at_unit: Option<usize> = None;
     let recipient_build = match recipient_build {
         Some(build) => build,
         None => {
@@ -1079,11 +1138,23 @@ pub fn seed_monitored(
         }
         let file = &planned.file;
         if now() > deadline {
-            return if wrote_any {
-                Err(work_deadline_after_clone())
-            } else {
-                Ok(skip(SeedSkipReason::WorkDeadline))
-            };
+            // The work budget caps an optional optimisation; it never fails the
+            // user's build (§8). Between complete unit directories it ends the
+            // clone loop and the verified prefix is published. Inside one it
+            // abandons the attempt: this recipient holds a unit whose clone set
+            // no write completed, and Cargo must never read that.
+            // `started` counts the units that begin at or before this file,
+            // so it is the first of its unit exactly when the last of those
+            // starts here. A published prefix needs one complete unit first.
+            let started = unit_starts.partition_point(|start| *start <= index);
+            if started >= 2 && unit_starts[started - 1] == index {
+                stopped_at_unit = Some(started - 1);
+                break;
+            }
+            if wrote_any {
+                return Ok(work_deadline_abandon());
+            }
+            return Ok(skip(SeedSkipReason::WorkDeadline));
         }
         let (parents, name) = split_relative(&file.path);
         let mut deepest: Option<OwnedFd> = None;
@@ -1149,7 +1220,10 @@ pub fn seed_monitored(
         };
         let digest = match hash_fd(cloned.as_fd(), deadline, monitor) {
             Ok(digest) => digest,
-            Err(StreamError::Deadline) => return pre_write(wrote_any, work_deadline_after_clone()),
+            // A clone exists and its digest is unverified: this unit directory
+            // is now partly written, so the attempt is abandoned rather than
+            // published (§8).
+            Err(StreamError::Deadline) => return Ok(work_deadline_abandon()),
             Err(StreamError::Monitor) => return Err(monitor_stop()),
             Err(StreamError::Io(error)) => return pre_write(wrote_any, error),
             Err(StreamError::TooLarge) => {
@@ -1175,8 +1249,9 @@ pub fn seed_monitored(
             path: &recipient_path,
         });
     }
-    // Once every planned clone has verified there is no remaining clone work
-    // for the cooperative deadline to stop: a tiny overrun after the last
+    // Every clone this attempt makes has verified: no clone work remains for
+    // the cooperative deadline to stop, and a stop at a unit boundary above
+    // left only units that are never started. A tiny overrun after the last
     // clone must not refuse an otherwise fully verified seed. The walk below
     // carries its own independent bound.
     // Final donor recheck: the ledger still names the planned generation for
@@ -1213,14 +1288,34 @@ pub fn seed_monitored(
         elapsed_ms: walked.elapsed_ms,
     };
     if walked.gap.is_some() {
-        return Ok(SeedOutcome::Abandoned(SeedAbandon { observation }));
+        return Ok(SeedOutcome::Abandoned(SeedAbandon {
+            reason: SeedAbandonReason::WalkIncomplete,
+            observation: Some(observation),
+        }));
     }
+    // §8: a stop at a unit boundary publishes exactly the units whose every
+    // clone verified; nothing after that index was ever written.
+    let (units, files, logical_bytes) = match stopped_at_unit {
+        Some(units) => {
+            let files = unit_starts[units];
+            (
+                units,
+                files,
+                plan.files[..files]
+                    .iter()
+                    .map(|planned| planned.file.size)
+                    .sum(),
+            )
+        }
+        None => (plan.units, plan.files.len(), plan.logical_bytes),
+    };
     Ok(SeedOutcome::Seeded(SeedReceipt {
         donor_slot: request.donor.slot_id.clone(),
         donor_incarnation: request.donor.incarnation.clone(),
-        units: plan.units as u64,
-        files: plan.files.len() as u64,
-        logical_bytes: plan.logical_bytes,
+        units: units as u64,
+        planned_units: plan.units as u64,
+        files: files as u64,
+        logical_bytes,
         catalog_digest: actual_catalog_digest,
         observation,
         elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -1301,8 +1396,24 @@ struct PlannedFile {
 /// unit identities.
 struct Plan {
     units: usize,
+    /// Files per unit, in plan order. A unit's files are contiguous, so the
+    /// prefix sums are the only unit boundaries the clone loop can stop at.
+    unit_file_counts: Vec<usize>,
     files: Vec<PlannedFile>,
     logical_bytes: u64,
+}
+
+impl Plan {
+    /// The first file index of each planned unit, in order.
+    fn unit_starts(&self) -> Vec<usize> {
+        let mut starts = Vec::with_capacity(self.unit_file_counts.len());
+        let mut at = 0usize;
+        for count in &self.unit_file_counts {
+            starts.push(at);
+            at += count;
+        }
+        starts
+    }
 }
 
 fn plan_units(catalog: &SeedCatalog, units: &[SeedUnitRef]) -> Result<Plan, SeedSkipReason> {
@@ -1310,6 +1421,7 @@ fn plan_units(catalog: &SeedCatalog, units: &[SeedUnitRef]) -> Result<Plan, Seed
         return Err(SeedSkipReason::PlanCap);
     }
     let mut files: Vec<PlannedFile> = Vec::new();
+    let mut unit_file_counts: Vec<usize> = Vec::with_capacity(units.len());
     let mut seen_paths = std::collections::BTreeSet::new();
     let mut seen_units = std::collections::BTreeSet::new();
     let mut join_inputs = 0usize;
@@ -1354,6 +1466,9 @@ fn plan_units(catalog: &SeedCatalog, units: &[SeedUnitRef]) -> Result<Plan, Seed
             .filter(|file| file.kind == SeedFileKind::Artifact)
             .map(|file| file.path.clone())
             .collect();
+        // One unit's files are pushed contiguously, which is what lets the
+        // clone loop recognise a complete unit directory.
+        unit_file_counts.push(unit.files.len());
         for file in &unit.files {
             if !seen_paths.insert(file.path.as_str()) {
                 return Err(SeedSkipReason::PlanCap);
@@ -1382,6 +1497,7 @@ fn plan_units(catalog: &SeedCatalog, units: &[SeedUnitRef]) -> Result<Plan, Seed
     // 4,096.
     Ok(Plan {
         units: units.len(),
+        unit_file_counts,
         files,
         logical_bytes,
     })
@@ -1509,8 +1625,11 @@ fn work_budget(ms: Option<u64>) -> Duration {
     )
 }
 
-fn work_deadline_after_clone() -> LeaseError {
-    LeaseError::Io("cold-seed work deadline expired after the first clone".to_owned())
+fn work_deadline_abandon() -> SeedOutcome {
+    SeedOutcome::Abandoned(SeedAbandon {
+        reason: SeedAbandonReason::WorkDeadline,
+        observation: None,
+    })
 }
 
 /// Before the first recipient write, a fault abandons the attempt and the same

@@ -594,14 +594,21 @@ fn seed_recipient(
                     eprintln!("oxide: seeding skipped: {reason}");
                     production = Some(prepared);
                 }
-                Ok(store::SeedRun::Seeded(_, last)) => {
+                Ok(store::SeedRun::Seeded(receipt, last)) => {
                     eprintln!("{}", seed_summary::summary(&last));
+                    // The cooperative work budget may stop the clone loop at a
+                    // complete unit boundary: the published prefix is the whole
+                    // seed, so say so instead of letting the summary look
+                    // short for no reason.
+                    if let Some(note) = receipt.truncation_note() {
+                        eprintln!("{note}");
+                    }
                     // The recipient was populated by a seed, so it is not a
                     // producing generation: publishing its catalog would spend
                     // the post-build verification pass only to discard the
                     // result.
                 }
-                Ok(store::SeedRun::Abandoned) => {
+                Ok(store::SeedRun::Abandoned(reason)) => {
                     (held, gate, binding) = match abandon_seed_and_reacquire(
                         request, bind_plan, waits, grants, held, binding,
                     )? {
@@ -614,7 +621,7 @@ fn seed_recipient(
                             return Ok(Step::Exit(stop_for_admission(budget::Lease::Released)))
                         }
                     };
-                    eprintln!("oxide: seeding skipped: recipient walk incomplete");
+                    eprintln!("oxide: seeding skipped: {}", reason.as_str());
                 }
                 Err(reason) => {
                     return refuse_seed(request.store, held, binding, reason).map(Step::Exit);

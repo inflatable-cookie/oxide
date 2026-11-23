@@ -37,13 +37,16 @@ pub(super) fn source_identity_matches(
 pub(crate) enum SeedRun {
     Skipped(&'static str),
     Seeded(
-        /// The transaction's own receipt. The command logs the `last`
-        /// document and ignores this one; the seed-outcome regression reads it.
-        #[allow(dead_code)]
+        /// The transaction's own receipt. The command prints its truncation
+        /// note, if any, and logs the `last` document; the seed-outcome
+        /// regression reads the receipt.
         oxide_storage::lease::managed::SeedReceipt,
         oxide_storage::lease::managed::SeedLast,
     ),
-    Abandoned,
+    /// Seeding only was abandoned after its first recipient write: the caller
+    /// releases the recipient untrusted and cold-builds in a new slot. The
+    /// reason is the bounded token after `seeding skipped: `.
+    Abandoned(oxide_storage::lease::managed::SeedAbandonReason),
 }
 
 impl Store {
@@ -393,11 +396,11 @@ impl Store {
                     .map_err(|error| lease_error("cannot record seed skip", &error))?;
                 Ok(SeedRun::Skipped(skip.reason.as_str()))
             }
-            Ok(SeedOutcome::Abandoned(_)) => {
+            Ok(SeedOutcome::Abandoned(abandon)) => {
                 attempt.state = SeedAttemptState::Reset;
                 write_seed_attempt(&self.pool, &attempt)
                     .map_err(|error| lease_error("cannot record abandoned seed", &error))?;
-                Ok(SeedRun::Abandoned)
+                Ok(SeedRun::Abandoned(abandon.reason))
             }
             Ok(SeedOutcome::Seeded(receipt)) => {
                 attempt.state = SeedAttemptState::Seeded;

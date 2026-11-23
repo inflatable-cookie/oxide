@@ -26,6 +26,11 @@ const DEP: &str = "debug/deps/cfg_if-aaaaaaaaaaaaaaaa.d";
 const ARTIFACT: &str = "debug/deps/libcfg_if-aaaaaaaaaaaaaaaa.rmeta";
 const SOURCE_A: &str = "/fixture/src/lib.rs";
 const SOURCE_B: &str = "/fixture/src/other.rs";
+/// A second complete layout-v1 library unit, so the clone loop meets exactly
+/// one unit-directory boundary.
+const FINGERPRINT_B: &str = "debug/.fingerprint/itoa-bbbbbbbbbbbbbbbb";
+const DEP_B: &str = "debug/deps/itoa-bbbbbbbbbbbbbbbb.d";
+const ARTIFACT_B: &str = "debug/deps/libitoa-bbbbbbbbbbbbbbbb.rmeta";
 
 thread_local! {
     static WALK_LIMITS: Cell<Option<SeedWalkLimits>> = const { Cell::new(None) };
@@ -35,7 +40,6 @@ thread_local! {
     static PLANT_SYMLINK: Cell<bool> = const { Cell::new(false) };
     static TAMPER_LEDGER: Cell<bool> = const { Cell::new(false) };
     static VERIFY_DELAY_MS: Cell<Option<u64>> = const { Cell::new(None) };
-    static CLONE_DELAY_MS: Cell<Option<u64>> = const { Cell::new(None) };
     static CLONE_DELAY_AT: Cell<Option<(usize, u64)>> = const { Cell::new(None) };
     static REMOVE_CREATED_DIRECTORY: Cell<bool> = const { Cell::new(false) };
     static UNREADABLE_CLONE: Cell<Option<usize>> = const { Cell::new(None) };
@@ -99,7 +103,6 @@ fn reset_hooks() {
     PLANT_SYMLINK.with(|cell| cell.set(false));
     TAMPER_LEDGER.with(|cell| cell.set(false));
     VERIFY_DELAY_MS.with(|cell| cell.set(None));
-    CLONE_DELAY_MS.with(|cell| cell.set(None));
     CLONE_DELAY_AT.with(|cell| cell.set(None));
     REMOVE_CREATED_DIRECTORY.with(|cell| cell.set(false));
     UNREADABLE_CLONE.with(|cell| cell.set(None));
@@ -140,9 +143,6 @@ pub(super) fn inject(point: TestPoint<'_>) {
             }
         }
         TestPoint::DuringClone { index, path } => {
-            if index == 0 {
-                sleep_opt(CLONE_DELAY_MS.with(Cell::get));
-            }
             if let Some((at, ms)) = CLONE_DELAY_AT.with(Cell::get) {
                 if at == index {
                     std::thread::sleep(Duration::from_millis(ms));
@@ -563,21 +563,29 @@ fn sha(text: &str) -> String {
     catalog_digest(text.as_bytes())
 }
 
-fn dep_info_text() -> String {
-    // The ordinary rustc shape: the `.d`'s own rule first, then the role's
-    // artifact, then one empty phony rule per source input.
+/// The ordinary rustc shape: the `.d`'s own rule first, then the role's
+/// artifact, then one empty phony rule per source input.
+fn dep_info_for(dep: &str, artifact: &str) -> String {
     format!(
-        "{DEP}: {SOURCE_A} {SOURCE_B}\n{ARTIFACT}: {SOURCE_A} {SOURCE_B}\n{SOURCE_A}:\n{SOURCE_B}:\n"
+        "{dep}: {SOURCE_A} {SOURCE_B}\n{artifact}: {SOURCE_A} {SOURCE_B}\n{SOURCE_A}:\n{SOURCE_B}:\n"
     )
 }
 
-fn dep_targets() -> Vec<String> {
+fn dep_info_text() -> String {
+    dep_info_for(DEP, ARTIFACT)
+}
+
+fn dep_targets_for(dep: &str, artifact: &str) -> Vec<String> {
     vec![
-        DEP.to_owned(),
-        ARTIFACT.to_owned(),
+        dep.to_owned(),
+        artifact.to_owned(),
         SOURCE_A.to_owned(),
         SOURCE_B.to_owned(),
     ]
+}
+
+fn dep_targets() -> Vec<String> {
+    dep_targets_for(DEP, ARTIFACT)
 }
 
 fn dep_inputs() -> Vec<String> {
@@ -585,28 +593,105 @@ fn dep_inputs() -> Vec<String> {
 }
 
 fn file_kind(path: &str) -> SeedFileKind {
-    match path {
-        DEP => SeedFileKind::DepInfo,
-        ARTIFACT => SeedFileKind::Artifact,
-        _ => SeedFileKind::Fingerprint,
+    if path == DEP || path == DEP_B {
+        SeedFileKind::DepInfo
+    } else if path == ARTIFACT || path == ARTIFACT_B {
+        SeedFileKind::Artifact
+    } else {
+        SeedFileKind::Fingerprint
     }
 }
 
-fn files_with_dep(dep: &str) -> Vec<(String, String)> {
+/// One layout-v1 library unit's five files: the fingerprint triple, its rmeta
+/// artifact and its `.d`.
+fn unit_files(
+    fingerprint: &str,
+    target: &str,
+    artifact: &str,
+    dep: &str,
+    join: &str,
+) -> Vec<(String, String)> {
     vec![
         (
-            format!("{FINGERPRINT}/lib-cfg_if"),
+            format!("{fingerprint}/lib-{target}"),
             "fingerprint".to_owned(),
         ),
-        (format!("{FINGERPRINT}/lib-cfg_if.json"), "{}".to_owned()),
-        (format!("{FINGERPRINT}/dep-lib-cfg_if"), String::new()),
-        (ARTIFACT.to_owned(), "rmeta-fixture".to_owned()),
-        (DEP.to_owned(), dep.to_owned()),
+        (format!("{fingerprint}/lib-{target}.json"), "{}".to_owned()),
+        (format!("{fingerprint}/dep-lib-{target}"), String::new()),
+        (artifact.to_owned(), "rmeta-fixture".to_owned()),
+        (dep.to_owned(), join.to_owned()),
     ]
+}
+
+fn files_with_dep(dep: &str) -> Vec<(String, String)> {
+    unit_files(FINGERPRINT, "cfg_if", ARTIFACT, DEP, dep)
 }
 
 fn default_files() -> Vec<(String, String)> {
     files_with_dep(&dep_info_text())
+}
+
+/// Two complete library units: `cfg_if`, then a second `itoa` unit.
+fn two_unit_files() -> Vec<(String, String)> {
+    let mut files = default_files();
+    files.extend(unit_files(
+        FINGERPRINT_B,
+        "itoa",
+        ARTIFACT_B,
+        DEP_B,
+        &dep_info_for(DEP_B, ARTIFACT_B),
+    ));
+    files
+}
+
+/// The catalog for [`two_unit_files`]: one package per unit.
+fn two_unit_catalog(grant: &LeaseGrant, record_id: u64, files: &[(String, String)]) -> SeedCatalog {
+    let boundary = default_files().len();
+    let mut catalog = catalog_with_join(
+        grant,
+        record_id,
+        &files[..boundary],
+        &dep_targets(),
+        &dep_inputs(),
+        &dep_info_text(),
+    );
+    let join = dep_info_for(DEP_B, ARTIFACT_B);
+    let entries: Vec<SeedFile> = files[boundary..]
+        .iter()
+        .map(|(path, content)| SeedFile {
+            path: path.clone(),
+            size: content.len() as u64,
+            mtime_ms: 0,
+            digest: sha(content),
+            kind: file_kind(path),
+        })
+        .collect();
+    catalog.packages.push(SeedPackage {
+        name: "itoa".to_owned(),
+        target: "itoa".to_owned(),
+        version: "1.0.18".to_owned(),
+        source: "registry+https://github.com/rust-lang/crates.io-index".to_owned(),
+        checksum: Some("a".repeat(64)),
+        unique: true,
+        leaf: true,
+        source_root: SeedSourceRoot {
+            kind: SeedSourceKind::Registry,
+            digest: "b".repeat(64),
+        },
+        units: vec![SeedUnit {
+            fingerprint_dir: FINGERPRINT_B.to_owned(),
+            role: SeedRole::Lib,
+            target: "itoa".to_owned(),
+            join: SeedJoin {
+                path: DEP_B.to_owned(),
+                targets: dep_targets_for(DEP_B, ARTIFACT_B),
+                inputs: dep_inputs(),
+                digest: sha(&join),
+            },
+            files: entries,
+        }],
+    });
+    catalog
 }
 
 fn write_files(build: &Path, files: &[(String, String)]) {
@@ -727,6 +812,26 @@ fn make_donor_in(
     targets: &[String],
     inputs: &[String],
 ) -> Donor {
+    make_donor_catalog(rig, label, folder, files, |grant, record_id, files| {
+        let dep = files
+            .iter()
+            .find(|(path, _)| path == DEP)
+            .map(|(_, content)| content.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        catalog_with_join(grant, record_id, files, targets, inputs, &dep)
+    })
+}
+
+/// A donor whose catalog a fixture builds itself, for shapes one unit cannot
+/// express.
+fn make_donor_catalog(
+    rig: &Rig,
+    label: &str,
+    folder: Option<&str>,
+    files: Vec<(String, String)>,
+    catalog: impl FnOnce(&LeaseGrant, u64, &[(String, String)]) -> SeedCatalog,
+) -> Donor {
     // A front-door lease records its record's affinity directory as the
     // project, which is the binding a catalog's record id must match.
     let record_id = rig.next_record_id();
@@ -746,13 +851,7 @@ fn make_donor_in(
         None => rig.lease_at(&name, holder, project),
     };
     write_files(&grant.env.cargo_build_build_dir, &files);
-    let dep = files
-        .iter()
-        .find(|(path, _)| path == DEP)
-        .map(|(_, content)| content.as_str())
-        .unwrap_or_default()
-        .to_owned();
-    let catalog = catalog_with_join(&grant, record_id, &files, targets, inputs, &dep);
+    let catalog = catalog(&grant, record_id, &files);
     publish_seed_catalog(&rig.pool, &catalog).expect("publish catalog");
     let bytes = catalog.to_bytes().expect("catalog bytes");
     let digest = catalog_digest(&bytes);
@@ -766,6 +865,17 @@ fn make_donor_in(
         digest,
         files,
     }
+}
+
+/// A released two-unit donor, and a request that plans both units.
+fn two_unit_donor(rig: &Rig, label: &str, recipient: &SeedRecipient) -> (Donor, SeedRequest) {
+    let donor = make_donor_catalog(rig, label, None, two_unit_files(), two_unit_catalog);
+    let mut request = donor.request(recipient);
+    request.units.push(SeedUnitRef {
+        fingerprint_dir: FINGERPRINT_B.to_owned(),
+        role: SeedRole::Lib,
+    });
+    (donor, request)
 }
 
 /// A held producing lease and the catalog it would publish, before release:
@@ -803,6 +913,14 @@ fn seed_recipient(grant: &LeaseGrant) -> SeedRecipient {
 
 fn candidates(rig: &Rig, recipient: &SeedRecipient) -> SeedCandidates {
     seed_candidates(&rig.pool, recipient, 8).expect("candidates")
+}
+
+/// The walk fact of an abandonment that stopped after the post-clone walk.
+fn walked(abandon: SeedAbandon) -> SeedObservation {
+    assert_eq!(abandon.reason, SeedAbandonReason::WalkIncomplete);
+    abandon
+        .observation
+        .expect("a walk-incomplete abandonment records its walk")
 }
 
 fn tree(root: &Path) -> Vec<(String, u64, Vec<u8>)> {
@@ -1685,24 +1803,92 @@ fn seed_skips_on_the_work_deadline_before_the_first_write() {
 }
 
 #[test]
-fn seed_refuses_after_the_clone_when_the_work_deadline_expires() {
+fn the_work_budget_publishes_the_verified_prefix_at_a_unit_boundary() {
     reset_hooks();
-    let rig = Rig::new("deadline-clone");
-    let donor = make_donor(&rig, "a");
+    let rig = Rig::new("deadline-boundary");
     let (grant, recipient) = lease_recipient(&rig, "a");
-    let mut request = donor.request(&recipient);
+    let (donor, mut request) = two_unit_donor(&rig, "a", &recipient);
     // A generous-enough budget that the pre-clone revalidation cannot
-    // plausibly exhaust it, then a delay longer than it after the first clone.
+    // plausibly exhaust it, then a delay after the first unit's last verified
+    // clone: the loop meets the deadline at the second unit's first file,
+    // which is a complete unit-directory boundary.
+    let boundary = default_files().len();
     request.work_budget_ms = Some(1_000);
-    CLONE_DELAY_MS.with(|cell| cell.set(Some(1_200)));
-    let refused = seed(&rig.pool, &request);
-    assert!(matches!(refused, Err(LeaseError::Io(_))));
-    // The clone is retained untrusted; nothing is published.
-    assert!(grant
-        .env
-        .cargo_build_build_dir
-        .join(&donor.files[0].0)
-        .exists());
+    CLONE_DELAY_AT.with(|cell| cell.set(Some((boundary - 1, 1_200))));
+    let outcome = seed(&rig.pool, &request).expect("the work budget never fails a build");
+    let SeedOutcome::Seeded(receipt) = outcome else {
+        panic!("expected the verified prefix to publish, got {outcome:?}");
+    };
+    // The receipt records the prefix, not the plan.
+    assert_eq!(receipt.units, 1);
+    assert_eq!(receipt.planned_units, 2);
+    assert_eq!(receipt.files, boundary as u64);
+    assert_eq!(
+        receipt.logical_bytes,
+        donor.files[..boundary]
+            .iter()
+            .map(|(_, content)| content.len() as u64)
+            .sum::<u64>()
+    );
+    assert!(receipt.observation.complete());
+    let note = receipt
+        .truncation_note()
+        .expect("a stopped seed says it stopped early");
+    assert!(note.contains("after 1 of 2 units"), "{note}");
+    // The whole first unit is cloned and verified; the second was never
+    // started, so Cargo finds no half-written unit directory.
+    let build = &grant.env.cargo_build_build_dir;
+    for (relative, content) in &donor.files[..boundary] {
+        assert_eq!(
+            &fs::read(build.join(relative)).expect("cloned file"),
+            content.as_bytes()
+        );
+    }
+    assert!(!build.join(FINGERPRINT_B).exists());
+    for (relative, _) in &donor.files[boundary..] {
+        assert!(!build.join(relative).exists(), "{relative} was cloned");
+    }
+}
+
+#[test]
+fn the_work_budget_abandons_a_partly_written_unit_without_failing_the_build() {
+    reset_hooks();
+    let rig = Rig::new("deadline-part-unit");
+    let (grant, recipient) = lease_recipient(&rig, "a");
+    let (donor, mut request) = two_unit_donor(&rig, "a", &recipient);
+    // The delay lands after the second unit's first verified clone, so the
+    // deadline expires with that unit directory only partly written.
+    let boundary = default_files().len();
+    request.work_budget_ms = Some(1_000);
+    CLONE_DELAY_AT.with(|cell| cell.set(Some((boundary, 1_200))));
+    let outcome = seed(&rig.pool, &request).expect("the work budget never fails a build");
+    let SeedOutcome::Abandoned(abandon) = outcome else {
+        panic!("expected the attempt to be abandoned, got {outcome:?}");
+    };
+    assert_eq!(abandon.reason, SeedAbandonReason::WorkDeadline);
+    assert!(abandon.observation.is_none());
+    assert_eq!(abandon.reason.as_str(), "deadline");
+    // Nothing is published and the partly written unit is retained untrusted
+    // for the ordinary release, exactly as a failed walk leaves it.
+    let build = &grant.env.cargo_build_build_dir;
+    assert!(build.join(&donor.files[boundary].0).exists());
+    assert!(!build.join(&donor.files[boundary + 1].0).exists());
+}
+
+#[test]
+fn a_seed_the_work_budget_stopped_records_its_prefix_and_note() {
+    // The note is printed only when the plan is larger than the receipt, so a
+    // full seed carries none.
+    reset_hooks();
+    let rig = Rig::new("deadline-note");
+    let donor = make_donor(&rig, "a");
+    let (_, recipient) = lease_recipient(&rig, "a");
+    let outcome = seed(&rig.pool, &donor.request(&recipient)).expect("seed");
+    let SeedOutcome::Seeded(receipt) = outcome else {
+        panic!("expected a published seed, got {outcome:?}");
+    };
+    assert_eq!(receipt.units, receipt.planned_units);
+    assert_eq!(receipt.truncation_note(), None);
 }
 
 #[test]
@@ -1899,9 +2085,10 @@ fn seed_abandons_on_a_failed_recipient_walk_and_publishes_nothing() {
     let SeedOutcome::Abandoned(abandon) = outcome else {
         panic!("expected an abandoned seed, got {outcome:?}");
     };
-    assert_eq!(abandon.observation.gap, Some(SeedWalkGap::UnexpectedType));
-    assert!(!abandon.observation.complete());
-    assert_eq!(abandon.observation.slot_id, grant.slot_id);
+    let observation = walked(abandon);
+    assert_eq!(observation.gap, Some(SeedWalkGap::UnexpectedType));
+    assert!(!observation.complete());
+    assert_eq!(observation.slot_id, grant.slot_id);
     // The clone is retained, untrusted, and nothing was published.
     assert!(grant
         .env
@@ -1928,8 +2115,9 @@ fn seed_abandons_on_an_entry_limit_walk() {
     let SeedOutcome::Abandoned(abandon) = outcome else {
         panic!("expected an abandoned seed, got {outcome:?}");
     };
-    assert_eq!(abandon.observation.gap, Some(SeedWalkGap::EntryLimit));
-    assert_eq!(abandon.observation.limits.max_entries, 1);
+    let observation = walked(abandon);
+    assert_eq!(observation.gap, Some(SeedWalkGap::EntryLimit));
+    assert_eq!(observation.limits.max_entries, 1);
 }
 
 #[test]
@@ -1946,7 +2134,8 @@ fn seed_abandons_on_an_unreadable_recipient_entry() {
     let SeedOutcome::Abandoned(abandon) = outcome else {
         panic!("expected an abandoned seed, got {outcome:?}");
     };
-    assert_eq!(abandon.observation.gap, Some(SeedWalkGap::Unreadable));
+    let observation = walked(abandon);
+    assert_eq!(observation.gap, Some(SeedWalkGap::Unreadable));
     // The clone is retained, untrusted, and nothing was published.
     assert!(grant
         .env
@@ -1972,8 +2161,9 @@ fn seed_abandons_when_a_listed_recipient_entry_vanishes() {
     let SeedOutcome::Abandoned(abandon) = outcome else {
         panic!("expected an abandoned seed, got {outcome:?}");
     };
-    assert_eq!(abandon.observation.gap, Some(SeedWalkGap::Vanished));
-    assert!(!abandon.observation.complete());
+    let observation = walked(abandon);
+    assert_eq!(observation.gap, Some(SeedWalkGap::Vanished));
+    assert!(!observation.complete());
     assert_eq!(rig.sidecars(), before_sidecars);
     // The recipient is retained untrusted, not published.
     assert!(grant
@@ -2003,8 +2193,9 @@ fn seed_abandons_when_the_walk_deadline_expires_at_completion() {
     let SeedOutcome::Abandoned(abandon) = outcome else {
         panic!("expected an abandoned seed, got {outcome:?}");
     };
-    assert_eq!(abandon.observation.gap, Some(SeedWalkGap::Deadline));
-    assert_eq!(abandon.observation.limits.max_elapsed_ms, 10);
+    let observation = walked(abandon);
+    assert_eq!(observation.gap, Some(SeedWalkGap::Deadline));
+    assert_eq!(observation.limits.max_elapsed_ms, 10);
 }
 
 #[test]
