@@ -7,7 +7,7 @@
 //! creation case creates a temporary `directory-budget` pool inside its own
 //! scratch root and removes it.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[path = "cli_papercuts/nested_sessions.rs"]
 mod nested_sessions;
 

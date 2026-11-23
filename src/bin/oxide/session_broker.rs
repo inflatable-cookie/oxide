@@ -1,8 +1,8 @@
 //! Parent-owned transport for nested session membership and permit borrowing.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod socket_root;
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests;
 mod wire;
 
@@ -30,7 +30,14 @@ use wire::{Request, Response};
 pub(super) const BROKER_ENV: &str = "OXIDE_SESSION_BROKER";
 pub(super) const TOKEN_ENV: &str = "OXIDE_SESSION_TOKEN";
 const SOCKET_NAME: &str = "s";
-const MAX_SOCKET_PATH_BYTES: usize = 103; // Darwin sun_path, including its terminator, is 104.
+/// `sun_path` is the last field, so its capacity is the struct tail. That is
+/// 104 bytes on Darwin and 108 on Linux, both including the terminator.
+const SUN_PATH_BYTES: usize =
+    std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+const MAX_SOCKET_PATH_BYTES: usize = SUN_PATH_BYTES - 1;
+/// Platforms with the peer-credential check and the broker's Unix-socket
+/// transport. Other Unix targets refuse before binding or joining.
+pub(super) const SUPPORTED: bool = cfg!(any(target_os = "macos", target_os = "linux"));
 const MAX_CONNECTIONS: usize = 64;
 const ACCEPT_INTERVAL: Duration = Duration::from_millis(10);
 const AUTH_READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -152,7 +159,7 @@ impl SocketDirectory {
         let root = root.canonicalize()?;
         let template = root.join("ox.XXXXXX");
         check_socket_path(&template.join(SOCKET_NAME))?;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         socket_root::verify(&root)?;
 
         let mut name = CString::new(template.as_os_str().as_bytes())
@@ -187,7 +194,9 @@ fn check_socket_path(path: &Path) -> io::Result<()> {
     if !path.is_absolute() || bytes.len() > MAX_SOCKET_PATH_BYTES || bytes.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "session broker requires an absolute socket path of at most 103 bytes without NUL",
+            format!(
+                "session broker requires an absolute socket path of at most {MAX_SOCKET_PATH_BYTES} bytes without NUL"
+            ),
         ));
     }
     Ok(())
@@ -205,14 +214,47 @@ fn random_hex<const N: usize>() -> io::Result<String> {
     Ok(value)
 }
 
+/// The kernel's effective UID of the connected peer, read through the socket.
 #[cfg(target_os = "macos")]
-fn check_peer(stream: &UnixStream) -> io::Result<()> {
+fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
     let mut uid = 0;
     let mut gid = 0;
     // SAFETY: The socket is open, and both output pointers are valid.
     if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(uid)
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
+        .expect("ucred fits in socklen_t");
+    // SAFETY: The socket is open. `credentials` and `length` are valid for the
+    // size the kernel is told, and SO_PEERCRED writes one `ucred` into them.
+    let status = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(credentials.uid)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn check_peer(stream: &UnixStream) -> io::Result<()> {
+    let uid = peer_uid(stream)?;
     // SAFETY: geteuid takes no arguments and has no preconditions.
     if uid != unsafe { libc::geteuid() } {
         return Err(io::Error::new(
@@ -223,43 +265,28 @@ fn check_peer(stream: &UnixStream) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn check_peer(_: &UnixStream) -> io::Result<()> {
     Err(unsupported())
 }
 
-#[cfg(target_os = "macos")]
+/// Compare fixed-length tokens without an early exit on the first mismatch.
+/// Token length is public: every token is exactly `TOKEN_HEX_BYTES` digits.
 fn tokens_match(expected: &str, provided: &str) -> bool {
-    unsafe extern "C" {
-        fn timingsafe_bcmp(
-            left: *const libc::c_void,
-            right: *const libc::c_void,
-            len: libc::size_t,
-        ) -> libc::c_int;
-    }
-
     if expected.len() != TOKEN_HEX_BYTES || provided.len() != TOKEN_HEX_BYTES {
         return false;
     }
-    // SAFETY: Both strings have at least TOKEN_HEX_BYTES readable bytes.
-    unsafe {
-        timingsafe_bcmp(
-            expected.as_ptr().cast(),
-            provided.as_ptr().cast(),
-            TOKEN_HEX_BYTES,
-        ) == 0
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn tokens_match(_: &str, _: &str) -> bool {
-    false
+    expected
+        .bytes()
+        .zip(provided.bytes())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
 }
 
 fn unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "session broker peer credentials are only supported on macOS",
+        "session broker peer credentials are only supported on macOS and Linux",
     )
 }
 
@@ -281,9 +308,9 @@ pub(super) struct SessionBroker {
 }
 
 impl SessionBroker {
-    /// Bind before spawning a leased child. Linux keeps its independent path.
+    /// Bind before spawning a leased child. Unsupported Unix targets get none.
     pub(super) fn for_child(root: &Path, command: &mut Command) -> Result<Option<Self>, String> {
-        if !cfg!(target_os = "macos") {
+        if !SUPPORTED {
             return Ok(None);
         }
         Self::for_permits(root, command, PermitMode::Inherited, DenyBorrowing).map(Some)
@@ -307,7 +334,7 @@ impl SessionBroker {
         permit_mode: PermitMode,
         permits: impl PermitController,
     ) -> io::Result<Self> {
-        if !cfg!(target_os = "macos") {
+        if !SUPPORTED {
             return Err(unsupported());
         }
         let directory = SocketDirectory::create(root)?;
@@ -359,7 +386,7 @@ impl SessionBroker {
     }
 
     /// Snapshot of live joined connections.
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     pub(super) fn member_count(&self) -> usize {
         self.session.members.load(Ordering::Relaxed)
     }
@@ -691,7 +718,7 @@ impl SessionClient {
     }
 
     /// Wait for EOF from the parent. Any read error also invalidates the grant.
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     pub(super) fn wait_for_end(mut self) -> io::Result<()> {
         if !self.reader.fill_buf()?.is_empty() {
             return Err(wire::invalid("unexpected session broker message"));
@@ -756,7 +783,7 @@ impl JoinedSession {
                 ))
             }
         };
-        if !cfg!(target_os = "macos") {
+        if !SUPPORTED {
             return Err(format!(
                 "cannot join the outer Oxide session: {}",
                 unsupported()

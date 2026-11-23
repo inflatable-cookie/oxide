@@ -1,10 +1,13 @@
 //! Qualify the canonical namespace used for binding and pathname cleanup.
 
-use std::ffi::{c_int, c_void, CString};
+use std::ffi::CString;
+#[cfg(target_os = "macos")]
+use std::ffi::{c_int, c_void};
 use std::fs;
 use std::io;
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::ptr::{self, NonNull};
 
 /// Establish trust from `/` down so an unchecked parent cannot replace an
@@ -28,12 +31,12 @@ pub(super) fn verify(root: &Path) -> io::Result<()> {
             let mount = crate::store::statfs(&prefix).ok_or_else(|| {
                 refuse(&prefix, "cannot verify that the volume enforces ownership")
             })?;
-            if mount.f_flags & libc::MNT_IGNORE_OWNERSHIP as u32 != 0 {
+            if ignores_ownership(&mount) {
                 return Err(refuse(&prefix, "the volume ignores ownership"));
             }
             device = Some(metadata.dev());
         }
-        if !deny_only_acl(&prefix)? {
+        if !acl_is_clean(&prefix)? {
             return Err(refuse(&prefix, "the ACL grants access"));
         }
     }
@@ -50,12 +53,32 @@ fn refuse(path: &Path, reason: &str) -> io::Error {
     )
 }
 
+/// Darwin reports enforcement of ownership as a mount flag.
+#[cfg(target_os = "macos")]
+fn ignores_ownership(mount: &libc::statfs) -> bool {
+    mount.f_flags & libc::MNT_IGNORE_OWNERSHIP as u32 != 0
+}
+
+/// Linux has no mount flag for this. Refuse the filesystems that present fixed
+/// owners and modes whatever the directory records: FAT and exFAT.
+#[cfg(target_os = "linux")]
+fn ignores_ownership(mount: &libc::statfs) -> bool {
+    const MSDOS_SUPER_MAGIC: u64 = 0x4d44;
+    const EXFAT_SUPER_MAGIC: u64 = 0x2011_bab0;
+    matches!(mount.f_type as u64, MSDOS_SUPER_MAGIC | EXFAT_SUPER_MAGIC)
+}
+
 // The macOS SDK's <sys/acl.h> defines these interfaces and values.
+#[cfg(target_os = "macos")]
 const ACL_TYPE_EXTENDED: c_int = 0x100;
+#[cfg(target_os = "macos")]
 const ACL_FIRST_ENTRY: c_int = 0;
+#[cfg(target_os = "macos")]
 const ACL_NEXT_ENTRY: c_int = -1;
+#[cfg(target_os = "macos")]
 const ACL_EXTENDED_DENY: c_int = 2;
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn acl_get_link_np(path: *const libc::c_char, kind: c_int) -> *mut c_void;
     fn acl_get_entry(acl: *mut c_void, index: c_int, entry: *mut *mut c_void) -> c_int;
@@ -63,8 +86,10 @@ unsafe extern "C" {
     fn acl_free(acl: *mut c_void) -> c_int;
 }
 
+#[cfg(target_os = "macos")]
 struct Acl(NonNull<c_void>);
 
+#[cfg(target_os = "macos")]
 impl Drop for Acl {
     fn drop(&mut self) {
         // SAFETY: this guard owns the ACL allocated by acl_get_link_np.
@@ -72,7 +97,9 @@ impl Drop for Acl {
     }
 }
 
-fn deny_only_acl(path: &Path) -> io::Result<bool> {
+/// True when the path has no ACL that grants access. A deny-only ACL is clean.
+#[cfg(target_os = "macos")]
+fn acl_is_clean(path: &Path) -> io::Result<bool> {
     let name = CString::new(path.as_os_str().as_bytes())?;
     // SAFETY: name is a live NUL-terminated pathname and the ACL type is valid.
     let acl = unsafe { acl_get_link_np(name.as_ptr(), ACL_TYPE_EXTENDED) };
@@ -106,4 +133,26 @@ fn deny_only_acl(path: &Path) -> io::Result<bool> {
         }
         index = ACL_NEXT_ENTRY;
     }
+}
+
+/// True when the path carries no POSIX ACL extension. Linux stores those in
+/// these attributes, and a directory with only its mode bits has neither. Any
+/// extended entry refuses, since this check tolerates no ACL form at all.
+#[cfg(target_os = "linux")]
+fn acl_is_clean(path: &Path) -> io::Result<bool> {
+    let name = CString::new(path.as_os_str().as_bytes())?;
+    for attribute in [c"system.posix_acl_access", c"system.posix_acl_default"] {
+        // SAFETY: both names are NUL-terminated. A zero-size probe with no
+        // buffer writes nothing and only reports whether the attribute exists.
+        let size =
+            unsafe { libc::lgetxattr(name.as_ptr(), attribute.as_ptr(), std::ptr::null_mut(), 0) };
+        if size >= 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENODATA) {
+            return Err(error);
+        }
+    }
+    Ok(true)
 }

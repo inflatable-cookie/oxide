@@ -40,18 +40,11 @@ Open, with a no-go for the current shared-daemon route. The normal detached scca
 
 ## Q-018 — How do per-command admission and execution budgets behave after freeze?
 
-Implemented as the frozen v1 budget contract in [workflow](contracts/workflow.md). Inner-deadline inheritance was settled on 2026-11-23 as part of Q-020: nested commands clamp their admission and execution budgets to `min(inner_budget, outer_remaining_execution_ms)` received from the parent's session broker handshake, never extending or resetting the outer budget, while the outer process-group kill remains the hard backstop. Still open: whether a future event transport should carry more than the v1 start and terminal records.
+Implemented as the frozen v1 budget contract in [workflow](contracts/workflow.md). Inner-deadline inheritance was settled on 2026-11-23 with the [session broker](contracts/session-broker.md): nested commands clamp their admission and execution budgets to `min(inner_budget, outer_remaining_execution_ms)` received from the parent's session broker handshake, never extending or resetting the outer budget, while the outer process-group kill remains the hard backstop. Still open: whether a future event transport should carry more than the v1 start and terminal records.
 
 ## Q-019 — How should `oxide exec` know a tool's profile output members?
 
 Open, narrowed. The receipt-derived member set is implemented: [exec output inference](contracts/exec-output-inference.md) derives it from the checkout's committed placement, so `--output` need not be declared. Still open: whether a derived member may ever be newly linked (this needs a keyed reservation and a custody change), whether a derived set may exceed the eight-member declaration cap, and whether a later slice adds a `cargo` launcher guard.
-
-## Q-020 — How should nested Oxide lease joining and permit borrowing work?
-
-Settled by [Tom's 2026-11-23 ruling](vision.md#product-workflow-direction).
-The [session-broker contract](contracts/session-broker.md) defines the transport
-for nested lease joining, inner-deadline inheritance (Q-018) and idle
-`oxide exec` permit borrowing.
 
 ## Q-022 — Can a held zombie establish its group's lifetime?
 

@@ -1092,7 +1092,6 @@ These are not current behaviour. Their designs are proposed only.
 
 - `linux-image-v1` storage, CI cache save and restore, and container or remote
   executors. Linux has no runtime proof of storage behaviour yet.
-- Session joining and idle exec permit borrowing on Linux.
 - Alternative run strategies, such as ahead-of-time or JIT codegen or hot patching.
 - Per-project profile overrides or project files. Oxide reads none.
 - Interception of plain `cargo`, and an adaptive `rustc` wrapper for builds that

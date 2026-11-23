@@ -238,6 +238,23 @@ fn refuses_a_private_root_beneath_a_writable_nonsticky_ancestor() {
 }
 
 #[test]
+fn socket_path_accepts_the_platform_limit_and_refuses_one_more_byte() {
+    let accepted = format!("/{}", "a".repeat(MAX_SOCKET_PATH_BYTES - 1));
+    assert_eq!(accepted.len(), MAX_SOCKET_PATH_BYTES);
+    assert!(check_socket_path(Path::new(&accepted)).is_ok());
+    let refused = format!("{accepted}a");
+    assert_eq!(
+        check_socket_path(Path::new(&refused)).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(SUN_PATH_BYTES, 104);
+    #[cfg(target_os = "linux")]
+    assert_eq!(SUN_PATH_BYTES, 108);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn refuses_an_ancestor_with_an_acl_grant() {
     let fixture = SocketDirectory::create(&scratch_root()).unwrap();
     let root = fixture.path.join("temp");
@@ -256,6 +273,57 @@ fn refuses_an_ancestor_with_an_acl_grant() {
         fs::metadata(&fixture.path).unwrap().permissions().mode() & 0o777,
         0o700
     );
+
+    let result = SessionBroker::bind(&root, PermitMode::Inherited, DenyBorrowing);
+    let error = result.err().expect("the ACL grant should refuse binding");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains("ACL grants access"));
+    assert!(fs::read_dir(&root).unwrap().next().is_none());
+    fs::remove_dir(root).unwrap();
+}
+
+/// A named-user entry makes the Linux POSIX ACL extended, so it grants access.
+#[cfg(target_os = "linux")]
+#[test]
+fn refuses_an_ancestor_with_an_acl_grant() {
+    const ACL_VERSION: u32 = 2;
+    const USER_OBJ: u16 = 0x01;
+    const NAMED_USER: u16 = 0x02;
+    const GROUP_OBJ: u16 = 0x04;
+    const MASK: u16 = 0x10;
+    const OTHER: u16 = 0x20;
+    const NOBODY: u32 = 65534;
+    const UNDEFINED_ID: u32 = u32::MAX;
+
+    let fixture = SocketDirectory::create(&scratch_root()).unwrap();
+    let root = fixture.path.join("temp");
+    fs::create_dir(&root).unwrap();
+    let entries: [(u16, u16, u32); 5] = [
+        (USER_OBJ, 7, UNDEFINED_ID),
+        (NAMED_USER, 7, NOBODY),
+        (GROUP_OBJ, 0, UNDEFINED_ID),
+        (MASK, 7, UNDEFINED_ID),
+        (OTHER, 0, UNDEFINED_ID),
+    ];
+    let mut blob = ACL_VERSION.to_le_bytes().to_vec();
+    for (tag, perm, id) in entries {
+        blob.extend_from_slice(&tag.to_le_bytes());
+        blob.extend_from_slice(&perm.to_le_bytes());
+        blob.extend_from_slice(&id.to_le_bytes());
+    }
+    let path = CString::new(fixture.path.as_os_str().as_bytes()).unwrap();
+    let attribute = c"system.posix_acl_access";
+    // SAFETY: both names are NUL-terminated and `blob` is valid for its length.
+    let status = unsafe {
+        libc::lsetxattr(
+            path.as_ptr(),
+            attribute.as_ptr(),
+            blob.as_ptr().cast(),
+            blob.len(),
+            0,
+        )
+    };
+    assert_eq!(status, 0, "{}", io::Error::last_os_error());
 
     let result = SessionBroker::bind(&root, PermitMode::Inherited, DenyBorrowing);
     let error = result.err().expect("the ACL grant should refuse binding");

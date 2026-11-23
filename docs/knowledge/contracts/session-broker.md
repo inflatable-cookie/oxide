@@ -1,6 +1,6 @@
 # Session broker
 
-On macOS, a leased command hosts a session broker for nested Oxide commands.
+On macOS and Linux, a leased command hosts a session broker for nested Oxide commands.
 Each joined command takes its own exclusive slot. A build can inherit an
 active outer permit or borrow one through an `oxide exec` session. See
 [architecture](../architecture.md) for ownership and [workflow](workflow.md)
@@ -13,12 +13,15 @@ directory with mode `0700` under the leased child's [chosen temporary root](work
 Before creating it, Oxide checks the canonical path from `/` down. Each
 directory must be owned by the current user or root on a volume that enforces
 ownership. A directory writable by its group or by others must be sticky.
-Any ACL grant refuses the path. These checks protect the pathname used for
-binding and cleanup from replacement by another user.
+Any ACL grant refuses the path. On Linux, any POSIX ACL extension refuses it,
+and so does a FAT or exFAT volume, which presents fixed owners and modes. These
+checks protect the pathname used for binding and cleanup from replacement by
+another user.
 
-Oxide also checks the socket's absolute pathname before creation. macOS has 104 bytes in `sun_path`
-including the terminating NUL, which leaves at most 103 bytes for the path.
-An overlong path refuses the launch.
+Oxide also checks the socket's absolute pathname before creation. `sun_path`
+includes the terminating NUL: 104 bytes on macOS, which leaves at most 103 bytes
+for the path, and 108 bytes on Linux, which leaves at most 107. An overlong path
+refuses the launch.
 
 The broker supplies two variables for the outer command to pass to its children.
 
@@ -27,13 +30,14 @@ The broker supplies two variables for the outer command to pass to its children.
 | `OXIDE_SESSION_BROKER` | Absolute socket path. |
 | `OXIDE_SESSION_TOKEN` | 256-bit token generated with OS randomness and encoded as 64 lowercase hex digits. Treat it as a secret. |
 
-On macOS each side checks the other's effective UID with `getpeereid` before
-exchanging protocol data. The UID must equal the local `geteuid()`. The broker
-also compares the initial frame's token in constant time after checking its
-length. The socket directory and peer check limit access to the local UID.
-The token binds a connection to the advertised session within that trust
-boundary. On other platforms, including Linux, peer verification fails closed
-with an unsupported-platform error.
+On macOS and Linux each side checks the other's effective UID before exchanging
+protocol data: `getpeereid` on macOS and `SO_PEERCRED` on Linux. The UID must
+equal the local `geteuid()`. The broker also compares the initial frame's token
+in constant time after checking its length. The socket directory and peer check
+limit access to the local UID. The token binds a connection to the advertised
+session within that trust boundary. On other Unix platforms, peer verification
+fails closed with an unsupported-platform error, and the broker neither binds
+nor joins.
 
 A leased invocation given either variable requires both and authenticates
 before opening the pool. A missing, invalid, unreachable or refusing broker
