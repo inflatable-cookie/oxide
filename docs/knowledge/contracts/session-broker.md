@@ -10,8 +10,13 @@ later slice. See [architecture](../architecture.md) for ownership and
 
 The outer process binds a Unix domain socket inside a fresh, per-session
 directory with mode `0700` under the leased child's [chosen temporary root](workflow.md#child-temporary-files).
-The root must have trusted ancestors. Oxide checks the socket's absolute
-pathname before creating the directory. macOS has 104 bytes in `sun_path`
+Before creating it, Oxide checks the canonical path from `/` down. Each
+directory must be owned by the current user or root on a volume that enforces
+ownership. A directory writable by its group or by others must be sticky.
+Any ACL grant refuses the path. These checks protect the pathname used for
+binding and cleanup from replacement by another user.
+
+Oxide also checks the socket's absolute pathname before creation. macOS has 104 bytes in `sun_path`
 including the terminating NUL, which leaves at most 103 bytes for the path.
 An overlong path refuses the launch.
 

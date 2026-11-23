@@ -1,5 +1,7 @@
 //! Parent-owned transport for nested session membership and permit borrowing.
 
+#[cfg(target_os = "macos")]
+mod socket_root;
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
 mod wire;
@@ -89,8 +91,11 @@ struct SocketDirectory {
 
 impl SocketDirectory {
     fn create(root: &Path) -> io::Result<Self> {
-        let template = root.canonicalize()?.join("ox.XXXXXX");
+        let root = root.canonicalize()?;
+        let template = root.join("ox.XXXXXX");
         check_socket_path(&template.join(SOCKET_NAME))?;
+        #[cfg(target_os = "macos")]
+        socket_root::verify(&root)?;
 
         let mut name = CString::new(template.as_os_str().as_bytes())
             .map_err(|_| wire::invalid("session broker directory contains NUL"))?
