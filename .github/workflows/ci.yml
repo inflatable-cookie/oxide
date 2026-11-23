@@ -105,9 +105,12 @@ jobs:
           export OXIDE_TEST_INTERNAL_ROOT="$scratch"
           cargo test --workspace --locked -- --test-threads=1
 
-  # Linux lib/bin/integration suites are not run here yet: `src/lease/seed/tests.rs`
-  # asserts cloning outcomes that `src/lease/seed/mod.rs` marks unsupported outside
-  # macOS, and integration suites require macOS scratch/launch assumptions.
+  # Linux runs `cargo check` for every target, a release build, and the targeted
+  # session-broker unit tests plus the nested-session CLI tests (Q-020). The
+  # rest of the lib, bin and integration suites stay macOS-only for now:
+  # `src/lease/seed/tests.rs` asserts cloning outcomes that `src/lease/seed/mod.rs`
+  # marks unsupported outside macOS, and most integration suites assume macOS
+  # scratch and launch paths.
   check-linux:
     name: Check & Build (Linux)
     runs-on: ubuntu-24.04
@@ -138,3 +141,19 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
         run: cargo build --release --locked --bin oxide
+
+      - name: Run session broker and nested session tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch=$(mktemp -d "${RUNNER_TEMP}/oxide-linux-test.XXXXXX")
+          chmod 700 "$scratch"
+          scratch=$(cd "$scratch" && pwd -P)
+          trap 'rm -rf -- "$scratch"' EXIT
+          export TMPDIR="$scratch"
+          export TMP="$scratch"
+          export TEMP="$scratch"
+          export OXIDE_TASK_SCRATCH_ROOT="$scratch"
+          export OXIDE_TEST_INTERNAL_ROOT="$scratch"
+          cargo test --locked --bin oxide session_broker -- --test-threads=1
+          cargo test --locked --test cli_papercuts nested_sessions -- --test-threads=1

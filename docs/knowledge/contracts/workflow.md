@@ -1063,6 +1063,9 @@ proof ladders, reviewer-native sessions or qualification selectors exist.
   covered by ordinary regression tests.
 - Linux: `rust:barge-adoption-linux` compiles all targets offline for the installed
   target, including the Linux pool regression. It makes no link or runtime claim.
+  The CI `check-linux` job also runs the session-broker unit tests and the
+  nested-session CLI tests on Linux, in an owner-only scratch directory. The rest
+  of the suite stays macOS-only.
 - Other surviving selectors: `rust:tree-duplicates`, `dogfood:scripts:test` (the
   installer's synthetic install, rollback and canary cases, including the three canary
   modes with a fake staged binary and a check that the format-change run never names
