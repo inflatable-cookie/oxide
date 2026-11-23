@@ -540,23 +540,35 @@ def _removable_payload_on_volume(payload, mount, device):
     `mount`, and free of `..` components, and its canonical location must
     stay on the mount's device strictly beneath `mount` (so a symlink
     escaping the volume is refused). The payload exists on a live
-    registered pool, so it resolves strictly; a missing payload falls back
-    to its nearest existing ancestor's canonical location.
+    registered pool, so anything present at the payload path — including a
+    dangling symlink — must resolve strictly; only a truly absent path
+    falls back to its nearest existing ancestor's canonical location.
+    Unresolvable links fail closed.
     """
     if not payload.is_absolute() or payload == mount or not payload.is_relative_to(mount):
         return False
     if ".." in payload.parts:
         return False
-    anchor = payload
-    while not anchor.exists():
+    if os.path.lexists(payload):
+        try:
+            resolved = payload.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return False
+        if resolved == mount or not resolved.is_relative_to(mount):
+            return False
+        try:
+            return resolved.stat().st_dev == device
+        except OSError:
+            return False
+    anchor = payload.parent
+    while not os.path.lexists(anchor):
         if anchor == anchor.parent:
             return False
         anchor = anchor.parent
     try:
-        resolved_anchor = anchor.resolve(strict=True)
-    except OSError:
+        resolved = anchor.resolve(strict=True) / payload.relative_to(anchor)
+    except (OSError, RuntimeError):
         return False
-    resolved = resolved_anchor / payload.relative_to(anchor)
     if resolved == mount or not resolved.is_relative_to(mount):
         return False
     try:

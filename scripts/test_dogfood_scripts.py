@@ -1239,6 +1239,23 @@ class DocumentAndScratchTests(unittest.TestCase):
         with self.assertRaisesRegex(installer.Refusal, "registered mounted volume"):
             self.run_removable_canary(self.describe_removable(mount, payload))
 
+    def test_canary_scratch_refuses_a_dangling_payload_symlink(self):
+        # A dangling link is present at the payload path, so it must resolve
+        # strictly and fail closed — never fall back to the parent chain.
+        self.write_live_pool()
+        mount = self.root / "mnt"
+        mount.mkdir()
+        (mount / "scratch").mkdir(mode=0o700)
+        outside = mount / "pool"
+        outside.symlink_to(self.root / "elsewhere" / "missing")
+        inside = mount / "builds" / "pool"
+        inside.parent.mkdir(parents=True)
+        inside.symlink_to(mount / "builds" / "also-missing")
+        for payload in (outside, inside):
+            with self.subTest(payload=payload):
+                with self.assertRaisesRegex(installer.Refusal, "registered mounted volume"):
+                    self.run_removable_canary(self.describe_removable(mount, payload))
+
     def test_format_canary_scratch_ignores_a_registered_removable_volume(self):
         self.write_live_pool()
         scratch = self.scratch()
