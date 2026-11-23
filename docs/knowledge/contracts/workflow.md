@@ -576,11 +576,20 @@ paths. The summary says `temp: inherited <path>` or `temp: oxide <path>`.
 
 ## Removable build volume
 
-- **Registration:** `oxide pool register-removable <mount> --reserve <size> --cap <size> [--mode ephemeral|permanent]`.
+- **Registration:** `oxide pool register-removable <mount> --reserve <size> --cap <size> [--mode ephemeral|permanent] [--payload-dir <rel>] [--outputs-dir <rel>]`.
   The default mode is `ephemeral`. `oxide pool set-mode <ephemeral|permanent>` may
   run while the drive is absent. The registration file is Oxide's user policy
-  (mount, UUID, mode, reserve, budget). It is imported into the pool's Barge
-  account. A different UUID or path refuses.
+  (mount, UUID, mode, reserve, budget, payload and outputs directories). It is
+  imported into the pool's Barge account. A different UUID or path refuses.
+- **Layout:** the payload directory (`payload_dir`, default `oxide-pool`) and the
+  outputs directory (`outputs_dir`, default `oxide-outputs`) are clean relative
+  paths under the volume root, up to 8 names deep, which may be nested such as
+  `builds/oxide/pool` and `builds/oxide/outputs`. They must differ and neither may
+  contain the other. Each component is walked through the verified volume
+  descriptor with no-follow and same-device checks. Registration version 3 records
+  both fields. Versions 1 and 2 read with the defaults and keep working unchanged;
+  the next write publishes version 3 with those defaults. The layout is fixed at
+  registration: moving an existing pool or outputs directory is not supported yet.
 - **Selection:** when a build starts, the drive is selected only if it is mounted,
   its registered UUID matches and it is writable. Selection does not repeat the
   boot-container or APFS-role checks; registration and `describe` run those, and
@@ -602,9 +611,10 @@ paths. The summary says `temp: inherited <path>` or `temp: oxide <path>`.
   slot.
 - **Previous registrations:** a registration under another pool's control root is
   never moved, adopted or removed. `register-removable` refuses while one exists
-  or while the `oxide-pool` payload directory is not empty.
+  or while the payload directory is not empty.
 - **Describe:** `oxide pool describe --json` (see [status](#status-and-inspection))
-  reports the registration without writing anything.
+  reports the registration without writing anything, including the `payload` and
+  `outputs` paths on the volume.
 
 ## Final outputs
 
@@ -620,8 +630,9 @@ to the registered drive, and Oxide owns the links that point there.
   `<checkout>/target` itself a link; checkouts switch to the profile layout via
   `oxide outputs detach` followed by `oxide outputs adopt`. A member link points
   at its approved subpath only.
-- **Roots and marker.** A root is `<mount>/oxide-outputs/<project>-<checkout id>/`
-  on the registered volume, or the local fallback
+- **Roots and marker.** A root is `<mount>/<outputs_dir>/<project>-<checkout id>/`
+  on the registered volume (`outputs_dir` is `oxide-outputs` unless the
+  registration names a nested directory such as `builds/oxide/outputs`), or the local fallback
   `<checkout>/.oxide-outputs/local/`. Each root carries `.oxide-output.json` (the
   checkout, its id, the project label, the kind, the volume UUID and the creation
   generation). A link is owned only when it points at a real directory with this
@@ -794,7 +805,9 @@ Privacy & Security, Developer Tools. It states that the cause is inferred.
   Fields:
   - `removable` is `null` when no drive is registered. `mount_point`, `volume_uuid`,
     `mode`, `reserve_bytes`, `pending_reconciliation_slots` and
-    `pending_reconciliation_slot_ids` describe a registered one.
+    `pending_reconciliation_slot_ids` describe a registered one. `payload` and
+    `outputs` are the registration's payload and outputs directories under the
+    mount point, `null` when no registration can be read.
   - `available` is passive eligibility. It needs the mount to hold the registered
     volume's root, the UUID to match, the volume to be writable and outside the
     boot container, the payload to exist, and the config and ledger to read

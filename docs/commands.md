@@ -87,7 +87,7 @@ oxide exec --manifest-path crates/app/Cargo.toml -- ./scripts/package.sh
 `pool` manages removable drives. See [configuration](configuration.md#removable-drives) for the full workflow.
 
 ```sh
-oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ephemeral|permanent]
+oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ephemeral|permanent] [--payload-dir <rel>] [--outputs-dir <rel>]
 oxide pool set-mode <ephemeral|permanent>
 oxide pool describe --json
 oxide pool recover-interrupted <slot>

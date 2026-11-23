@@ -64,6 +64,7 @@ struct Removable {
     unavailable_reason: Option<&'static str>,
     unavailable_detail: Option<String>,
     payload: Option<String>,
+    outputs: Option<String>,
     suggested_scratch_root: Option<String>,
 }
 
@@ -165,6 +166,7 @@ fn describe(configured: &Path) -> Result<Description, String> {
                 unavailable_reason: Some(Reason::MetadataUnknown.tag()),
                 unavailable_detail: Some(detail),
                 payload: None,
+                outputs: None,
                 suggested_scratch_root: None,
             }),
             "internal",
@@ -190,7 +192,10 @@ fn describe(configured: &Path) -> Result<Description, String> {
                 unavailable_reason: reason,
                 unavailable_detail: detail,
                 payload: Some(lossy(
-                    &registration.mount_point.join(removable::PAYLOAD_DIR),
+                    &registration.mount_point.join(registration.payload_dir()),
+                )),
+                outputs: Some(lossy(
+                    &registration.mount_point.join(registration.outputs_dir()),
                 )),
                 suggested_scratch_root: Some(lossy(&registration.mount_point.join(SCRATCH_DIR))),
             };
@@ -220,7 +225,7 @@ fn availability(
 ) -> Result<(usize, Vec<String>), Unavailable> {
     let binding = probe_volume(registration)?;
     let description = probe_control(control, registration)?;
-    probe_payload(&binding)?;
+    probe_payload(&binding, registration.payload_dir())?;
     Ok(pending(&description))
 }
 
@@ -307,7 +312,7 @@ fn probe_control(
     })?;
     if description.mount_point != registration.mount_point
         || description.volume_uuid != registration.volume_uuid
-        || description.payload_dir != removable::PAYLOAD_DIR
+        || description.payload_dir != registration.payload_dir()
         || description.cap_bytes != registration.cap_bytes
     {
         return Err(unavailable(
@@ -319,11 +324,11 @@ fn probe_control(
 }
 
 /// The payload directory on the volume, opened read-only.
-fn probe_payload(binding: &Binding) -> Result<(), Unavailable> {
-    match binding.dir_at(binding.fd(), removable::PAYLOAD_DIR, false) {
+fn probe_payload(binding: &Binding, payload_dir: &str) -> Result<(), Unavailable> {
+    match binding.dir_path_at(payload_dir, false) {
         Ok(_) => Ok(()),
         Err(error) => {
-            let path = binding.mount_point().join(removable::PAYLOAD_DIR);
+            let path = binding.mount_point().join(payload_dir);
             match fs::symlink_metadata(path) {
                 Err(missing) if missing.kind() == ErrorKind::NotFound => {
                     Err(unavailable(Reason::PayloadMissing, error))
@@ -576,6 +581,7 @@ mod tests {
     #[test]
     fn unknown_registration_invents_no_identity_and_escapes_detail() {
         let removable = Removable {
+            outputs: None,
             mount_point: None,
             volume_uuid: None,
             mode: DriveMode::Ephemeral,
@@ -634,7 +640,7 @@ mod tests {
         let mut permanent = ephemeral.clone();
         permanent["mode"] = "permanent".into();
         let mut unknown_version = permanent.clone();
-        unknown_version["version"] = 3.into();
+        unknown_version["version"] = 4.into();
         let mut missing_mode = legacy.clone();
         missing_mode["version"] = 2.into();
         let mut unknown_mode = permanent.clone();
@@ -643,18 +649,33 @@ mod tests {
         legacy_mode["mode"] = "permanent".into();
         let mut unknown_field = permanent.clone();
         unknown_field["unknown"] = true.into();
-        let mut cases = vec![(b"{malformed".to_vec(), None)];
-        for (registration, mode) in [
-            (legacy, Some("ephemeral")),
-            (ephemeral, Some("ephemeral")),
-            (permanent, Some("permanent")),
-            (unknown_version, None),
-            (missing_mode, None),
-            (unknown_mode, None),
-            (legacy_mode, None),
-            (unknown_field, None),
+        let mut nested = permanent.clone();
+        nested["version"] = 3.into();
+        nested["payload_dir"] = "builds/oxide/pool".into();
+        nested["outputs_dir"] = "builds/oxide/outputs".into();
+        let mut cases = vec![(b"{malformed".to_vec(), None, "", "")];
+        for (registration, mode, payload, outputs) in [
+            (legacy, Some("ephemeral"), "oxide-pool", "oxide-outputs"),
+            (ephemeral, Some("ephemeral"), "oxide-pool", "oxide-outputs"),
+            (permanent, Some("permanent"), "oxide-pool", "oxide-outputs"),
+            (
+                nested,
+                Some("permanent"),
+                "builds/oxide/pool",
+                "builds/oxide/outputs",
+            ),
+            (unknown_version, None, "", ""),
+            (missing_mode, None, "", ""),
+            (unknown_mode, None, "", ""),
+            (legacy_mode, None, "", ""),
+            (unknown_field, None, "", ""),
         ] {
-            cases.push((serde_json::to_vec(&registration).unwrap(), mode));
+            cases.push((
+                serde_json::to_vec(&registration).unwrap(),
+                mode,
+                payload,
+                outputs,
+            ));
         }
         let registration_path = control.join("removable.json");
         let snapshot = || {
@@ -678,7 +699,7 @@ mod tests {
             });
             (fs::read(&registration_path).unwrap(), metadata, entries)
         };
-        for (bytes, mode) in cases {
+        for (bytes, mode, payload, outputs) in cases {
             fs::write(&registration_path, &bytes).unwrap();
             fs::set_permissions(&registration_path, fs::Permissions::from_mode(0o600)).unwrap();
             let before = snapshot();
@@ -696,7 +717,8 @@ mod tests {
                 );
                 assert_eq!(removable["reserve_bytes"], 4096);
                 assert_eq!(removable["unavailable_reason"], "absent");
-                assert_eq!(removable["payload"], format!("{mount}/oxide-pool"));
+                assert_eq!(removable["payload"], format!("{mount}/{payload}"));
+                assert_eq!(removable["outputs"], format!("{mount}/{outputs}"));
                 assert_eq!(
                     removable["suggested_scratch_root"],
                     format!("{mount}/scratch")
@@ -708,6 +730,7 @@ mod tests {
                     "volume_uuid",
                     "reserve_bytes",
                     "payload",
+                    "outputs",
                     "suggested_scratch_root",
                 ] {
                     assert!(removable[field].is_null(), "{field}: {removable}");
@@ -721,6 +744,7 @@ mod tests {
     #[test]
     fn registered_reserve_is_reported_as_a_number() {
         let removable = Removable {
+            outputs: None,
             mount_point: Some("/Volumes/Builds".to_owned()),
             volume_uuid: Some("A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned()),
             mode: DriveMode::Ephemeral,
@@ -784,6 +808,7 @@ mod tests {
     #[test]
     fn pending_count_is_a_number_beside_available() {
         let removable = Removable {
+            outputs: None,
             mount_point: Some("/Volumes/Builds".to_owned()),
             volume_uuid: Some("A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned()),
             mode: DriveMode::Permanent,
@@ -830,7 +855,9 @@ mod tests {
 
     fn registration(mount: &Path, uuid: &str) -> Registration {
         Registration {
-            version: 2,
+            payload_dir: "oxide-pool".to_owned(),
+            outputs_dir: "oxide-outputs".to_owned(),
+            version: removable::REGISTRATION_VERSION,
             mount_point: mount.to_path_buf(),
             volume_uuid: uuid.to_owned(),
             container_uuid: "B7BD4FE8-44FB-47C5-9193-8365DF302FE3".to_owned(),

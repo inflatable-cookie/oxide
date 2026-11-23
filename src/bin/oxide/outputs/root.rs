@@ -6,10 +6,7 @@ use super::receipt::{
     RootKind, Selected, MARKER_VERSION, MAX_MARKER_BYTES,
 };
 use super::transition::rename_no_replace;
-use super::{
-    Context, TargetState, EXTERNAL_DIR, GITIGNORE_LINE, LOCAL_DIR, LOCAL_ROOT, MARKER, MEMBER,
-    RECIPE,
-};
+use super::{Context, TargetState, GITIGNORE_LINE, LOCAL_DIR, LOCAL_ROOT, MARKER, MEMBER, RECIPE};
 use crate::identity;
 use crate::process;
 use crate::removable::{self, DriveMode};
@@ -313,7 +310,7 @@ pub(in crate::outputs) enum RootSpec {
     External {
         root: PathBuf,
         uuid: String,
-        /// One directory name under `<mount>/oxide-outputs`.
+        /// One directory name under the registered outputs directory.
         leaf: String,
     },
     Local {
@@ -464,7 +461,10 @@ pub(in crate::outputs) fn external_spec(
     let id = identity::digest(&checkout.to_string_lossy());
     let leaf = format!("{label}-{}", &id[..8]);
     RootSpec::External {
-        root: registration.mount_point.join(EXTERNAL_DIR).join(&leaf),
+        root: registration
+            .mount_point
+            .join(registration.outputs_dir())
+            .join(&leaf),
         uuid: registration.volume_uuid.clone(),
         leaf,
     }
@@ -947,16 +947,20 @@ fn create_root(
     binding: &Option<Binding>,
 ) -> Result<(), String> {
     match (spec, binding) {
-        (RootSpec::External { leaf, .. }, Some(binding)) => {
+        (RootSpec::External { root, leaf, .. }, Some(binding)) => {
             // Recheck identity, then create through the verified volume
             // descriptor: never through a re-resolved path, and never on
-            // another device.
+            // another device. The outputs directory is the root's parent,
+            // relative to the verified mount point (it may be nested).
             binding.verify()?;
-            let outer = binding
-                .dir_at(binding.fd(), EXTERNAL_DIR, true)
-                .map_err(|error| {
-                    format!("cannot create the output directory on the volume: {error}")
-                })?;
+            let outputs = root
+                .parent()
+                .and_then(|parent| parent.strip_prefix(binding.mount_point()).ok())
+                .and_then(Path::to_str)
+                .ok_or("the output root is not under the registered volume")?;
+            let outer = binding.dir_path_at(outputs, true).map_err(|error| {
+                format!("cannot create the output directory on the volume: {error}")
+            })?;
             binding
                 .dir_at(outer.as_fd(), leaf, true)
                 .map_err(|error| format!("cannot create the output root {leaf}: {error}"))?;

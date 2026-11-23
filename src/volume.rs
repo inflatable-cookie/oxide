@@ -223,6 +223,67 @@ impl Binding {
         self.verify()?;
         dir_at(dir, name, create)
     }
+
+    /// Open (creating owner-only each missing component if `create`) the
+    /// nested directory `rel` under this volume's mount root. The path is
+    /// validated before any effect, the volume is reverified, and every
+    /// component is walked through [`dir_at`] from the held descriptor.
+    pub fn dir_path_at(&self, rel: &str, create: bool) -> Result<OwnedFd, String> {
+        relative_components(rel)?;
+        self.verify()?;
+        walk_dir_path(self.fd.as_fd(), rel, create)
+    }
+}
+
+/// The deepest nested relative directory a removable pool or outputs root may
+/// use under the volume's mount root.
+pub const MAX_RELATIVE_DEPTH: usize = 8;
+
+/// Split a volume-relative directory path into its segments. It must be one
+/// or more clean `/`-separated names: not empty, not absolute, with no empty
+/// segment (leading, trailing or doubled `/`), no `.` or `..`, no NUL, and at
+/// most [`MAX_RELATIVE_DEPTH`] segments.
+pub fn relative_components(rel: &str) -> Result<Vec<&str>, String> {
+    if rel.is_empty() {
+        return Err("the relative path is empty".to_owned());
+    }
+    if rel.contains('\0') {
+        return Err(format!("{rel:?} contains NUL"));
+    }
+    if rel.starts_with('/') {
+        return Err(format!(
+            "{rel:?} must be relative to the volume root, not absolute"
+        ));
+    }
+    let parts: Vec<&str> = rel.split('/').collect();
+    for part in &parts {
+        match *part {
+            "" => {
+                return Err(format!(
+                    "{rel:?} has an empty segment; use clean names separated by single '/'"
+                ))
+            }
+            "." | ".." => return Err(format!("{rel:?} must not contain '.' or '..'")),
+            _ => {}
+        }
+    }
+    if parts.len() > MAX_RELATIVE_DEPTH {
+        return Err(format!(
+            "{rel:?} is deeper than {MAX_RELATIVE_DEPTH} directories"
+        ));
+    }
+    Ok(parts)
+}
+
+/// Walk `rel` from `dir`, one [`dir_at`] per component, so every step keeps
+/// the no-follow and same-device checks. The caller validates `rel` first.
+pub fn walk_dir_path(dir: BorrowedFd<'_>, rel: &str, create: bool) -> Result<OwnedFd, String> {
+    let parts = relative_components(rel)?;
+    let mut current = dir_at(dir, parts[0], create)?;
+    for part in &parts[1..] {
+        current = dir_at(current.as_fd(), part, create)?;
+    }
+    Ok(current)
 }
 
 /// Whether the effective user may write `path`, ACLs included.
@@ -613,6 +674,49 @@ mod tests {
         assert!(dir_at(fd.as_fd(), "link", false).is_err());
         assert!(dir_at(fd.as_fd(), "..", true).is_err());
         assert!(dir_at(fd.as_fd(), "a/b", true).is_err());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn relative_paths_are_clean_and_bounded() {
+        for ok in ["oxide-pool", "builds/oxide/pool", "a/b/c/d/e/f/g/h"] {
+            assert!(relative_components(ok).is_ok(), "{ok}");
+        }
+        assert_eq!(
+            relative_components("builds/oxide/pool").unwrap(),
+            vec!["builds", "oxide", "pool"]
+        );
+        for bad in [
+            "",
+            "/abs",
+            "../escape",
+            "a/../b",
+            "a/./b",
+            "a//b",
+            "a/",
+            ".",
+            "..",
+            "a\0b",
+            "a/b/c/d/e/f/g/h/i",
+        ] {
+            assert!(relative_components(bad).is_err(), "{bad:?} must refuse");
+        }
+    }
+
+    #[test]
+    fn nested_directory_path_walks_each_component_without_following_links() {
+        let parent = scratch("nested");
+        let fd = open_dir(None, &parent).unwrap();
+        walk_dir_path(fd.as_fd(), "builds/oxide/pool", true).unwrap();
+        assert!(parent.join("builds/oxide/pool").is_dir());
+        walk_dir_path(fd.as_fd(), "builds/oxide/pool", false).unwrap();
+        assert!(walk_dir_path(fd.as_fd(), "builds/missing", false).is_err());
+        assert!(walk_dir_path(fd.as_fd(), "../escape", true).is_err());
+        let target = parent.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, parent.join("linked")).unwrap();
+        assert!(walk_dir_path(fd.as_fd(), "linked/nested", true).is_err());
+        assert!(!target.join("nested").exists());
         std::fs::remove_dir_all(parent).unwrap();
     }
 }

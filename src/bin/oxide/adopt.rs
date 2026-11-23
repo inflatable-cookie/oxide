@@ -1074,7 +1074,9 @@ Managed by `oxide init`; edits between these markers are replaced.
         let absent = base.join(format!("readiness-absent-{}", std::process::id()));
         let pool = base.join("readiness-pool");
         let registration = |mount: PathBuf| crate::removable::Registration {
-            version: 2,
+            payload_dir: "oxide-pool".to_owned(),
+            outputs_dir: "oxide-outputs".to_owned(),
+            version: crate::removable::REGISTRATION_VERSION,
             mount_point: mount,
             volume_uuid: "11111111-2222-3333-4444-555555555555".to_owned(),
             container_uuid: "66666666-7777-8888-9999-000000000000".to_owned(),

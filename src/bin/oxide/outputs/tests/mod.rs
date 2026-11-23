@@ -7,7 +7,7 @@ use super::root::*;
 use super::transition::*;
 use super::*;
 use std::fs;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{symlink, DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -454,7 +454,9 @@ fn register(fixture: &Fixture, mode: DriveMode) {
 
 fn register_at(fixture: &Fixture, control: &Path, mode: DriveMode) {
     let registration = removable::Registration {
-        version: 2,
+        payload_dir: "oxide-pool".to_owned(),
+        outputs_dir: "oxide-outputs".to_owned(),
+        version: removable::REGISTRATION_VERSION,
         mount_point: fixture.root.join("absent-volume"),
         volume_uuid: "11111111-2222-3333-4444-555555555555".to_owned(),
         container_uuid: "66666666-7777-8888-9999-000000000000".to_owned(),
@@ -821,7 +823,9 @@ fn register_live_volume(fixture: &Fixture) -> (PathBuf, PathBuf) {
             .expect("the fixture directory is on a volume with an identity")
     };
     let registration = removable::Registration {
-        version: 2,
+        payload_dir: "oxide-pool".to_owned(),
+        outputs_dir: "oxide-outputs".to_owned(),
+        version: removable::REGISTRATION_VERSION,
         mount_point: mount.clone(),
         volume_uuid: uuid.clone(),
         container_uuid: "66666666-7777-8888-9999-000000000000".to_owned(),
@@ -836,6 +840,13 @@ fn register_live_volume(fixture: &Fixture) -> (PathBuf, PathBuf) {
     fs::write(&path, serde_json::to_vec(&registration).unwrap()).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     let state = removable::removable_control(&fixture.control);
+    // Barge creates missing state directories under the umask. Oxide's control
+    // checks need them owner-only whatever the host umask is.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&state)
+        .unwrap();
     let storage = oxide_storage::storage::Storage::open(&state).unwrap();
     storage
         .declare(
