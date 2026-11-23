@@ -13,10 +13,13 @@ directory with mode `0700` under the leased child's [chosen temporary root](work
 Before creating it, Oxide checks the canonical path from `/` down. Each
 directory must be owned by the current user or root on a volume that enforces
 ownership. A directory writable by its group or by others must be sticky.
-Any ACL grant refuses the path. On Linux, any POSIX ACL extension refuses it,
-and so does a FAT or exFAT volume, which presents fixed owners and modes. These
-checks protect the pathname used for binding and cleanup from replacement by
-another user.
+Any ACL grant refuses the path. On Linux, the volume must positively establish
+ownership enforcement: it must be one of ext2/3/4, XFS, Btrfs, tmpfs or
+overlayfs, as reported by `statfs`. Any other filesystem type refuses the path,
+including network, FUSE, CIFS, SMB, FAT and exFAT volumes. Any POSIX ACL
+extension also refuses it. Idmapped mounts are not inspected, so they are not
+established by this check. These checks protect the pathname used for binding
+and cleanup from replacement by another user.
 
 Oxide also checks the socket's absolute pathname before creation. `sun_path`
 includes the terminating NUL: 104 bytes on macOS, which leaves at most 103 bytes

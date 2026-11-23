@@ -31,8 +31,11 @@ pub(super) fn verify(root: &Path) -> io::Result<()> {
             let mount = crate::store::statfs(&prefix).ok_or_else(|| {
                 refuse(&prefix, "cannot verify that the volume enforces ownership")
             })?;
-            if ignores_ownership(&mount) {
-                return Err(refuse(&prefix, "the volume ignores ownership"));
+            if !ownership_enforced(&mount) {
+                return Err(refuse(
+                    &prefix,
+                    "the volume does not establish ownership enforcement",
+                ));
             }
             device = Some(metadata.dev());
         }
@@ -53,19 +56,61 @@ fn refuse(path: &Path, reason: &str) -> io::Error {
     )
 }
 
-/// Darwin reports enforcement of ownership as a mount flag.
+/// Darwin reports a volume that ignores ownership as a mount flag. A volume
+/// without that flag is accepted, as it was before Linux parity.
 #[cfg(target_os = "macos")]
-fn ignores_ownership(mount: &libc::statfs) -> bool {
-    mount.f_flags & libc::MNT_IGNORE_OWNERSHIP as u32 != 0
+fn ownership_enforced(mount: &libc::statfs) -> bool {
+    (mount.f_flags & libc::MNT_IGNORE_OWNERSHIP as u32) == 0
 }
 
-/// Linux has no mount flag for this. Refuse the filesystems that present fixed
-/// owners and modes whatever the directory records: FAT and exFAT.
+/// Linux has no mount flag that says ownership is enforced, so the check is
+/// positive. The filesystem type must be a local one known to enforce POSIX
+/// ownership and modes on its own inodes. Every other type refuses, including
+/// network, FUSE, FAT and exFAT volumes.
 #[cfg(target_os = "linux")]
-fn ignores_ownership(mount: &libc::statfs) -> bool {
-    const MSDOS_SUPER_MAGIC: u64 = 0x4d44;
-    const EXFAT_SUPER_MAGIC: u64 = 0x2011_bab0;
-    matches!(mount.f_type as u64, MSDOS_SUPER_MAGIC | EXFAT_SUPER_MAGIC)
+fn ownership_enforced(mount: &libc::statfs) -> bool {
+    linux_enforces_ownership(mount.f_type as u64)
+}
+
+/// statfs(2) `f_type` magic numbers for local filesystems that enforce
+/// ownership. Idmapped mounts are not inspected, so they are not established.
+#[cfg(any(target_os = "linux", test))]
+const OWNERSHIP_ENFORCING: [u64; 5] = [
+    0xEF53,      // ext2, ext3 and ext4
+    0x5846_5342, // XFS
+    0x9123_683E, // Btrfs
+    0x0102_1994, // tmpfs
+    0x794C_7630, // overlayfs, which takes ownership from its local layers
+];
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_enforces_ownership(filesystem: u64) -> bool {
+    OWNERSHIP_ENFORCING.contains(&filesystem)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::linux_enforces_ownership;
+
+    #[test]
+    fn only_listed_local_filesystems_establish_ownership() {
+        // ext4, XFS, Btrfs, tmpfs and overlayfs.
+        for magic in [0xEF53, 0x5846_5342, 0x9123_683E, 0x0102_1994, 0x794C_7630] {
+            assert!(linux_enforces_ownership(magic), "{magic:#x} should enforce");
+        }
+        // NFS, FUSE, CIFS, SMB2, FAT, exFAT, and an unknown or zero type.
+        for magic in [
+            0x6969,
+            0x6573_5546,
+            0xFF53_4D42,
+            0xFE53_4D42,
+            0x4D44,
+            0x2011_BAB0,
+            0,
+        ] {
+            assert!(!linux_enforces_ownership(magic), "{magic:#x} should refuse");
+        }
+    }
 }
 
 // The macOS SDK's <sys/acl.h> defines these interfaces and values.
