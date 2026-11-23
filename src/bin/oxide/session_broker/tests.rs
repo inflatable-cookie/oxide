@@ -321,13 +321,16 @@ fn set_access_acl(path: &Path, entries: &[(u16, u16, u32)]) {
     assert_eq!(status, 0, "{}", io::Error::last_os_error());
 }
 
-/// A named writer on an ancestor is an untrusted grant of write, which refuses.
+/// A named writer on a sticky ancestor is an untrusted grant of write, which
+/// refuses. The ACL's mask sets the group mode bits, so this ancestor is
+/// group-writable and needs the sticky bit to reach the ACL check.
 #[cfg(target_os = "linux")]
 #[test]
 fn refuses_an_ancestor_that_grants_write() {
     let fixture = SocketDirectory::create(&scratch_root()).unwrap();
     let root = fixture.path.join("temp");
     fs::create_dir(&root).unwrap();
+    fs::set_permissions(&fixture.path, Permissions::from_mode(0o1770)).unwrap();
     set_access_acl(
         &fixture.path,
         &[
@@ -344,8 +347,13 @@ fn refuses_an_ancestor_that_grants_write() {
         .err()
         .expect("the writable ACL should refuse binding");
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        fs::metadata(&fixture.path).unwrap().permissions().mode() & 0o1000,
+        0o1000,
+        "the sticky bit should keep the mode check out of the way"
+    );
     assert!(error.to_string().contains("ACL grants access"));
-    assert!(fs::read_dir(&root).unwrap().next().is_none());
+    fs::set_permissions(&fixture.path, Permissions::from_mode(0o700)).unwrap();
     fs::remove_dir(root).unwrap();
 }
 
