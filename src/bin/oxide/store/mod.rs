@@ -738,6 +738,30 @@ impl Store {
         self.control.join("waiters").join(format!("{id}.lock"))
     }
 
+    fn ticket_blocked_path(&self, id: u64) -> PathBuf {
+        self.control.join("waiters").join(format!("{id}.blocked"))
+    }
+
+    pub(super) fn is_ticket_blocked(&self, id: u64) -> Result<bool, String> {
+        private_file(&self.ticket_blocked_path(id), false).map(|file| file.is_some())
+    }
+
+    pub(super) fn set_ticket_blocked(&self, id: u64, blocked: bool) -> Result<(), String> {
+        let path = self.ticket_blocked_path(id);
+        if blocked {
+            private_file(&path, true)?;
+            Ok(())
+        } else {
+            match fs::remove_file(&path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(format!(
+                    "cannot clear waiter state {}: {error}",
+                    path.display()
+                )),
+                _ => Ok(()),
+            }
+        }
+    }
+
     /// Take admission, then publish the generation before the first
     /// protected write. Release takes the same gate after Cargo has closed.
     fn admission(&self) -> Result<File, String> {

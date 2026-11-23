@@ -78,7 +78,7 @@ oxide exec --manifest-path crates/app/Cargo.toml -- ./scripts/package.sh
 
 ## `oxide status`
 
-- `oxide status` is read-only and fast. It reports the selected pool, slots and holders, waiting commands, the last recorded size of each slot and its age, the config file in use and the effective host limit.
+- `oxide status` is read-only and fast. It reports the selected pool, slots and holders (including ledger-idle slots whose Barge hold is still held by another process, when observable), waiting commands, the last recorded size of each slot and its age, the config file in use and the effective host limit.
 - `oxide status --measure` adds bounded walks of the pool, the slots, the checkout's stray output and the Cargo home, under one 60-second budget. It still writes nothing.
 - `oxide status --launch-check` (macOS) times the first launch of a new executable against a re-run. It runs under a 3-second limit and changes no setting.
 

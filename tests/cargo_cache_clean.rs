@@ -153,18 +153,34 @@ fn verify_runs_and_skips_for_channel(channel: &str) {
     );
 
     // First run initializes Cargo's cache db with `last_auto_gc = now`, so
-    // Cargo skips on the same-second frequency gate (exit 75).
-    let first = oxide_command(scratch.path(), None, &cargo_home, &app)
-        .args(["clean", "--cargo-cache"])
-        .output()
-        .expect("first clean --cargo-cache");
-    let first_stderr = String::from_utf8_lossy(&first.stderr);
-    assert_eq!(first.status.code(), Some(75), "{channel}: {first_stderr}");
-    assert!(
-        first_stderr.contains("Cargo skipped cleanup: its frequency gate"),
-        "{channel}: {first_stderr}"
-    );
-
+    // Cargo skips on the same-second frequency gate (exit 75). That stamp
+    // has one-second granularity: when a second boundary falls between the
+    // previous run's db write and this run's gate check, Cargo runs cleanup
+    // instead of skipping. Retry at once on a run (which refreshes the db)
+    // so the skip is proven against a db this test just refreshed; a gate
+    // that never skips still exhausts the retries and fails.
+    (0..5)
+        .find_map(|_| {
+            let first = oxide_command(scratch.path(), None, &cargo_home, &app)
+                .args(["clean", "--cargo-cache"])
+                .output()
+                .expect("clean --cargo-cache");
+            let first_stderr = String::from_utf8_lossy(&first.stderr).into_owned();
+            match first.status.code() {
+                Some(75) => {
+                    assert!(
+                        first_stderr.contains("Cargo skipped cleanup: its frequency gate"),
+                        "{channel}: {first_stderr}"
+                    );
+                    Some(first_stderr)
+                }
+                Some(0) => None,
+                _ => panic!("{channel}: unexpected clean exit: {first_stderr}"),
+            }
+        })
+        .unwrap_or_else(|| {
+            panic!("{channel}: frequency gate never skipped across 5 immediate retries")
+        });
     // Advance past Cargo's one-second `last_auto_gc` timestamp granularity.
     std::thread::sleep(Duration::from_millis(1200));
 

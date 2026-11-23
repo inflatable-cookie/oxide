@@ -5,7 +5,8 @@ use super::super::{
     canonical_existing_dir, ensure_private_dir, io_error, LeaseError, Leased, LedgerView,
     MeasuredPool, PassiveSnapshot, PoolInfo, PoolStatus, ReleaseReceipt, VolumeDescription,
     ACCOUNTING_MAX_ELAPSED_MS, BUDGET_BACKEND_DIRECTORY_V1, CONFIG_NAME, LEASE_VERSION,
-    LEDGER_NAME, LEDGER_VERSION, MAX_SLOTS, PAYLOAD_NAME, SLOTS_NAME, VOLUME_BACKEND_APFS_V1,
+    LEDGER_NAME, LEDGER_VERSION, MANAGED_NAME, MAX_SLOTS, PAYLOAD_NAME, SLOTS_NAME,
+    VOLUME_BACKEND_APFS_V1,
 };
 use super::LeaseRequest;
 use super::{describe_pins, Phase};
@@ -320,6 +321,57 @@ pub fn pinned_roots(pool: &Path) -> Result<String, LeaseError> {
         line.push_str(&format!(" ({unreadable} unreadable)"));
     }
     Ok(line)
+}
+
+/// Slot IDs of Barge-owned ledger slots whose Barge hold is currently held by
+/// another process, read without taking the pool lock, reconciling or walking
+/// slot trees.
+pub fn barge_held_slots(pool: &Path) -> Result<std::collections::BTreeSet<String>, LeaseError> {
+    use std::collections::BTreeSet;
+    let opened = Pool::open_passive(
+        pool,
+        std::time::Instant::now() + Duration::from_millis(ACCOUNTING_MAX_ELAPSED_MS),
+    )?;
+    let folders: BTreeSet<Option<&str>> = opened
+        .ledger
+        .slots
+        .iter()
+        .filter(|slot| slot.owned && slot.root.is_some())
+        .map(|slot| slot.area_folder())
+        .collect();
+    if folders.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let storage = crate::storage::Storage::open_read_only(&opened.root.join(MANAGED_NAME))
+        .map_err(LeaseError::Barge)?;
+    let backing = super::pool_backing(&opened.root, &opened.config)?;
+    let mut held_roots = BTreeSet::new();
+    for folder in folders {
+        let area = backing
+            .existing_pool_area(&storage, folder)
+            .map_err(LeaseError::Barge)?;
+        let listing = area
+            .list_without_bytes()
+            .map_err(|error| LeaseError::Barge(error.to_string()))?;
+        for root in listing.roots {
+            if root.held {
+                held_roots.insert(root.id);
+            }
+        }
+    }
+    Ok(opened
+        .ledger
+        .slots
+        .iter()
+        .filter(|slot| {
+            slot.owned
+                && slot
+                    .root
+                    .as_deref()
+                    .is_some_and(|root_id| held_roots.contains(root_id))
+        })
+        .map(|slot| slot.id.to_string())
+        .collect())
 }
 
 /// Prepare a pool at the front door before leasing. Only pending legacy

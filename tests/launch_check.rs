@@ -196,7 +196,7 @@ fn a_slow_probe_group_is_closed_before_the_cli_exits() {
 
 #[test]
 fn a_blocked_copy_start_or_removal_cannot_outlive_the_cli() {
-    for delay in ["copy:2000", "start:2000", "remove:2000"] {
+    for delay in ["copy:6000", "start:6000", "remove:6000"] {
         // The start delay holds a running slow probe; the others hold a
         // created copy.
         let script = if delay.starts_with("start") {
@@ -208,13 +208,20 @@ fn a_blocked_copy_start_or_removal_cannot_outlive_the_cli() {
             delay.split(':').next().unwrap_or("delay"),
             script,
             &[
-                ("OXIDE_TEST_LAUNCH_LIMIT_MS", "600"),
+                // Generous enough for a loaded CI VM: killing the helper's
+                // process group and confirming it closed must fit inside
+                // the limit after the work deadline, and 600 ms flaked at
+                // 613-632 ms on macos-15 runners. The block delays stay
+                // well past the limit so the helper is still blocked when
+                // the deadline expires, proving it is stopped and closed
+                // before CLI exit either way.
+                ("OXIDE_TEST_LAUNCH_LIMIT_MS", "2000"),
                 ("OXIDE_TEST_LAUNCH_DELAY", delay),
             ],
         );
         assert!(
             run.stdout
-                .contains("result: inconclusive (the 600 ms limit was reached)"),
+                .contains("result: inconclusive (the 2000 ms limit was reached)"),
             "{delay}: {}",
             run.stdout
         );

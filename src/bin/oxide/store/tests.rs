@@ -3867,3 +3867,335 @@ fn a_refused_count_replacement_never_adds_a_thirteenth_project_slot() {
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Hold a ledger slot's Barge root externally while keeping the control record
+/// and ledger idle (simulating an orphaned child that kept the inherited Barge
+/// hold descriptor after its parent `oxide` process released/exited).
+fn hold_slot_barge_externally(store: &Store, slot_id: &str) -> barge::Hold {
+    use oxide_storage::storage::{PoolBacking, PoolStorage};
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(store.pool.join("ledger.json")).unwrap()).unwrap();
+    let slot = ledger["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"].to_string() == slot_id)
+        .expect("slot in ledger");
+    let root_id = slot["root"].as_str().expect("owned Barge root id");
+    let area_folder = slot["dir"]
+        .as_str()
+        .and_then(|dir| dir.split_once('/').map(|(folder, _)| folder));
+    let storage = PoolStorage::open(
+        &store.control,
+        &PoolBacking::budget(&store.pool, store.recorded_budget),
+    )
+    .unwrap();
+    storage
+        .try_hold_in(area_folder, root_id)
+        .unwrap()
+        .expect("slot Barge hold was free to take")
+}
+
+/// Waiter at position 0 blocked on a per-checkout / Barge-held wait must not
+/// head-of-line block an unrelated checkout behind it when `active < max_active`,
+/// while strict FIFO ordering among unblocked waiters is preserved when
+/// `active == max_active`.
+#[test]
+fn per_checkout_blocked_waiter_does_not_hol_block_unrelated_checkouts_while_fifo_holds_at_host_limit(
+) {
+    let (root, mut store, key_a) = lease_fixture("fifo-non-hol");
+    store.max_active = 2;
+    let checkout_b = root.join("checkout-b");
+    let checkout_c = root.join("checkout-c");
+    fs::create_dir_all(&checkout_b).unwrap();
+    fs::create_dir_all(&checkout_c).unwrap();
+    let key_b = SlotKey {
+        checkout: checkout_b.clone(),
+        identity: "identity-b".to_owned(),
+        compatibility: "quick-key".to_owned(),
+    };
+    let key_c = SlotKey {
+        checkout: checkout_c.clone(),
+        identity: "identity-c".to_owned(),
+        compatibility: "quick-key".to_owned(),
+    };
+
+    // Ticket 0 (checkout A) hits a clean barrier -> marked blocked, stays at index 0.
+    let (ticket_a, _lock_a) = store.register_ticket().unwrap();
+    let Cleaning::Guard(clean_guard_a) = store
+        .begin_clean(&key_a.checkout, &mut WaitAccounting::default())
+        .unwrap()
+    else {
+        panic!("expected clean barrier guard for checkout A");
+    };
+    let wait_a = store
+        .attempt(ticket_a, &key_a, Profile::Quick, 2, false, None)
+        .unwrap()
+        .err()
+        .expect("ticket_a waits on clean");
+    assert!(matches!(wait_a, Wait::Clean), "{wait_a:?}");
+
+    let state = store.load().unwrap();
+    assert_eq!(state.tickets.len(), 1);
+    assert_eq!(state.tickets[0].id, ticket_a);
+    assert!(store.is_ticket_blocked(ticket_a).unwrap());
+
+    // Status marks the blocked ticket as not blocking other checkouts.
+    let report = store.report(Accounting::Recorded, 1).unwrap();
+    assert_eq!(report.waiters.len(), 1);
+    assert!(report.waiters[0].blocked);
+
+    // Ticket 1 (unrelated checkout B) advances past blocked ticket 0 immediately when active < max_active!
+    let (ticket_b, _lock_b) = store.register_ticket().unwrap();
+    let lease_b = store
+        .attempt(ticket_b, &key_b, Profile::Quick, 2, false, None)
+        .unwrap()
+        .ok()
+        .expect("unrelated checkout B acquired immediately past blocked checkout A");
+    store.remove_ticket(ticket_b).unwrap();
+
+    // Ticket 0 is never dropped while still waiting.
+    let state = store.load().unwrap();
+    assert_eq!(state.tickets.len(), 1);
+    assert_eq!(state.tickets[0].id, ticket_a);
+
+    // Fill active to max_active (2) using another build on checkout B.
+    let lease_b2 = lease_as(&store, &key_b, false).expect("second active build reaches max_active");
+
+    // Ticket 1 (unblocked, checkout C) hits HostLimit(2); Ticket 2 (unblocked, checkout B)
+    // sees 1 unblocked waiter ahead of it -> Wait::Queue(2), even with blocked ticket 0 at index 0.
+    let (ticket_c, _lock_c) = store.register_ticket().unwrap();
+    let (ticket_b3, _lock_b3) = store.register_ticket().unwrap();
+    let wait_c = store
+        .attempt(ticket_c, &key_c, Profile::Quick, 2, false, None)
+        .unwrap()
+        .err()
+        .expect("ticket_c waits on host limit");
+    assert!(matches!(wait_c, Wait::HostLimit(2)), "{wait_c:?}");
+    let wait_b3 = store
+        .attempt(ticket_b3, &key_b, Profile::Quick, 2, false, None)
+        .unwrap()
+        .err()
+        .expect("ticket_b3 waits in queue");
+    assert!(matches!(wait_b3, Wait::Queue(2)), "{wait_b3:?}");
+    let queue_text = wait_b3.describe(2);
+    assert!(
+        queue_text.contains("earlier unblocked oxide commands (position 2)"),
+        "{queue_text}"
+    );
+
+    // Even if one active build finishes (active drops to 1 < max_active = 2),
+    // ticket_b3 still waits in Queue(2) behind unblocked ticket_c (strict FIFO among unblocked).
+    store.release(lease_b2, None).unwrap();
+    let wait_b3_again = store
+        .attempt(ticket_b3, &key_b, Profile::Quick, 2, false, None)
+        .unwrap()
+        .err()
+        .expect("ticket_b3 stays in queue behind ticket_c");
+    assert!(matches!(wait_b3_again, Wait::Queue(2)), "{wait_b3_again:?}");
+
+    // Unblocked ticket_c acquires in FIFO order, then ticket_b3 hits HostLimit(2) once C takes the slot.
+    let lease_c = store
+        .attempt(ticket_c, &key_c, Profile::Quick, 2, false, None)
+        .unwrap()
+        .ok()
+        .expect("ticket_c acquires in FIFO order");
+    store.remove_ticket(ticket_c).unwrap();
+    let wait_b3_limit = store
+        .attempt(ticket_b3, &key_b, Profile::Quick, 2, false, None)
+        .unwrap()
+        .err()
+        .expect("ticket_b3 hits host limit");
+    assert!(
+        matches!(wait_b3_limit, Wait::HostLimit(2)),
+        "{wait_b3_limit:?}"
+    );
+
+    // Clear checkout A's clean barrier and free a build slot: ticket_a acquires!
+    store.release(lease_b, None).unwrap();
+    store.abandon_clean(clean_guard_a).unwrap();
+    let lease_a = store
+        .attempt(ticket_a, &key_a, Profile::Quick, 2, false, None)
+        .unwrap()
+        .ok()
+        .expect("ticket_a acquires once its clean barrier clears");
+    store.remove_ticket(ticket_a).unwrap();
+    assert!(!store.is_ticket_blocked(ticket_a).unwrap());
+    assert_eq!(
+        fs::read_dir(store.control.join("waiters")).unwrap().count(),
+        1,
+        "only ticket_b3 lock remains after ticket_a removal"
+    );
+
+    store.remove_ticket(ticket_b3).unwrap();
+    store.release(lease_a, None).unwrap();
+    store.release(lease_c, None).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// End-to-end `Store::acquire` test: a waiter capped on a Barge-held idle slot
+/// at ticket position 0 does not block an unrelated checkout's `acquire()` call.
+#[test]
+fn acquire_does_not_hol_block_unrelated_checkout_behind_barge_held_waiter() {
+    let (root, store, key_a) = lease_fixture("acquire-non-hol");
+    let checkout_b = root.join("checkout-b");
+    fs::create_dir_all(&checkout_b).unwrap();
+    let key_b = SlotKey {
+        checkout: checkout_b,
+        identity: "identity-b".to_owned(),
+        compatibility: "quick-key".to_owned(),
+    };
+
+    // Fill project A to PROJECT_SLOT_CAP with idle slots, and hold all of their
+    // Barge locks externally so project A must wait on Wait::BargeHeld.
+    let mut leases = Vec::new();
+    for _ in 0..PROJECT_SLOT_CAP {
+        leases.push(lease_as(&store, &key_a, false).expect("slot below cap"));
+    }
+    let mut slot_ids = Vec::new();
+    for leased in leases {
+        slot_ids.push(leased.slot_id.clone());
+        store.release(leased, None).unwrap();
+    }
+    let external_holds: Vec<_> = slot_ids
+        .iter()
+        .map(|slot_id| hold_slot_barge_externally(&store, slot_id))
+        .collect();
+
+    let (ticket_a, _lock_a) = store.register_ticket().unwrap();
+    let wait_a = store
+        .attempt(ticket_a, &key_a, Profile::Quick, 4, false, None)
+        .unwrap()
+        .err()
+        .expect("ticket_a waits on BargeHeld");
+    assert!(
+        matches!(wait_a, Wait::BargeHeld(_)),
+        "expected BargeHeld wait at cap, got {wait_a:?}"
+    );
+    assert!(store.is_ticket_blocked(ticket_a).unwrap());
+
+    // Unrelated checkout B calls `acquire()` and succeeds immediately without waiting on ticket A!
+    let mut waits_b = WaitAccounting::default();
+    let acquired_b = store
+        .acquire(&key_b, Profile::Quick, false, None, &mut waits_b)
+        .expect("acquire for checkout B");
+    let lease_b = match acquired_b {
+        Acquired::Lease(lease) => lease,
+        other => panic!(
+            "expected immediate lease for checkout B, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    };
+    assert_eq!(waits_b.summary_suffix(), None, "checkout B should not wait");
+
+    store.release(lease_b, None).unwrap();
+    store.remove_ticket(ticket_a).unwrap();
+    assert!(!store.is_ticket_blocked(ticket_a).unwrap());
+    assert_eq!(
+        fs::read_dir(store.control.join("waiters")).unwrap().count(),
+        0,
+        "no waiter files remain after ticket_a removal"
+    );
+    drop(external_holds);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Barge-held idle slot recovery under the second-slot rule:
+/// 1. When another idle compatible slot exists, admission skips the Barge-held
+///    slot and reuses the unheld one.
+/// 2. When no other idle compatible slot exists and `< PROJECT_SLOT_CAP`,
+///    admission skips the Barge-held slot and allocates a fresh slot without
+///    corrupting the held slot.
+/// 3. At `PROJECT_SLOT_CAP`, replacement skips Barge-held victims (replacing an
+///    unheld idle slot if available, or waiting with `Wait::BargeHeld` when
+///    none is evictable).
+/// 4. `Store::report` marks the held-but-ledger-idle slot as `barge_held`.
+#[test]
+fn barge_held_idle_slot_recovers_via_second_slot_and_surfaces_in_status() {
+    let (root, store, key) = lease_fixture("barge-held-second-slot");
+
+    // 1. Create slot 1, release it, and hold its Barge lock externally.
+    let first = lease_as(&store, &key, false).expect("first lease");
+    let first_slot = first.slot_id.clone();
+    let first_build_dir = first.build_dir.clone();
+    store.release(first, None).unwrap();
+    let hold_1 = hold_slot_barge_externally(&store, &first_slot);
+
+    // Status reports the ledger-idle slot as Barge-held.
+    let report = store.report(Accounting::Recorded, 1).unwrap();
+    let first_view = report
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == first_slot)
+        .expect("first slot in status");
+    assert_eq!(first_view.state, SlotOccupancy::Idle);
+    assert!(first_view.barge_held, "status must observe Barge hold");
+
+    // 2. Under PROJECT_SLOT_CAP, next command allocates a fresh second slot (no spin!).
+    let second = lease_as(&store, &key, false).expect("fresh second slot allocated");
+    let second_slot = second.slot_id.clone();
+    assert_ne!(second_slot, first_slot);
+    assert!(first_build_dir.is_dir(), "held first slot was kept intact");
+
+    // 3. Release second slot and verify that with both slots idle and slot 1 Barge-held,
+    //    the next command reuses slot 2 (skipping Barge-held slot 1).
+    store.release(second, None).unwrap();
+    let reused_second = lease_as(&store, &key, false).expect("reused unheld second slot");
+    assert_eq!(reused_second.slot_id, second_slot);
+    store.release(reused_second, None).unwrap();
+
+    // 4. Fill to PROJECT_SLOT_CAP with idle slots (slot 1 still Barge-held, slots 2..=12 unheld).
+    //    Releasing all and requesting a different checkout key in the same repository must
+    //    replace an unheld idle slot (never the Barge-held slot 1).
+    let mut extra_leases = Vec::new();
+    for _ in 2..PROJECT_SLOT_CAP {
+        extra_leases.push(lease_as(&store, &key, false).expect("fill project cap"));
+    }
+    let mut unheld_slot_ids = vec![second_slot.clone()];
+    for extra in extra_leases {
+        unheld_slot_ids.push(extra.slot_id.clone());
+        store.release(extra, None).unwrap();
+    }
+
+    let other_checkout = root.join("other-checkout");
+    fs::create_dir(&other_checkout).unwrap();
+    let other_key = SlotKey {
+        checkout: other_checkout,
+        identity: key.identity.clone(),
+        compatibility: "release-key".to_owned(),
+    };
+    let replaced_into = lease_as(&store, &other_key, false)
+        .expect("cap replacement skips Barge-held slot 1 and replaces an unheld idle slot");
+    assert_ne!(replaced_into.slot_id, first_slot);
+    assert!(
+        first_build_dir.is_dir(),
+        "Barge-held slot 1 was not evicted"
+    );
+
+    // Now hold ALL remaining slots externally so none can be replaced at cap.
+    store.release(replaced_into, None).unwrap();
+    let view = store.ledger().unwrap();
+    let mut other_holds = Vec::new();
+    for slot in &view.slots {
+        if slot.slot_id != first_slot {
+            other_holds.push(hold_slot_barge_externally(&store, &slot.slot_id));
+        }
+    }
+    let wait = lease_as(&store, &key, false)
+        .err()
+        .expect("project cap with all slots Barge-held waits");
+    match &wait {
+        Wait::BargeHeld(slot_id) => {
+            let reason = wait.describe(16);
+            assert!(
+                reason.contains(slot_id) && reason.contains("Barge hold"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected Wait::BargeHeld, got {other:?}"),
+    }
+
+    drop(other_holds);
+    drop(hold_1);
+    fs::remove_dir_all(root).unwrap();
+}

@@ -2741,6 +2741,7 @@ mod tests {
     fn clean_cargo_for(toolchain: &str, dir: &Path) -> Command {
         let mut command = Command::new(CARGO);
         command.current_dir(dir).env("RUSTUP_TOOLCHAIN", toolchain);
+        command.env("CARGO_TERM_COLOR", "never");
         for name in [
             "CARGO_TARGET_DIR",
             "CARGO_BUILD_BUILD_DIR",

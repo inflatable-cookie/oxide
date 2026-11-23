@@ -2574,6 +2574,7 @@ mod tests {
             let output = cargo_1_100(checkout)
                 .args(["run", "-q"])
                 .env("CARGO_BUILD_BUILD_DIR", &slot)
+                .env("CARGO_TERM_COLOR", "never")
                 .output()
                 .expect("cargo run");
             assert!(
