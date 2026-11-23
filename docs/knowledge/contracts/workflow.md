@@ -939,7 +939,12 @@ Oxide's own repository is the only adopter that installs the binary.
     layout. The copy always lives on the internal pool's volume (`DIR`, or the
     pool's sibling `scratch/` by default), never on a registered removable
     volume's scratch directory, because an explicit internal pool on an external
-    volume is refused. The staged binary then runs status, a new-slot check (which
+    volume is refused. The copy carries an empty owner-only `payload/slots/`
+    directory (a payload with no `slots/` refuses as unknown accounting before
+    the copied ledger is read); the staged binary initializes the copy's own
+    Barge state under the copied `oxide-managed/` directory on first open and
+    reconciles the copied ledger there, so the live pool is never written. The
+    staged binary then runs status, a new-slot check (which
     performs the upgrade) and a warm rerun, all against the copy. It prints the
     control-state version before and after the upgrade and refuses if the upgraded
     version is not the staged one, if the live state is newer than the staged build,

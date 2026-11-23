@@ -865,10 +865,21 @@ def verify_live_documents(pool, before):
 
 
 def write_document_copy(root, documents):
-    """Write the copied documents into a scratch pool layout, owner-only."""
+    """Write the copied documents into a scratch pool layout, owner-only.
+
+    The copy always carries a budget-pool payload with an empty `slots/`
+    directory: without it the staged binary refuses the copy with
+    unknown_accounting before the copied ledger is even read, because a
+    payload with no slots is not valid accounting. The staged binary then
+    initializes the copy's own Barge state under the copied
+    `oxide-managed/` directory on first open and reconciles the copied
+    ledger (retiring the absent roots) into the copy alone; the live pool
+    is never written.
+    """
     copy = root / "pool"
     copy.mkdir(mode=0o700)
     (copy / "payload").mkdir(mode=0o700)
+    (copy / "payload" / "slots").mkdir(mode=0o700)
     if LIVE_CONTROL in documents:
         (copy / "oxide-managed").mkdir(mode=0o700)
     for name, (data, _) in documents.items():
