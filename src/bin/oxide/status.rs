@@ -670,7 +670,16 @@ fn slot_state_text(slot: &store::SlotView, pending_reconciliation: &[String]) ->
             format!("held by an interrupted {command} (oxide pid {holder}, {path})")
         }
         (SlotOccupancy::Held, None) => match &slot.holder {
-            Some(command) => format!("held by {command}"),
+            Some(command) => {
+                let permit = match slot.exec_permit {
+                    Some(store::ExecPermit::Yielded) => {
+                        " (slot custody only; no host build permit)"
+                    }
+                    Some(store::ExecPermit::Borrowed) => " (host build permit borrowed)",
+                    None => "",
+                };
+                format!("held by {command}{permit}")
+            }
             None => "held".to_owned(),
         },
         (SlotOccupancy::Idle, _) if slot.barge_held => {
@@ -943,6 +952,7 @@ mod tests {
             interrupted: None,
             retired: None,
             holder: None,
+            exec_permit: None,
             barge_held: false,
             size: store::SlotSize::NotMeasured("not measured".to_owned()),
         }

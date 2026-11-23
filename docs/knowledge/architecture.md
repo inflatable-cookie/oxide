@@ -39,9 +39,12 @@ reuse never counts as validation success.
 On macOS the [session broker](contracts/session-broker.md) lets nested commands
 use their parent's host permit. Each nested command holds its own exclusive
 slot. Host admission counts the parent's permit once while the nested command
-holds a private, locked permit marker beside its own record lock. A crashed
-joiner's marker unlocks, so its unsettled record counts conservatively until
-recovery. The control document is unchanged.
+holds a private, locked permit marker beside its own record lock. An idle
+`exec` keeps its record and slot locks and has no host permit. Its broker
+takes a separate permit lock through normal host admission and holds it while
+at least one nested build has a grant. A crashed holder's exemption marker
+unlocks, so its unsettled record counts conservatively until recovery. The
+control document is unchanged.
 
 Prepare only requested components lazily. No eager copying of all targets and
 no full-copy fallback. Evict idle slots only, within explicit budgets; occupied

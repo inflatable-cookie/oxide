@@ -46,7 +46,7 @@ oxide check --admission-budget 45s --execution-budget 300s
 oxide run --execution-budget 120s
 ```
 
-- `--admission-budget` covers everything before the build starts: setup, waiting for a slot and the freshness check. If it expires, nothing starts and Oxide exits with **124**.
+- `--admission-budget` covers everything before the build starts, including setup, slot and permit waits, and the freshness check. If it expires, nothing starts and Oxide exits with **124**.
 - `--execution-budget` starts when the build process is seen to start. It covers compilation, tests and cleanup. If it expires, Oxide stops the process group (TERM, a short grace period, then KILL) and exits with **125**.
 - A `run` keeps one window across the build and the program.
 - Durations are whole seconds or milliseconds, such as `30s` or `1500ms`. Minutes and hours are refused.
@@ -72,6 +72,7 @@ oxide exec --manifest-path crates/app/Cargo.toml -- ./scripts/package.sh
 - Final outputs go to `<workspace>/target`, or to the profile links in a converted checkout (see [configuration](configuration.md#owned-outputs)). `--output <member>` declares the complete set of output directories. If you leave it out, Oxide derives the set from the checkout's recorded output receipt.
 - A tool that passes its own `--target` needs a matching `--output <triple>/debug` or `--output <triple>/release`.
 - The tool leads its own process group. Oxide holds the slot until that group is empty. Ctrl-C and termination signals reach the whole group.
+- On macOS an independent `exec` yields its host build permit after the tool starts. Nested Oxide builds borrow one shared permit through the session, waiting if the host is at its limit. The last nested build returns it. Direct Cargo calls made by the tool do not participate in permit borrowing.
 - Exit codes: the tool's own code, or 128 plus the signal number. **127** means the command was not found and **126** means it could not start.
 
 `exec` is cooperative. A tool that sets its own build directory, changes its workspace or toolchain, or detaches with `setsid` escapes Oxide's custody, and Oxide makes no guarantee about it.
@@ -83,6 +84,7 @@ oxide exec --manifest-path crates/app/Cargo.toml -- ./scripts/package.sh
 ## `oxide status`
 
 - `oxide status` is read-only and fast. It reports the selected pool, slots and holders (including ledger-idle slots whose Barge hold is still held by another process, when observable), waiting commands, the last recorded size of each slot and its age, the config file in use and the effective host limit.
+- A yielded macOS `exec` shows as holding a slot without a host build permit. A session with active borrowers shows the borrowed permit.
 - `oxide status --measure` adds bounded walks of the pool, the slots, the checkout's stray output and the Cargo home, under one 60-second budget. It still writes nothing.
 - `oxide status --launch-check` (macOS) times the first launch of a new executable against a re-run. It runs under a 3-second limit and changes no setting.
 

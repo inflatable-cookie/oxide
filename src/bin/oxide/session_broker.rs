@@ -7,6 +7,7 @@ mod tests;
 mod wire;
 
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::ffi::{CString, OsStr};
 use std::fs::{self, File, Permissions};
 use std::io::{self, BufRead, BufReader, Read};
@@ -68,21 +69,78 @@ pub(super) enum PermitDenial {
     DeadlineExpired,
 }
 
-/// Supplies permit policy and owns actual permit custody. Both callbacks must
-/// return promptly. The broker calls them concurrently and drains them on drop.
+/// A grant owns its share of the permit until the connection ends.
+pub(super) type PermitGrant = Box<dyn Send>;
+
+/// The broker calls this concurrently. A pending borrow must observe the
+/// deadline and the connection, which is also how broker shutdown cancels it.
 pub(super) trait PermitController: Send + Sync + 'static {
-    fn try_borrow(&self, borrow_id: u64) -> Result<(), PermitDenial>;
-    fn release(&self, borrow_id: u64);
+    fn borrow(&self, id: u64, wait: &BorrowWait<'_>) -> Result<PermitGrant, PermitDenial>;
 }
 
 pub(super) struct DenyBorrowing;
 
 impl PermitController for DenyBorrowing {
-    fn try_borrow(&self, _: u64) -> Result<(), PermitDenial> {
+    fn borrow(&self, _: u64, _: &BorrowWait<'_>) -> Result<PermitGrant, PermitDenial> {
         Err(PermitDenial::Unavailable)
     }
+}
 
-    fn release(&self, _: u64) {}
+const BORROW_POLL: Duration = Duration::from_millis(50);
+
+pub(super) struct BorrowWait<'a> {
+    peer: &'a UnixStream,
+    deadline: Option<Instant>,
+}
+
+impl BorrowWait<'_> {
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    pub(super) fn check(&self) -> Result<(), PermitDenial> {
+        self.check_after(Duration::ZERO)
+    }
+
+    pub(super) fn wait(&self) -> Result<(), PermitDenial> {
+        self.check_after(BORROW_POLL)
+    }
+
+    fn check_after(&self, limit: Duration) -> Result<(), PermitDenial> {
+        if socket_ready(self.peer, time_left(self.deadline, limit))
+            .map_err(|_| PermitDenial::Unavailable)?
+        {
+            return Err(PermitDenial::Unavailable);
+        }
+        if remaining_ms(self.deadline) == Some(0) {
+            return Err(PermitDenial::DeadlineExpired);
+        }
+        Ok(())
+    }
+}
+
+fn time_left(deadline: Option<Instant>, limit: Duration) -> Duration {
+    deadline.map_or(limit, |at| {
+        limit.min(at.saturating_duration_since(Instant::now()))
+    })
+}
+
+fn socket_ready(socket: &UnixStream, limit: Duration) -> io::Result<bool> {
+    let mut poll = libc::pollfd {
+        fd: socket.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout = i32::try_from(limit.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: one valid pollfd and a bounded, nonnegative timeout.
+    let ready = unsafe { libc::poll(&mut poll, 1, timeout) };
+    if ready < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok(ready > 0)
 }
 
 struct SocketDirectory {
@@ -228,10 +286,19 @@ impl SessionBroker {
         if !cfg!(target_os = "macos") {
             return Ok(None);
         }
-        let broker = Self::bind(root, PermitMode::Inherited, DenyBorrowing)
+        Self::for_permits(root, command, PermitMode::Inherited, DenyBorrowing).map(Some)
+    }
+
+    pub(super) fn for_permits(
+        root: &Path,
+        command: &mut Command,
+        mode: PermitMode,
+        permits: impl PermitController,
+    ) -> Result<Self, String> {
+        let broker = Self::bind(root, mode, permits)
             .map_err(|error| format!("cannot start the Oxide session broker: {error}"))?;
         broker.apply(command);
-        Ok(Some(broker))
+        Ok(broker)
     }
 
     /// Bind inside a caller-selected temporary directory with trusted ancestors.
@@ -390,17 +457,6 @@ impl Drop for Member<'_> {
     }
 }
 
-struct Borrowed<'a> {
-    controller: &'a dyn PermitController,
-    id: u64,
-}
-
-impl Drop for Borrowed<'_> {
-    fn drop(&mut self) {
-        self.controller.release(self.id);
-    }
-}
-
 fn serve(
     stream: UnixStream,
     session: &Session,
@@ -427,6 +483,7 @@ fn serve_request(
     let stream = *reader.get_ref();
     check_peer(stream)?;
     stream.set_read_timeout(Some(AUTH_READ_TIMEOUT))?;
+    let received_at = Instant::now();
     let Some(request) = wire::read::<Request>(reader)? else {
         return Ok(());
     };
@@ -453,8 +510,20 @@ fn serve_request(
                 _ => Err(wire::invalid("unexpected session member request")),
             }
         }
-        Request::BorrowPermit { token } if tokens_match(&session.token, &token) => {
-            serve_borrow(reader, session.permits.as_ref(), id, deadline)
+        Request::BorrowPermit {
+            token,
+            admission_ms,
+        } if tokens_match(&session.token, &token) => {
+            let admission = reported_deadline(received_at, admission_ms)?;
+            let wait = BorrowWait {
+                peer: stream,
+                deadline: admission.into_iter().chain(deadline).min(),
+            };
+            if reader.buffer().is_empty() {
+                serve_borrow(reader, session.permits.as_ref(), id, deadline, &wait)
+            } else {
+                Err(wire::invalid("unexpected data after the permit request"))
+            }
         }
         _ => Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -468,39 +537,31 @@ fn serve_borrow(
     permits: &dyn PermitController,
     id: u64,
     deadline: Option<Instant>,
+    wait: &BorrowWait<'_>,
 ) -> io::Result<()> {
     let mut stream = *reader.get_ref();
-    if remaining_ms(deadline) == Some(0) {
-        return wire::write(
-            &mut stream,
-            Response::PermitDenied {
-                reason: PermitDenial::DeadlineExpired,
-            },
-        );
-    }
-    if let Err(reason) = permits.try_borrow(id) {
-        return wire::write(&mut stream, Response::PermitDenied { reason });
-    }
-
-    let borrow = Borrowed {
-        controller: permits,
-        id,
+    let _grant = match wait
+        .check()
+        .and_then(|()| permits.borrow(id, wait))
+        .and_then(|grant| {
+            wait.check()?;
+            Ok(grant)
+        }) {
+        Ok(grant) => grant,
+        Err(reason) => {
+            if socket_ready(stream, Duration::ZERO)? {
+                return Err(wire::invalid(
+                    "permit borrower disconnected or sent unexpected data",
+                ));
+            }
+            return wire::write(&mut stream, Response::PermitDenied { reason });
+        }
     };
-    let remaining_execution_ms = remaining_ms(deadline);
-    if remaining_execution_ms == Some(0) {
-        drop(borrow);
-        return wire::write(
-            &mut stream,
-            Response::PermitDenied {
-                reason: PermitDenial::DeadlineExpired,
-            },
-        );
-    }
     wire::write(
         &mut stream,
         Response::PermitGranted(PermitGranted {
             borrow_id: id,
-            remaining_execution_ms,
+            remaining_execution_ms: remaining_ms(deadline),
         }),
     )?;
     if !reader.fill_buf()?.is_empty() {
@@ -516,10 +577,6 @@ pub(super) struct SessionClient {
     member_id: Option<u64>,
 }
 
-#[allow(
-    dead_code,
-    reason = "idle exec borrowing uses this client in the next slice"
-)]
 #[derive(Debug)]
 pub(super) enum BorrowOutcome {
     Granted {
@@ -531,22 +588,29 @@ pub(super) enum BorrowOutcome {
     },
 }
 
+fn reported_deadline(sent: Instant, remaining_ms: Option<u64>) -> io::Result<Option<Instant>> {
+    remaining_ms
+        .map(|ms| {
+            sent.checked_add(Duration::from_millis(ms))
+                .ok_or_else(|| wire::invalid("invalid outer Oxide deadline"))
+        })
+        .transpose()
+}
+
 impl SessionClient {
     fn live(reader: BufReader<UnixStream>, member_id: Option<u64>) -> io::Result<Self> {
         reader.get_ref().set_read_timeout(None)?;
         Ok(Self { reader, member_id })
     }
 
-    fn open(path: &Path, request: Request) -> io::Result<(BufReader<UnixStream>, Response)> {
+    fn open(path: &Path, request: Request) -> io::Result<BufReader<UnixStream>> {
         check_socket_path(path)?;
         let mut stream = UnixStream::connect(path)?;
         check_peer(&stream)?;
         stream.set_read_timeout(Some(AUTH_READ_TIMEOUT))?;
         stream.set_write_timeout(Some(AUTH_READ_TIMEOUT))?;
         wire::write(&mut stream, request)?;
-        let mut reader = BufReader::new(stream);
-        let reply = Self::read_response(&mut reader)?;
-        Ok((reader, reply))
+        Ok(BufReader::new(stream))
     }
 
     fn read_response(reader: &mut BufReader<UnixStream>) -> io::Result<Response> {
@@ -560,13 +624,13 @@ impl SessionClient {
 
     /// Join using the endpoint inherited from the parent.
     pub(super) fn join(path: &Path, token: &str) -> io::Result<(Self, Joined)> {
-        let (reader, reply) = Self::open(
+        let mut reader = Self::open(
             path,
             Request::Join {
                 token: token.into(),
             },
         )?;
-        let Response::Joined(joined) = reply else {
+        let Response::Joined(joined) = Self::read_response(&mut reader)? else {
             return Err(wire::invalid("expected a session join response"));
         };
         let client = Self::live(reader, Some(joined.member_id))?;
@@ -574,18 +638,32 @@ impl SessionClient {
     }
 
     /// Request a permit on a separate, connection-scoped grant.
-    #[allow(
-        dead_code,
-        reason = "idle exec borrowing uses this client in the next slice"
-    )]
-    pub(super) fn borrow_permit(path: &Path, token: &str) -> io::Result<BorrowOutcome> {
-        let (reader, reply) = Self::open(
+    fn borrow_permit(
+        path: &Path,
+        token: &str,
+        deadline: Option<Instant>,
+        mut check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<BorrowOutcome> {
+        let mut reader = Self::open(
             path,
             Request::BorrowPermit {
                 token: token.into(),
+                admission_ms: remaining_ms(deadline),
             },
         )?;
-        match reply {
+        loop {
+            check()?;
+            if remaining_ms(deadline) == Some(0) {
+                return Ok(BorrowOutcome::Denied {
+                    reason: PermitDenial::DeadlineExpired,
+                });
+            }
+            if socket_ready(reader.get_ref(), time_left(deadline, BORROW_POLL))? {
+                check()?;
+                break;
+            }
+        }
+        match Self::read_response(&mut reader)? {
             Response::PermitGranted(permit) => Ok(BorrowOutcome::Granted {
                 client: Self::live(reader, None)?,
                 permit,
@@ -613,21 +691,55 @@ impl SessionClient {
     }
 
     /// Wait for EOF from the parent. Any read error also invalidates the grant.
-    #[allow(
-        dead_code,
-        reason = "idle exec borrowing uses this client in the next slice"
-    )]
+    #[cfg(all(test, target_os = "macos"))]
     pub(super) fn wait_for_end(mut self) -> io::Result<()> {
         if !self.reader.fill_buf()?.is_empty() {
             return Err(wire::invalid("unexpected session broker message"));
         }
         Ok(())
     }
+
+    fn check_live(&self) -> io::Result<()> {
+        if self.reader.buffer().is_empty() && !socket_ready(self.reader.get_ref(), Duration::ZERO)?
+        {
+            Ok(())
+        } else {
+            Err(wire::invalid("socket closed or sent unexpected data"))
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct PermitRelay {
+    path: PathBuf,
+    token: String,
+}
+
+impl PermitController for PermitRelay {
+    fn borrow(&self, _: u64, wait: &BorrowWait<'_>) -> Result<PermitGrant, PermitDenial> {
+        let response = SessionClient::borrow_permit(&self.path, &self.token, wait.deadline, || {
+            wait.check()
+                .map_err(|_| io::Error::from(io::ErrorKind::Interrupted))
+        });
+        wait.check()?;
+        match response.map_err(|_| PermitDenial::Unavailable)? {
+            BorrowOutcome::Granted { client, .. } => Ok(Box::new(client)),
+            BorrowOutcome::Denied { reason } => Err(reason),
+        }
+    }
+}
+
+pub(super) enum BorrowStop {
+    Admission,
+    Signal(i32),
+    Failed(String),
 }
 
 /// A command's authenticated membership and conservative local deadline.
 pub(super) struct JoinedSession {
     client: SessionClient,
+    relay: Option<PermitRelay>,
+    permit: RefCell<Option<SessionClient>>,
     pub(super) deadline: Option<Instant>,
 }
 
@@ -664,38 +776,84 @@ impl JoinedSession {
         let sent = Instant::now();
         let (client, joined) = SessionClient::join(path, token)
             .map_err(|error| format!("cannot join the outer Oxide session: {error}"))?;
-        if joined.permit_mode != PermitMode::Inherited {
-            return Err("the outer Oxide session requires a separate permit grant".to_owned());
-        }
-        let deadline = joined
-            .remaining_execution_ms
-            .map(|ms| {
-                sent.checked_add(Duration::from_millis(ms))
-                    .ok_or("invalid outer Oxide execution deadline")
-            })
-            .transpose()?;
-        Ok(Some(Self { client, deadline }))
+        let deadline = reported_deadline(sent, joined.remaining_execution_ms)
+            .map_err(|error| error.to_string())?;
+        let relay = (joined.permit_mode == PermitMode::BorrowRequired).then(|| PermitRelay {
+            path: path.into(),
+            token: token.into(),
+        });
+        Ok(Some(Self {
+            client,
+            relay,
+            permit: RefCell::new(None),
+            deadline,
+        }))
     }
 
-    /// An idle joined socket has no pending data until this process releases it.
-    pub(super) fn check_live(&self) -> Result<(), String> {
-        let mut socket = libc::pollfd {
-            fd: self.client.reader.get_ref().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
+    pub(super) fn relay(&self) -> Option<PermitRelay> {
+        self.relay.clone()
+    }
+
+    pub(super) fn borrow(&self) -> Result<(), BorrowStop> {
+        let Some(relay) = &self.relay else {
+            return Ok(());
         };
-        // SAFETY: one valid pollfd, with a zero timeout to avoid blocking.
-        let ready = unsafe { libc::poll(&mut socket, 1, 0) };
-        let idle = ready == 0
-            || (ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted);
-        if idle && self.client.reader.buffer().is_empty() {
-            Ok(())
-        } else {
-            Err("the outer Oxide session closed or sent unexpected data".to_owned())
+        let response = SessionClient::borrow_permit(
+            &relay.path,
+            &relay.token,
+            crate::budget::admission_deadline(),
+            || {
+                self.client.check_live()?;
+                if crate::process::received_signal().is_some() {
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                Ok(())
+            },
+        );
+        if crate::budget::admission_expired() {
+            return Err(BorrowStop::Admission);
         }
+        if let Some(signal) = crate::process::received_signal() {
+            return Err(BorrowStop::Signal(signal));
+        }
+        match response {
+            Ok(BorrowOutcome::Granted { client, permit }) => {
+                // The Join anchored this same outer clock, before the wait.
+                // A grant never starts a fresh clock.
+                if permit.remaining_execution_ms == Some(0) || crate::budget::admission_expired() {
+                    return Err(BorrowStop::Admission);
+                }
+                *self.permit.borrow_mut() = Some(client);
+                Ok(())
+            }
+            Ok(BorrowOutcome::Denied {
+                reason: PermitDenial::DeadlineExpired,
+            }) => Err(BorrowStop::Admission),
+            Ok(BorrowOutcome::Denied { reason }) => Err(BorrowStop::Failed(format!(
+                "the outer Oxide session denied the build permit ({reason:?})"
+            ))),
+            Err(error) => Err(BorrowStop::Failed(format!(
+                "cannot borrow an Oxide build permit: {error}"
+            ))),
+        }
+    }
+
+    pub(super) fn return_permit(&self) {
+        self.permit.borrow_mut().take();
+    }
+
+    pub(super) fn check_live(&self) -> Result<(), String> {
+        let check = self.client.check_live().and_then(|()| {
+            self.permit
+                .borrow()
+                .as_ref()
+                .map_or(Ok(()), SessionClient::check_live)
+        });
+        check.map_err(|error| format!("the outer Oxide session: {error}"))
     }
 
     pub(super) fn release(self) -> io::Result<()> {
+        self.return_permit();
         self.client.release()
     }
 }

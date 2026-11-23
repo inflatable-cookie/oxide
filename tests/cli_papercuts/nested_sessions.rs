@@ -9,7 +9,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -62,6 +62,205 @@ impl Fixture {
         );
         assert_eq!(state["tickets"].as_array().unwrap().len(), 0);
     }
+}
+
+impl Fixture {
+    fn install_blocking_cargo(&self) -> PathBuf {
+        let other = self.scratch.path().join("other");
+        fs::create_dir(&other).unwrap();
+        fs::copy(self.checkout.join("Cargo.toml"), other.join("Cargo.toml")).unwrap();
+        fs::write(
+            self.bin.join("cargo"),
+            r#"#!/bin/sh
+            case "$1" in
+              locate-project) echo "$PWD/Cargo.toml" ;;
+              check)
+                if [ "${CRASH_BUILD:-}" = 1 ]; then
+                    kill -KILL "$PPID"
+                elif [ -n "${BUILD_GATE:-}" ]; then
+                    touch "$BUILD_GATE.ready"
+                    while [ ! -f "$BUILD_GATE.done" ]; do sleep 0.02; done
+                fi
+                ;;
+            esac
+            "#,
+        )
+        .unwrap();
+        other
+    }
+
+    fn status(&self) -> String {
+        let output = self.command().arg("status").output().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn wait_for(&self, name: &str) {
+        eventually(|| self.scratch.path().join(name).exists(), name);
+    }
+
+    fn signal(&self, name: &str) {
+        fs::write(self.scratch.path().join(name), "").unwrap();
+    }
+}
+
+fn eventually(mut predicate: impl FnMut() -> bool, description: &str) {
+    let until = Instant::now() + Duration::from_secs(12);
+    while !predicate() {
+        assert!(
+            Instant::now() < until,
+            "timed out waiting for {description}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn idle_exec_yields_and_concurrent_nested_builds_share_one_permit() {
+    let fixture = Fixture::new();
+    let other = fixture.install_blocking_cargo();
+    let mut outer = fixture
+        .command()
+        .env("GATES", fixture.scratch.path())
+        .args([
+            "exec",
+            "--execution-budget",
+            "45s",
+            "--",
+            "/bin/sh",
+            "-ec",
+            r#"
+            touch "$GATES/outer.ready"
+            while [ ! -f "$GATES/outer.build" ]; do sleep 0.02; done
+            if "$1" check --admission-budget 500ms; then exit 99; else
+                test "$?" -eq 124
+            fi
+            touch "$GATES/deadline.done"
+            BUILD_GATE="$GATES/first" "$1" check --admission-budget 25s &
+            first=$!
+            while [ ! -f "$GATES/second.build" ]; do sleep 0.02; done
+            BUILD_GATE="$GATES/second" "$1" exec -- "$1" check --admission-budget 15s &
+            second=$!
+            wait "$first"
+            touch "$GATES/first.returned"
+            wait "$second"
+            touch "$GATES/second.returned"
+            while [ ! -f "$GATES/outer.done" ]; do sleep 0.02; done
+            "#,
+            "outer",
+            OXIDE,
+        ])
+        .spawn()
+        .unwrap();
+    let idle = "held by exec /bin/sh (slot custody only; no host build permit)";
+    let borrowed = "held by exec /bin/sh (host build permit borrowed)";
+    fixture.wait_for("outer.ready");
+    eventually(|| fixture.status().contains(idle), "the yielded exec slot");
+
+    let mut unrelated = fixture
+        .command()
+        .current_dir(&other)
+        .env("BUILD_GATE", fixture.scratch.path().join("other"))
+        .args([
+            "check",
+            "--admission-budget",
+            "8s",
+            "--execution-budget",
+            "30s",
+        ])
+        .spawn()
+        .unwrap();
+    fixture.wait_for("other.ready");
+    fixture.signal("outer.build");
+    fixture.wait_for("deadline.done");
+    let waiter = format!("recorded lease-ticket waiter PID {}", outer.id());
+    eventually(
+        || fixture.status().contains(&waiter),
+        "the exec permit ticket",
+    );
+    assert!(!fixture.scratch.path().join("first.ready").exists());
+    assert!(fixture.status().contains(idle));
+
+    fixture.signal("other.done");
+    assert!(unrelated.wait().unwrap().success());
+    fixture.wait_for("first.ready");
+    assert!(fixture.status().contains(borrowed));
+    fixture.signal("second.build");
+    fixture.wait_for("second.ready");
+    fixture.signal("first.done");
+    fixture.wait_for("first.returned");
+    assert!(fixture.status().contains(borrowed));
+    let blocked = fixture
+        .command()
+        .current_dir(&other)
+        .args(["check", "--admission-budget", "750ms"])
+        .output()
+        .unwrap();
+    assert_eq!(blocked.status.code(), Some(124), "{}", stderr(&blocked));
+
+    fixture.signal("second.done");
+    fixture.wait_for("second.returned");
+    eventually(
+        || fixture.status().contains(idle),
+        "the returned build permit",
+    );
+    let admitted = fixture
+        .command()
+        .current_dir(&other)
+        .args(["check", "--admission-budget", "5s"])
+        .output()
+        .unwrap();
+    assert!(admitted.status.success(), "{}", stderr(&admitted));
+    fixture.signal("outer.done");
+    assert!(outer.wait().unwrap().success());
+    fixture.assert_idle_slots(5);
+}
+
+#[test]
+fn a_crashed_nested_build_returns_its_borrow_while_exec_keeps_the_slot() {
+    let fixture = Fixture::new();
+    let other = fixture.install_blocking_cargo();
+    let mut outer = fixture
+        .command()
+        .env("GATES", fixture.scratch.path())
+        .args([
+            "exec",
+            "--execution-budget",
+            "25s",
+            "--",
+            "/bin/sh",
+            "-ec",
+            r#"
+            if CRASH_BUILD=1 "$1" check --admission-budget 10s; then exit 99; else
+                test "$?" -eq 137
+            fi
+            touch "$GATES/crash.done"
+            while [ ! -f "$GATES/outer.done" ]; do sleep 0.02; done
+            "#,
+            "outer",
+            OXIDE,
+        ])
+        .spawn()
+        .unwrap();
+    fixture.wait_for("crash.done");
+    eventually(
+        || {
+            fixture
+                .status()
+                .contains("held by exec /bin/sh (slot custody only; no host build permit)")
+        },
+        "the crashed child's returned build permit",
+    );
+    let admitted = fixture
+        .command()
+        .current_dir(&other)
+        .args(["check", "--admission-budget", "5s"])
+        .output()
+        .unwrap();
+    assert!(admitted.status.success(), "{}", stderr(&admitted));
+    fixture.signal("outer.done");
+    assert!(outer.wait().unwrap().success());
+    fixture.assert_idle_slots(3);
 }
 
 fn stderr(output: &Output) -> String {

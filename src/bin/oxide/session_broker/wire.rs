@@ -17,9 +17,17 @@ struct Frame<T> {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Request {
-    Join { token: String },
-    BorrowPermit { token: String },
-    Release { member_id: u64 },
+    Join {
+        token: String,
+    },
+    BorrowPermit {
+        token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admission_ms: Option<u64>,
+    },
+    Release {
+        member_id: u64,
+    },
 }
 
 #[derive(Deserialize, Serialize)]

@@ -1,10 +1,10 @@
 # Session broker
 
 On macOS, a leased command hosts a session broker for nested Oxide commands.
-Each joined command takes its own exclusive slot under the outer command's
-host permit. Idle `oxide exec` permit borrowing is a protocol capability for a
-later slice. See [architecture](../architecture.md) for ownership and
-[workflow](workflow.md) for the command budgets.
+Each joined command takes its own exclusive slot. A build can inherit an
+active outer permit or borrow one through an `oxide exec` session. See
+[architecture](../architecture.md) for ownership and [workflow](workflow.md)
+for the command budgets.
 
 ## Endpoint and authentication
 
@@ -52,16 +52,24 @@ A policy refusal of an authenticated permit request returns `permit_denied`.
 | Request body | Response body | Lifetime |
 | --- | --- | --- |
 | `join { token }` | `joined { session_id, member_id, remaining_execution_ms, permit_mode }` | The socket owns the membership. `permit_mode` is `inherited` or `borrow_required`. |
-| `borrow_permit { token }` | `permit_granted { borrow_id, remaining_execution_ms }` or `permit_denied { reason }` | A separate socket owns the borrowed permit. Denial reasons are `unavailable`, `busy` and `deadline_expired`. |
+| `borrow_permit { token, admission_ms? }` | `permit_granted { borrow_id, remaining_execution_ms }` or `permit_denied { reason }` | A separate socket owns the borrowed permit until close. Denial reasons are `unavailable`, `busy` and `deadline_expired`. |
 | `release { member_id }` | `released` | Releases the member on its original joined socket, then closes that socket. |
 
 The session ID is an opaque string. Member and borrow IDs are unsigned integers
 scoped to that session. A join with `inherited` uses the outer permit.
-`borrow_required` tells the member to obtain a separate grant before using a
-permit. The parent's permit controller grants or denies a borrow and receives
-its return when the grant ends. The current command path grants inherited
-membership and denies borrow requests. A command refuses `borrow_required`
-until borrowing is available.
+`borrow_required` tells a nested build to obtain a separate grant after it
+gets a slot and before it binds outputs or starts Cargo. A nested `exec` can
+start its tool without borrowing and relays its descendants' requests
+upstream. An `exec` that inherits an already-active build permit passes that
+permit through to its children.
+
+An independent `exec` yields its startup permit after it records the tool's
+process group. Its first pending borrow competes in the pool's normal host
+admission queue, skipping waiters blocked on checkout or slot custody. The
+broker shares the same permit across concurrent grants and returns it when
+the last grant closes. Plain Cargo launched by a tool still uses the tool's
+slot under the cooperative storage contract. It does not request a host
+permit because Oxide does not intercept it.
 
 The broker starts accepting handshakes once the parent publishes the outer
 execution deadline, or explicitly marks execution unbounded. The deadline is
@@ -71,13 +79,19 @@ meaning no usable time remains and JSON `null` meaning unbounded. Nested
 admission and execution each use the tighter of their own budget and the
 remaining outer window. The client anchors the reported interval before the
 handshake, then retains that absolute cap through admission and execution.
-Zero refuses before pool or slot admission with exit 124. The outer
-process-group kill remains the hard backstop.
+The optional `admission_ms` in a borrow request carries the caller's
+remaining admission budget. The broker also caps its wait to its execution
+deadline. The client cancels by closing the pending socket at its own
+deadline or on interruption. A permit grant does not restart either budget.
+A zero join window refuses before pool or slot admission with exit 124.
+Expiry while waiting for a permit also exits 124 without starting Cargo.
+The outer process-group kill remains the hard backstop.
 
 ## Close and crash
 
 EOF or a socket failure releases the connection's member or borrowed permit
-automatically. Connection cleanup gives no authority to release a storage hold
+automatically. A disconnected pending request also stops competing for a
+permit. Connection cleanup gives no authority to release a storage hold
 or assume a process group has stopped writing. On normal shutdown the broker
 stops accepting, shuts down all client sockets, drains connection cleanup, and
 removes the socket and its private directory. An already-connected child
