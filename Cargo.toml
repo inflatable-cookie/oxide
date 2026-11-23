@@ -19,7 +19,7 @@ readme = "README.md"
 # Oxide keeps its Cargo front door, slots, leases, recipes, output member links
 # and seeding. Its own dependencies (serde, serde_json, libc) are already pinned
 # here.
-barge = { git = "https://github.com/inflatable-cookie/barge", rev = "04e52d8742e8f56c8a0e634834700e18500d9d8d" }
+barge = { git = "https://github.com/inflatable-cookie/barge", rev = "f3f7b6333168aed51af786a96ba5d17ef8d4e462" }
 basic-toml = "=0.1.10"
 # Cold-slot seeding source verification (oxide#166): a pinned archive reader
 # for registry `.crate` files. `flate2` uses its pure-Rust backend and `tar` is
@@ -36,7 +36,7 @@ sha2 = "=0.11.0"
 tar = { version = "=0.4.46", default-features = false }
 
 [dev-dependencies]
-barge = { git = "https://github.com/inflatable-cookie/barge", rev = "04e52d8742e8f56c8a0e634834700e18500d9d8d", features = ["testing"] }
+barge = { git = "https://github.com/inflatable-cookie/barge", rev = "f3f7b6333168aed51af786a96ba5d17ef8d4e462", features = ["testing"] }
 
 [[bin]]
 name = "oxide"
