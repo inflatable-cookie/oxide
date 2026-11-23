@@ -418,7 +418,7 @@ else:
     with open(CONFIG["log"], "a") as log:
         print(json.dumps([args[0], os.getcwd(), pool]), file=log)
     if args == ["pool", "describe", "--json"]:
-        print(json.dumps({"schema": "oxide.pool.describe/1", "selected": "internal",
+        print(json.dumps(CONFIG.get("describe") or {"schema": "oxide.pool.describe/1", "selected": "internal",
                           "internal": {"pool": LIVE}, "removable": None}))
     elif args[0] == "check":
         assert args[-1] == "--offline" and Path("target").is_dir()
@@ -491,14 +491,15 @@ class CanaryTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def fake_build(self, cold_ms=12_200, warm_ms=200, queue_ns=12_000_000_000, mode="live",
-                   mutate_live=False, **capabilities):
+                   mutate_live=False, describe=None, **capabilities):
         probe = {**self.CAPABILITIES, **capabilities, "test_controls": False}
 
         def build(pin, instance, staging):
             built = staging / "oxide"
             config = dict(probe=probe, pin=pin, instance=instance, mode=mode, live=str(self.pool),
                           scratch=str(self.scratch), log=str(self.log), cold_ms=cold_ms,
-                          warm_ms=warm_ms, queue_ns=queue_ns, mutate_live=mutate_live)
+                          warm_ms=warm_ms, queue_ns=queue_ns, mutate_live=mutate_live,
+                          describe=describe)
             built.write_text(FAKE_OXIDE.replace("__PYTHON__", sys.executable)
                              .replace("__CONFIG__", repr(json.dumps(config))))
             built.chmod(0o700)
@@ -633,6 +634,34 @@ class CanaryTests(unittest.TestCase):
         status, _, stderr, builder = self.invoke(["--replace", "--check", "--require-canary"], None)
         self.assertEqual(status, 0, stderr)
         builder.assert_not_called()
+
+    def test_format_change_uses_internal_scratch_when_a_removable_pool_is_registered(self):
+        self.write_live_state(10)
+        removable_scratch = self.root / "removable-scratch"
+        removable_scratch.mkdir()
+        describe = {
+            "schema": "oxide.pool.describe/1",
+            "selected": "removable",
+            "internal": {"pool": str(self.pool)},
+            "removable": {
+                "available": True,
+                "mount_point": str(self.root / "removable-mount"),
+                "payload": str(self.root / "removable-mount" / "payload"),
+                "suggested_scratch_root": str(removable_scratch),
+                "unavailable_reason": None,
+            },
+        }
+        build = lambda: self.fake_build(mode="format", control_state_version=11, describe=describe)
+        for flags in (["--canary", "--format-change"],
+                       ["--canary", "--format-change", "--scratch-root", str(self.scratch)]):
+            with self.subTest(flags=flags):
+                status, stdout, stderr, _ = self.invoke(flags, build())
+                self.assertEqual(status, 0, stderr)
+                self.assertIn("oxide:canary PASS for " + self.PIN + " (format-change)", stdout)
+                self.assertIn("format-change: control state 10 -> 11 (staged 11)", stdout)
+                self.assertEqual(list(self.scratch.iterdir()), [self.scratch / "unrelated"])
+                self.assertEqual(list(removable_scratch.iterdir()), [])
+        self.assertFalse((self.pool / "slot-9").exists())
 
     def test_format_change_without_a_control_state_still_passes(self):
         status, stdout, stderr, _ = self.invoke(
@@ -1042,6 +1071,48 @@ class DocumentAndScratchTests(unittest.TestCase):
         other = scratch.stat().st_dev + 1
         with self.assertRaisesRegex(installer.Refusal, "volume"):
             installer.verify_scratch_dir(scratch, other)
+
+    def test_format_canary_scratch_ignores_a_registered_removable_volume(self):
+        self.write_live_pool()
+        scratch = self.scratch()
+        description = {
+            "schema": "oxide.pool.describe/1",
+            "selected": "removable",
+            "internal": {"pool": str(self.pool)},
+            "removable": {
+                "available": True,
+                "mount_point": str(self.root / "mount"),
+                "payload": str(self.root / "mount" / "payload"),
+                "suggested_scratch_root": str(self.root / "mount" / "scratch"),
+                "unavailable_reason": None,
+            },
+        }
+        with mock.patch.object(installer, "verify_scratch_dir", return_value="identity") as check:
+            pool, selected, identity = installer.format_canary_scratch(description, None)
+            self.assertEqual(pool, self.root / "pool")
+            self.assertEqual(selected, scratch)
+            check.assert_called_once_with(scratch, os.stat(self.pool).st_dev)
+            self.assertEqual(identity, "identity")
+
+    def test_format_canary_scratch_honors_an_explicit_scratch_root(self):
+        self.write_live_pool()
+        scratch = self.scratch()
+        description = {
+            "schema": "oxide.pool.describe/1",
+            "selected": "removable",
+            "internal": {"pool": str(self.pool)},
+            "removable": {
+                "available": True,
+                "mount_point": str(self.root / "mount"),
+                "payload": str(self.root / "mount" / "payload"),
+                "suggested_scratch_root": str(self.root / "mount" / "scratch"),
+                "unavailable_reason": None,
+            },
+        }
+        with mock.patch.object(installer, "verify_scratch_dir", return_value="identity") as check:
+            _, selected, _ = installer.format_canary_scratch(description, scratch)
+            self.assertEqual(selected, scratch)
+            check.assert_called_once_with(scratch, os.stat(self.pool).st_dev)
 
     def test_git_is_bounded_in_time(self):
         expired = subprocess.TimeoutExpired(["git"], installer.GIT_SECONDS)
