@@ -108,6 +108,13 @@ pub(crate) enum Chosen {
 }
 
 impl Chosen {
+    pub(super) fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Inherited(path) => path,
+            Self::Oxide(owned) => &owned.path,
+        }
+    }
+
     /// The bounded, escaped summary and status fragment.
     pub(crate) fn note(&self) -> String {
         match self {
@@ -134,10 +141,7 @@ impl Chosen {
     /// `TEMP` all name the chosen directory, so a conflicting alias never
     /// survives to the child.
     pub(crate) fn apply(&self, command: &mut std::process::Command) {
-        let value: &OsStr = match self {
-            Self::Inherited(path) => path.as_os_str(),
-            Self::Oxide(owned) => owned.path.as_os_str(),
-        };
+        let value = self.path();
         for name in VARIABLES {
             command.env(name, value);
         }

@@ -1461,7 +1461,7 @@ mod tests {
     fn acquire_slot(store: &Store, key: &SlotKey) -> Lease {
         let mut waits = WaitAccounting::default();
         match store
-            .acquire(key, Profile::Quick, false, None, &mut waits)
+            .acquire(key, Profile::Quick, false, None, &mut waits, None)
             .expect("acquire")
         {
             Acquired::Lease(lease) => lease,

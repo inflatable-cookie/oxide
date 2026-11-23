@@ -294,6 +294,7 @@ struct State {
     invocation: String,
     options: Options,
     admission: Option<Admission>,
+    outer_deadline: Option<Instant>,
     execution: Option<LiveExecution>,
     /// Latched controlled-stop origin; set once, never re-armed.
     origin: Option<Origin>,
@@ -336,6 +337,7 @@ pub fn install(options: Options) -> Result<(), String> {
             invocation: format!("{}-{}", std::process::id(), crate::process::started_ms()),
             options,
             admission,
+            outer_deadline: None,
             execution: None,
             origin: None,
             late: false,
@@ -349,9 +351,33 @@ pub fn install(options: Options) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether an execution window was requested. Only this makes a `run` bounded.
+/// Inherit an absolute deadline without re-arming the admission clock.
+pub(super) fn cap_to_outer(deadline: Instant) -> Result<(), String> {
+    if with(|state| state.is_none()) {
+        install(Options::default())?;
+    }
+    with(|state| {
+        let state = state.expect("budget state was installed");
+        let expires = state
+            .admission
+            .as_ref()
+            .map_or(deadline, |entry| entry.expires.min(deadline));
+        let limit = expires.saturating_duration_since(state.started);
+        state.options.admission = Some(limit);
+        state.admission = Some(Admission { expires, limit });
+        state.outer_deadline = Some(deadline);
+        oxide_storage::lease::set_admission_deadline(Some(expires));
+    });
+    Ok(())
+}
+
+/// Whether a local or inherited execution window makes a `run` bounded.
 pub fn has_execution() -> bool {
-    with(|state| state.is_some_and(|state| state.options.execution.is_some()))
+    with(|state| {
+        state.is_some_and(|state| {
+            state.options.execution.is_some() || state.outer_deadline.is_some()
+        })
+    })
 }
 
 pub(crate) fn has_events() -> bool {
@@ -408,15 +434,19 @@ pub fn arm_execution(started: Instant, phase: Phase) {
             .as_ref()
             .is_some_and(|admission| started >= admission.expires);
         state.late = late;
-        let stop = match state.options.execution {
-            Some(limit) => Some(if late {
-                Instant::now()
-            } else {
-                started + limit
-            }),
-            // A late start with no execution axis is still a stop: the
-            // admission window had already closed.
-            None => late.then(Instant::now),
+        let remaining = state
+            .outer_deadline
+            .map(|deadline| deadline.saturating_duration_since(started));
+        state.options.execution = match (state.options.execution, remaining) {
+            (Some(local), Some(outer)) => Some(local.min(outer)),
+            (local, outer) => local.or(outer),
+        };
+        // A late start with no execution axis is still a stop: the admission
+        // window had already closed.
+        let stop = if late {
+            Some(Instant::now())
+        } else {
+            state.options.execution.map(|limit| started + limit)
         };
         state.execution = Some(LiveExecution { started, stop });
         if late {
@@ -441,6 +471,11 @@ pub fn arm_execution(started: Instant, phase: Phase) {
             overshoot,
         );
     });
+}
+
+/// The absolute deadline published to a broker after the primary child starts.
+pub(super) fn execution_deadline() -> Option<Instant> {
+    with(|state| state.and_then(|state| state.execution.as_ref()?.stop))
 }
 
 /// One admitted-child-start record. The primary child passes its real lateness
@@ -1216,6 +1251,34 @@ mod tests {
         assert!(clamp(Duration::from_secs(60)) <= Duration::from_secs(30));
         assert_eq!(take_execution_stop(), None);
         assert_eq!(origin(), None);
+        clear();
+    }
+
+    #[test]
+    fn inherited_deadline_spans_both_admission_and_execution() {
+        clear();
+        guard(Options {
+            admission: Some(Duration::from_secs(2)),
+            execution: Some(Duration::from_secs(30)),
+            events: None,
+        });
+        let admission = admission_deadline().unwrap();
+        let outer = admission + Duration::from_secs(8);
+        cap_to_outer(outer).unwrap();
+        assert_eq!(admission_deadline(), Some(admission));
+        arm_execution(admission - Duration::from_secs(1), Phase::PrimaryCargo);
+        assert_eq!(execution_deadline(), Some(outer));
+        clear();
+
+        guard(Options {
+            admission: None,
+            execution: Some(Duration::from_secs(1)),
+            events: None,
+        });
+        cap_to_outer(outer).unwrap();
+        assert_eq!(admission_deadline(), Some(outer));
+        arm_execution(outer - Duration::from_secs(3), Phase::PrimaryCargo);
+        assert_eq!(execution_deadline(), Some(outer - Duration::from_secs(2)));
         clear();
     }
 

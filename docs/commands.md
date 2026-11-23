@@ -52,7 +52,11 @@ oxide run --execution-budget 120s
 - Durations are whole seconds or milliseconds, such as `30s` or `1500ms`. Minutes and hours are refused.
 - `--budget-events <fd>` writes one JSON record per line to an already-open, non-blocking pipe. If the pipe is lost, the run is reported as unknown rather than successful.
 
-An omitted budget is unlimited. A nested `oxide` call uses the outer window rather than starting a deadline of its own.
+An omitted budget is unlimited unless a nested call inherits a deadline. On
+macOS, a leased `oxide` call inside another leased command shares the outer
+host build permit and gets its own slot. Its admission and execution each use
+the tighter of their own budget and the outer execution time left. Help,
+passthrough and inspection commands do not join.
 
 ## `oxide exec`
 

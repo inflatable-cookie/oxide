@@ -1,10 +1,5 @@
 //! Parent-owned transport for nested session membership and permit borrowing.
 
-#![allow(
-    dead_code,
-    reason = "Q-020 wires the broker into command entry points in later slices"
-)]
-
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
 mod wire;
@@ -14,6 +9,7 @@ use std::ffi::{CString, OsStr};
 use std::fs::{self, File, Permissions};
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::Shutdown;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -148,8 +144,6 @@ fn random_hex<const N: usize>() -> io::Result<String> {
 
 #[cfg(target_os = "macos")]
 fn check_peer(stream: &UnixStream) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-
     let mut uid = 0;
     let mut gid = 0;
     // SAFETY: The socket is open, and both output pointers are valid.
@@ -224,6 +218,17 @@ pub(super) struct SessionBroker {
 }
 
 impl SessionBroker {
+    /// Bind before spawning a leased child. Linux keeps its independent path.
+    pub(super) fn for_child(root: &Path, command: &mut Command) -> Result<Option<Self>, String> {
+        if !cfg!(target_os = "macos") {
+            return Ok(None);
+        }
+        let broker = Self::bind(root, PermitMode::Inherited, DenyBorrowing)
+            .map_err(|error| format!("cannot start the Oxide session broker: {error}"))?;
+        broker.apply(command);
+        Ok(Some(broker))
+    }
+
     /// Bind inside a caller-selected temporary directory with trusted ancestors.
     pub(super) fn bind(
         root: &Path,
@@ -282,6 +287,7 @@ impl SessionBroker {
     }
 
     /// Snapshot of live joined connections.
+    #[cfg(all(test, target_os = "macos"))]
     pub(super) fn member_count(&self) -> usize {
         self.session.members.load(Ordering::Relaxed)
     }
@@ -505,6 +511,10 @@ pub(super) struct SessionClient {
     member_id: Option<u64>,
 }
 
+#[allow(
+    dead_code,
+    reason = "idle exec borrowing uses this client in the next slice"
+)]
 #[derive(Debug)]
 pub(super) enum BorrowOutcome {
     Granted {
@@ -517,10 +527,17 @@ pub(super) enum BorrowOutcome {
 }
 
 impl SessionClient {
+    fn live(reader: BufReader<UnixStream>, member_id: Option<u64>) -> io::Result<Self> {
+        reader.get_ref().set_read_timeout(None)?;
+        Ok(Self { reader, member_id })
+    }
+
     fn open(path: &Path, request: Request) -> io::Result<(BufReader<UnixStream>, Response)> {
         check_socket_path(path)?;
         let mut stream = UnixStream::connect(path)?;
         check_peer(&stream)?;
+        stream.set_read_timeout(Some(AUTH_READ_TIMEOUT))?;
+        stream.set_write_timeout(Some(AUTH_READ_TIMEOUT))?;
         wire::write(&mut stream, request)?;
         let mut reader = BufReader::new(stream);
         let reply = Self::read_response(&mut reader)?;
@@ -547,14 +564,15 @@ impl SessionClient {
         let Response::Joined(joined) = reply else {
             return Err(wire::invalid("expected a session join response"));
         };
-        let client = Self {
-            reader,
-            member_id: Some(joined.member_id),
-        };
+        let client = Self::live(reader, Some(joined.member_id))?;
         Ok((client, joined))
     }
 
     /// Request a permit on a separate, connection-scoped grant.
+    #[allow(
+        dead_code,
+        reason = "idle exec borrowing uses this client in the next slice"
+    )]
     pub(super) fn borrow_permit(path: &Path, token: &str) -> io::Result<BorrowOutcome> {
         let (reader, reply) = Self::open(
             path,
@@ -564,10 +582,7 @@ impl SessionClient {
         )?;
         match reply {
             Response::PermitGranted(permit) => Ok(BorrowOutcome::Granted {
-                client: Self {
-                    reader,
-                    member_id: None,
-                },
+                client: Self::live(reader, None)?,
                 permit,
             }),
             Response::PermitDenied { reason } => Ok(BorrowOutcome::Denied { reason }),
@@ -578,6 +593,9 @@ impl SessionClient {
     /// Release a member with acknowledgement, or close a borrowed permit socket.
     pub(super) fn release(mut self) -> io::Result<()> {
         if let Some(member_id) = self.member_id {
+            self.reader
+                .get_ref()
+                .set_read_timeout(Some(AUTH_READ_TIMEOUT))?;
             wire::write(&mut self.reader.get_ref(), Request::Release { member_id })?;
             if !matches!(
                 Self::read_response(&mut self.reader)?,
@@ -590,10 +608,89 @@ impl SessionClient {
     }
 
     /// Wait for EOF from the parent. Any read error also invalidates the grant.
+    #[allow(
+        dead_code,
+        reason = "idle exec borrowing uses this client in the next slice"
+    )]
     pub(super) fn wait_for_end(mut self) -> io::Result<()> {
         if !self.reader.fill_buf()?.is_empty() {
             return Err(wire::invalid("unexpected session broker message"));
         }
         Ok(())
+    }
+}
+
+/// A command's authenticated membership and conservative local deadline.
+pub(super) struct JoinedSession {
+    client: SessionClient,
+    pub(super) deadline: Option<Instant>,
+}
+
+impl JoinedSession {
+    pub(super) fn from_env() -> Result<Option<Self>, String> {
+        let endpoint = std::env::var_os(BROKER_ENV);
+        let token = std::env::var_os(TOKEN_ENV);
+        let (path, token) = match (endpoint.as_deref(), token.as_deref()) {
+            (None, None) => return Ok(None),
+            (Some(path), Some(token)) => (Path::new(path), token),
+            _ => {
+                return Err(format!(
+                    "nested Oxide requires both {BROKER_ENV} and {TOKEN_ENV}"
+                ))
+            }
+        };
+        if !cfg!(target_os = "macos") {
+            return Err(format!(
+                "cannot join the outer Oxide session: {}",
+                unsupported()
+            ));
+        }
+        let token = token
+            .to_str()
+            .filter(|token| {
+                token.len() == TOKEN_HEX_BYTES
+                    && token
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            })
+            .ok_or("invalid outer Oxide session token")?;
+        // Anchor before sending Join so time in transit can only shorten the
+        // advertised interval. A descendant cannot move this deadline later.
+        let sent = Instant::now();
+        let (client, joined) = SessionClient::join(path, token)
+            .map_err(|error| format!("cannot join the outer Oxide session: {error}"))?;
+        if joined.permit_mode != PermitMode::Inherited {
+            return Err("the outer Oxide session requires a separate permit grant".to_owned());
+        }
+        let deadline = joined
+            .remaining_execution_ms
+            .map(|ms| {
+                sent.checked_add(Duration::from_millis(ms))
+                    .ok_or("invalid outer Oxide execution deadline")
+            })
+            .transpose()?;
+        Ok(Some(Self { client, deadline }))
+    }
+
+    /// An idle joined socket has no pending data until this process releases it.
+    pub(super) fn check_live(&self) -> Result<(), String> {
+        let mut socket = libc::pollfd {
+            fd: self.client.reader.get_ref().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd, with a zero timeout to avoid blocking.
+        let ready = unsafe { libc::poll(&mut socket, 1, 0) };
+        let idle = ready == 0
+            || (ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted);
+        if idle && self.client.reader.buffer().is_empty() {
+            Ok(())
+        } else {
+            Err("the outer Oxide session closed or sent unexpected data".to_owned())
+        }
+    }
+
+    pub(super) fn release(self) -> io::Result<()> {
+        self.client.release()
     }
 }

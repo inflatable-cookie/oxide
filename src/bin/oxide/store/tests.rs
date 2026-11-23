@@ -109,7 +109,7 @@ fn a_failed_attempt_leaves_no_dead_wait_ticket() {
     // before any admission work runs.
     let store = store.with_sibling(&root.join("paired-control"), true);
     let mut waits = WaitAccounting::default();
-    let refused = store.acquire(&key, Profile::Quick, false, None, &mut waits);
+    let refused = store.acquire(&key, Profile::Quick, false, None, &mut waits, None);
     let error = match refused {
         Err(error) => error,
         Ok(_) => panic!("the paired control has no admission lock to take"),
@@ -1474,7 +1474,7 @@ fn host_limit_counts_internal_and_removable_activity_in_both_routes() {
     internal.save(&active).unwrap();
     let (ticket, _file) = removable.register_ticket().unwrap();
     assert!(matches!(
-        removable.attempt(ticket, &key, Profile::Quick, 2, false, None),
+        removable.attempt(ticket, &key, Profile::Quick, Some(2), false, None),
         Ok(Err(Wait::HostLimit(2)))
     ));
     removable.remove_ticket(ticket).unwrap();
@@ -1484,7 +1484,7 @@ fn host_limit_counts_internal_and_removable_activity_in_both_routes() {
     removable.save(&active).unwrap();
     let (ticket, _file) = internal.register_ticket().unwrap();
     assert!(matches!(
-        internal.attempt(ticket, &key, Profile::Quick, 2, false, None),
+        internal.attempt(ticket, &key, Profile::Quick, Some(2), false, None),
         Ok(Err(Wait::HostLimit(2)))
     ));
     internal.remove_ticket(ticket).unwrap();
@@ -1500,7 +1500,7 @@ pub(super) fn lease(store: &Store, key: &SlotKey, label: Option<&str>) -> Result
     for _ in 0..200 {
         let (ticket, _file) = store.register_ticket().unwrap();
         let outcome = store
-            .attempt(ticket, key, Profile::Quick, 16, false, label)
+            .attempt(ticket, key, Profile::Quick, Some(16), false, label)
             .unwrap();
         store.remove_ticket(ticket).unwrap();
         match outcome {
@@ -3277,7 +3277,7 @@ fn a_legacy_match_past_the_first_batch_refuses_and_the_next_command_reuses_it() 
     let path = store.payload.join("slots/9");
     assert!(!path.join(oxide_storage::storage::ROOT_MARKER).exists());
     let (ticket, _lock) = store.register_ticket().unwrap();
-    let attempt = store.attempt(ticket, &key, Profile::Quick, 16, false, None);
+    let attempt = store.attempt(ticket, &key, Profile::Quick, Some(16), false, None);
     let refusal = attempt
         .err()
         .expect("pending adoption finishes this attempt without entering the wait loop");
@@ -3368,7 +3368,7 @@ fn a_ceiling_wait_keeps_the_held_and_pinned_diagnosis() {
 fn lease_as(store: &Store, key: &SlotKey, share: bool) -> Result<Lease, Wait> {
     let (ticket, _file) = store.register_ticket().unwrap();
     let outcome = store
-        .attempt(ticket, key, Profile::Quick, 16, share, None)
+        .attempt(ticket, key, Profile::Quick, Some(16), share, None)
         .unwrap();
     store.remove_ticket(ticket).unwrap();
     outcome
@@ -3845,7 +3845,7 @@ fn a_refused_count_replacement_never_adds_a_thirteenth_project_slot() {
     fs::write(&slot_root, b"not a directory").unwrap();
 
     let (ticket, _file) = store.register_ticket().unwrap();
-    let outcome = store.attempt(ticket, &key, Profile::Quick, 16, false, None);
+    let outcome = store.attempt(ticket, &key, Profile::Quick, Some(16), false, None);
     store.remove_ticket(ticket).unwrap();
     let error = match outcome {
         Err(error) => error,
@@ -3929,7 +3929,7 @@ fn per_checkout_blocked_waiter_does_not_hol_block_unrelated_checkouts_while_fifo
         panic!("expected clean barrier guard for checkout A");
     };
     let wait_a = store
-        .attempt(ticket_a, &key_a, Profile::Quick, 2, false, None)
+        .attempt(ticket_a, &key_a, Profile::Quick, Some(2), false, None)
         .unwrap()
         .err()
         .expect("ticket_a waits on clean");
@@ -3948,7 +3948,7 @@ fn per_checkout_blocked_waiter_does_not_hol_block_unrelated_checkouts_while_fifo
     // Ticket 1 (unrelated checkout B) advances past blocked ticket 0 immediately when active < max_active!
     let (ticket_b, _lock_b) = store.register_ticket().unwrap();
     let lease_b = store
-        .attempt(ticket_b, &key_b, Profile::Quick, 2, false, None)
+        .attempt(ticket_b, &key_b, Profile::Quick, Some(2), false, None)
         .unwrap()
         .ok()
         .expect("unrelated checkout B acquired immediately past blocked checkout A");
@@ -3967,13 +3967,13 @@ fn per_checkout_blocked_waiter_does_not_hol_block_unrelated_checkouts_while_fifo
     let (ticket_c, _lock_c) = store.register_ticket().unwrap();
     let (ticket_b3, _lock_b3) = store.register_ticket().unwrap();
     let wait_c = store
-        .attempt(ticket_c, &key_c, Profile::Quick, 2, false, None)
+        .attempt(ticket_c, &key_c, Profile::Quick, Some(2), false, None)
         .unwrap()
         .err()
         .expect("ticket_c waits on host limit");
     assert!(matches!(wait_c, Wait::HostLimit(2)), "{wait_c:?}");
     let wait_b3 = store
-        .attempt(ticket_b3, &key_b, Profile::Quick, 2, false, None)
+        .attempt(ticket_b3, &key_b, Profile::Quick, Some(2), false, None)
         .unwrap()
         .err()
         .expect("ticket_b3 waits in queue");
@@ -3988,7 +3988,7 @@ fn per_checkout_blocked_waiter_does_not_hol_block_unrelated_checkouts_while_fifo
     // ticket_b3 still waits in Queue(2) behind unblocked ticket_c (strict FIFO among unblocked).
     store.release(lease_b2, None).unwrap();
     let wait_b3_again = store
-        .attempt(ticket_b3, &key_b, Profile::Quick, 2, false, None)
+        .attempt(ticket_b3, &key_b, Profile::Quick, Some(2), false, None)
         .unwrap()
         .err()
         .expect("ticket_b3 stays in queue behind ticket_c");
@@ -3996,13 +3996,13 @@ fn per_checkout_blocked_waiter_does_not_hol_block_unrelated_checkouts_while_fifo
 
     // Unblocked ticket_c acquires in FIFO order, then ticket_b3 hits HostLimit(2) once C takes the slot.
     let lease_c = store
-        .attempt(ticket_c, &key_c, Profile::Quick, 2, false, None)
+        .attempt(ticket_c, &key_c, Profile::Quick, Some(2), false, None)
         .unwrap()
         .ok()
         .expect("ticket_c acquires in FIFO order");
     store.remove_ticket(ticket_c).unwrap();
     let wait_b3_limit = store
-        .attempt(ticket_b3, &key_b, Profile::Quick, 2, false, None)
+        .attempt(ticket_b3, &key_b, Profile::Quick, Some(2), false, None)
         .unwrap()
         .err()
         .expect("ticket_b3 hits host limit");
@@ -4015,7 +4015,7 @@ fn per_checkout_blocked_waiter_does_not_hol_block_unrelated_checkouts_while_fifo
     store.release(lease_b, None).unwrap();
     store.abandon_clean(clean_guard_a).unwrap();
     let lease_a = store
-        .attempt(ticket_a, &key_a, Profile::Quick, 2, false, None)
+        .attempt(ticket_a, &key_a, Profile::Quick, Some(2), false, None)
         .unwrap()
         .ok()
         .expect("ticket_a acquires once its clean barrier clears");
@@ -4064,7 +4064,7 @@ fn acquire_does_not_hol_block_unrelated_checkout_behind_barge_held_waiter() {
 
     let (ticket_a, _lock_a) = store.register_ticket().unwrap();
     let wait_a = store
-        .attempt(ticket_a, &key_a, Profile::Quick, 4, false, None)
+        .attempt(ticket_a, &key_a, Profile::Quick, Some(4), false, None)
         .unwrap()
         .err()
         .expect("ticket_a waits on BargeHeld");
@@ -4077,7 +4077,7 @@ fn acquire_does_not_hol_block_unrelated_checkout_behind_barge_held_waiter() {
     // Unrelated checkout B calls `acquire()` and succeeds immediately without waiting on ticket A!
     let mut waits_b = WaitAccounting::default();
     let acquired_b = store
-        .acquire(&key_b, Profile::Quick, false, None, &mut waits_b)
+        .acquire(&key_b, Profile::Quick, false, None, &mut waits_b, None)
         .expect("acquire for checkout B");
     let lease_b = match acquired_b {
         Acquired::Lease(lease) => lease,

@@ -6,6 +6,7 @@
 //! (Ctrl-Z) hands the terminal back and stops this command with it, as a shell
 //! does for a stopped job.
 
+use crate::session_broker::JoinedSession;
 use crate::watchdog::Watchdog;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -139,14 +140,30 @@ pub fn terminate_group(group: i32) {
 /// the space/volume watchdog: a budgeted stop happens even when no watchdog
 /// exists (a `DirectoryBudget` run-program wait, for example).
 #[derive(Default)]
-pub struct Stop {
+pub struct Stop<'session> {
+    session: Option<&'session JoinedSession>,
     term_at: Option<Instant>,
     kill_at: Option<Instant>,
 }
 
-impl Stop {
+impl<'session> Stop<'session> {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(super) fn with_session(session: Option<&'session JoinedSession>) -> Self {
+        Self {
+            session,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn check_session(&self) -> Result<(), String> {
+        self.session.map_or(Ok(()), JoinedSession::check_live)
+    }
+
+    pub(super) fn is_joined(&self) -> bool {
+        self.session.is_some()
     }
 
     /// Latch and escalate a budget stop when its deadline has arrived. Returns
@@ -155,7 +172,7 @@ impl Stop {
     pub fn poll(&mut self, group: i32) -> bool {
         let now = Instant::now();
         if self.term_at.is_none() {
-            if crate::budget::take_execution_stop().is_none() {
+            if crate::budget::take_execution_stop().is_none() && self.check_session().is_ok() {
                 return false;
             }
             self.term_at = Some(now);

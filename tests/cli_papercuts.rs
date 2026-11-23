@@ -7,6 +7,10 @@
 //! creation case creates a temporary `directory-budget` pool inside its own
 //! scratch root and removes it.
 
+#[cfg(target_os = "macos")]
+#[path = "cli_papercuts/nested_sessions.rs"]
+mod nested_sessions;
+
 use serde_json::{json, Value};
 use sha2::Digest;
 use std::ffi::{CStr, CString};

@@ -3,6 +3,7 @@
 use crate::cli::{Invocation, Profile, LEGACY_PROFILE_ENVIRONMENT};
 use crate::freshness::{Gate, Refusal};
 use crate::identity::{RunPick, SlotKey};
+use crate::session_broker::{JoinedSession, SessionBroker};
 use crate::store::{Acquired, Backend, Store};
 use crate::watchdog::Watchdog;
 use crate::{
@@ -40,13 +41,45 @@ pub(crate) fn apply_storage(
     wrapper::apply(command);
 }
 
-pub(crate) fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
-    run_invocation(cli::parse_leased(command, args)?)
+pub(crate) fn run_invocation(invocation: Invocation) -> Result<u8, String> {
+    let budgeted = invocation.budget.any();
+    if budgeted {
+        budget::install(invocation.budget)?;
+    }
+    process::install_signal_handlers()?;
+    let joined = JoinedSession::from_env()?;
+    if let Some(deadline) = joined.as_ref().and_then(|session| session.deadline) {
+        budget::cap_to_outer(deadline)?;
+    }
+    let outcome = run_session(invocation, joined.as_ref(), budgeted);
+    if let Some(joined) = joined {
+        // The slot is already released or retained according to writer
+        // closure. EOF also clears membership if the acknowledgement is lost.
+        let _ = joined.release();
+    }
+    outcome
 }
 
-pub(crate) fn run_invocation(invocation: Invocation) -> Result<u8, String> {
+fn run_session(
+    invocation: Invocation,
+    joined: Option<&JoinedSession>,
+    budgeted: bool,
+) -> Result<u8, String> {
+    if budget::admission_expired() {
+        return Ok(stop_for_admission(budget::Lease::Released));
+    }
+    if let Some(signal) = process::received_signal() {
+        return Ok(process::signal_exit_code(signal));
+    }
+    if let Some(joined) = joined {
+        joined.check_live()?;
+    }
+    // An exec hand-off would discard the membership and restart its clock.
+    if let Some(code) = crate::handoff::preflight(budgeted || joined.is_some()) {
+        return Ok(code);
+    }
     oxide_storage::lease::admission_cost::start_summary();
-    let outcome = run_invocation_inner(invocation);
+    let outcome = run_invocation_inner(invocation, joined);
     if let Some(summary) = oxide_storage::lease::admission_cost::take_summary() {
         eprintln!("oxide: {summary}");
     }
@@ -77,6 +110,7 @@ struct LeaseRequest<'a> {
     profile: Profile,
     resolution: &'a cli::Resolution,
     label: Option<&'a str>,
+    joined: Option<&'a JoinedSession>,
 }
 
 struct OutputBindPlan<'a> {
@@ -99,10 +133,10 @@ struct PreparedPrimary {
     prune_session: Option<cargo_prune::Session>,
 }
 
-struct PrimaryExecution {
+struct PrimaryExecution<'session> {
     outcome: Result<(Option<ExitStatus>, Option<RunTarget>, bool), String>,
     execution_started: Option<Instant>,
-    budget_stop: process::Stop,
+    budget_stop: process::Stop<'session>,
     watchdog: Option<Watchdog>,
     target_entries_before: Option<Vec<String>>,
 }
@@ -168,7 +202,10 @@ struct SummaryContext<'a> {
     waits: &'a store::WaitAccounting,
 }
 
-fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
+fn run_invocation_inner(
+    mut invocation: Invocation,
+    joined: Option<&JoinedSession>,
+) -> Result<u8, String> {
     let prepared = match prepare_invocation(&mut invocation)? {
         Step::Continue(prepared) => prepared,
         Step::Exit(code) => return Ok(code),
@@ -189,6 +226,7 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         profile: invocation.profile,
         resolution: &resolution,
         label: label.as_deref(),
+        joined,
     };
     let bind_plan = OutputBindPlan {
         planned: prepared.planned.as_ref(),
@@ -221,7 +259,8 @@ fn run_invocation_inner(mut invocation: Invocation) -> Result<u8, String> {
         &invocation,
         held,
         session.binding,
-        &mut primary.cargo,
+        &mut primary,
+        joined,
     )? {
         Step::Continue(executed) => executed,
         Step::Exit(code) => return Ok(code),
@@ -309,11 +348,8 @@ fn prepare_invocation(invocation: &mut Invocation) -> Result<Step<PreparedInvoca
     {
         eprintln!("oxide: seeding skipped: {reason}");
     }
-    // The clock was installed by `run` before the hand-off check; nothing here
-    // may re-arm it (oxide#140).
     let exec = invocation.command == "exec";
     let run = invocation.command == "run";
-    process::install_signal_handlers()?;
     // A preparation step stopped by the admission window is the admission
     // deadline (124), never an internal error: the window is what refused it.
     macro_rules! prep {
@@ -698,13 +734,14 @@ fn prepare_primary_command(
     )))
 }
 
-fn execute_primary_group(
+fn execute_primary_group<'session>(
     prepared: &PreparedInvocation,
     invocation: &Invocation,
     held: store::Lease,
     binding: outputs::OutputBinding,
-    cargo: &mut Command,
-) -> Result<Step<(store::Lease, PrimaryExecution)>, String> {
+    primary: &mut PreparedPrimary,
+    joined: Option<&'session JoinedSession>,
+) -> Result<Step<(store::Lease, PrimaryExecution<'session>)>, String> {
     // oxide#164: a tool's own directory that is not a profile member (the
     // nextest `target/nextest` or llvm-cov analogue) stays a real local
     // directory, and is reported once. This is a bounded observation of ONE
@@ -719,11 +756,32 @@ fn execute_primary_group(
     let target_entries_before = reports_tool_directories
         .then(|| outputs::target_entries(&prepared.key.checkout))
         .flatten();
+    let mut budget_stop = process::Stop::with_session(joined);
+    let broker = budget_stop
+        .check_session()
+        .and_then(|()| SessionBroker::for_child(primary.chosen_temp.path(), &mut primary.cargo));
+    if budget::admission_expired() {
+        drop(broker);
+        drop(binding);
+        let origin = held.prior.unchanged();
+        return stop_after_release(prepared.store.release(held, origin)).map(Step::Exit);
+    }
+    let mut broker = match broker {
+        Ok(broker) => broker,
+        Err(error) => {
+            drop(binding);
+            let origin = held.prior.unchanged();
+            return Err(release_error_after(
+                prepared.store.release(held, origin),
+                error,
+            ));
+        }
+    };
     let started_group = prepared
         .store
         .mark_spawning(&held)
         .map_err(Unstarted::Record)
-        .and_then(|()| process::start_group(cargo).map_err(Unstarted::Spawn));
+        .and_then(|()| process::start_group(&mut primary.cargo).map_err(Unstarted::Spawn));
     let mut group = match started_group {
         Ok(group) => group,
         Err(error) => {
@@ -784,11 +842,11 @@ fn execute_primary_group(
             budget::Phase::PrimaryCargo
         },
     );
-    let mut budget_stop = process::Stop::new();
+    let armed = arm_broker(broker.as_mut());
     let mut watchdog = prepared.store.watchdog();
     // The binding mutex is released only once this command is recorded as
     // running, so no peer can repoint the link between the check and Cargo.
-    let marked = prepared.store.mark_running(&held, group.id);
+    let marked = prepared.store.mark_running(&held, group.id).and(armed);
     drop(binding);
     // Set only when the group could not be recorded and was stopped here: the
     // bounded stop's own verdict on closure replaces the waits below.
@@ -855,6 +913,12 @@ fn execute_primary_group(
         );
         return Ok(Step::Exit(1));
     }
+    let outcome = outcome.and_then(|result| {
+        if budget::origin().is_none() {
+            budget_stop.check_session()?;
+        }
+        Ok(result)
+    });
     Ok(Step::Continue((
         held,
         PrimaryExecution {
@@ -865,6 +929,15 @@ fn execute_primary_group(
             target_entries_before,
         },
     )))
+}
+
+fn arm_broker(broker: Option<&mut SessionBroker>) -> Result<(), String> {
+    if let Some(broker) = broker {
+        broker
+            .arm(budget::execution_deadline())
+            .map_err(|error| format!("cannot publish the Oxide session deadline: {error}"))?;
+    }
+    Ok(())
 }
 
 fn compose_summary_note(
@@ -892,7 +965,7 @@ fn compose_summary_note(
 
 fn resolve_run_program(
     prepared: &PreparedInvocation,
-    execution: &PrimaryExecution,
+    execution: &PrimaryExecution<'_>,
     output_root: &Option<PathBuf>,
     chosen_temp: &child_temp::Chosen,
 ) -> Option<(RunProgram, bool)> {
@@ -917,7 +990,7 @@ fn resolve_run_program(
             && stopped.is_none()
             && budget::origin().is_none()
             && process::received_signal().is_none()
-            && (root.is_some() || bounded_run)
+            && (root.is_some() || bounded_run || execution.budget_stop.is_joined())
         {
             // #133 maps only a linked member beneath its owned root and
             // requires the mapped file to be a real executable; #140 keeps the
@@ -968,7 +1041,7 @@ fn resolve_run_program(
 fn finish_released_invocation(
     custody: ProgramCustody<'_>,
     summary: &SummaryContext<'_>,
-    execution: PrimaryExecution,
+    execution: PrimaryExecution<'_>,
 ) -> Result<u8, String> {
     let stopped = execution
         .watchdog
@@ -1336,7 +1409,7 @@ fn fail_unstarted(custody: ProgramCustody<'_>, error: String) -> Result<u8, Stri
 fn run_owned_program(
     custody: ProgramCustody<'_>,
     target: OwnedProgram<'_>,
-    budget_stop: &mut process::Stop,
+    budget_stop: &mut process::Stop<'_>,
 ) -> Result<u8, String> {
     let mut command = Command::new(target.program);
     command.args(target.args).env(
@@ -1349,6 +1422,15 @@ fn run_owned_program(
     {
         eprintln!("oxide: warning: {error}; the program runs without Cargo's full run environment");
     }
+    let broker = budget_stop.check_session().and_then(|()| {
+        let mut broker = SessionBroker::for_child(custody.child_temp.path(), &mut command)?;
+        arm_broker(broker.as_mut())?;
+        Ok(broker)
+    });
+    let broker = match broker {
+        Ok(broker) => broker,
+        Err(error) => return fail_unstarted(custody, error),
+    };
     if let Err(error) = custody.store.mark_spawning(&custody.held) {
         return fail_unstarted(custody, error);
     }
@@ -1419,6 +1501,7 @@ fn run_owned_program(
         }
     });
     drop(foreground);
+    drop(broker);
     let stopped = watchdog.as_ref().filter(|watchdog| watchdog.stopped());
     if let Some(watchdog) = stopped {
         report_stop(watchdog, group.id, closed, &custody.store.payload);
@@ -1450,6 +1533,14 @@ fn run_owned_program(
             group.id, custody.held.slot_id
         );
         return Ok(1);
+    }
+    if budget::origin().is_none() {
+        if let Err(error) = budget_stop.check_session() {
+            return Err(release_error_after(
+                custody.finish_and_release(false, false),
+                error,
+            ));
+        }
     }
     let seed_successful = status.is_some_and(|status| status.success())
         && stopped.is_none()
@@ -1631,6 +1722,7 @@ fn lease_with_gate(
             grants.share,
             request.label,
             waits,
+            request.joined,
         )? {
             Acquired::Lease(held) => held,
             Acquired::Interrupted(signal) => return Ok(Err(Stop::Signal(signal))),
@@ -1693,7 +1785,7 @@ fn collect_run(
     group: &mut process::Group,
     invocation: &Invocation,
     mut watchdog: Option<&mut Watchdog>,
-    budget_stop: &mut process::Stop,
+    budget_stop: &mut process::Stop<'_>,
 ) -> Result<(Option<ExitStatus>, Option<RunTarget>, bool), String> {
     let stdout = group
         .child
@@ -2060,6 +2152,7 @@ mod tests {
             profile: cli::Profile::Quick,
             resolution: &resolution,
             label: None,
+            joined: None,
         };
         let bind_plan = OutputBindPlan {
             planned: None,
