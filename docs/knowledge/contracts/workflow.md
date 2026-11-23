@@ -588,8 +588,18 @@ paths. The summary says `temp: inherited <path>` or `temp: oxide <path>`.
   contain the other. Each component is walked through the verified volume
   descriptor with no-follow and same-device checks. Registration version 3 records
   both fields. Versions 1 and 2 read with the defaults and keep working unchanged;
-  the next write publishes version 3 with those defaults. The layout is fixed at
-  registration: moving an existing pool or outputs directory is not supported yet.
+  the next write publishes version 3. Existing layouts can move with
+  `oxide pool relocate --payload-dir <rel> --outputs-dir <rel>`.
+- **Relocation:** Oxide takes internal then removable admission and holds the
+  removable ledger lock through publication. Held builds, waiter tickets,
+  cleans, Barge holds, unknown writer custody and unfinished holding entries
+  refuse. Both destinations must be absent and disjoint from the source paths.
+  Oxide moves the two areas through Barge, updates the path-keyed outputs
+  account, registry, receipts and still-owned member links, clears removable
+  compile origins and publishes the new config and registration. A failed move
+  rolls back completed steps. If interrupted or rollback fails,
+  `pool-relocation.json` records both layouts and fences registration readers
+  until the paths and records have been reconciled.
 - **Selection:** when a build starts, the drive is selected only if it is mounted,
   its registered UUID matches and it is writable. Selection does not repeat the
   boot-container or APFS-role checks; registration and `describe` run those, and

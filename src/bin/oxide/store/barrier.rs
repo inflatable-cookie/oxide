@@ -171,11 +171,38 @@ impl Store {
     pub fn lock_binding(&self, checkout: &Path) -> Result<File, String> {
         let directory = self.owner_control().join("bindings");
         ensure_private_dir(&directory)?;
-        let id = identity::digest(&checkout.to_string_lossy());
-        let file = private_file(&directory.join(format!("{id}.lock")), true)?
+        let file = private_file(&binding_path(&directory, checkout), true)?
             .ok_or("the checkout binding lock is missing")?;
         crate::budget::lock(&file, "checkout binding")?;
         Ok(file)
+    }
+
+    /// A pre-admission output reservation can hold the checkout binding
+    /// mutex before it has a wait ticket. The caller already holds admission,
+    /// so it must probe these locks without waiting.
+    pub(crate) fn lock_relocation_bindings(
+        &self,
+        checkouts: &[PathBuf],
+        dry_run: bool,
+    ) -> Result<Vec<File>, String> {
+        let directory = self.owner_control().join("bindings");
+        if !dry_run && !checkouts.is_empty() {
+            ensure_private_dir(&directory)?;
+        }
+        let mut locks = Vec::new();
+        for checkout in checkouts {
+            match probe_lock(&binding_path(&directory, checkout), !dry_run)? {
+                Probe::Free(lock) => locks.push(lock),
+                Probe::Missing => {}
+                Probe::Held => {
+                    return Err(format!(
+                        "checkout binding is held at {}",
+                        checkout.display()
+                    ))
+                }
+            }
+        }
+        Ok(locks)
     }
 
     /// One checkout's cooperative custody for an output transition or a clean.
@@ -367,4 +394,9 @@ impl Store {
         let _ = fs::remove_file(self.ticket_path(guard.id));
         Ok(())
     }
+}
+
+fn binding_path(directory: &Path, checkout: &Path) -> PathBuf {
+    let id = identity::digest(&checkout.to_string_lossy());
+    directory.join(format!("{id}.lock"))
 }

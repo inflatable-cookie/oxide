@@ -13,7 +13,7 @@ storage invariants still apply.
 
 `barge` is a Git dependency pinned by a full 40-hex revision in `Cargo.toml` and
 `Cargo.lock`, never a branch or tag. The current pin is Barge main
-`7c91e356ecf71f90680f6d58870c800132c6d130`. Only test builds request Barge's
+`04e52d8742e8f56c8a0e634834700e18500d9d8d`. Only test builds request Barge's
 `testing` feature.
 
 Barge reads no Oxide format and knows nothing about Oxide. Oxide writes no Barge
@@ -71,6 +71,12 @@ even if a stray carries a copied old marker.
 Registration imports Oxide's policy into Barge when the volume is positively
 present. A nonzero reserve below the default floor lowers the floor to that
 reserve, so the floor never exceeds the prune target.
+
+Quiet-window relocation uses `Barge::relocate_area` in each private account.
+Barge moves the area folder and records its new location while holding its
+area and root locks. Root IDs, markers and pins travel with the folder. Oxide
+moves the outputs account to the hash of its new parent. The host account's
+class placements and shared volume layout play no part in the move.
 
 ## Holds, pins and prune
 

@@ -464,7 +464,7 @@ pub(super) fn read_control_state_if_present(control: &Path) -> Result<Option<Sta
 /// over `name`, and then `dir` is synced so the rename itself survives a crash.
 /// Any failure removes the temp file. The temp name carries this process's ID
 /// and a counter, so a temp left by a crashed writer never blocks a later one.
-pub(super) fn atomic_write_private(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write_private(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let temp = dir.join(format!(
         "{name}.{}.{}.tmp",

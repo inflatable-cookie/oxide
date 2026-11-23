@@ -39,6 +39,7 @@ mod exec;
 mod git;
 mod plan;
 mod receipt;
+mod relocation;
 mod root;
 mod transition;
 
@@ -59,7 +60,9 @@ pub(crate) use receipt::{
     LinkPlacement, Receipt, Reservation,
 };
 pub use receipt::{RootKind, Selected};
+pub(crate) use relocation::{plan_relocated_receipts, FileEdit, LinkEdit};
 pub(crate) use root::is_real_dir_path;
+pub(crate) use transition::rename_no_replace;
 
 use crate::identity;
 use crate::removable::{self, DriveMode};

@@ -436,7 +436,7 @@ pub(in crate::outputs) fn publish_link(
 }
 
 #[cfg(target_os = "macos")]
-pub(in crate::outputs) fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     let from = path_c_string(from)?;
     let to = path_c_string(to)?;
     // SAFETY: both pointers come from live NUL-terminated strings that outlive
@@ -450,7 +450,7 @@ pub(in crate::outputs) fn rename_no_replace(from: &Path, to: &Path) -> std::io::
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(in crate::outputs) fn rename_no_replace(_from: &Path, _to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_no_replace(_from: &Path, _to: &Path) -> std::io::Result<()> {
     // The removable backend is macOS-only, so no automatic conversion reaches
     // here elsewhere; an explicit refusal, never a replacing rename.
     Err(std::io::Error::new(

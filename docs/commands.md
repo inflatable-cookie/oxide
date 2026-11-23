@@ -88,12 +88,17 @@ oxide exec --manifest-path crates/app/Cargo.toml -- ./scripts/package.sh
 
 ```sh
 oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ephemeral|permanent] [--payload-dir <rel>] [--outputs-dir <rel>]
+oxide pool relocate --payload-dir <rel> --outputs-dir <rel> [--dry-run] [--json]
 oxide pool set-mode <ephemeral|permanent>
 oxide pool describe --json
 oxide pool recover-interrupted <slot>
 ```
 
 `describe --json` prints a stable, read-only description of the registered drive (schema `oxide.pool.describe/1`). It changes nothing.
+
+`relocate` moves the registered pool and any declared external outputs during
+a quiet window. Use `--dry-run` to check the destinations and preview the move.
+`--json` reports the old and new paths and any checkout links left untouched.
 
 ## `oxide outputs`
 

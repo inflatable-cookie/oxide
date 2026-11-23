@@ -22,6 +22,60 @@ use std::os::fd::AsFd;
 use std::path::Path;
 use std::time::Duration;
 
+/// The removable pool's configuration held against concurrent lease writers
+/// during an area move. The area and its bytes are moved by Barge.
+#[derive(Debug)]
+pub struct PayloadRelocation {
+    pool: std::path::PathBuf,
+    config: PoolConfig,
+    _lock: std::fs::File,
+}
+
+impl PayloadRelocation {
+    /// Lock the ledger and verify that the registered layout is still current
+    /// and no lease or pending eviction can be displaced.
+    pub fn begin(pool: &Path, recorded: &super::super::RecordedVolume) -> Result<Self, LeaseError> {
+        let pool = canonical_existing_dir(pool, true)?;
+        refuse_foreign_pool_entries(&pool)?;
+        let lock = super::lock_pool_inner(&pool, false, false)?;
+        let (config, ledger) = read_consistent_pair(&pool)?;
+        if config.backend != VOLUME_BACKEND_APFS_V1
+            || recorded_volume(&BackingPaths::under(&pool), &config)? != *recorded
+        {
+            return Err(LeaseError::BackingMismatch);
+        }
+        if super::held_eviction::HeldEvictionIntent::read(&pool)?.is_some()
+            || !ledger.holding.is_empty()
+            || ledger
+                .slots
+                .iter()
+                .any(|slot| slot.state != SlotPersistState::Idle)
+        {
+            return Err(LeaseError::InvalidInput(
+                "the removable ledger has a held slot or unfinished eviction",
+            ));
+        }
+        Ok(Self {
+            pool,
+            config,
+            _lock: lock,
+        })
+    }
+
+    /// Publish the moved payload's relative path. All other config fields
+    /// and the ledger stay as they were.
+    pub fn publish(&self, payload_dir: &str) -> Result<(), LeaseError> {
+        crate::volume::relative_components(payload_dir).map_err(LeaseError::Io)?;
+        let mut config = self.config.clone();
+        config
+            .volume
+            .as_mut()
+            .ok_or(LeaseError::BackingMismatch)?
+            .payload_dir = payload_dir.to_owned();
+        write_config(&self.pool, &config)
+    }
+}
+
 pub use super::super::seed::{
     held_seed_attempt, publish_seed_catalog, read_seed_last, seed, seed_candidates, seed_monitored,
     write_seed_attempt, write_seed_last, write_seed_sources, SeedAbandon, SeedAttempt,
