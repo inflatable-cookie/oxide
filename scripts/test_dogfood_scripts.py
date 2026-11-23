@@ -1134,6 +1134,111 @@ class DocumentAndScratchTests(unittest.TestCase):
         with self.assertRaisesRegex(installer.Refusal, "volume"):
             installer.verify_scratch_dir(scratch, other)
 
+    def describe_removable(self, mount, payload):
+        return {
+            "schema": "oxide.pool.describe/1",
+            "selected": "removable",
+            "internal": {"pool": str(self.pool)},
+            "removable": {
+                "available": True,
+                "mount_point": str(mount),
+                "payload": str(payload),
+                "suggested_scratch_root": str(mount / "scratch"),
+                "unavailable_reason": None,
+            },
+        }
+
+    def run_removable_canary(self, description):
+        """Run `canary_scratch` with the fixture mount presented as its own volume.
+
+        The fixture lives on one filesystem, so the mount's `stat` reports a
+        distinct device while every other path keeps its real identity.
+        """
+        real_stat = Path.stat
+        mount = Path(description["removable"]["mount_point"])
+        device = real_stat(mount).st_dev + 1
+
+        class _MountedStat:
+            def __init__(self, real):
+                self._real = real
+                self.st_dev = device
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        def fake_stat(self):
+            real = real_stat(self)
+            if self == mount or mount in self.parents:
+                return _MountedStat(real)
+            return real
+
+        with mock.patch.object(Path, "stat", fake_stat), \
+                mock.patch.object(installer, "verify_scratch_dir",
+                                  return_value="identity") as check:
+            result = installer.canary_scratch(description, None)
+        return result, check, device
+
+    def make_removable_mount(self, payload_parts):
+        self.write_live_pool()
+        mount = self.root / "mnt"
+        payload = mount.joinpath(*payload_parts)
+        payload.mkdir(parents=True)
+        (mount / "scratch").mkdir(mode=0o700)
+        return mount, payload
+
+    def test_canary_scratch_accepts_a_nested_removable_payload(self):
+        mount, payload = self.make_removable_mount(("builds", "oxide", "pool"))
+        (result, check, device) = self.run_removable_canary(
+            self.describe_removable(mount, payload))
+        pool, selected_payload, scratch, identity = result
+        self.assertEqual(pool, self.pool)
+        self.assertEqual(selected_payload, payload)
+        self.assertEqual(scratch, mount / "scratch")
+        self.assertEqual(identity, "identity")
+        check.assert_called_once_with(scratch, device)
+
+    def test_canary_scratch_still_accepts_a_flat_removable_payload(self):
+        mount, payload = self.make_removable_mount(("oxide-pool",))
+        (pool, selected_payload, scratch, identity), _, _ = self.run_removable_canary(
+            self.describe_removable(mount, payload))
+        self.assertEqual(pool, self.pool)
+        self.assertEqual(selected_payload, payload)
+        self.assertEqual(scratch, mount / "scratch")
+        self.assertEqual(identity, "identity")
+
+    def test_canary_scratch_refuses_a_payload_equal_to_the_mount(self):
+        self.write_live_pool()
+        mount = self.root / "mnt"
+        mount.mkdir()
+        (mount / "scratch").mkdir(mode=0o700)
+        with self.assertRaisesRegex(installer.Refusal, "registered mounted volume"):
+            self.run_removable_canary(self.describe_removable(mount, mount))
+
+    def test_canary_scratch_refuses_a_payload_outside_the_mount(self):
+        self.write_live_pool()
+        mount = self.root / "mnt"
+        mount.mkdir()
+        (mount / "scratch").mkdir(mode=0o700)
+        elsewhere = self.root / "elsewhere" / "pool"
+        elsewhere.mkdir(parents=True)
+        dotted = mount / "builds" / ".." / "escape"
+        for payload in (elsewhere, dotted):
+            with self.subTest(payload=payload):
+                with self.assertRaisesRegex(installer.Refusal, "registered mounted volume"):
+                    self.run_removable_canary(self.describe_removable(mount, payload))
+
+    def test_canary_scratch_refuses_a_payload_escaping_via_a_symlink(self):
+        self.write_live_pool()
+        mount = self.root / "mnt"
+        mount.mkdir()
+        (mount / "scratch").mkdir(mode=0o700)
+        target = self.root / "elsewhere" / "pool"
+        target.mkdir(parents=True)
+        payload = mount / "pool"
+        payload.symlink_to(target)
+        with self.assertRaisesRegex(installer.Refusal, "registered mounted volume"):
+            self.run_removable_canary(self.describe_removable(mount, payload))
+
     def test_format_canary_scratch_ignores_a_registered_removable_volume(self):
         self.write_live_pool()
         scratch = self.scratch()
