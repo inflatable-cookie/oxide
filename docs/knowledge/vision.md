@@ -137,9 +137,9 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   never pause or reset an outer budget. Signal forwarding and conservative
   group closure are preserved. Consumer adoption and installation remain
   separate gates.
-Nested commands on macOS join the outer host permit and keep independent slot
-custody. Idle `oxide exec` sessions still hold their host permit for the full
-session. Tom's 2026-11-23 ruling
+Nested commands on macOS share the outer host permit and keep independent
+slot custody. Idle `oxide exec` sessions yield their permit and lend it on
+demand. Tom's 2026-11-23 ruling
 settled the Q-020 / Q-018 direction: build both nested lease joining and idle
 `oxide exec` permit borrowing over a parent-owned local Unix domain socket
 broker with a per-session random token (`0700` socket dir, same-UID peer
@@ -258,8 +258,8 @@ operator instruction; the general lean reset is not deletion authority.
   writes to or removes one. Otherwise Oxide owns one short per-command
   directory inside the slot, removed at release after writer closure; a `run`
   program that uses one keeps the lease until its own group closes
-  ([workflow](contracts/workflow.md)). Idle exec-session custody design is tracked
-  in Nucleus and is not implemented. Proof and validation scratch placement is
+  ([workflow](contracts/workflow.md)). Idle exec sessions on macOS keep this
+  custody while yielding their host build permit. Proof and validation scratch placement is
   retired history: oxide#145 (merged at `0520fc04`, guard `a6d73326`) placed and
   monitored proof scratch on the selected pool's own volume with a warned
   `/private/tmp` fallback, and oxide#322 removed that proof ladder, its selectors

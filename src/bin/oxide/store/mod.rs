@@ -51,7 +51,7 @@ pub(crate) mod tests;
 
 pub(crate) use oxide_storage::lease::control::*;
 
-pub(crate) use admission::{Acquired, Lease, WaitAccounting, PROJECT_SLOT_CAP};
+pub(crate) use admission::{Acquired, ExecPermit, Lease, WaitAccounting, PROJECT_SLOT_CAP};
 pub(crate) use barrier::publication_guard;
 pub(crate) use barrier::{CheckoutCustody, CleanGuard, Cleaning};
 #[cfg(test)]
@@ -93,6 +93,7 @@ pub const GIB: u64 = 1024 * 1024 * 1024;
 /// Automatic creation refuses below this host free space.
 pub const HOST_RESERVE_BYTES: u64 = 20 * GIB;
 
+#[derive(Clone)]
 pub struct Store {
     pub pool: PathBuf,
     pub backend: Backend,
@@ -115,6 +116,7 @@ pub struct Store {
 }
 
 /// The other pool of a registered pair.
+#[derive(Clone)]
 struct Sibling {
     control: PathBuf,
     /// Set on the removable store: its slot attempts also hold the internal
@@ -701,6 +703,8 @@ impl Store {
         let _ = fs::remove_dir(self.affinity_dir(id));
         let _ = fs::remove_file(self.lock_path(id));
         let _ = fs::remove_file(admission::permit_path(&self.control, id));
+        let _ = fs::remove_file(admission::exec_permit_path(&self.control, id, "yielded"));
+        let _ = fs::remove_file(admission::exec_permit_path(&self.control, id, "borrowed"));
         let _ = fs::remove_file(self.origin_path(id));
     }
 

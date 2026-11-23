@@ -83,7 +83,13 @@ oxide exec [--manifest-path <Cargo.toml>] [--profile quick|debug|release] [--out
   means it could not start.
 - A terminal standard input is replaced by `/dev/null`. Interactive prompts are
   not supported.
-- `oxide status` shows the holder as `exec <program>`.
+- On macOS an independent `exec` yields its startup permit once the tool's
+  process group is recorded. Nested Oxide builds borrow a shared host permit
+  on demand. A nested `exec` passes that capability through to its children
+  or uses an already-active outer build permit. Direct Cargo calls have no
+  permit handshake.
+- `oxide status` shows the holder as `exec <program>` and distinguishes
+  a yielded slot from one with a borrowed host build permit.
 - The contract is cooperative. A tool that sets `CARGO_TARGET_DIR` or
   `--target-dir` moves only its final outputs. A tool that sets its own build
   directory, changes workspace or toolchain, or daemonizes with `setsid` escapes
@@ -220,10 +226,11 @@ digest and the receipt digest are reported under separate labels.
   `min(4, max(2, floor(physical_cores / 4)))` from `hw.physicalcpu`. Other
   platforms, and any failed or implausible query, use 2. The count covers
   commands in both the internal and the removable pool. Lowering the limit leaves
-  running commands alone. On macOS a nested leased Oxide command joins the
+  running commands alone. On macOS a nested leased Oxide command shares the
   outer command's permit through its [session broker](session-broker.md).
-  It skips the host-permit queue and follows the same slot, checkout and
-  output custody rules. The joined slot counts against storage caps as usual.
+  A build under a yielded `exec` competes for the permit after slot admission.
+  The joined slot follows the same custody rules and counts against storage
+  caps as usual.
 - **Waiting:** unblocked waiters competing for the host-wide active-build limit
   wait in strict FIFO order. Waiters blocked only on a per-checkout or per-slot
   condition (a checkout clean barrier, project cap, uncertain interrupted slot,
@@ -250,8 +257,9 @@ oxide run --execution-budget 120s
 oxide exec --execution-budget 300s -- npm run tauri build
 ```
 
-- `--admission-budget` covers everything before the child starts: preparation,
-  slot waits and the freshness gate. Expiry starts nothing and exits 124.
+- `--admission-budget` covers everything before the child starts, including
+  preparation, slot and permit waits, and the freshness gate. Expiry starts
+  nothing and exits 124.
 - `--execution-budget` starts when the child is observed to start. It covers
   compilation, Cargo locks, tests, output drain and closeout. Expiry stops the
   owned process group (TERM, a grace period, then KILL) and exits 125. A child's
@@ -1084,9 +1092,7 @@ These are not current behaviour. Their designs are proposed only.
 
 - `linux-image-v1` storage, CI cache save and restore, and container or remote
   executors. Linux has no runtime proof of storage behaviour yet.
-- Nested commands joining their outer lease. Today each nested command takes its
-  own independent lease; the future design is tracked in Nucleus.
-- Separating an idle exec session's host permit from its slot. Today an exec session holds its host permit throughout; the future design is tracked in Nucleus.
+- Session joining and idle exec permit borrowing on Linux.
 - Alternative run strategies, such as ahead-of-time or JIT codegen or hot patching.
 - Per-project profile overrides or project files. Oxide reads none.
 - Interception of plain `cargo`, and an adaptive `rustc` wrapper for builds that

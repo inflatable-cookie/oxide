@@ -427,6 +427,8 @@ pub struct SlotView {
     pub retired: Option<String>,
     /// The holding command's label (`exec <program>`), while held.
     pub holder: Option<String>,
+    /// The host permit attached to a live exec slot, if it can yield.
+    pub exec_permit: Option<super::ExecPermit>,
     /// True when Barge reports that this slot's root hold is currently held by
     /// another process (for example, an orphaned child on a ledger-idle slot).
     pub barge_held: bool,
@@ -733,6 +735,13 @@ impl Store {
                         .filter(|_| slot.state == SlotOccupancy::Held)
                         .and_then(|record| record.holder.as_ref())
                         .and_then(|holder| holder.command.clone()),
+                    exec_permit: record
+                        .filter(|record| record.active() && slot.state == SlotOccupancy::Held)
+                        .and_then(|record| {
+                            super::admission::exec_permit(&self.control, record.id)
+                                .ok()
+                                .flatten()
+                        }),
                     barge_held: slot.state == SlotOccupancy::Idle
                         && record.is_some()
                         && barge_held.contains(&slot.slot_id),

@@ -3,7 +3,7 @@
 use crate::cli::{Invocation, Profile, LEGACY_PROFILE_ENVIRONMENT};
 use crate::freshness::{Gate, Refusal};
 use crate::identity::{RunPick, SlotKey};
-use crate::session_broker::{JoinedSession, SessionBroker};
+use crate::session_broker::{BorrowStop, JoinedSession, PermitMode, SessionBroker};
 use crate::store::{Acquired, Backend, Store};
 use crate::watchdog::Watchdog;
 use crate::{
@@ -737,7 +737,7 @@ fn prepare_primary_command(
 fn execute_primary_group<'session>(
     prepared: &PreparedInvocation,
     invocation: &Invocation,
-    held: store::Lease,
+    mut held: store::Lease,
     binding: outputs::OutputBinding,
     primary: &mut PreparedPrimary,
     joined: Option<&'session JoinedSession>,
@@ -757,9 +757,24 @@ fn execute_primary_group<'session>(
         .then(|| outputs::target_entries(&prepared.key.checkout))
         .flatten();
     let mut budget_stop = process::Stop::with_session(joined);
-    let broker = budget_stop
-        .check_session()
-        .and_then(|()| SessionBroker::for_child(primary.chosen_temp.path(), &mut primary.cargo));
+    let relay = joined.and_then(JoinedSession::relay);
+    let yields_permit =
+        cfg!(target_os = "macos") && prepared.exec && (joined.is_none() || relay.is_some());
+    let broker = budget_stop.check_session().and_then(|()| {
+        let root = primary.chosen_temp.path();
+        let command = &mut primary.cargo;
+        if !yields_permit {
+            return SessionBroker::for_child(root, command);
+        }
+        let mode = PermitMode::BorrowRequired;
+        match relay {
+            Some(relay) => SessionBroker::for_permits(root, command, mode, relay),
+            None => {
+                SessionBroker::for_permits(root, command, mode, prepared.store.exec_permits(&held))
+            }
+        }
+        .map(Some)
+    });
     if budget::admission_expired() {
         drop(broker);
         drop(binding);
@@ -842,12 +857,23 @@ fn execute_primary_group<'session>(
             budget::Phase::PrimaryCargo
         },
     );
-    let armed = arm_broker(broker.as_mut());
+    let armed = if yields_permit {
+        Ok(())
+    } else {
+        arm_broker(broker.as_mut())
+    };
     let mut watchdog = prepared.store.watchdog();
     // The binding mutex is released only once this command is recorded as
     // running, so no peer can repoint the link between the check and Cargo.
     let marked = prepared.store.mark_running(&held, group.id).and(armed);
     drop(binding);
+    let marked = marked.and_then(|()| {
+        if yields_permit {
+            prepared.store.yield_exec_permit(&mut held)?;
+            arm_broker(broker.as_mut())?;
+        }
+        Ok(())
+    });
     // Set only when the group could not be recorded and was stopped here: the
     // bounded stop's own verdict on closure replaces the waits below.
     let mut unrecorded_closed = None;
@@ -862,8 +888,7 @@ fn execute_primary_group<'session>(
                 .map(|status| (status, None, true)),
         },
         Err(error) => {
-            // The group never recorded as running: stop it with a bounded
-            // escalation rather than waiting on it unbounded.
+            // Startup did not settle; stop the group with bounded escalation.
             unrecorded_closed = Some(process::stop_unrecorded(&mut group));
             Err(error)
         }
@@ -1681,6 +1706,9 @@ fn abandon_seed_and_reacquire(
 ) -> Result<Result<(store::Lease, Gate, outputs::OutputBinding), Stop>, String> {
     drop(binding);
     release_ok(request.store.release(held, None))?;
+    if let Some(joined) = request.joined {
+        joined.return_permit();
+    }
     grants.share = false;
     let (held, gate) = match lease_with_gate(request, waits, grants)? {
         Ok(leased) => leased,
@@ -1734,7 +1762,23 @@ fn lease_with_gate(
         // that died before Cargo.
         let foreign = held.prior.foreign(&request.key.checkout);
         let reason = match refusal {
-            Ok(gate) => return Ok(Ok((held, gate))),
+            Ok(gate) => {
+                // First get a usable slot, then compete for the host permit.
+                // Taking it before the checkout's output binding lock lets
+                // any current permit holder finish starting.
+                if let Some(joined) = request.joined.filter(|_| request.label.is_none()) {
+                    if let Err(stop) = joined.borrow() {
+                        let origin = held.prior.unchanged();
+                        release_ok(request.store.release(held, origin))?;
+                        return match stop {
+                            BorrowStop::Admission => Ok(Err(Stop::Admission)),
+                            BorrowStop::Signal(signal) => Ok(Err(Stop::Signal(signal))),
+                            BorrowStop::Failed(error) => Err(error),
+                        };
+                    }
+                }
+                return Ok(Ok((held, gate)));
+            }
             Err(Refusal::Unvouched(reason)) => reason,
             Err(Refusal::Lock { code, message }) => {
                 eprint!("{message}");

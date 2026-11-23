@@ -269,18 +269,28 @@ struct OnePermit {
     borrowed: Arc<std::sync::Mutex<Option<u64>>>,
 }
 
+struct TestGrant {
+    borrowed: Arc<std::sync::Mutex<Option<u64>>>,
+    id: u64,
+}
+
+impl Drop for TestGrant {
+    fn drop(&mut self) {
+        assert_eq!(self.borrowed.lock().unwrap().take(), Some(self.id));
+    }
+}
+
 impl PermitController for OnePermit {
-    fn try_borrow(&self, id: u64) -> Result<(), PermitDenial> {
+    fn borrow(&self, id: u64, _: &BorrowWait<'_>) -> Result<PermitGrant, PermitDenial> {
         let mut borrowed = self.borrowed.lock().unwrap();
         if borrowed.is_some() {
             return Err(PermitDenial::Busy);
         }
         *borrowed = Some(id);
-        Ok(())
-    }
-
-    fn release(&self, id: u64) {
-        assert_eq!(self.borrowed.lock().unwrap().take(), Some(id));
+        Ok(Box::new(TestGrant {
+            borrowed: Arc::clone(&self.borrowed),
+            id,
+        }))
     }
 }
 
@@ -302,14 +312,14 @@ fn permit_policy_controls_grant_and_broker_drop_returns_it() {
     assert_eq!(joined.permit_mode, PermitMode::BorrowRequired);
 
     let BorrowOutcome::Granted { client, permit } =
-        SessionClient::borrow_permit(&path, token).unwrap()
+        SessionClient::borrow_permit(&path, token, None, || Ok(())).unwrap()
     else {
         panic!("first borrower should get the available permit");
     };
     assert_eq!(*borrowed.lock().unwrap(), Some(permit.borrow_id));
     assert!(permit.remaining_execution_ms.unwrap() <= joined.remaining_execution_ms.unwrap());
     assert!(matches!(
-        SessionClient::borrow_permit(&path, token).unwrap(),
+        SessionClient::borrow_permit(&path, token, None, || Ok(())).unwrap(),
         BorrowOutcome::Denied {
             reason: PermitDenial::Busy
         }
@@ -324,7 +334,8 @@ fn permit_policy_controls_grant_and_broker_drop_returns_it() {
         );
         thread::sleep(Duration::from_millis(5));
     }
-    let BorrowOutcome::Granted { client, .. } = SessionClient::borrow_permit(&path, token).unwrap()
+    let BorrowOutcome::Granted { client, .. } =
+        SessionClient::borrow_permit(&path, token, None, || Ok(())).unwrap()
     else {
         panic!("first borrower should have returned the permit");
     };

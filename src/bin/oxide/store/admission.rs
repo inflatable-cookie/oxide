@@ -11,7 +11,9 @@ use crate::cli::Profile;
 use crate::freshness::{Built, Prior};
 use crate::identity::{self, SlotKey};
 use crate::process;
-use crate::session_broker::JoinedSession;
+use crate::session_broker::{
+    BorrowWait, JoinedSession, PermitController, PermitDenial, PermitGrant,
+};
 use oxide_storage::lease::managed::lease_measured;
 use oxide_storage::lease::{
     LeaseError, LeaseRequest, LedgerSlot, LedgerView, Profile as LeaseProfile, ReuseMeasurement,
@@ -21,9 +23,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use super::control_io::{bounded_read, ensure_private_dir, lease_error, probe_lock, Probe};
+use super::control_io::{
+    bounded_read, ensure_private_dir, flock_nonblocking, lease_error, open_admission_file,
+    probe_lock, Probe,
+};
 use super::status::{Observation, ObservationSource};
 
 /// Slots one project identity may keep; a new checkout or a command with no
@@ -339,6 +345,7 @@ pub struct Lease {
     // Keep the inherited permit marker locked while this process owns the
     // slot. A crash closes it, making any unsettled record count again.
     _inherited_permit: Option<File>,
+    yielded_permit: Option<File>,
     /// The cooperative hold on the slot's Barge root, kept for as long as the
     /// command uses it. A child that kept the inherited descriptor keeps the
     /// root held after this lease is dropped.
@@ -454,23 +461,256 @@ pub(super) fn permit_path(control: &std::path::Path, record: u64) -> PathBuf {
         .join(format!("{record}.inherited-permit"))
 }
 
+pub(super) fn exec_permit_path(control: &Path, record: u64, marker: &str) -> PathBuf {
+    control
+        .join("locks")
+        .join(format!("{record}.exec-{marker}"))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ExecPermit {
+    Yielded,
+    Borrowed,
+}
+
+pub(super) fn exec_permit(control: &Path, record: u64) -> Result<Option<ExecPermit>, String> {
+    if !matches!(
+        probe_lock(&exec_permit_path(control, record, "yielded"), false)?,
+        Probe::Held
+    ) {
+        return Ok(None);
+    }
+    let borrowed = matches!(
+        probe_lock(&exec_permit_path(control, record, "borrowed"), false)?,
+        Probe::Held
+    );
+    Ok(Some(if borrowed {
+        ExecPermit::Borrowed
+    } else {
+        ExecPermit::Yielded
+    }))
+}
+
 pub(super) fn host_permit_count(
     control: &std::path::Path,
     records: &[Record],
 ) -> Result<usize, String> {
     let mut count = 0;
     for record in records.iter().filter(|record| record.active()) {
-        if !matches!(
-            probe_lock(&permit_path(control, record.id), false)?,
-            Probe::Held
-        ) {
-            count += 1;
+        match exec_permit(control, record.id)? {
+            Some(ExecPermit::Yielded) => {}
+            Some(ExecPermit::Borrowed) => count += 1,
+            None => {
+                if !matches!(
+                    probe_lock(&permit_path(control, record.id), false)?,
+                    Probe::Held
+                ) {
+                    count += 1;
+                }
+            }
         }
     }
     Ok(count)
 }
 
+/// Counts once in host admission while any nested build has an open grant.
+/// The weak reference never extends the lifetime of a grant.
+pub(crate) struct ExecPermits {
+    store: Store,
+    record: u64,
+    active: Mutex<Weak<File>>,
+}
+
+struct BorrowTicket<'a> {
+    store: &'a Store,
+    ticket: Option<(u64, File)>,
+}
+
+impl Drop for BorrowTicket<'_> {
+    fn drop(&mut self) {
+        if self.ticket.take().is_some() {
+            // Dropping the lock cancels immediately. Reap now if admission
+            // is free, or let the next admission do it under that same lock.
+            let _ = self.store.reap_borrow_tickets();
+        }
+    }
+}
+
+impl PermitController for ExecPermits {
+    fn borrow(&self, _: u64, wait: &BorrowWait<'_>) -> Result<PermitGrant, PermitDenial> {
+        let mut ticket = BorrowTicket {
+            store: &self.store,
+            ticket: None,
+        };
+        loop {
+            wait.check()?;
+            match self.try_grant(&mut ticket, wait) {
+                Ok(Some(permit)) => return Ok(Box::new(permit)),
+                Ok(None) => wait.wait()?,
+                Err(error) => {
+                    eprintln!("oxide: cannot admit an exec build permit: {error}");
+                    return Err(PermitDenial::Unavailable);
+                }
+            }
+        }
+    }
+}
+
+impl ExecPermits {
+    fn try_grant(
+        &self,
+        ticket: &mut BorrowTicket<'_>,
+        wait: &BorrowWait<'_>,
+    ) -> Result<Option<Arc<File>>, String> {
+        // A live grant can share immediately, even during another admission.
+        if let Some(active) = self.active_permit()? {
+            return Ok(Some(active));
+        }
+        let Some(_locks) = self.store.try_permit_admission()? else {
+            return Ok(None);
+        };
+        // No other thread can create a new permit while admission is held.
+        if let Some(active) = self.active_permit()? {
+            return Ok(Some(active));
+        }
+
+        let mut state = self.store.load()?;
+        let waits_before = state.tickets.len() + state.cleans.len();
+        self.store.drop_dead_tickets(&mut state)?;
+        let reaped = state.tickets.len() + state.cleans.len() != waits_before;
+        let enqueued = ticket.ticket.is_none();
+        if enqueued {
+            self.store.check_waiter_pool()?;
+            ticket.ticket = Some(self.store.enqueue_waiter(&mut state, false)?);
+        }
+        if enqueued || reaped {
+            self.store.save(&state)?;
+        }
+        let (id, _) = ticket
+            .ticket
+            .as_ref()
+            .ok_or("missing exec build permit ticket")?;
+        if self.store.queue_position(&state, *id)?.is_some() {
+            return Ok(None);
+        }
+        // A build that died while we waited may need normal slot recovery
+        // before it stops counting. Unknown writers still count.
+        if self
+            .store
+            .host_limit(&state, self.store.max_active)?
+            .is_some()
+        {
+            let active_before = state
+                .records
+                .iter()
+                .filter(|record| record.active())
+                .count();
+            oxide_storage::lease::set_admission_deadline(wait.deadline());
+            let recovered = self.store.recover_settled(&mut state);
+            oxide_storage::lease::set_admission_deadline(None);
+            recovered?;
+            if state
+                .records
+                .iter()
+                .filter(|record| record.active())
+                .count()
+                != active_before
+            {
+                self.store.save(&state)?;
+            }
+            if self
+                .store
+                .host_limit(&state, self.store.max_active)?
+                .is_some()
+            {
+                return Ok(None);
+            }
+        }
+        if wait.check().is_err() {
+            return Ok(None);
+        }
+        let Probe::Free(marker) = probe_lock(
+            &exec_permit_path(&self.store.control, self.record, "borrowed"),
+            true,
+        )?
+        else {
+            return Err("the exec build permit marker is unexpectedly held".to_owned());
+        };
+        let permit = Arc::new(marker);
+        self.store.remove_waiter(&mut state, *id)?;
+        ticket.ticket.take();
+        *self
+            .active
+            .lock()
+            .map_err(|_| "exec build permit state is poisoned")? = Arc::downgrade(&permit);
+        Ok(Some(permit))
+    }
+
+    fn active_permit(&self) -> Result<Option<Arc<File>>, String> {
+        Ok(self
+            .active
+            .lock()
+            .map_err(|_| "exec build permit state is poisoned")?
+            .upgrade())
+    }
+}
+
 impl Store {
+    /// The exec tool has started and its group is recorded. Its slot and
+    /// writer custody stay held while the separate host permit is yielded.
+    pub(crate) fn yield_exec_permit(&self, lease: &mut Lease) -> Result<(), String> {
+        let Probe::Free(marker) = probe_lock(
+            &exec_permit_path(&self.control, lease.record, "yielded"),
+            true,
+        )?
+        else {
+            return Err("the exec yield marker is unexpectedly held".to_owned());
+        };
+        lease.yielded_permit = Some(marker);
+        Ok(())
+    }
+
+    pub(crate) fn exec_permits(&self, lease: &Lease) -> ExecPermits {
+        ExecPermits {
+            store: self.clone(),
+            record: lease.record,
+            active: Mutex::new(Weak::new()),
+        }
+    }
+
+    /// Use the slot admission gates in the same order. A pending borrower
+    /// must be free to notice disconnects even while another writer holds them.
+    fn try_permit_admission(&self) -> Result<Option<(Option<File>, File)>, String> {
+        fn try_lock(control: &Path) -> Result<Option<File>, String> {
+            let file = open_admission_file(control)?
+                .ok_or_else(|| format!("{} does not exist", control.display()))?;
+            Ok(flock_nonblocking(&file)?.then_some(file))
+        }
+
+        let internal = if let Some(sibling) = self.sibling.as_ref().filter(|s| s.barrier) {
+            let Some(internal) = try_lock(&sibling.control)? else {
+                return Ok(None);
+            };
+            Some(internal)
+        } else {
+            None
+        };
+        let Some(admission) = try_lock(&self.control)? else {
+            return Ok(None);
+        };
+        self.fence_admission_state()?;
+        Ok(Some((internal, admission)))
+    }
+
+    fn reap_borrow_tickets(&self) -> Result<(), String> {
+        if let Some(_locks) = self.try_permit_admission()? {
+            let mut state = self.load()?;
+            self.drop_dead_tickets(&mut state)?;
+            self.save(&state)?;
+        }
+        Ok(())
+    }
+
     /// Lease this checkout's slot, waiting in FIFO order. Ctrl-C while waiting
     /// cancels without touching any slot.
     /// `share` allows taking another checkout's idle compatible slot.
@@ -681,6 +921,7 @@ impl Store {
             record: claimed.record,
             _lock: claimed.lock,
             _inherited_permit: inherited_permit,
+            yielded_permit: None,
             _root_hold: root_hold,
         }))
     }
@@ -700,21 +941,12 @@ impl Store {
         independent_limit: Option<usize>,
         cleaning: bool,
     ) -> Result<Option<Wait>, String> {
-        let position = state
-            .tickets
-            .iter()
-            .position(|entry| entry.id == ticket)
-            .ok_or("Oxide wait ticket was lost")?;
         if independent_limit.is_some() {
-            let mut unblocked_ahead = 0usize;
-            for entry in &state.tickets[..position] {
-                if !self.is_ticket_blocked(entry.id)? {
-                    unblocked_ahead += 1;
-                }
+            if let Some(wait) = self.queue_position(state, ticket)? {
+                return Ok(Some(wait));
             }
-            if unblocked_ahead > 0 {
-                return Ok(Some(Wait::Queue(unblocked_ahead + 1)));
-            }
+        } else if !state.tickets.iter().any(|entry| entry.id == ticket) {
+            return Err("Oxide wait ticket was lost".to_owned());
         }
         if cleaning
             || state
@@ -730,14 +962,30 @@ impl Store {
             self.discard_lost(state)?;
         }
         if let Some(limit) = independent_limit {
-            let active =
-                host_permit_count(&self.control, &state.records)? + self.sibling_active()?;
-            if active >= limit {
-                return Ok(Some(Wait::HostLimit(active)));
+            if let Some(wait) = self.host_limit(state, limit)? {
+                return Ok(Some(wait));
             }
             self.set_ticket_blocked(ticket, false)?;
         }
         Ok(None)
+    }
+
+    fn queue_position(&self, state: &State, ticket: u64) -> Result<Option<Wait>, String> {
+        let mut unblocked_ahead = 0;
+        for entry in &state.tickets {
+            if entry.id == ticket {
+                return Ok((unblocked_ahead > 0).then_some(Wait::Queue(unblocked_ahead + 1)));
+            }
+            if !self.is_ticket_blocked(entry.id)? {
+                unblocked_ahead += 1;
+            }
+        }
+        Err("Oxide wait ticket was lost".to_owned())
+    }
+
+    fn host_limit(&self, state: &State, limit: usize) -> Result<Option<Wait>, String> {
+        let active = host_permit_count(&self.control, &state.records)? + self.sibling_active()?;
+        Ok((active >= limit).then_some(Wait::HostLimit(active)))
     }
 
     /// Choose the record and slot this attempt uses: this checkout's own idle
@@ -1312,6 +1560,15 @@ impl Store {
 
     fn register_waiter(&self, already_admitted: bool) -> Result<(u64, File), String> {
         let _admission = self.admission()?;
+        self.check_waiter_pool()?;
+        let mut state = self.load()?;
+        self.drop_dead_tickets(&mut state)?;
+        let ticket = self.enqueue_waiter(&mut state, already_admitted)?;
+        self.save(&state)?;
+        Ok(ticket)
+    }
+
+    fn check_waiter_pool(&self) -> Result<(), String> {
         if self.backend == super::Backend::ApfsVolume && self.sibling.is_some() {
             let registration = crate::removable::read_registration(self.owner_control())?
                 .ok_or("the selected removable pool is no longer registered")?;
@@ -1321,8 +1578,14 @@ impl Store {
                 );
             }
         }
-        let mut state = self.load()?;
-        self.drop_dead_tickets(&mut state)?;
+        Ok(())
+    }
+
+    fn enqueue_waiter(
+        &self,
+        state: &mut State,
+        already_admitted: bool,
+    ) -> Result<(u64, File), String> {
         if state.tickets.len() >= MAX_TICKETS {
             return Err(format!(
                 "the Oxide wait queue is full ({MAX_TICKETS} commands)"
@@ -1338,15 +1601,18 @@ impl Store {
             id,
             pid: std::process::id(),
         });
-        self.save(&state)?;
         Ok((id, file))
     }
 
     pub(super) fn remove_ticket(&self, id: u64) -> Result<(), String> {
         let _admission = self.admission()?;
         let mut state = self.load()?;
+        self.remove_waiter(&mut state, id)
+    }
+
+    fn remove_waiter(&self, state: &mut State, id: u64) -> Result<(), String> {
         state.tickets.retain(|ticket| ticket.id != id);
-        self.save(&state)?;
+        self.save(state)?;
         self.set_ticket_blocked(id, false)?;
         match fs::remove_file(self.ticket_path(id)) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
