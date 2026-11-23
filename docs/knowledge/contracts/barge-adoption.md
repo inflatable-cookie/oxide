@@ -13,7 +13,7 @@ storage invariants still apply.
 
 `barge` is a Git dependency pinned by a full 40-hex revision in `Cargo.toml` and
 `Cargo.lock`, never a branch or tag. The current pin is Barge main
-`04e52d8742e8f56c8a0e634834700e18500d9d8d`. Only test builds request Barge's
+`f3f7b6333168aed51af786a96ba5d17ef8d4e462`. Only test builds request Barge's
 `testing` feature.
 
 Barge reads no Oxide format and knows nothing about Oxide. Oxide writes no Barge
