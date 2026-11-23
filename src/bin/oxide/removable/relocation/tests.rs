@@ -675,3 +675,414 @@ fn a_foreign_or_missing_checkout_link_stays_untouched() {
         );
     }
 }
+
+fn upgrade_fixture(
+    fixture: &Fixture,
+    dry_run: bool,
+) -> Result<super::super::upgrade_legacy::Report, String> {
+    super::super::upgrade_legacy::upgrade(&fixture.internal, dry_run, |_| Ok(fixture.media()))
+}
+
+fn legacy_output_fixture(fixture: &Fixture) {
+    fixture.outputs.unpin(&fixture.output.id).unwrap();
+    for root in [&fixture.output, &fixture.unused_output] {
+        fs::remove_file(root.path.join(oxide_storage::storage::ROOT_MARKER)).unwrap();
+    }
+    fs::write(fixture.unused_output.path.join("stale-artifact"), b"dead").unwrap();
+    let directory = fixture.internal.control().join("outputs");
+    let mut registry = read_json(&directory.join("registry.json"));
+    registry["rows"][1]["checkout"] = json!(fixture.checkout.with_file_name("deleted-checkout"));
+    // One dead reference to a live root must not make the root deletable.
+    let mut history = registry["rows"][0].clone();
+    history["checkout"] = registry["rows"][1]["checkout"].clone();
+    history["selected"] = json!(false);
+    registry["rows"].as_array_mut().unwrap().push(history);
+    for row in registry["rows"].as_array_mut().unwrap() {
+        row.as_object_mut().unwrap().remove("barge_id");
+    }
+    write_json(&directory, "registry.json", &registry);
+}
+
+fn upgrade_ready_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    for pool in [&fixture.internal, &fixture.removable] {
+        store::lock_admission(pool.control()).unwrap();
+    }
+    fixture
+}
+
+fn legacy_project(fixture: &Fixture, name: &str) -> Area {
+    let folder = format!("oxide-pool/slots/{name}");
+    private_tree(&fixture.mount.join(&folder).join(".barge/locks"));
+    fixture
+        .media()
+        .account(fixture.removable.control(), false)
+        .unwrap()
+        .area(
+            AreaSpec::new(NAMESPACE, format!("pool-{name}"), "pool")
+                .folder(folder)
+                .soft_cap_bytes(Some(CAP))
+                .counts_toward_reserve(true),
+        )
+        .unwrap()
+}
+
+#[test]
+fn upgrade_legacy_adopts_and_cleans_then_relocation_succeeds() {
+    let fixture = upgrade_ready_fixture();
+    legacy_output_fixture(&fixture);
+    let slots = fixture.mount.join("oxide-pool/slots");
+    let empty = slots.join("empty-project");
+    private_tree(&empty);
+    legacy_project(&fixture, "empty-area");
+    private_tree(&slots.join("empty-area/.trash"));
+    let legacy = legacy_project(&fixture, "legacy-project");
+    let dead_slot = slots.join("legacy-project/quick-2");
+    private_tree(&dead_slot);
+    let adopted = legacy
+        .adopt_root("quick-2", "quick", "legacy-slot-id")
+        .unwrap();
+    fs::write(dead_slot.join("stale-intermediate"), "dead slot").unwrap();
+    let markerless_slot = slots.join("legacy-project/quick-3");
+    private_tree(&markerless_slot);
+    fs::write(
+        markerless_slot.join("stale-intermediate"),
+        "dead pre-Barge slot",
+    )
+    .unwrap();
+    let trash = slots.join(".trash/.barge-claim-oxide-quick-0123456789abcdef.1");
+    private_tree(&trash);
+    symlink(&fixture.checkout, trash.join("never-follow")).unwrap();
+    let outside = fixture.checkout.join("outside-sentinel");
+    fs::write(&outside, "keep me").unwrap();
+
+    let affinity = fixture.removable.control().join("affinity/17");
+    private_tree(&affinity);
+    let missing_workspace = fixture.checkout.with_file_name("deleted-slot-workspace");
+    let mut ledger = read_json(&fixture.removable.pool.join("ledger.json"));
+    ledger["next_slot"] = json!(4);
+    let rows = ledger["slots"].as_array_mut().unwrap();
+    let mut row = rows[0].clone();
+    row["id"] = json!(2);
+    row["project"] = json!(affinity);
+    row["workspace"] = json!(missing_workspace);
+    row["dir"] = json!("legacy-project/quick-2");
+    row["root"] = json!(adopted.id);
+    rows.push(row.clone());
+    row["id"] = json!(3);
+    row["dir"] = json!("legacy-project/quick-3");
+    row.as_object_mut().unwrap().remove("root");
+    row["owned"] = json!(false);
+    rows.push(row);
+    write_json(&fixture.removable.pool, "ledger.json", &ledger);
+    let state_path = fixture.removable.control().join("state.json");
+    let mut state = read_json(&state_path);
+    let mut record = state["records"][0].clone();
+    record["id"] = json!(17);
+    record["checkout"] = json!(missing_workspace);
+    state["next_id"] = json!(18);
+    state["records"].as_array_mut().unwrap().push(record);
+    write_json(fixture.removable.control(), "state.json", &state);
+
+    let registry_path = fixture.internal.control().join("outputs/registry.json");
+    let registry_before = fs::read(&registry_path).unwrap();
+    let state_before = fs::read(&state_path).unwrap();
+    let ledger_before = fs::read(fixture.removable.pool.join("ledger.json")).unwrap();
+    let preview = upgrade_fixture(&fixture, true).unwrap();
+    assert!(preview.dry_run);
+    assert_eq!(preview.adopt_outputs.paths, [fixture.output.path.clone()]);
+    assert_eq!(
+        preview.remove_dead_outputs.paths,
+        [fixture.unused_output.path.clone()]
+    );
+    assert_eq!(preview.remove_empty_projects.paths, [empty.clone()]);
+    assert_eq!(
+        preview.remove_legacy_areas.paths,
+        [slots.join("empty-area"), slots.join("legacy-project")]
+    );
+    assert_eq!(
+        preview.retire_dead_slots.paths,
+        [dead_slot.clone(), markerless_slot.clone()]
+    );
+    assert_eq!(preview.remove_markerless_trash.paths, [trash.clone()]);
+    assert_eq!(fs::read(&registry_path).unwrap(), registry_before);
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+    assert_eq!(
+        fs::read(fixture.removable.pool.join("ledger.json")).unwrap(),
+        ledger_before
+    );
+    assert!(!fixture
+        .output
+        .path
+        .join(oxide_storage::storage::ROOT_MARKER)
+        .exists());
+    assert!(trash.is_dir() && dead_slot.is_dir() && empty.is_dir());
+    assert!(fixture
+        .run(true)
+        .unwrap_err()
+        .contains("cannot establish custody"));
+
+    let report = upgrade_fixture(&fixture, false).unwrap();
+    assert!(!report.dry_run);
+    let mut preview_json = serde_json::to_value(&preview).unwrap();
+    preview_json["dry_run"] = json!(false);
+    assert_eq!(serde_json::to_value(&report).unwrap(), preview_json);
+    assert!(fixture
+        .output
+        .path
+        .join(oxide_storage::storage::ROOT_MARKER)
+        .is_file());
+    assert_eq!(
+        fs::read(fixture.output.path.join("debug/output-sentinel")).unwrap(),
+        b"output data"
+    );
+    let registry = read_json(&registry_path);
+    let remaining = registry["rows"].as_array().unwrap();
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining
+        .iter()
+        .all(|row| row["root"] == json!(fixture.output.path)));
+    let imported = fixture.outputs.list_without_bytes().unwrap().roots;
+    assert_eq!(imported.len(), 1);
+    assert!(imported[0].pinned);
+    assert_eq!(remaining[0]["barge_id"], imported[0].id);
+    assert_eq!(
+        read_json(&state_path)["records"].as_array().unwrap().len(),
+        1
+    );
+    let ledger = read_json(&fixture.removable.pool.join("ledger.json"));
+    assert_eq!(ledger["slots"].as_array().unwrap().len(), 1);
+    assert_eq!(ledger["slots"][0]["id"], 1);
+    assert_eq!(fs::read(outside).unwrap(), b"keep me");
+    for removed in [
+        empty,
+        slots.join("empty-area"),
+        slots.join("legacy-project"),
+        dead_slot,
+        markerless_slot,
+        trash,
+        fixture.unused_output.path.clone(),
+        affinity,
+    ] {
+        assert!(!removed.exists(), "{} still exists", removed.display());
+    }
+    let declarations = fixture.removable.control().join("barge/areas");
+    for name in [
+        "oxide.pool-empty-area.json",
+        "oxide.pool-legacy-project.json",
+    ] {
+        assert!(!declarations.join(name).exists());
+    }
+    assert!(fixture
+        .slots
+        .list_without_bytes()
+        .unwrap()
+        .stragglers
+        .is_empty());
+    assert!(fixture
+        .outputs
+        .list_without_bytes()
+        .unwrap()
+        .stragglers
+        .is_empty());
+    let retry = upgrade_fixture(&fixture, false).unwrap();
+    assert_eq!(
+        retry.adopt_outputs.count + retry.remove_dead_outputs.count + retry.retire_dead_slots.count,
+        0
+    );
+
+    assert!(fixture.run(false).unwrap().moved_outputs);
+    let moved = fixture.mount.join(OUTPUTS).join(&fixture.output.folder);
+    assert_eq!(
+        fs::read(moved.join("debug/output-sentinel")).unwrap(),
+        b"output data"
+    );
+    assert_eq!(
+        fs::read_link(fixture.checkout.join("target/debug")).unwrap(),
+        moved.join("debug")
+    );
+}
+
+#[test]
+fn upgrade_legacy_refuses_an_absent_checkout_drive_without_a_recorded_uuid() {
+    for root_missing in [false, true] {
+        let fixture = upgrade_ready_fixture();
+        legacy_output_fixture(&fixture);
+        let empty = fixture.mount.join("oxide-pool/slots/empty");
+        private_tree(&empty);
+        // Name an absent mount without creating anything under /Volumes.
+        let mount = Path::new("/Volumes").join(fixture._temp.path().file_name().unwrap());
+        assert!(!mount.try_exists().unwrap());
+        let checkout = mount.join("checkout");
+        let directory = fixture.internal.control().join("outputs");
+        let registry_path = directory.join("registry.json");
+        let mut registry = read_json(&registry_path);
+        let row = &mut registry["rows"][1];
+        assert!(row.get("checkout_volume_uuid").is_none());
+        row["checkout"] = json!(checkout);
+        write_json(&directory, "registry.json", &registry);
+        let before = fs::read(&registry_path).unwrap();
+        if root_missing {
+            fs::remove_dir_all(&fixture.unused_output.path).unwrap();
+        }
+
+        for dry_run in [true, false] {
+            let error = upgrade_fixture(&fixture, dry_run).unwrap_err();
+            assert!(
+                error.contains(checkout.to_string_lossy().as_ref()),
+                "{error}"
+            );
+            assert!(
+                error.contains("cannot establish that the workspace volume"),
+                "{error}"
+            );
+            assert_eq!(fs::read(&registry_path).unwrap(), before);
+            assert!(empty.is_dir());
+            assert!(!fixture
+                .output
+                .path
+                .join(oxide_storage::storage::ROOT_MARKER)
+                .exists());
+            assert_eq!(fixture.unused_output.path.exists(), !root_missing);
+        }
+        if !root_missing {
+            assert_eq!(
+                fs::read(fixture.unused_output.path.join("stale-artifact")).unwrap(),
+                b"dead"
+            );
+        }
+    }
+}
+
+#[test]
+fn upgrade_legacy_resumes_after_dead_output_removal_before_registry_publish() {
+    let fixture = upgrade_ready_fixture();
+    let directory = fixture.internal.control().join("outputs");
+    let registry_path = directory.join("registry.json");
+    let mut registry = read_json(&registry_path);
+    let surviving = registry["rows"][0].clone();
+    let interrupted = &mut registry["rows"][1];
+    interrupted.as_object_mut().unwrap().remove("barge_id");
+    interrupted["checkout"] = json!(fixture.checkout.with_file_name("deleted-checkout"));
+    let mut retained = interrupted.clone();
+    retained["root"] = json!(fixture
+        .unused_output
+        .path
+        .with_file_name("missing-recorded-root"));
+    retained["barge_id"] = json!("previous-root-id");
+    registry["rows"]
+        .as_array_mut()
+        .unwrap()
+        .push(retained.clone());
+    write_json(&directory, "registry.json", &registry);
+    let before = fs::read(&registry_path).unwrap();
+    // Simulate interruption after removal of the markerless output directory.
+    fs::remove_file(
+        fixture
+            .unused_output
+            .path
+            .join(oxide_storage::storage::ROOT_MARKER),
+    )
+    .unwrap();
+    fs::remove_dir_all(&fixture.unused_output.path).unwrap();
+
+    let preview = upgrade_fixture(&fixture, true).unwrap();
+    assert_eq!(
+        preview.forget_missing_outputs.paths,
+        [fixture.unused_output.path.clone()]
+    );
+    assert_eq!(preview.remove_dead_outputs.count, 0);
+    assert_eq!(fs::read(&registry_path).unwrap(), before);
+
+    let applied = upgrade_fixture(&fixture, false).unwrap();
+    assert_eq!(
+        applied.forget_missing_outputs.paths,
+        preview.forget_missing_outputs.paths
+    );
+    assert_eq!(applied.remove_dead_outputs.count, 0);
+    let after = read_json(&registry_path);
+    assert_eq!(after["revision"], 2);
+    assert_eq!(after["rows"], json!([surviving, retained]));
+    assert!(fixture.output.path.join("debug/output-sentinel").is_file());
+    assert_eq!(
+        upgrade_fixture(&fixture, false)
+            .unwrap()
+            .forget_missing_outputs
+            .count,
+        0
+    );
+    assert_eq!(read_json(&registry_path), after);
+}
+
+#[test]
+fn upgrade_legacy_refuses_unknown_entries_before_any_payload_mutation() {
+    let fixture = upgrade_ready_fixture();
+    legacy_output_fixture(&fixture);
+    let empty = fixture.mount.join("oxide-pool/slots/empty");
+    private_tree(&empty);
+    let unknown = fixture.mount.join("oxide-outputs/unregistered");
+    private_tree(&unknown);
+    assert!(upgrade_fixture(&fixture, false)
+        .unwrap_err()
+        .contains("unregistered"));
+    assert!(unknown.is_dir() && empty.is_dir());
+
+    fs::remove_dir(unknown).unwrap();
+    let foreign = fixture.mount.join("oxide-pool/slots/foreign");
+    private_tree(&foreign);
+    fs::write(foreign.join("sentinel"), b"unowned").unwrap();
+    assert!(upgrade_fixture(&fixture, false)
+        .unwrap_err()
+        .contains("foreign/sentinel"));
+    assert!(empty.is_dir() && fixture.unused_output.path.is_dir());
+    assert!(!fixture
+        .output
+        .path
+        .join(oxide_storage::storage::ROOT_MARKER)
+        .exists());
+}
+
+#[test]
+fn upgrade_legacy_refuses_oxides_and_barges_active_writers() {
+    let fixture = upgrade_ready_fixture();
+    let control = fixture.removable.control();
+    let mut state = read_json(&control.join("state.json"));
+    state["records"][0]["phase"] = json!("running");
+    state["records"][0]["process_group"] = json!(std::process::id());
+    write_json(control, "state.json", &state);
+    assert!(upgrade_fixture(&fixture, false)
+        .unwrap_err()
+        .contains("build record 1"));
+    state["records"][0]["phase"] = json!("idle");
+    state["records"][0]["process_group"] = json!(null);
+    write_json(control, "state.json", &state);
+
+    let hold = fixture
+        .outputs
+        .hold(&fixture.output.id, Mode::Shared)
+        .unwrap();
+    assert!(upgrade_fixture(&fixture, true)
+        .unwrap_err()
+        .contains("Barge root"));
+    drop(hold);
+
+    let hold = fixture
+        .slots
+        .hold(&fixture.slot.id, Mode::Exclusive)
+        .unwrap();
+    assert!(upgrade_fixture(&fixture, false)
+        .unwrap_err()
+        .contains("Barge root"));
+    drop(hold);
+
+    legacy_project(&fixture, "locked-area");
+    let lock_path = fixture
+        .mount
+        .join("oxide-pool/slots/locked-area/.barge/locks/old.lock");
+    let file = store::private_file(&lock_path, true).unwrap().unwrap();
+    assert!(store::flock_nonblocking(&file).unwrap());
+    assert!(upgrade_fixture(&fixture, false)
+        .unwrap_err()
+        .contains("old.lock"));
+    assert!(lock_path.is_file());
+}

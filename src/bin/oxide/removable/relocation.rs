@@ -104,16 +104,7 @@ pub(super) fn run(args: &[&str]) -> Result<u8, String> {
     }
     let options = Options::parse(args)?;
     let internal = Store::open_recorded(&store::settings()?)?.ok_or("no internal pool exists")?;
-    let report = relocate(&internal, &options, |registration| {
-        let binding = Binding::open(&registration.mount_point, Some(&registration.volume_uuid))?;
-        if !volume::writable(binding.mount_point())? {
-            return Err(format!(
-                "{} is not writable",
-                binding.mount_point().display()
-            ));
-        }
-        Ok(Media::Mounted(binding))
-    })?;
+    let report = relocate(&internal, &options, Media::bind)?;
     if options.json {
         println!(
             "{}",
@@ -152,7 +143,7 @@ pub(super) fn run(args: &[&str]) -> Result<u8, String> {
     Ok(0)
 }
 
-enum Media {
+pub(super) enum Media {
     Mounted(Binding),
     #[cfg(all(test, target_os = "macos"))]
     Fake {
@@ -164,6 +155,17 @@ enum Media {
 }
 
 impl Media {
+    pub(super) fn bind(registration: &Registration) -> Result<Self, String> {
+        let binding = Binding::open(&registration.mount_point, Some(&registration.volume_uuid))?;
+        if !volume::writable(binding.mount_point())? {
+            return Err(format!(
+                "{} is not writable",
+                binding.mount_point().display()
+            ));
+        }
+        Ok(Self::Mounted(binding))
+    }
+
     fn fd(&self) -> BorrowedFd<'_> {
         match self {
             Self::Mounted(binding) => binding.fd(),
@@ -172,7 +174,7 @@ impl Media {
         }
     }
 
-    fn verify(&self) -> Result<(), String> {
+    pub(super) fn verify(&self) -> Result<(), String> {
         match self {
             Self::Mounted(binding) => binding.verify().map(|_| ()),
             #[cfg(all(test, target_os = "macos"))]
@@ -194,7 +196,7 @@ impl Media {
         }
     }
 
-    fn account(&self, control: &Path, read_only: bool) -> Result<Barge, String> {
+    pub(super) fn account(&self, control: &Path, read_only: bool) -> Result<Barge, String> {
         let os: Arc<dyn Os> = match self {
             Self::Mounted(_) => Arc::new(OxideOs),
             #[cfg(all(test, target_os = "macos"))]
@@ -213,7 +215,7 @@ impl Media {
         .map_err(|error| error.to_string())
     }
 
-    fn directory(&self, relative: &str) -> Result<File, String> {
+    pub(super) fn directory(&self, relative: &str) -> Result<File, String> {
         match self {
             Self::Mounted(binding) => binding.dir_path_at(relative, false).map(File::from),
             #[cfg(all(test, target_os = "macos"))]
@@ -497,7 +499,7 @@ fn relocate(
     Ok(report)
 }
 
-fn checked_area(
+pub(super) fn checked_area(
     barge: &Barge,
     name: &str,
     folder: &str,
@@ -510,6 +512,16 @@ fn checked_area(
         Err(error) if error.kind() == BargeError::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
     };
+    check_area_location(&area, folder, alias, registration)?;
+    Ok(Some(area))
+}
+
+pub(super) fn check_area_location(
+    area: &Area,
+    folder: &str,
+    alias: &str,
+    registration: &Registration,
+) -> Result<(), String> {
     let volume = area.volume().spec();
     if area.record().effective_folder() != folder
         || volume.name != alias
@@ -520,21 +532,17 @@ fn checked_area(
             != barge::Location::Volume(registration.mount_point.join(folder))
     {
         return Err(format!(
-            "{key} records {} on volume {}; expected {folder} on {alias}",
+            "{} records {} on volume {}; expected {folder} on {alias}",
+            area.key().label(),
             area.record().effective_folder(),
             volume.name
         ));
     }
-    Ok(Some(area))
+    Ok(())
 }
 
 fn require_unheld(area: &Area, moving: bool) -> Result<(), String> {
-    let listing = area
-        .list_without_bytes()
-        .map_err(|error| error.to_string())?;
-    if let Some(root) = listing.roots.iter().find(|root| root.held) {
-        return Err(format!("Barge root {} is held", root.path.display()));
-    }
+    let listing = unheld_listing(area)?;
     if moving {
         if let Some(root) = listing.stragglers.first() {
             return Err(format!(
@@ -545,6 +553,16 @@ fn require_unheld(area: &Area, moving: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+pub(super) fn unheld_listing(area: &Area) -> Result<barge::Listing, String> {
+    let listing = area
+        .list_without_bytes()
+        .map_err(|error| error.to_string())?;
+    if let Some(root) = listing.roots.iter().find(|root| root.held) {
+        return Err(format!("Barge root {} is held", root.path.display()));
+    }
+    Ok(listing)
 }
 
 fn move_area(media: &Media, barge: &Barge, key: &AreaKey, folder: &str) -> Result<(), String> {

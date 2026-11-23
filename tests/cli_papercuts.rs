@@ -1494,3 +1494,18 @@ fn output_prune_dry_run_preserves_pool_trash_and_partial_output_accounts() {
         b"retained owned bytes"
     );
 }
+
+#[test]
+fn upgrade_legacy_help_and_argument_refusal_are_passive() {
+    let scratch = Scratch::new();
+    let root = scratch.path();
+    let pool = root.join("uncreated-pool");
+    let run = |args: &[&str]| private_env(root, root, &pool).args(args).output().unwrap();
+    let help = run(&["pool", "upgrade-legacy", "--help"]);
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("upgrade-legacy [--dry-run] [--json]"));
+    let bad = run(&["pool", "upgrade-legacy", "--dry-run", "--dry-run"]);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("usage: oxide pool upgrade-legacy"));
+    assert!(!pool.exists());
+}

@@ -243,6 +243,16 @@ pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
     lock_admission_inner(control, None)
 }
 
+/// Take admission without creating any control files.
+pub(crate) fn lock_existing_admission(control: &Path) -> Result<File, String> {
+    verify_private_dir(control)?;
+    let path = control.join("admission.lock");
+    let file = private_file(&path, false)?
+        .ok_or_else(|| format!("cannot take admission: {} is missing", path.display()))?;
+    crate::budget::lock(&file, "admission")?;
+    Ok(file)
+}
+
 pub(super) fn prepare_front_door_pool(pool: &Path, context: &str) -> Result<LedgerView, String> {
     let result = prepare_pool(pool);
     if result != Err(LeaseError::WriterFenceBusy) {

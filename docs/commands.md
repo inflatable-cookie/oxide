@@ -89,6 +89,7 @@ oxide exec --manifest-path crates/app/Cargo.toml -- ./scripts/package.sh
 ```sh
 oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ephemeral|permanent] [--payload-dir <rel>] [--outputs-dir <rel>]
 oxide pool relocate --payload-dir <rel> --outputs-dir <rel> [--dry-run] [--json]
+oxide pool upgrade-legacy [--dry-run] [--json]
 oxide pool set-mode <ephemeral|permanent>
 oxide pool describe --json
 oxide pool recover-interrupted <slot>
@@ -99,6 +100,13 @@ oxide pool recover-interrupted <slot>
 `relocate` moves the registered pool and any declared external outputs during
 a quiet window. Use `--dry-run` to check the destinations and preview the move.
 `--json` reports the old and new paths and any checkout links left untouched.
+
+If pre-Barge entries block relocation, run `oxide pool upgrade-legacy --dry-run`
+with the registered drive attached and builds and cleans stopped. Apply with
+`oxide pool upgrade-legacy`. It adopts recorded outputs for surviving
+checkouts in place and removes recorded dead outputs, abandoned legacy slot
+projects and recognized markerless slot trash. Unknown entries and held
+locks stop the upgrade. Use `--json` for counts and paths by action.
 
 ## `oxide outputs`
 

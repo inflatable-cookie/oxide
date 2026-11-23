@@ -28,7 +28,18 @@ use std::time::Duration;
 pub struct PayloadRelocation {
     pool: std::path::PathBuf,
     config: PoolConfig,
+    ledger: Ledger,
     _lock: std::fs::File,
+}
+
+/// The path and ownership evidence for a slot in the locked removable ledger.
+#[derive(Debug)]
+pub struct QuietSlot<'a> {
+    pub id: u64,
+    pub folder: std::borrow::Cow<'a, str>,
+    pub project: &'a Path,
+    pub workspace: &'a Path,
+    pub root: Option<&'a str>,
 }
 
 impl PayloadRelocation {
@@ -46,10 +57,7 @@ impl PayloadRelocation {
         }
         if super::held_eviction::HeldEvictionIntent::read(&pool)?.is_some()
             || !ledger.holding.is_empty()
-            || ledger
-                .slots
-                .iter()
-                .any(|slot| slot.state != SlotPersistState::Idle)
+            || ledger.slots.iter().any(|slot| !slot.is_idle())
         {
             return Err(LeaseError::InvalidInput(
                 "the removable ledger has a held slot or unfinished eviction",
@@ -58,6 +66,7 @@ impl PayloadRelocation {
         Ok(Self {
             pool,
             config,
+            ledger,
             _lock: lock,
         })
     }
@@ -73,6 +82,48 @@ impl PayloadRelocation {
             .ok_or(LeaseError::BackingMismatch)?
             .payload_dir = payload_dir.to_owned();
         write_config(&self.pool, &config)
+    }
+
+    /// Inspect the slots without reopening or reconciling the locked ledger.
+    pub fn slots(&self) -> impl Iterator<Item = QuietSlot<'_>> {
+        self.ledger.slots.iter().map(|slot| QuietSlot {
+            id: slot.id,
+            folder: slot.dir.as_deref().map_or_else(
+                || std::borrow::Cow::Owned(slot.id.to_string()),
+                std::borrow::Cow::Borrowed,
+            ),
+            project: &slot.project,
+            workspace: &slot.workspace,
+            root: slot.root.as_deref(),
+        })
+    }
+
+    /// Validate the ledger replacement before maintenance starts deleting.
+    pub fn check_legacy_retirement(
+        &self,
+        ids: &std::collections::BTreeSet<u64>,
+    ) -> Result<(), LeaseError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut ledger = self.ledger.clone();
+        ledger.slots.retain(|slot| !ids.contains(&slot.id));
+        super::ledger::validate_ledger_write(&ledger)
+    }
+
+    /// Forget a nested legacy slot after its caller has removed the payload.
+    pub fn forget_legacy_slot(&mut self, id: u64) -> Result<(), LeaseError> {
+        let mut ledger = self.ledger.clone();
+        let index = ledger
+            .slots
+            .iter()
+            .position(|slot| slot.id == id && slot.area_folder().is_some())
+            .ok_or(LeaseError::InvalidInput("no such nested legacy slot"))?;
+        ledger.slots.remove(index);
+        super::ledger::validate_ledger_write(&ledger)?;
+        write_ledger(&self.pool, &ledger)?;
+        self.ledger = ledger;
+        Ok(())
     }
 }
 
