@@ -40,7 +40,7 @@ Open, with a no-go for the current shared-daemon route. The normal detached scca
 
 ## Q-018 — How do per-command admission and execution budgets behave after freeze?
 
-Implemented as the frozen v1 budget contract in [workflow](contracts/workflow.md). Still open: an inner-deadline inheritance interface for nested commands, which never inherit or reset a deadline today, and whether a future event transport should carry more than the v1 start and terminal records.
+Implemented as the frozen v1 budget contract in [workflow](contracts/workflow.md). Inner-deadline inheritance was settled on 2026-11-23 as part of Q-020: nested commands clamp their admission and execution budgets to `min(inner_budget, outer_remaining_execution_ms)` received from the parent's session broker handshake, never extending or resetting the outer budget, while the outer process-group kill remains the hard backstop. Still open: whether a future event transport should carry more than the v1 start and terminal records.
 
 ## Q-019 — How should `oxide exec` know a tool's profile output members?
 
@@ -48,7 +48,7 @@ Open, narrowed. The receipt-derived member set is implemented: [exec output infe
 
 ## Q-020 — How should nested Oxide lease joining and permit borrowing work?
 
-Open. Nested calls currently take independent leases, and idle exec sessions hold their host permit throughout. The future joining and permit-borrowing design is tracked in Nucleus. Open: the broker interface; implementation order; deadline inheritance (Q-018); hostile same-UID code; and non-macOS and Linux platforms.
+Settled by Tom's 2026-11-23 ruling (implementation tracked in Nucleus lane `oxide-nested-lease-joining`): implement both nested lease joining and idle `oxide exec` host-permit borrowing over a parent-owned local Unix domain socket broker with a per-session random token (`0700` socket dir, same-UID peer credential checks), clamp nested budgets to `min(inner, outer_remaining_execution_ms)` via the broker handshake (Q-018), and deliver macOS first followed by Linux parity. Leave this entry until the contract and implementation land.
 
 ## Q-022 — Can a held zombie establish its group's lifetime?
 
