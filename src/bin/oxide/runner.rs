@@ -3,7 +3,7 @@
 use crate::cli::{Invocation, Profile, LEGACY_PROFILE_ENVIRONMENT};
 use crate::freshness::{Gate, Refusal};
 use crate::identity::{RunPick, SlotKey};
-use crate::session_broker::{BorrowStop, JoinedSession, PermitMode, SessionBroker};
+use crate::session_broker::{BorrowStop, JoinedSession, PermitMode, SessionBroker, SUPPORTED};
 use crate::store::{Acquired, Backend, Store};
 use crate::watchdog::Watchdog;
 use crate::{
@@ -758,8 +758,7 @@ fn execute_primary_group<'session>(
         .flatten();
     let mut budget_stop = process::Stop::with_session(joined);
     let relay = joined.and_then(JoinedSession::relay);
-    let yields_permit =
-        cfg!(target_os = "macos") && prepared.exec && (joined.is_none() || relay.is_some());
+    let yields_permit = SUPPORTED && prepared.exec && (joined.is_none() || relay.is_some());
     let broker = budget_stop.check_session().and_then(|()| {
         let root = primary.chosen_temp.path();
         let command = &mut primary.cargo;

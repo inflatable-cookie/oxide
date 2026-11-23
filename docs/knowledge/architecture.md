@@ -36,7 +36,7 @@ owned and preserved. Cargo intermediates are internal and may contain test
 executables; separating output directories alone cannot prove isolation. Cache
 reuse never counts as validation success.
 
-On macOS the [session broker](contracts/session-broker.md) lets nested commands
+On macOS and Linux the [session broker](contracts/session-broker.md) lets nested commands
 use their parent's host permit. Each nested command holds its own exclusive
 slot. Host admission counts the parent's permit once while the nested command
 holds a private, locked permit marker beside its own record lock. An idle

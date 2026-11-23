@@ -1063,6 +1063,9 @@ proof ladders, reviewer-native sessions or qualification selectors exist.
   covered by ordinary regression tests.
 - Linux: `rust:barge-adoption-linux` compiles all targets offline for the installed
   target, including the Linux pool regression. It makes no link or runtime claim.
+  The CI `check-linux` job also runs the session-broker unit tests and the
+  nested-session CLI tests on Linux, in an owner-only scratch directory. The rest
+  of the suite stays macOS-only.
 - Other surviving selectors: `rust:tree-duplicates`, `dogfood:scripts:test` (the
   installer's synthetic install, rollback and canary cases, including the three canary
   modes with a fake staged binary and a check that the format-change run never names
@@ -1092,7 +1095,6 @@ These are not current behaviour. Their designs are proposed only.
 
 - `linux-image-v1` storage, CI cache save and restore, and container or remote
   executors. Linux has no runtime proof of storage behaviour yet.
-- Session joining and idle exec permit borrowing on Linux.
 - Alternative run strategies, such as ahead-of-time or JIT codegen or hot patching.
 - Per-project profile overrides or project files. Oxide reads none.
 - Interception of plain `cargo`, and an adaptive `rustc` wrapper for builds that
