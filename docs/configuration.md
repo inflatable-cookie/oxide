@@ -100,7 +100,10 @@ oxide pool describe --json
 
 To move an existing layout, stop builds, waiters, cleans and other writers on
 both pools. Keep the registered drive mounted and choose two unused paths.
-Existing parent directories must be private, owned by you and on that volume.
+The payload and outputs directories themselves must be private, owned by you
+and on that volume; existing shared parent directories (such as `builds/`)
+may instead be readable (`0755`), as long as they are owned by you, on that
+volume, and not group- or world-writable.
 
 ```sh
 oxide pool relocate --payload-dir builds/oxide/pool --outputs-dir builds/oxide/outputs --dry-run

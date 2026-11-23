@@ -225,13 +225,27 @@ impl Binding {
     }
 
     /// Open (creating owner-only each missing component if `create`) the
-    /// nested directory `rel` under this volume's mount root. The path is
+    /// nested directory `rel` under this volume's mount point. The path is
     /// validated before any effect, the volume is reverified, and every
-    /// component is walked through [`dir_at`] from the held descriptor.
+    /// component is walked from the held descriptor. Intermediate components
+    /// are shared parents checked with [`parent_dir_at`]; only the leaf is
+    /// Oxide's own directory and keeps the strict [`dir_at`] check.
     pub fn dir_path_at(&self, rel: &str, create: bool) -> Result<OwnedFd, String> {
         relative_components(rel)?;
         self.verify()?;
         walk_dir_path(self.fd.as_fd(), rel, create)
+    }
+
+    /// Open (creating owner-only each missing component if `create`) the
+    /// nested shared parent prefix `rel` under this volume's mount point.
+    /// Every component is checked with [`parent_dir_at`], so callers that
+    /// open or validate a shared parent itself (rather than Oxide's own
+    /// leaf) accept user-owned `0755` directories while refusing
+    /// group- or world-writable and foreign-owned ones.
+    pub fn parent_dir_path_at(&self, rel: &str, create: bool) -> Result<OwnedFd, String> {
+        relative_components(rel)?;
+        self.verify()?;
+        walk_parent_dir_path(self.fd.as_fd(), rel, create)
     }
 }
 
@@ -275,15 +289,46 @@ pub fn relative_components(rel: &str) -> Result<Vec<&str>, String> {
     Ok(parts)
 }
 
-/// Walk `rel` from `dir`, one [`dir_at`] per component, so every step keeps
-/// the no-follow and same-device checks. The caller validates `rel` first.
+/// Walk `rel` from `dir`, one [`parent_dir_at`] per intermediate component
+/// and one [`dir_at`] for the leaf, so every step keeps the no-follow and
+/// same-device checks. Shared parents such as `builds/` may be user-owned
+/// and readable (`0755`); only Oxide's own leaf (the payload or outputs
+/// directory) must be owner-only (`0700`). The caller validates `rel` first.
 pub fn walk_dir_path(dir: BorrowedFd<'_>, rel: &str, create: bool) -> Result<OwnedFd, String> {
     let parts = relative_components(rel)?;
-    let mut current = dir_at(dir, parts[0], create)?;
-    for part in &parts[1..] {
-        current = dir_at(current.as_fd(), part, create)?;
+    let (leaf, parents) = parts.split_last().expect("a relative path has a leaf");
+    let mut current: Option<OwnedFd> = None;
+    for part in parents {
+        current = Some(match &current {
+            None => parent_dir_at(dir, part, create)?,
+            Some(fd) => parent_dir_at(fd.as_fd(), part, create)?,
+        });
     }
-    Ok(current)
+    match &current {
+        None => dir_at(dir, leaf, create),
+        Some(fd) => dir_at(fd.as_fd(), leaf, create),
+    }
+}
+
+/// Walk `rel` from `dir`, one [`parent_dir_at`] per component, so every step
+/// keeps the no-follow and same-device checks. For callers that open or
+/// validate a shared parent prefix itself (such as `builds` or
+/// `builds/oxide`), where no component is Oxide's own leaf. The caller
+/// validates `rel` first.
+pub fn walk_parent_dir_path(
+    dir: BorrowedFd<'_>,
+    rel: &str,
+    create: bool,
+) -> Result<OwnedFd, String> {
+    let parts = relative_components(rel)?;
+    let mut current: Option<OwnedFd> = None;
+    for part in &parts {
+        current = Some(match &current {
+            None => parent_dir_at(dir, part, create)?,
+            Some(fd) => parent_dir_at(fd.as_fd(), part, create)?,
+        });
+    }
+    Ok(current.expect("a relative path has a component"))
 }
 
 /// Whether the effective user may write `path`, ACLs included.
@@ -323,6 +368,37 @@ pub fn observe_held(fd: BorrowedFd<'_>) -> Result<Facts, String> {
 /// Open `name` under `dir`, optionally creating it owner-only. It must be a
 /// real directory owned by the caller, owner-only, on `dir`'s device.
 pub fn dir_at(dir: BorrowedFd<'_>, name: &str, create: bool) -> Result<OwnedFd, String> {
+    open_checked(
+        dir,
+        name,
+        create,
+        0o077,
+        "an owner-only directory of this user",
+    )
+}
+
+/// Open `name` under `dir`, optionally creating it owner-only. It must be a
+/// real directory owned by the caller, on `dir`'s device, and not group- or
+/// world-writable. This is the check for shared intermediate parents (such
+/// as a class directory like `builds/`): `0755` and `0700` pass, `0775`,
+/// `0777` and foreign-owned directories refuse.
+pub fn parent_dir_at(dir: BorrowedFd<'_>, name: &str, create: bool) -> Result<OwnedFd, String> {
+    open_checked(
+        dir,
+        name,
+        create,
+        0o022,
+        "a directory of this user that is not group- or world-writable",
+    )
+}
+
+fn open_checked(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    create: bool,
+    group_other_mask: u32,
+    expectation: &str,
+) -> Result<OwnedFd, String> {
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
         return Err(format!("{name:?} is not one directory name"));
     }
@@ -344,10 +420,8 @@ pub fn dir_at(dir: BorrowedFd<'_>, name: &str, create: bool) -> Result<OwnedFd, 
     let child = fstat(fd.as_fd())?;
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
-    if child.st_uid != uid || u32::from(child.st_mode) & 0o077 != 0 {
-        return Err(format!(
-            "{name} must be an owner-only directory of this user"
-        ));
+    if child.st_uid != uid || u32::from(child.st_mode) & group_other_mask != 0 {
+        return Err(format!("{name} must be {expectation}"));
     }
     if child.st_dev != parent.st_dev {
         return Err(format!("{name} is on another device"));
@@ -701,6 +775,57 @@ mod tests {
         ] {
             assert!(relative_components(bad).is_err(), "{bad:?} must refuse");
         }
+    }
+
+    #[test]
+    fn shared_readable_parents_pass_but_writable_ones_and_loose_leaves_refuse() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = scratch("shared-parents");
+        let fd = open_dir(None, &parent).unwrap();
+        std::fs::create_dir(parent.join("builds")).unwrap();
+        std::fs::set_permissions(parent.join("builds"), PermissionsExt::from_mode(0o755)).unwrap();
+        // A user-owned `0755` intermediate is accepted; missing components
+        // below it are created owner-only.
+        walk_dir_path(fd.as_fd(), "builds/oxide/pool", true).unwrap();
+        assert!(parent.join("builds/oxide/pool").is_dir());
+        assert_eq!(
+            std::fs::metadata(parent.join("builds/oxide/pool"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        // Reopening without creation also accepts the `0755` parent.
+        walk_dir_path(fd.as_fd(), "builds/oxide/pool", false).unwrap();
+        walk_parent_dir_path(fd.as_fd(), "builds", false).unwrap();
+        walk_parent_dir_path(fd.as_fd(), "builds/oxide", false).unwrap();
+        // The leaf itself must stay owner-only: `0755` refuses.
+        std::fs::set_permissions(
+            parent.join("builds/oxide/pool"),
+            PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let error = walk_dir_path(fd.as_fd(), "builds/oxide/pool", false).unwrap_err();
+        assert!(error.contains("owner-only"), "{error}");
+        std::fs::set_permissions(
+            parent.join("builds/oxide/pool"),
+            PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        // A group-writable intermediate refuses, even with a private leaf.
+        std::fs::set_permissions(parent.join("builds"), PermissionsExt::from_mode(0o775)).unwrap();
+        let error = walk_dir_path(fd.as_fd(), "builds/oxide/pool", false).unwrap_err();
+        assert!(error.contains("not group- or world-writable"), "{error}");
+        let error = walk_parent_dir_path(fd.as_fd(), "builds", false).unwrap_err();
+        assert!(error.contains("not group- or world-writable"), "{error}");
+        // So does a world-writable one.
+        std::fs::set_permissions(parent.join("builds"), PermissionsExt::from_mode(0o777)).unwrap();
+        let error = walk_dir_path(fd.as_fd(), "builds/oxide/pool", false).unwrap_err();
+        assert!(error.contains("not group- or world-writable"), "{error}");
+        // Restoring `0755` accepts the whole path again.
+        std::fs::set_permissions(parent.join("builds"), PermissionsExt::from_mode(0o755)).unwrap();
+        walk_dir_path(fd.as_fd(), "builds/oxide/pool", false).unwrap();
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
