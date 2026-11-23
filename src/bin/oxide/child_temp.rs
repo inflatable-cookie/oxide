@@ -308,6 +308,8 @@ pub(crate) struct Entry {
     pub(crate) ino: u64,
     pub(crate) uid: u32,
     pub(crate) dir: bool,
+    pub(crate) regular: bool,
+    pub(crate) mode: libc::mode_t,
 }
 
 /// Open flags for a directory handle: a link at the last component is refused.
@@ -315,6 +317,10 @@ const DIR_FLAGS: libc::c_int =
     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
 
 impl Dir {
+    pub(crate) fn from_file(file: std::fs::File) -> Self {
+        Self(file.into())
+    }
+
     /// Open `path` as a directory. Components above the last are resolved as
     /// any path is; the last one may not be a link.
     pub(crate) fn open(path: &std::path::Path) -> std::io::Result<Self> {
@@ -355,6 +361,8 @@ impl Dir {
             ino: stat.st_ino as u64,
             uid: stat.st_uid,
             dir: stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+            regular: stat.st_mode & libc::S_IFMT == libc::S_IFREG,
+            mode: stat.st_mode,
         })
     }
 
@@ -373,7 +381,7 @@ impl Dir {
             libc::openat(
                 self.0.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
             )
         };
         owned(fd).map(std::fs::File::from)
@@ -396,8 +404,9 @@ impl Dir {
     /// or fails leaves entries behind, so the directory's own removal then
     /// refuses; an ended read is an error, never a short list.
     pub(crate) fn names(&self) -> std::io::Result<Vec<OsString>> {
-        // fdopendir takes ownership of its descriptor, so it gets a duplicate.
-        let fd = self.0.try_clone()?.into_raw_fd();
+        // Reopen with an independent offset so a second inventory starts at
+        // the beginning. fdopendir takes ownership of this descriptor.
+        let fd = self.open_dir(OsStr::new("."))?.0.into_raw_fd();
         // SAFETY: `fd` is an open directory; fdopendir owns it from here on.
         let dir = unsafe { libc::fdopendir(fd) };
         if dir.is_null() {

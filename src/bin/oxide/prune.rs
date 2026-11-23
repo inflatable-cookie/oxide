@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 mod relocation;
+mod upgrade_legacy;
+pub(crate) use upgrade_legacy::{plan_legacy_outputs, positively_missing, LegacyOutputAction};
 
 pub(crate) use relocation::{output_accounts, plan_registry_relocation};
 
@@ -1320,8 +1322,8 @@ fn existing_output_area(
     Storage::open_read_only(&account)?.existing_area(&config)
 }
 
-fn output_id(selected: &Selected) -> String {
-    sha256_hex(format!("{}:{}", selected.root().display(), selected.generation()).as_bytes())
+fn output_id(root: &Path, generation: u64) -> String {
+    sha256_hex(format!("{}:{generation}", root.display()).as_bytes())
 }
 
 /// Re-pin an already owned Barge identity without using mutable Oxide marker
@@ -1433,9 +1435,7 @@ fn import_output(
             selected.root().display()
         ));
     }
-    let mut identity = selected.clone();
-    identity.generation = marker.generation();
-    let id = output_id(&identity);
+    let id = output_id(selected.root(), marker.generation());
     let folder = selected
         .root()
         .file_name()

@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod relocation;
+mod upgrade_legacy;
 
 /// Registration file in the internal control directory.
 pub(crate) const REGISTRATION: &str = "removable.json";
@@ -203,6 +204,7 @@ const USAGE: &str = "\
 usage: oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ephemeral|permanent] [--payload-dir <rel>] [--outputs-dir <rel>]
        oxide pool set-mode <ephemeral|permanent>
        oxide pool relocate --payload-dir <rel> --outputs-dir <rel> [--dry-run] [--json]
+       oxide pool upgrade-legacy [--dry-run] [--json]
        oxide pool recover-interrupted <slot>
        oxide pool release-quarantined <slot> [--dry-run] --confirm-writers-stopped
        oxide pool describe --json
@@ -296,6 +298,7 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
         ["set-mode", mode] => set_mode(DriveMode::parse(mode)?),
         ["set-mode", ..] => Err(USAGE.to_owned()),
         ["relocate", rest @ ..] => relocation::run(rest),
+        ["upgrade-legacy", rest @ ..] => upgrade_legacy::run(rest),
         ["recover-interrupted", slot] => {
             let Some(internal) = Store::open_existing()? else {
                 return Err("no pool exists".to_owned());

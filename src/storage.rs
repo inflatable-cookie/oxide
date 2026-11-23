@@ -840,7 +840,7 @@ impl PoolStorage {
         let Some(folder) = folder else {
             return Ok(self.area.clone());
         };
-        let name = format!("{}-{}", self.name, slug(folder));
+        let name = project_area_name(&self.name, folder);
         let spec = barge::AreaSpec::new(NAMESPACE, name, "pool")
             .folder(format!("{}/{folder}", self.folder))
             .absent(self.absent.clone())
@@ -1262,6 +1262,11 @@ fn slug(text: &str) -> String {
         slug.pop();
     }
     slug
+}
+
+/// The name Oxide assigns to a legacy nested slot area.
+pub fn project_area_name(area: &str, folder: &str) -> String {
+    format!("{area}-{}", slug(folder))
 }
 
 /// The project folder of an area whose folder is `<base>/<project>`.

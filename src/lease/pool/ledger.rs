@@ -99,7 +99,7 @@ fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
 /// stored field against the raised bounds. An oversized legacy field
 /// refuses the revised write with the original file untouched; nothing is
 /// truncated or dropped.
-fn validate_ledger_write(ledger: &Ledger) -> Result<(), LeaseError> {
+pub(super) fn validate_ledger_write(ledger: &Ledger) -> Result<(), LeaseError> {
     validate_ledger_read(ledger)?;
     if ledger.slots.len() > MAX_SLOTS {
         return Err(LeaseError::LedgerExhausted);

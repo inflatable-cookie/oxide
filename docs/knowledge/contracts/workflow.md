@@ -600,6 +600,18 @@ paths. The summary says `temp: inherited <path>` or `temp: oxide <path>`.
   rolls back completed steps. If interrupted or rollback fails,
   `pool-relocation.json` records both layouts and fences registration readers
   until the paths and records have been reconciled.
+- **Legacy upgrade:** `oxide pool upgrade-legacy [--dry-run] [--json]` prepares
+  a previously used registered volume for relocation. It verifies the bound
+  volume and takes both existing admission locks and the removable ledger lock.
+  It plans all changes before writing and refuses unknown paths, live nested
+  slots, held roots or other active writers. The output registry must account
+  for each unmarked output. A live checkout keeps its output at the same path
+  with a Barge identity and pin protection for any selection. Only roots whose
+  recorded checkouts are all missing are removed, with an atomic registry
+  update. A dead nested slot is removed before its store and ledger records
+  are retired. Empty legacy project declarations and recognized markerless
+  slot trash are removed under the same quiet window. The preview reports the
+  same counts and paths without modifying files.
 - **Selection:** when a build starts, the drive is selected only if it is mounted,
   its registered UUID matches and it is writable. Selection does not repeat the
   boot-container or APFS-role checks; registration and `describe` run those, and

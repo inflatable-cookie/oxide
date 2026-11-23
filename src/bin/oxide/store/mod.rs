@@ -57,8 +57,8 @@ pub(crate) use barrier::{CheckoutCustody, CleanGuard, Cleaning};
 #[cfg(test)]
 pub(crate) use control_io::hold_record_for_tests;
 pub(crate) use control_io::{
-    atomic_write_private, flock_nonblocking, lock_admission, open_control_directory, private_file,
-    publish_writer_generation, statfs, writer_updated,
+    atomic_write_private, flock_nonblocking, lock_admission, lock_existing_admission,
+    open_control_directory, private_file, publish_writer_generation, statfs, writer_updated,
 };
 pub(crate) use recovery::Return;
 pub(crate) use release::ReleaseDisposition;

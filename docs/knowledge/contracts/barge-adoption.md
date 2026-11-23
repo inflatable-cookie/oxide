@@ -117,6 +117,13 @@ matching marker as a straggler and never reuses, evicts or deletes it.
   and unrecorded strays are retained.
 - Existing pins are not removed by the pinned API. They need explicit maintenance.
 
+The explicit [legacy upgrade](workflow.md#removable-build-volume) is the
+quiet-window exception for markerless legacy entries. It uses Oxide's registry
+and ledger for pre-Barge ownership, and removes only recognized trash from the
+private slot area. Barge still adopts current roots and removes its own marked
+slots. The pinned Barge API has no area removal method, so Oxide unlinks the
+verified declaration of an empty legacy project under the private account lock.
+
 ## Capacity and eviction
 
 - New-slot admission reads the Oxide ledger's logical-byte observations and walks
