@@ -13,13 +13,26 @@ directory with mode `0700` under the leased child's [chosen temporary root](work
 Before creating it, Oxide checks the canonical path from `/` down. Each
 directory must be owned by the current user or root on a volume that enforces
 ownership. A directory writable by its group or by others must be sticky.
-Any ACL grant refuses the path. On Linux, the volume must positively establish
-ownership enforcement: it must be one of ext2/3/4, XFS, Btrfs, tmpfs or
-overlayfs, as reported by `statfs`. Any other filesystem type refuses the path,
-including network, FUSE, CIFS, SMB, FAT and exFAT volumes. Any POSIX ACL
-extension also refuses it. Idmapped mounts are not inspected, so they are not
-established by this check. These checks protect the pathname used for binding
-and cleanup from replacement by another user.
+On macOS, any ACL grant refuses the path except a deny-only ACL. On Linux, the
+volume must positively establish ownership enforcement: it must be one of
+ext2/3/4, XFS, Btrfs, tmpfs or overlayfs, as reported by `statfs`. Any other
+filesystem type refuses the path, including network, FUSE, CIFS, SMB, FAT and
+exFAT volumes. Idmapped mounts are not inspected, so they are not established
+by this check.
+
+On Linux, the access ACL (`system.posix_acl_access`) is parsed as the version 2
+xattr encoding, with `ACL_MASK` applied to named users, the owning group and
+named groups. Entries for the owner, the root user and the effective user are
+trusted. An ancestor refuses if any other entry is effectively writable. It may
+grant read and traverse, as `/home` often does. The private socket directory
+refuses if any other entry is effectively readable, writable or executable. A
+malformed ACL, an unknown version, or a truncated attribute also refuses, and so
+does an ACL that changes between the size probe and the read. A default ACL
+shapes children that are created later, so the private socket directory's own
+access ACL is checked after creation to cover it.
+
+These checks protect the pathname used for binding and cleanup from replacement
+by another user.
 
 Oxide also checks the socket's absolute pathname before creation. `sun_path`
 includes the terminating NUL: 104 bytes on macOS, which leaves at most 103 bytes

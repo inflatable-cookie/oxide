@@ -282,36 +282,31 @@ fn refuses_an_ancestor_with_an_acl_grant() {
     fs::remove_dir(root).unwrap();
 }
 
-/// A named-user entry makes the Linux POSIX ACL extended, so it grants access.
 #[cfg(target_os = "linux")]
-#[test]
-fn refuses_an_ancestor_with_an_acl_grant() {
-    const ACL_VERSION: u32 = 2;
-    const USER_OBJ: u16 = 0x01;
-    const NAMED_USER: u16 = 0x02;
-    const GROUP_OBJ: u16 = 0x04;
-    const MASK: u16 = 0x10;
-    const OTHER: u16 = 0x20;
-    const NOBODY: u32 = 65534;
-    const UNDEFINED_ID: u32 = u32::MAX;
+const ACL_USER_OBJ: u16 = 0x01;
+#[cfg(target_os = "linux")]
+const ACL_NAMED_USER: u16 = 0x02;
+#[cfg(target_os = "linux")]
+const ACL_GROUP_OBJ: u16 = 0x04;
+#[cfg(target_os = "linux")]
+const ACL_MASK: u16 = 0x10;
+#[cfg(target_os = "linux")]
+const ACL_OTHER: u16 = 0x20;
+#[cfg(target_os = "linux")]
+const ACL_NOBODY: u32 = 65534;
+#[cfg(target_os = "linux")]
+const ACL_UNDEFINED: u32 = u32::MAX;
 
-    let fixture = SocketDirectory::create(&scratch_root()).unwrap();
-    let root = fixture.path.join("temp");
-    fs::create_dir(&root).unwrap();
-    let entries: [(u16, u16, u32); 5] = [
-        (USER_OBJ, 7, UNDEFINED_ID),
-        (NAMED_USER, 7, NOBODY),
-        (GROUP_OBJ, 0, UNDEFINED_ID),
-        (MASK, 7, UNDEFINED_ID),
-        (OTHER, 0, UNDEFINED_ID),
-    ];
-    let mut blob = ACL_VERSION.to_le_bytes().to_vec();
-    for (tag, perm, id) in entries {
+/// Write a POSIX access ACL in the kernel's version-2 xattr encoding.
+#[cfg(target_os = "linux")]
+fn set_access_acl(path: &Path, entries: &[(u16, u16, u32)]) {
+    let mut blob = 2u32.to_le_bytes().to_vec();
+    for &(tag, perm, id) in entries {
         blob.extend_from_slice(&tag.to_le_bytes());
         blob.extend_from_slice(&perm.to_le_bytes());
         blob.extend_from_slice(&id.to_le_bytes());
     }
-    let path = CString::new(fixture.path.as_os_str().as_bytes()).unwrap();
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
     let attribute = c"system.posix_acl_access";
     // SAFETY: both names are NUL-terminated and `blob` is valid for its length.
     let status = unsafe {
@@ -324,13 +319,85 @@ fn refuses_an_ancestor_with_an_acl_grant() {
         )
     };
     assert_eq!(status, 0, "{}", io::Error::last_os_error());
+}
+
+/// A named writer on an ancestor is an untrusted grant of write, which refuses.
+#[cfg(target_os = "linux")]
+#[test]
+fn refuses_an_ancestor_that_grants_write() {
+    let fixture = SocketDirectory::create(&scratch_root()).unwrap();
+    let root = fixture.path.join("temp");
+    fs::create_dir(&root).unwrap();
+    set_access_acl(
+        &fixture.path,
+        &[
+            (ACL_USER_OBJ, 7, ACL_UNDEFINED),
+            (ACL_NAMED_USER, 7, ACL_NOBODY),
+            (ACL_GROUP_OBJ, 0, ACL_UNDEFINED),
+            (ACL_MASK, 7, ACL_UNDEFINED),
+            (ACL_OTHER, 0, ACL_UNDEFINED),
+        ],
+    );
 
     let result = SessionBroker::bind(&root, PermitMode::Inherited, DenyBorrowing);
-    let error = result.err().expect("the ACL grant should refuse binding");
+    let error = result
+        .err()
+        .expect("the writable ACL should refuse binding");
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     assert!(error.to_string().contains("ACL grants access"));
     assert!(fs::read_dir(&root).unwrap().next().is_none());
     fs::remove_dir(root).unwrap();
+}
+
+/// A read-and-traverse ancestor such as `/home` binds, as it does on CI runners.
+#[cfg(target_os = "linux")]
+#[test]
+fn accepts_an_ancestor_that_grants_read_and_traverse() {
+    let fixture = SocketDirectory::create(&scratch_root()).unwrap();
+    let root = fixture.path.join("temp");
+    fs::create_dir(&root).unwrap();
+    set_access_acl(
+        &fixture.path,
+        &[
+            (ACL_USER_OBJ, 7, ACL_UNDEFINED),
+            (ACL_NAMED_USER, 5, ACL_NOBODY),
+            (ACL_GROUP_OBJ, 5, ACL_UNDEFINED),
+            (ACL_MASK, 5, ACL_UNDEFINED),
+            (ACL_OTHER, 5, ACL_UNDEFINED),
+        ],
+    );
+
+    let broker = SessionBroker::bind(&root, PermitMode::Inherited, DenyBorrowing)
+        .expect("a read and traverse ancestor should bind");
+    drop(broker);
+    fs::remove_dir(root).unwrap();
+}
+
+/// The private socket directory refuses any entry for another principal.
+#[cfg(target_os = "linux")]
+#[test]
+fn refuses_a_private_leaf_with_an_untrusted_entry() {
+    let fixture = SocketDirectory::create(&scratch_root()).unwrap();
+    let leaf = fixture.path.join("leaf");
+    fs::create_dir(&leaf).unwrap();
+    fs::set_permissions(&leaf, Permissions::from_mode(0o700)).unwrap();
+    super::socket_root::verify_private_leaf(&leaf).unwrap();
+
+    set_access_acl(
+        &leaf,
+        &[
+            (ACL_USER_OBJ, 7, ACL_UNDEFINED),
+            (ACL_NAMED_USER, 6, ACL_NOBODY),
+            (ACL_GROUP_OBJ, 0, ACL_UNDEFINED),
+            (ACL_MASK, 6, ACL_UNDEFINED),
+            (ACL_OTHER, 0, ACL_UNDEFINED),
+        ],
+    );
+    let error = super::socket_root::verify_private_leaf(&leaf)
+        .expect_err("another principal's entry should refuse the leaf");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains("another principal"));
+    fs::remove_dir(leaf).unwrap();
 }
 
 struct OnePermit {

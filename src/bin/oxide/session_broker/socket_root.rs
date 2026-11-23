@@ -1,5 +1,10 @@
 //! Qualify the canonical namespace used for binding and pathname cleanup.
 
+#[cfg(any(target_os = "linux", test))]
+mod posix_acl;
+
+#[cfg(target_os = "linux")]
+use std::ffi::CStr;
 use std::ffi::CString;
 #[cfg(target_os = "macos")]
 use std::ffi::{c_int, c_void};
@@ -180,24 +185,92 @@ fn acl_is_clean(path: &Path) -> io::Result<bool> {
     }
 }
 
-/// True when the path carries no POSIX ACL extension. Linux stores those in
-/// these attributes, and a directory with only its mode bits has neither. Any
-/// extended entry refuses, since this check tolerates no ACL form at all.
+/// Linux keeps the access ACL in this attribute. A directory with only mode
+/// bits has none. The access ACL governs the directory itself. A default ACL
+/// only shapes children created later, and the leaf check covers those.
+#[cfg(target_os = "linux")]
+const POSIX_ACL_ACCESS: &CStr = c"system.posix_acl_access";
+
+/// Users whose entries are trusted: the root user and the effective user.
+#[cfg(target_os = "linux")]
+fn trusted_principals() -> [u32; 2] {
+    // SAFETY: geteuid takes no arguments and has no preconditions.
+    [0, unsafe { libc::geteuid() }]
+}
+
+/// The access ACL bytes for `path`, or `None` when it has only mode bits.
+#[cfg(target_os = "linux")]
+fn access_acl(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let name = CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: the name is NUL-terminated. A zero-size probe writes nothing.
+    let size = unsafe {
+        libc::lgetxattr(
+            name.as_ptr(),
+            POSIX_ACL_ACCESS.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if size < 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENODATA) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    let capacity =
+        usize::try_from(size).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    let mut value = vec![0u8; capacity];
+    // SAFETY: `value` is writable for its length. An ACL that grew since the
+    // probe fails with ERANGE and refuses, rather than being read partially.
+    let read = unsafe {
+        libc::lgetxattr(
+            name.as_ptr(),
+            POSIX_ACL_ACCESS.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if read < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    value.truncate(usize::try_from(read).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?);
+    Ok(Some(value))
+}
+
+/// Effective permissions the access ACL grants to principals other than the
+/// owner and the trusted users. A malformed ACL is an error, which refuses.
+#[cfg(target_os = "linux")]
+fn untrusted_access(path: &Path) -> io::Result<u16> {
+    let Some(acl) = access_acl(path)? else {
+        return Ok(0);
+    };
+    posix_acl::untrusted_permissions(&acl, &trusted_principals()).map_err(
+        |posix_acl::Malformed(reason)| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("malformed POSIX ACL on {}: {reason}", path.display()),
+            )
+        },
+    )
+}
+
+/// An ancestor may grant read and traverse to anyone, but never write.
 #[cfg(target_os = "linux")]
 fn acl_is_clean(path: &Path) -> io::Result<bool> {
-    let name = CString::new(path.as_os_str().as_bytes())?;
-    for attribute in [c"system.posix_acl_access", c"system.posix_acl_default"] {
-        // SAFETY: both names are NUL-terminated. A zero-size probe with no
-        // buffer writes nothing and only reports whether the attribute exists.
-        let size =
-            unsafe { libc::lgetxattr(name.as_ptr(), attribute.as_ptr(), std::ptr::null_mut(), 0) };
-        if size >= 0 {
-            return Ok(false);
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ENODATA) {
-            return Err(error);
-        }
+    Ok(untrusted_access(path)? & posix_acl::WRITE == 0)
+}
+
+/// The private socket directory must be reachable by its owner and trusted
+/// users only. Any other effective permission refuses the bind.
+#[cfg(target_os = "linux")]
+pub(super) fn verify_private_leaf(path: &Path) -> io::Result<()> {
+    if untrusted_access(path)? != 0 {
+        return Err(refuse(
+            path,
+            "the socket directory grants access to another principal",
+        ));
     }
-    Ok(true)
+    Ok(())
 }

@@ -174,6 +174,10 @@ impl SocketDirectory {
             path: OsStr::from_bytes(&name).into(),
         };
         fs::set_permissions(&directory.path, Permissions::from_mode(0o700))?;
+        // Checked after the directory exists, so a default ACL inherited from
+        // the root is seen. Dropping `directory` on refusal removes it.
+        #[cfg(target_os = "linux")]
+        socket_root::verify_private_leaf(&directory.path)?;
         Ok(directory)
     }
 
