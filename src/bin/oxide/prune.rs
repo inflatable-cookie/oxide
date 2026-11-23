@@ -18,6 +18,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+mod relocation;
+
+pub(crate) use relocation::{output_accounts, plan_registry_relocation};
+
 pub const REGISTRY_VERSION: &str = "oxide.outputs.registry/2";
 /// Schema 1 named only a whole `target` placement; schema 2 names one
 /// reference per profile member and is read from a version-1 document without
@@ -30,7 +34,7 @@ const OBSERVATIONS_FILE: &str = "prune-observations.json";
 const MAX_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ROWS: usize = 4096;
 const MAX_TEXT_BYTES: usize = 1024;
-const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const SNAPSHOT_TIME: Duration = Duration::from_secs(10);
 
 /// The registry's one writer-facing document.
@@ -426,6 +430,10 @@ fn create_or_validate_registry(
 /// foreign-version document. `Ok(None)` only when the file is positively
 /// absent.
 fn read_registry(control: &Path) -> Result<Option<Registry>, String> {
+    Ok(read_registry_with_bytes(control)?.map(|(registry, _)| registry))
+}
+
+fn read_registry_with_bytes(control: &Path) -> Result<Option<(Registry, Vec<u8>)>, String> {
     let path = registry_path(control);
     let Some(file) = store::private_file(&path, false)? else {
         return Ok(None);
@@ -443,7 +451,7 @@ fn read_registry(control: &Path) -> Result<Option<Registry>, String> {
     let registry: Registry = serde_json::from_slice(&bytes)
         .map_err(|error| format!("{} is invalid: {error}", path.display()))?;
     registry.validate()?;
-    Ok(Some(registry))
+    Ok(Some((registry, bytes)))
 }
 
 /// Require the forward format and registry to be ready without changing
@@ -1202,8 +1210,7 @@ fn output_area_config(
         .parent()
         .ok_or("an output root has no parent")?;
     let (mount, folder) = output_area_location(control, selected, parent)?;
-    let location = sha256_hex(parent.as_os_str().as_encoded_bytes());
-    let account = control.join("output-storage").join(location);
+    let account = output_account(control, parent);
     let uuid = if oxide_storage::storage::is_drive_mount_point(&mount) {
         selected.volume_uuid.clone()
     } else {
@@ -1216,6 +1223,11 @@ fn output_area_config(
             .folder(folder)
             .floor_bytes(0),
     ))
+}
+
+pub(crate) fn output_account(control: &Path, parent: &Path) -> PathBuf {
+    let location = sha256_hex(parent.as_os_str().as_encoded_bytes());
+    control.join("output-storage").join(location)
 }
 
 /// The mount point and the area folder an output root's parent names. An
@@ -1639,6 +1651,12 @@ fn preview(control: &Path, registry: &Registry) -> Result<Preview, String> {
         registry_revision: registry.revision,
         roots,
     })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn planned_paths_for_tests(control: &Path) -> Result<Vec<PathBuf>, String> {
+    let planned = preview(control, &ready_registry(control)?)?;
+    Ok(planned.roots.into_iter().map(|root| root.path).collect())
 }
 
 /// What Barge did with one planned root.

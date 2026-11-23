@@ -34,6 +34,7 @@ mod control_io;
 mod outputs;
 mod recovery;
 mod release;
+mod relocation;
 mod seeding;
 mod status;
 
@@ -56,7 +57,7 @@ pub(crate) use barrier::{CheckoutCustody, CleanGuard, Cleaning};
 #[cfg(test)]
 pub(crate) use control_io::hold_record_for_tests;
 pub(crate) use control_io::{
-    flock_nonblocking, lock_admission, open_control_directory, private_file,
+    atomic_write_private, flock_nonblocking, lock_admission, open_control_directory, private_file,
     publish_writer_generation, statfs, writer_updated,
 };
 pub(crate) use recovery::Return;
@@ -80,9 +81,9 @@ use oxide_storage::lease::{
 };
 
 use self::control_io::{
-    atomic_write_private, check_writer_generation, create_pool, ensure_private_dir,
-    free_bytes_for_creation, lease_error, lock_admission_inner, prepare_front_door_pool,
-    read_control_state_if_present, read_state, verify_private_dir,
+    check_writer_generation, create_pool, ensure_private_dir, free_bytes_for_creation, lease_error,
+    lock_admission_inner, prepare_front_door_pool, read_control_state_if_present, read_state,
+    verify_private_dir,
 };
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};

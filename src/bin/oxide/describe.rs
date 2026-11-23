@@ -133,6 +133,13 @@ pub fn print_json() -> Result<u8, String> {
 }
 
 fn describe(configured: &Path) -> Result<Description, String> {
+    describe_with(configured, availability)
+}
+
+fn describe_with(
+    configured: &Path,
+    probe: impl FnOnce(&Registration, &Path) -> Result<(usize, Vec<String>), Unavailable>,
+) -> Result<Description, String> {
     let observed_at = rfc3339(process::now_ms() / 1000);
     let internal = Internal {
         pool: configured.to_string_lossy().into_owned(),
@@ -173,7 +180,7 @@ fn describe(configured: &Path) -> Result<Description, String> {
         ),
         Registered::Known(registration) => {
             let control = control.ok_or("the registered control directory is missing")?;
-            let outcome = availability(&registration, &control);
+            let outcome = probe(&registration, &control);
             let available = outcome.is_ok();
             let (pending, pending_ids, reason, detail) = match outcome {
                 Ok((count, ids)) => (Some(count), Some(ids), None, None),
@@ -212,6 +219,19 @@ fn describe(configured: &Path) -> Result<Description, String> {
         selected,
         removable,
     })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn describe_fake_volume(
+    configured: &Path,
+    verify: impl FnOnce(&Registration) -> Result<(), String>,
+) -> Result<serde_json::Value, String> {
+    let description = describe_with(configured, |registration, control| {
+        let description = probe_control(control, registration)?;
+        verify(registration).map_err(|error| unavailable(Reason::PayloadMissing, error))?;
+        Ok(pending(&description))
+    })?;
+    serde_json::to_value(description).map_err(|error| error.to_string())
 }
 
 /// Passive eligibility: every check a build's selection makes, probed

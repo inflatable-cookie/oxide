@@ -75,6 +75,7 @@ USAGE:
     oxide status --measure               bounded payload, slot, checkout and Cargo-home walks
     oxide status --launch-check          macOS: time a new executable's first launch
     oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ...] [--payload-dir <rel>] [--outputs-dir <rel>]
+    oxide pool relocate --payload-dir <rel> --outputs-dir <rel> [--dry-run] [--json]
                                          macOS: register an APFS volume; mode defaults to ephemeral;
                                          payload and outputs default to oxide-pool and oxide-outputs
     oxide pool set-mode <ephemeral|permanent>

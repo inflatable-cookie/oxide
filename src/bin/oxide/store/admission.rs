@@ -1262,6 +1262,15 @@ impl Store {
 
     pub(super) fn register_ticket(&self) -> Result<(u64, File), String> {
         let _admission = self.admission()?;
+        if self.backend == super::Backend::ApfsVolume && self.sibling.is_some() {
+            let registration = crate::removable::read_registration(self.owner_control())?
+                .ok_or("the selected removable pool is no longer registered")?;
+            if registration.mount_point.join(registration.payload_dir()) != self.payload {
+                return Err(
+                    "the removable pool moved before admission; retry the command".to_owned(),
+                );
+            }
+        }
         let mut state = self.load()?;
         self.drop_dead_tickets(&mut state)?;
         if state.tickets.len() >= MAX_TICKETS {

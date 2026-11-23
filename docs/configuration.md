@@ -88,12 +88,30 @@ oxide pool describe --json
 ```
 
 - **Registration** records the volume's mount point and UUID, the mode, the free-space reserve and the budget. A different UUID or path is refused. Only one drive can be registered.
-- **Layout.** The pool's payload and the output roots live under the volume root, at `oxide-pool` and `oxide-outputs` by default. Pass `--payload-dir` and `--outputs-dir` to nest them, for example `--payload-dir builds/oxide/pool --outputs-dir builds/oxide/outputs`. Each is a clean relative path of at most 8 names (no `.`, `..`, empty names, or leading `/`), and the two must differ and neither may contain the other. Missing directories are created on the volume through its verified root. The layout is fixed at registration; moving an existing registration's directories is not supported yet. Existing registrations keep their default layout.
+- **Layout.** The pool's payload and output roots live under the volume root,
+  at `oxide-pool` and `oxide-outputs` by default. Each path has at most eight
+  names, with no `.`, `..`, empty names, or leading `/`. The paths must be
+  distinct and neither may contain the other.
 - **Modes.** `ephemeral` (the default) keeps final outputs in the project's `target/` on the internal disk. `permanent` moves them to the drive (see [owned outputs](#owned-outputs)). Both modes use the same checks.
 - **Selection.** A build uses the drive only when it is mounted, its UUID matches and it is writable. When the drive is absent, Oxide falls back to the internal pool and prints a warning. A different drive under the same mount point is refused.
 - **Free space.** Space below the reserve starts pruning. It does not block a build unless pruning cannot recover enough.
 - **Removal.** Unplugging the drive during a build stops that build and reports the lost volume. A slot whose writers cannot be confirmed as stopped stays held. `oxide pool recover-interrupted <slot>` releases it once you are sure nothing is writing to it.
 - `oxide pool describe --json` reports the registration without changing anything. Tools that need the drive should read it rather than guess at mount points.
+
+To move an existing layout, stop builds, waiters, cleans and other writers on
+both pools. Keep the registered drive mounted and choose two unused paths.
+Existing parent directories must be private, owned by you and on that volume.
+
+```sh
+oxide pool relocate --payload-dir builds/oxide/pool --outputs-dir builds/oxide/outputs --dry-run
+oxide pool relocate --payload-dir builds/oxide/pool --outputs-dir builds/oxide/outputs
+```
+
+Oxide updates owned checkout links that still point to their old external
+roots and reports any missing or changed links it leaves alone. The next build
+checks slot freshness again. If relocation reports an incomplete rollback,
+keep the pool idle and inspect `pool-relocation.json` in the internal pool's
+`oxide-managed` directory before recovering it.
 
 ## Owned outputs
 

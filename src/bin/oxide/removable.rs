@@ -26,6 +26,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod relocation;
+
 /// Registration file in the internal control directory.
 pub(crate) const REGISTRATION: &str = "removable.json";
 /// The removable pool's internal root (config, ledger, lock, Oxide state).
@@ -200,6 +202,7 @@ pub struct Selected {
 const USAGE: &str = "\
 usage: oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ephemeral|permanent] [--payload-dir <rel>] [--outputs-dir <rel>]
        oxide pool set-mode <ephemeral|permanent>
+       oxide pool relocate --payload-dir <rel> --outputs-dir <rel> [--dry-run] [--json]
        oxide pool recover-interrupted <slot>
        oxide pool release-quarantined <slot> [--dry-run] --confirm-writers-stopped
        oxide pool describe --json
@@ -215,8 +218,7 @@ Oxide's admission budget on the volume. Both are required.
 directories under the volume root, as clean relative paths of up to 8 names
 (for example builds/oxide/pool and builds/oxide/outputs). The defaults are
 oxide-pool and oxide-outputs. They must differ and neither may contain the
-other. The layout is fixed at registration; moving an existing pool is not yet
-supported.
+other. Use relocate during a quiet window to move an existing layout.
 
 set-mode updates the existing removable registration only. Permanent mode
 warns when a build falls back to the internal pool; ephemeral mode keeps the
@@ -293,6 +295,7 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
         }
         ["set-mode", mode] => set_mode(DriveMode::parse(mode)?),
         ["set-mode", ..] => Err(USAGE.to_owned()),
+        ["relocate", rest @ ..] => relocation::run(rest),
         ["recover-interrupted", slot] => {
             let Some(internal) = Store::open_existing()? else {
                 return Err("no pool exists".to_owned());
@@ -795,6 +798,7 @@ pub(crate) fn read_registration(control: &Path) -> Result<Option<Registration>, 
 
 /// Read a bounded registration through the verified control descriptor.
 pub(crate) fn read_registration_at(directory: &File) -> Result<Option<Registration>, String> {
+    relocation::check_pending(directory)?;
     let name = CString::new(REGISTRATION).map_err(|error| error.to_string())?;
     // SAFETY: `name` is a live CString with initialized bytes through its
     // terminator, and `directory` owns a live descriptor that anchors this
