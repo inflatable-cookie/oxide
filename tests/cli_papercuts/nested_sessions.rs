@@ -2,8 +2,10 @@ use super::{fake_cargo, private_env, Scratch, OXIDE};
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
@@ -148,8 +150,11 @@ fn a_joined_slot_leaves_the_other_host_permit_available() {
 
 /// Supply a fixed remaining window without a competing outer signal. The
 /// conversation also proves the process releases on the original connection.
-fn with_broker(remaining_ms: u64, run: impl FnOnce(&mut Command) -> Output) -> (Fixture, Output) {
-    let fixture = Fixture::new();
+fn with_broker(
+    fixture: &Fixture,
+    remaining_ms: u64,
+    run: impl FnOnce(&mut Command) -> Output,
+) -> Output {
     let dir = fixture.scratch.path().join("broker");
     fs::create_dir(&dir).unwrap();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
@@ -173,7 +178,7 @@ fn with_broker(remaining_ms: u64, run: impl FnOnce(&mut Command) -> Output) -> (
         // Darwin accepted sockets inherit the listener's nonblocking mode.
         stream.set_nonblocking(false).unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(15)))
+            .set_read_timeout(Some(Duration::from_secs(90)))
             .unwrap();
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
@@ -198,15 +203,18 @@ fn with_broker(remaining_ms: u64, run: impl FnOnce(&mut Command) -> Output) -> (
     });
     let output = run(fixture
         .command()
-        .env("OXIDE_SESSION_BROKER", path)
+        .env("OXIDE_SESSION_BROKER", &path)
         .env("OXIDE_SESSION_TOKEN", TOKEN));
     server.join().unwrap();
-    (fixture, output)
+    fs::remove_file(path).unwrap();
+    fs::remove_dir(dir).unwrap();
+    output
 }
 
 #[test]
 fn exhausted_outer_window_refuses_before_opening_a_pool() {
-    let (fixture, output) = with_broker(0, |command| {
+    let fixture = Fixture::new();
+    let output = with_broker(&fixture, 0, |command| {
         command
             .args(["exec", "--admission-budget", "30s", "--", "/usr/bin/true"])
             .output()
@@ -214,7 +222,7 @@ fn exhausted_outer_window_refuses_before_opening_a_pool() {
     });
     assert_eq!(output.status.code(), Some(124), "{}", stderr(&output));
     assert!(
-        stderr(&output).contains("admission budget (0ms)"),
+        stderr(&output).contains("stopped by the admission budget"),
         "{}",
         stderr(&output)
     );
@@ -222,36 +230,90 @@ fn exhausted_outer_window_refuses_before_opening_a_pool() {
     assert!(!fixture.scratch.path().join("cargo.log").exists());
 }
 
+fn pass_budget_event_pipe(command: &mut Command, writer: std::io::PipeWriter) {
+    let fd = writer.as_raw_fd();
+    // SAFETY: the pipe is new and writer owns the open descriptor.
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) },
+        0
+    );
+    command.arg("--budget-events").arg(fd.to_string());
+    // SAFETY: the closure keeps the descriptor open and uses only fcntl and
+    // errno in the child. Clearing CLOEXEC here affects only this child.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(writer.as_raw_fd(), libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 #[test]
 fn execution_budget_uses_the_tighter_window() {
-    // Allow scratch-pool creation under contention so this exercises execution.
-    for (outer_ms, inner_budget, limit_ms) in [(8000, "30s", 8000), (30_000, "500ms", 500)] {
-        let (fixture, output) = with_broker(outer_ms, |command| {
+    const OUTER_MS: u64 = 60_000;
+    let fixture = Fixture::new();
+    // First-use pool creation and its Time Machine exclusion belong to setup.
+    let setup = fixture
+        .command()
+        .args(["exec", "--", "/bin/sh", "-c", ":"])
+        .output()
+        .unwrap();
+    assert!(setup.status.success(), "{}", stderr(&setup));
+
+    for (inner_budget, tool, code, outcome) in [
+        ("90s", "echo tool-started", 0, "child_exit"),
+        (
+            "2s",
+            "echo tool-started; exec /bin/sleep 20",
+            125,
+            "execution_deadline",
+        ),
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let output = with_broker(&fixture, OUTER_MS, |command| {
+            command.args([
+                "exec",
+                "--admission-budget",
+                "90s",
+                "--execution-budget",
+                inner_budget,
+            ]);
+            pass_budget_event_pipe(command, writer);
             command
-                .args([
-                    "exec",
-                    "--admission-budget",
-                    "30s",
-                    "--execution-budget",
-                    inner_budget,
-                    "--",
-                    "/bin/sh",
-                    "-c",
-                    "echo tool-started; exec /bin/sleep 20",
-                ])
+                .args(["--", "/bin/sh", "-c", tool])
                 .output()
                 .unwrap()
         });
         let error = stderr(&output);
-        assert_eq!(output.status.code(), Some(125), "{error}");
+        assert_eq!(output.status.code(), Some(code), "{error}");
         assert_eq!(output.stdout, b"tool-started\n");
-        let limit = error
+        let events: Vec<Value> = BufReader::new(reader)
             .lines()
-            .find_map(|line| line.strip_prefix("oxide: stopped by the execution budget ("))
-            .and_then(|rest| rest.strip_suffix("ms)"))
-            .and_then(|ms| ms.parse::<u64>().ok())
-            .expect("effective execution budget");
-        assert!((1..=limit_ms).contains(&limit), "{error}");
+            .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+            .collect();
+        let [started, finished] = events.as_slice() else {
+            panic!("expected start and finish records: {events:?}\n{error}");
+        };
+        assert_eq!(started["event"], "admitted_child_started");
+        assert_eq!(started["spawn_late"], false);
+        let admission = started["admission_ms"].as_u64().unwrap();
+        // Admission is reported from command start, which precedes Join.
+        assert!((1..90_000).contains(&admission), "{started}");
+        let execution = started["execution_ms"].as_u64().unwrap();
+        if code == 0 {
+            assert!((1..=OUTER_MS).contains(&execution), "{started}");
+            assert!(
+                execution < admission,
+                "admission consumes the outer window: {started}"
+            );
+        } else {
+            assert_eq!(execution, 2000, "{started}");
+        }
+        assert_eq!(finished["event"], "finished");
+        assert_eq!(finished["outcome"], outcome);
+        assert_eq!(finished["exit_code"], code);
         fixture.assert_idle_slots(1);
         assert!(
             fs::read_dir(fixture.scratch.path()).unwrap().all(|entry| {
