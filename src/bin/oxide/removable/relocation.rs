@@ -223,6 +223,21 @@ impl Media {
             }
         }
     }
+
+    /// The nearest existing shared parent prefix of a relocation destination
+    /// (such as `builds` or `builds/oxide`). No component is Oxide's own
+    /// leaf, so user-owned readable parents (`0755`) pass while group- or
+    /// world-writable ones refuse.
+    fn parent_directory(&self, relative: &str) -> Result<File, String> {
+        match self {
+            Self::Mounted(binding) => binding.parent_dir_path_at(relative, false).map(File::from),
+            #[cfg(all(test, target_os = "macos"))]
+            Self::Fake { .. } => {
+                self.verify()?;
+                volume::walk_parent_dir_path(self.fd(), relative, false).map(File::from)
+            }
+        }
+    }
 }
 
 /// Readers stop using the registration if the writer died between the area
@@ -568,7 +583,7 @@ fn check_existing_parents(media: &Media, mount: &Path, path: &Path) -> Result<()
                 .ok()
                 .and_then(Path::to_str)
                 .ok_or("destination parent is not under the registered volume")?;
-            media.directory(relative)?;
+            media.parent_directory(relative)?;
             break;
         }
     }
@@ -623,7 +638,16 @@ fn ensure_directory(
                 return Err(format!("cannot create {}: {error}", path.display()));
             }
         }
-        let child = volume::dir_at(parent.as_fd(), part, false)?;
+        // Intermediate components are shared parents: user-owned readable
+        // directories (`0755`) pass. Only Oxide's own leaf (a payload created
+        // exclusively here, or the holding child) keeps the owner-only check;
+        // an outputs parent prefix never is a leaf.
+        let leaf = exclusive_leaf && parts.peek().is_none();
+        let child = if leaf {
+            volume::dir_at(parent.as_fd(), part, false)?
+        } else {
+            volume::parent_dir_at(parent.as_fd(), part, false)?
+        };
         if result == 0 {
             let file = File::from(
                 child

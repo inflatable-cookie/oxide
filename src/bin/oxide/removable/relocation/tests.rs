@@ -326,6 +326,58 @@ fn read_json(path: &Path) -> Value {
 }
 
 #[test]
+fn shared_readable_builds_parent_allows_nested_relocation() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let builds = fixture.mount.join("builds");
+    fs::create_dir(&builds).unwrap();
+    fs::set_permissions(&builds, PermissionsExt::from_mode(0o755)).unwrap();
+    let report = fixture.run(false).unwrap();
+    assert!(report.moved_outputs);
+    assert!(report.cleanup.is_empty());
+    assert!(fixture.mount.join(PAYLOAD).join(HOLDING).is_dir());
+    assert_eq!(
+        std::fs::metadata(fixture.mount.join(PAYLOAD))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let registration = read_registration(fixture.internal.control())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (registration.payload_dir(), registration.outputs_dir()),
+        (PAYLOAD, OUTPUTS)
+    );
+}
+
+#[test]
+fn group_writable_builds_parent_refuses_nested_relocation() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let builds = fixture.mount.join("builds");
+    fs::create_dir(&builds).unwrap();
+    fs::set_permissions(&builds, PermissionsExt::from_mode(0o775)).unwrap();
+    let error = fixture.run(false).unwrap_err();
+    assert!(error.contains("not group- or world-writable"), "{error}");
+    // Nothing moved: the original layout, links and registration are intact,
+    // and no nested payload was created under the refused parent.
+    assert_eq!(
+        read_registration(fixture.internal.control())
+            .unwrap()
+            .unwrap()
+            .payload_dir(),
+        "oxide-pool"
+    );
+    assert!(fixture.slot.path.exists());
+    assert!(fixture.output.path.exists());
+    assert!(!fixture.mount.join(PAYLOAD).exists());
+    assert!(!fixture.internal.control().join(PENDING).exists());
+}
+
+#[test]
 fn legacy_layout_moves_both_areas_with_links_receipts_and_origins() {
     let fixture = Fixture::new();
     let preview = fixture.run(true).unwrap();
