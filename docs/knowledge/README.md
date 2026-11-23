@@ -19,6 +19,7 @@ Each fact has one owning file.
 - [Project adoption](contracts/project-adoption.md) owns the consumer integration boundary.
 - [Optimization adoption](contracts/optimization-adoption.md) owns the policy for component-lazy preparation.
 - [Local lease](contracts/local-lease.md) owns the retained lease library semantics.
+- [Session broker](contracts/session-broker.md) owns the nested membership and permit-borrowing transport.
 - [Warm-reuse admission](contracts/warm-reuse-admission.md) owns admission of a normal warm reuse without a recursive size scan.
 - [Stable Cargo profiles](contracts/stable-cargo-profiles.md) owns Oxide's own profile recipes and their trade-offs.
 - [Exec output inference](contracts/exec-output-inference.md) owns how `oxide exec` derives a tool's output members without a declared output. The receipt-derived set is implemented; derived link creation stays open in [Q-019](questions.md#q-019--how-should-oxide-exec-know-a-tools-profile-output-members).

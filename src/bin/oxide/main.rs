@@ -37,6 +37,7 @@ mod seed_lock;
 mod seed_plan;
 mod seed_sources;
 mod seed_summary;
+mod session_broker;
 mod status;
 mod store;
 mod version;

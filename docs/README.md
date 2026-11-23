@@ -28,6 +28,7 @@ Contracts:
 - [Project adoption](knowledge/contracts/project-adoption.md): the consumer integration boundary.
 - [Optimization adoption](knowledge/contracts/optimization-adoption.md): policy for component-lazy preparation.
 - [Local lease](knowledge/contracts/local-lease.md): the retained lease library semantics.
+- [Session broker](knowledge/contracts/session-broker.md): the macOS transport for nested session membership and host-permit borrowing.
 - [Warm-reuse admission](knowledge/contracts/warm-reuse-admission.md): admission without a recursive size scan.
 - [Stable Cargo profiles](knowledge/contracts/stable-cargo-profiles.md): Oxide's own profile recipes.
 - [Cold-slot seeding](knowledge/contracts/cold-slot-seeding.md): seeding a new slot from an idle donor.
