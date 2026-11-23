@@ -415,6 +415,12 @@ else:
         else:
             assert "OXIDE_POOL_CREATE" not in os.environ and pool != LIVE, "format-change never names the live pool"
             assert pool.startswith(CONFIG["scratch"] + "/") and Path(pool, "config.json").is_file(), pool
+            # The real open refuses a payload with no slots/ as unknown
+            # accounting before the copied ledger is read (oxide#367).
+            if not Path(pool, "payload", "slots").is_dir():
+                print("cannot open: cannot open the pool: unknown_accounting "
+                      "(owned accounting is unknown or a foreign entry is present)", file=sys.stderr)
+                sys.exit(1)
     with open(CONFIG["log"], "a") as log:
         print(json.dumps([args[0], os.getcwd(), pool]), file=log)
     if args == ["pool", "describe", "--json"]:
@@ -634,6 +640,46 @@ class CanaryTests(unittest.TestCase):
         status, _, stderr, builder = self.invoke(["--replace", "--check", "--require-canary"], None)
         self.assertEqual(status, 0, stderr)
         builder.assert_not_called()
+
+    def test_format_change_supports_a_barge_backed_pool_with_owned_slots(self):
+        # A Barge-backed internal pool names Barge-owned slots in ledger.json
+        # whose roots live in Barge state, not in payload/. The copy carries
+        # an empty payload/slots/ so the staged binary still opens the copied
+        # documents and upgrades the copied control state (oxide#367).
+        (self.pool / "payload").mkdir()
+        (self.pool / "payload" / "slots").mkdir()
+        (self.pool / "config.json").write_text(json.dumps({
+            "version": 1, "backend": "directory-budget-v1", "store_id": "live",
+            "cap_bytes": 100000000000, "image_bytes": 0}))
+        owned = [
+            {"id": 1, "incarnation": 2, "state": "idle", "project": "p",
+             "workspace": "w", "profile": "quick", "holder": "oxide-11-3",
+             "lease_id": None, "last_lease_id": "lease-1", "dir": None,
+             "root": "6b86b273ff34fce1", "owned": True, "rank": 1},
+            {"id": 2, "incarnation": 1, "state": "idle", "project": "p",
+             "workspace": "w", "profile": "quick", "holder": "oxide-11-4",
+             "lease_id": None, "last_lease_id": "lease-2",
+             "dir": "effigy-abc/quick-2", "root": "d4735e3a265e16ee",
+             "owned": True, "rank": 2},
+        ]
+        (self.pool / "ledger.json").write_text(json.dumps({
+            "version": 3, "store_id": "live", "cap_bytes": 100000000000,
+            "next_slot": 3, "next_lease": 5, "holding": [], "slots": owned}))
+        self.write_live_state(10)
+        before = self.live_bytes()
+        before_state = (self.pool / "oxide-managed" / "state.json").read_bytes()
+        status, stdout, stderr, _ = self.invoke(
+            ["--canary", "--format-change", "--scratch-root", str(self.scratch)],
+            self.fake_build(mode="format", control_state_version=11),
+        )
+        self.assertEqual(status, 0, stderr)
+        self.assertIn("oxide:canary PASS for " + self.PIN + " (format-change)", stdout)
+        self.assertIn("format-change: control state 10 -> 11 (staged 11)", stdout)
+        self.assertIn("format-change: live documents unchanged", stdout)
+        self.assertEqual(self.live_bytes(), before)
+        self.assertEqual((self.pool / "oxide-managed" / "state.json").read_bytes(), before_state)
+        self.assertFalse((self.pool / "slot-9").exists())
+        self.assertEqual(list(self.scratch.iterdir()), [self.scratch / "unrelated"])
 
     def test_format_change_uses_internal_scratch_when_a_removable_pool_is_registered(self):
         self.write_live_state(10)
@@ -1034,6 +1080,22 @@ class DocumentAndScratchTests(unittest.TestCase):
         (self.pool / "oxide-managed").symlink_to(elsewhere)
         with self.assertRaises(installer.Refusal):
             installer.read_live_documents(self.pool)
+
+    def test_write_document_copy_carries_an_empty_owner_only_slots_directory(self):
+        # A Barge-backed pool's copy must open: an empty payload/ with no
+        # slots/ refuses as unknown accounting before the ledger is read.
+        self.write_live_pool()
+        documents = installer.read_live_documents(self.pool)
+        root = self.root / "copy-root"
+        root.mkdir(mode=0o700)
+        copy = installer.write_document_copy(root, documents)
+        slots = copy / "payload" / "slots"
+        self.assertTrue(slots.is_dir())
+        self.assertEqual(list(slots.iterdir()), [])
+        self.assertEqual(stat.S_IMODE(slots.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((copy / "payload").stat().st_mode), 0o700)
+        for name in ("config.json", "ledger.json", "oxide-managed/state.json"):
+            self.assertEqual((copy / name).read_bytes(), documents[name][0])
 
     def test_verify_live_documents_detects_a_changed_document(self):
         self.write_live_pool()
