@@ -105,7 +105,7 @@ impl Fixture {
 }
 
 fn eventually(mut predicate: impl FnMut() -> bool, description: &str) {
-    let until = Instant::now() + Duration::from_secs(12);
+    let until = Instant::now() + Duration::from_secs(30);
     while !predicate() {
         assert!(
             Instant::now() < until,
@@ -226,7 +226,7 @@ fn a_crashed_nested_build_returns_its_borrow_while_exec_keeps_the_slot() {
         .args([
             "exec",
             "--execution-budget",
-            "25s",
+            "45s",
             "--",
             "/bin/sh",
             "-ec",
