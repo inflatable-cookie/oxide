@@ -87,6 +87,12 @@ pub const MAX_LEASE_ID_BYTES: usize = 160;
 /// The most slot IDs a bounded capacity refusal names before it counts the
 /// rest (oxide#186). Keeps one refusal line bounded at the 256-slot ceiling.
 pub const MAX_REFUSAL_SLOTS: usize = 8;
+/// Longest owned scratch path Oxide injects into a slot (oxide#136).
+/// macOS `sun_path` is 104 bytes including the NUL; a Unix socket needs a
+/// `/` and a short name inside the directory, so 91 + 1 + 11 + NUL is the
+/// whole budget. This is the single source of truth: the slot-label budget
+/// in `pool` derives from it and the child-temporary decision enforces it.
+pub const MAX_SCRATCH_PATH_BYTES: usize = 91;
 /// Cooperative inventory bounds for pool accounting (oxide#108), separate
 /// from the inventory tool's defaults. Sized for real build caches: the
 /// entry bound still admits one 60k-entry Cargo build directory (Farmyard's

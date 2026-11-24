@@ -16,6 +16,8 @@ mod recover;
 mod seed_view;
 
 #[cfg(test)]
+mod barge_label_tests;
+#[cfg(test)]
 mod injected;
 #[cfg(test)]
 mod lock_wait_tests;
@@ -32,7 +34,7 @@ use super::{
     RecordedFact, RecordedVolume, ReleaseReceipt, SlotOccupancy, SlotStatus, UnmeasuredSlot,
     ACCOUNTING_MAX_ELAPSED_MS, CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
     LEDGER_VERSION, LEGACY_CAPACITY_POLICY_VERSION, LEGACY_MAX_SLOTS, LOCK_NAME, MANAGED_NAME,
-    MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS,
+    MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SCRATCH_PATH_BYTES, MAX_SLOTS,
     PREVIOUS_CAPACITY_POLICY_VERSION, RAISED_CAPACITY_POLICY_VERSION, SLOTS_NAME,
 };
 use super::{
@@ -152,11 +154,34 @@ fn legacy_root_id(folder: &str) -> String {
         .collect()
 }
 
+/// Longest Barge root label that keeps `<slots>/<label>-<16 hex>/scratch`
+/// within [`MAX_SCRATCH_PATH_BYTES`] (oxide#376): the slots directory, one
+/// `/`, Barge's `-` plus 16-hex id, and `/scratch`. Capped at Barge's own
+/// 32-byte label limit. A zero budget still yields 1 so a new slot gets a
+/// valid label and the child-temporary decision keeps refusing the genuinely
+/// overlong pool path instead of this label.
+pub(super) fn max_barge_label_bytes(slots_dir: &Path) -> usize {
+    let overhead = slots_dir
+        .as_os_str()
+        .as_bytes()
+        .len()
+        .saturating_add(1)
+        .saturating_add(17)
+        .saturating_add(8);
+    MAX_SCRATCH_PATH_BYTES
+        .saturating_sub(overhead)
+        .min(32)
+        .max(1)
+}
+
 /// The Barge label for a new slot root: the project folder and profile
-/// squeezed into one label (lowercase letters, digits and `-`, at most 32, no
-/// trailing `-`). The root's own random id follows it, so labels repeat
-/// freely.
-fn barge_label(layout: Option<&SlotLayout>) -> String {
+/// squeezed into one label (lowercase letters, digits and `-`, at most
+/// `max_bytes`, no trailing `-`). The root's own random id follows it, so
+/// labels repeat freely. `max_bytes` comes from [`max_barge_label_bytes`];
+/// values above 32 still cap at Barge's own limit, and a zero budget falls
+/// back to one byte so the label stays valid.
+fn barge_label(layout: Option<&SlotLayout>, max_bytes: usize) -> String {
+    let max_bytes = max_bytes.max(1).min(32);
     let profile = layout
         .map(|layout| layout.profile.as_str())
         .unwrap_or("slot");
@@ -178,10 +203,13 @@ fn barge_label(layout: Option<&SlotLayout>) -> String {
             }
         })
         .collect();
-    label.truncate(32);
+    // The sanitised label is ASCII only, so a byte truncation cannot split
+    // a character.
+    label.truncate(max_bytes);
     while label.ends_with('-') || label.is_empty() {
         if label.is_empty() {
             label.push_str("slot");
+            label.truncate(max_bytes);
             break;
         }
         label.pop();
