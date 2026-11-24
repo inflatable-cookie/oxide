@@ -5,11 +5,11 @@
 ## [0.3.0] - 2026-11-24
 
 ### Added
-- - Removable pool and outputs directories can be nested under the volume root, for example `builds/oxide/pool` and `builds/oxide/outputs`, via `oxide pool register-removable --payload-dir --outputs-dir`. Registrations are now version 3; version 1 and 2 registrations keep the `oxide-pool` and `oxide-outputs` layout.
+- Removable pool and outputs directories can be nested under the volume root, for example `builds/oxide/pool` and `builds/oxide/outputs`, via `oxide pool register-removable --payload-dir --outputs-dir`. Registrations are now version 3; version 1 and 2 registrations keep the `oxide-pool` and `oxide-outputs` layout.
 - Add `oxide pool relocate` to move a quiet removable pool and its owned outputs to a new volume-relative layout.
 - Add `oxide pool upgrade-legacy` to adopt live legacy outputs and clear abandoned slot and output directories before relocation.
 - Add the macOS session broker foundation and protocol for nested Oxide sessions and permit borrowing.
-- - On macOS, nested leased Oxide commands share the outer host build permit, keep their own slots, and inherit the tighter command deadline.
+- On macOS, nested leased Oxide commands share the outer host build permit, keep their own slots, and inherit the tighter command deadline.
 - On macOS, idle `oxide exec` sessions yield their host build permit while keeping their slot. Nested Oxide builds borrow one shared permit on demand, and `oxide status` shows when it is borrowed.
 - On Linux, nested Oxide commands join their outer session, inherit its tighter deadline and share or lend its host build permit, matching macOS.
 - Added GitHub Actions CI (macOS and Linux) and explicit `workflow_dispatch` binary release workflows for macOS and Linux tarballs with SHA-256 checksums, and updated release and installation documentation.
