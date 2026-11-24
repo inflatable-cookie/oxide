@@ -46,6 +46,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 
+/// Longest owned scratch path, mirroring the library's single source of
+/// truth so the two can never drift: [`oxide_storage::lease::MAX_SCRATCH_PATH_BYTES`].
+pub(crate) const MAX_SCRATCH_PATH_BYTES: usize = oxide_storage::lease::MAX_SCRATCH_PATH_BYTES;
 /// The Oxide-owned directory inside the held slot.
 const SCRATCH_NAME: &str = "scratch";
 /// Ownership marker inside that directory, written before any writer starts.
@@ -54,10 +57,6 @@ const OWNER_VERSION: &str = "oxide.scratch/1";
 const MAX_OWNER_BYTES: u64 = 1024;
 /// Variables a child's temporary directory is published through.
 pub(crate) const VARIABLES: [&str; 3] = ["TMPDIR", "TMP", "TEMP"];
-/// Longest owned scratch path Oxide injects. macOS `sun_path` is 104 bytes
-/// including the terminating NUL; a Unix socket needs a `/` and a short name
-/// inside the directory, so 91 + 1 + 11 + NUL is the whole budget.
-pub(crate) const MAX_SCRATCH_PATH_BYTES: usize = 91;
 
 /// The durable binding of one owned scratch directory: the pool's recorded
 /// store identity, the slot number and its incarnation. The lease that

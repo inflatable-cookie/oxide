@@ -387,8 +387,10 @@ impl Pool {
         // keeps the root through the command. Every mutating open has a
         // storage authority; one that does not cannot allocate.
         let storage = self.storage.clone().ok_or(LeaseError::UnknownAccounting)?;
+        let slots_dir = self.backing.payload_root().join(SLOTS_NAME);
+        let budget = max_barge_label_bytes(&slots_dir);
         let root = storage
-            .create(&barge_label(request.layout.as_ref()))
+            .create(&barge_label(request.layout.as_ref(), budget))
             .map_err(LeaseError::Barge)?;
         // From here on this is a marked Barge root with no ledger row. A
         // failure before the row is durable drops the hold and evicts the
