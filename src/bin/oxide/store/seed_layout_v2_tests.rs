@@ -230,7 +230,7 @@ fn a_cold_1_100_slot_seeds_from_an_idle_donor_and_cargo_reuses_the_unit() {
     match seeded {
         SeedRun::Seeded(..) => {}
         SeedRun::Skipped(reason) => panic!("seeding skipped: {reason}"),
-        SeedRun::Abandoned => panic!("seeding abandoned"),
+        SeedRun::Abandoned(reason) => panic!("seeding abandoned: {}", reason.as_str()),
     }
     assert!(
         expected == unit_files(&fresh.build_dir.join(&unit_dir)),

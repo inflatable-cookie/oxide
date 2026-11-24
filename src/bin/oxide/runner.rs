@@ -568,6 +568,31 @@ fn acquire_and_bind(
     )
 }
 
+/// What the command does with a finished seed attempt. Only a refusal fails the
+/// command: the cooperative work budget and an incomplete walk abandon seeding
+/// and the command continues, in a fresh slot when the recipient is untrusted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SeedFollowUp {
+    /// Run the command in the slot the seed warmed, or in the same empty slot
+    /// after a cold skip.
+    Continue,
+    /// Release the untrusted recipient, reacquire a fresh slot, then run the
+    /// command. The token is the bounded reason printed for the skip.
+    Reacquire(&'static str),
+    /// Release the untrusted recipient and refuse with this reason.
+    Refuse(String),
+}
+
+impl SeedFollowUp {
+    fn of(outcome: &Result<store::SeedRun, String>) -> Self {
+        match outcome {
+            Ok(store::SeedRun::Abandoned(reason)) => Self::Reacquire(reason.as_str()),
+            Ok(_) => Self::Continue,
+            Err(reason) => Self::Refuse(reason.clone()),
+        }
+    }
+}
+
 fn seed_recipient(
     request: &LeaseRequest<'_>,
     bind_plan: &OutputBindPlan<'_>,
@@ -582,26 +607,49 @@ fn seed_recipient(
     let (mut held, mut gate, mut binding) = leased;
     let mut production = None;
     if cold_seed_active(std::env::var_os("OXIDE_COLD_SEED").as_deref()) {
-        match seed_sources::Production::prepare(
+        let seedable = match seed_sources::Production::prepare(
             invocation,
             &request.key.checkout,
             &held,
             request.store,
         ) {
-            Ok(mut prepared) => match prepared.seed(request.store, &held) {
+            Ok(prepared) => Some(prepared),
+            Err(seed_sources::PreparationError::Skip(reason)) => {
+                eprintln!("oxide: seeding skipped: {reason}");
+                None
+            }
+            Err(seed_sources::PreparationError::SkipNamed(reason)) => {
+                eprintln!("oxide: seeding skipped: {reason}");
+                None
+            }
+        };
+        if let Some(mut prepared) = seedable {
+            let outcome = prepared.seed(request.store, &held);
+            match &outcome {
                 Ok(store::SeedRun::Skipped(reason)) => {
                     let reason = seed_lock::skip_reason(reason, &prepared.lock);
                     eprintln!("oxide: seeding skipped: {reason}");
                     production = Some(prepared);
                 }
-                Ok(store::SeedRun::Seeded(_, last)) => {
-                    eprintln!("{}", seed_summary::summary(&last));
+                Ok(store::SeedRun::Seeded(receipt, last)) => {
+                    eprintln!("{}", seed_summary::summary(last));
+                    // The cooperative work budget may stop the clone loop at a
+                    // complete unit boundary: the published prefix is the whole
+                    // seed, so say so instead of letting the summary look
+                    // short for no reason.
+                    if let Some(note) = receipt.truncation_note() {
+                        eprintln!("{note}");
+                    }
                     // The recipient was populated by a seed, so it is not a
                     // producing generation: publishing its catalog would spend
                     // the post-build verification pass only to discard the
                     // result.
                 }
-                Ok(store::SeedRun::Abandoned) => {
+                Ok(store::SeedRun::Abandoned(_)) | Err(_) => {}
+            }
+            match SeedFollowUp::of(&outcome) {
+                SeedFollowUp::Continue => {}
+                SeedFollowUp::Reacquire(reason) => {
                     (held, gate, binding) = match abandon_seed_and_reacquire(
                         request, bind_plan, waits, grants, held, binding,
                     )? {
@@ -614,17 +662,11 @@ fn seed_recipient(
                             return Ok(Step::Exit(stop_for_admission(budget::Lease::Released)))
                         }
                     };
-                    eprintln!("oxide: seeding skipped: recipient walk incomplete");
+                    eprintln!("oxide: seeding skipped: {reason}");
                 }
-                Err(reason) => {
+                SeedFollowUp::Refuse(reason) => {
                     return refuse_seed(request.store, held, binding, reason).map(Step::Exit);
                 }
-            },
-            Err(seed_sources::PreparationError::Skip(reason)) => {
-                eprintln!("oxide: seeding skipped: {reason}");
-            }
-            Err(seed_sources::PreparationError::SkipNamed(reason)) => {
-                eprintln!("oxide: seeding skipped: {reason}");
             }
         }
     }
@@ -2181,7 +2223,18 @@ mod tests {
     fn failed_walk_releases_then_reacquires_under_the_original_grant_limit() {
         let (root, store, key) = store::tests::seed_fixture();
         let held = store::tests::seed_fixture_lease(&store, &key);
-        std::fs::write(held.build_dir.join("partial"), b"untrusted").unwrap();
+        // A mid-unit stop leaves one partly written layout-v2 unit directory.
+        // The command must not run Cargo there, so it reacquires a fresh slot
+        // and continues in that one instead of refusing.
+        let partial = held
+            .build_dir
+            .join("debug/build/cfg-if/aaaaaaaaaaaaaaaa/out");
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(
+            partial.join("libcfg_if-aaaaaaaaaaaaaaaa.rmeta"),
+            b"untrusted",
+        )
+        .unwrap();
         let binding =
             outputs::bind_for_command(&store, &key.checkout, held.record_id(), None, None, false)
                 .unwrap();
@@ -2215,12 +2268,42 @@ mod tests {
             panic!("cold admission stopped")
         };
         assert!(matches!(cold.prior, freshness::Prior::Fresh));
-        assert!(!cold.build_dir.join("partial").exists());
+        assert!(!cold.build_dir.join("debug").exists());
         assert!(grants.remaining < (store::PROJECT_SLOT_CAP + 1) as u8);
         assert!(!grants.share);
         drop(binding);
         store.release(cold, None).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_a_refused_seed_fails_the_command() {
+        use oxide_storage::lease::managed::SeedAbandonReason;
+        // An abandoned attempt — including one the cooperative work budget
+        // stopped with a unit only partly written — releases the untrusted
+        // recipient, reacquires a fresh slot, and runs the command.
+        assert_eq!(
+            SeedFollowUp::of(&Ok(store::SeedRun::Abandoned(
+                SeedAbandonReason::WorkDeadline
+            ))),
+            SeedFollowUp::Reacquire("deadline")
+        );
+        assert_eq!(
+            SeedFollowUp::of(&Ok(store::SeedRun::Abandoned(
+                SeedAbandonReason::WalkIncomplete
+            ))),
+            SeedFollowUp::Reacquire("recipient walk incomplete")
+        );
+        // A cold skip and a published prefix both run the command in place.
+        assert_eq!(
+            SeedFollowUp::of(&Ok(store::SeedRun::Skipped("no eligible donor"))),
+            SeedFollowUp::Continue
+        );
+        // A refusal still releases the untrusted generation and refuses.
+        assert_eq!(
+            SeedFollowUp::of(&Err("seed reserve stop".to_owned())),
+            SeedFollowUp::Refuse("seed reserve stop".to_owned())
+        );
     }
 
     #[test]

@@ -320,6 +320,8 @@ pre-empted. Passive status reads never take these locks.
 | A precondition, cap or deadline fails, or the donor is busy or its custody unknown, before the first write into the recipient | `oxide: seeding skipped: <token>`. The attempt becomes `skipped`, and the command builds cold in the same empty slot. |
 | The reserve gate is below the trigger or unknown, before the first write | Refuse before any child. No marker and no clone are written. |
 | After the first write, the post-clone walk is incomplete or fails (bound, ownership, device, boundary or read) | Abandon seeding only. Publish nothing. Release the recipient with no trusted origin, through the ordinary release (a removable pool flushes before idle, and a failed flush retires the slot). Never reuse it. Build cold in a newly admitted slot under normal admission. No extra grant. |
+| After the first write, the seed's own cooperative work budget expires at a complete unit-directory boundary | Publish the units whose every clone verified. The attempt becomes `seeded` with their counts, the walk still runs and must be complete, and the summary is followed by `oxide: seeding stopped at the work budget after <N> of <M> units; the remaining units build cold`. The command runs; the seed never fails it. |
+| After the first write, the seed's own cooperative work budget expires with a unit only partly written | Abandon seeding only, exactly as for an incomplete walk: no clone set completed that unit, so nothing is published, the recipient is released untrusted, and the command cold-builds in a newly admitted slot. |
 | After the first write, any other fault: clone, digest or file-type error, a changed donor file, donor transition, reserve breach, lost reading or unreadable path | Record `reset`, meaning abandoned and not repaired. Release the recipient with no trusted origin. Refuse with a non-zero exit. Cargo never runs in that slot, and seeding deletes nothing. |
 | Unknown ownership, accounting, device or custody fact | Refuse. An unknown fact is never a cold fallback. |
 | Recipient `build/` is not an empty owned directory | Refuse. Nothing is cleaned. |
@@ -359,12 +361,20 @@ unchanged. The seed's gate is a precondition of seeding alone.
 The seed's own cooperative work budget covers donor revalidation, cloning and
 digest verification; it is a ceiling a caller may lower and never a figure that
 extends admission. Expiry before the first recipient write means no seed and the
-same slot builds cold. Expiry between the first write and the last verified
-clone records `reset` and refuses: the untrusted generation is retained and
-released without a trusted origin, never repaired (section 7). Once every
-planned clone has verified, the work budget no longer refuses a seed, because
-no clone work remains; the post-clone walk keeps its own separate bound. The
-pool's space budget stays soft, as it is for Cargo.
+same slot builds cold. After a write it never fails the command, because it
+bounds an optional cache-warming optimisation: a unit directory is written whole
+or not at all, so the clone loop stops only between unit directories and
+publishes the verified prefix, leaving the rest of the plan to build cold.
+Expiry inside a unit abandons seeding only, because that recipient then holds a
+unit whose clone set no write completed: nothing is published, it is released
+without a trusted origin and never repaired, and the command cold-builds in a
+newly admitted slot. A clone's own recorded facts — an owned regular file of the
+catalog's size on the payload device — are checked from its metadata **before**
+its bytes are hashed, so an expiry never downgrades a clone that was already
+observably wrong: that fault still refuses (section 7). Once every clone this
+attempt makes has verified, the work budget has nothing left to stop; the
+post-clone walk keeps its own separate bound. The pool's space budget stays
+soft, as it is for Cargo.
 
 | Item | Bound |
 | --- | --- |
@@ -414,6 +424,9 @@ it must stop and return to design rather than bump the format.
 - Success prints `oxide: seeded <N> units (<M> MiB) from slot <X>`. N counts
   completely cloned compile units, and M counts logical cloned bytes. The output
   never says reused, fresh or saved, because it makes no Cargo freshness claim.
+- A seed the work budget stopped at a unit boundary prints one more line,
+  `oxide: seeding stopped at the work budget after <N> of <M> units; the
+  remaining units build cold`, so a short summary is never unexplained.
 - Donor candidates rejected in the producing epoch appear as a bounded skip
   suffix. Unknown counts are reported separately from zero.
 - A miss prints `oxide: seeding skipped: <reason>` with a fixed set of reason

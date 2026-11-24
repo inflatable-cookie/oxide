@@ -1684,6 +1684,274 @@ fn seed_with_an_empty_allowlist_skips_without_side_effects() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// A store with one idle donor whose published catalog offers one layout-v2
+/// library unit (a whole `debug/build/<package>/<hex>/` directory), and its
+/// `Store::seed_with` inputs: the producer the catalog records, the lock entry
+/// selection matches, and the verified source it names. The catalog is
+/// hand-written on the library fixtures' terms, because these regressions
+/// exercise the command's handoff of a seed outcome, not Cargo.
+fn seed_handoff_fixture() -> (
+    PathBuf,
+    Store,
+    Lease,
+    oxide_storage::lease::managed::SeedProducer,
+    crate::seed_lock::Analysis,
+    Vec<crate::seed_plan::VerifiedSource>,
+) {
+    use oxide_storage::lease::managed::{
+        publish_seed_catalog, SeedAttemptState, SeedCatalog, SeedFile, SeedFileKind, SeedJoin,
+        SeedPackage, SeedProducer, SeedRole, SeedSourceKind, SeedSourceRoot, SeedUnit,
+    };
+    use oxide_storage::lease::seed::catalog::SEED_CATALOG_SCHEMA;
+    let (root, store, key) = seed_fixture();
+    let donor_key = SlotKey {
+        checkout: root.join("donor"),
+        identity: "donor-identity".into(),
+        compatibility: "quick-key".into(),
+    };
+    fs::create_dir(&donor_key.checkout).unwrap();
+    let donor = seed_fixture_lease(&store, &donor_key);
+    // One layout-v2 library unit: the fingerprint triple in the unit's own
+    // `fingerprint/`, its rmeta artifact and joining `.d` in its `out/`.
+    let fingerprint = "debug/build/cfg-if/aaaaaaaaaaaaaaaa";
+    let artifact = "debug/build/cfg-if/aaaaaaaaaaaaaaaa/out/libcfg_if-aaaaaaaaaaaaaaaa.rmeta";
+    let dep = "debug/build/cfg-if/aaaaaaaaaaaaaaaa/out/cfg_if-aaaaaaaaaaaaaaaa.d";
+    let join = format!(
+        "{dep}: /fixture/src/lib.rs\n{artifact}: /fixture/src/lib.rs\n/fixture/src/lib.rs:\n"
+    );
+    let files: Vec<(String, String)> = vec![
+        (
+            format!("{fingerprint}/fingerprint/lib-cfg_if"),
+            "fingerprint".into(),
+        ),
+        (
+            format!("{fingerprint}/fingerprint/lib-cfg_if.json"),
+            "{}".into(),
+        ),
+        (
+            format!("{fingerprint}/fingerprint/dep-lib-cfg_if"),
+            String::new(),
+        ),
+        (artifact.to_owned(), "rmeta-fixture".into()),
+        (dep.to_owned(), join.clone()),
+    ];
+    for (relative, content) in &files {
+        let path = donor.build_dir.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+    }
+    let digest = |text: &str| oxide_storage::lease::seed::catalog_digest(text.as_bytes());
+    let checksum = "a".repeat(64);
+    let source_root_digest = "b".repeat(64);
+    let producer = SeedProducer {
+        rustc_digest: "d".repeat(64),
+        context_digest: "e".repeat(64),
+        flags_digest: "f".repeat(64),
+        adapter: oxide_storage::lease::seed::ADAPTER_V2.to_owned(),
+        ..seed_test_producer()
+    };
+    let catalog = SeedCatalog {
+        schema: SEED_CATALOG_SCHEMA.to_owned(),
+        store_id: donor.store_id.clone(),
+        slot_id: donor.slot_id.clone(),
+        incarnation: donor.incarnation.clone(),
+        lease_id: donor.lease_id.clone(),
+        record_id: donor.record_id(),
+        mark: 1,
+        started_at_ms: 1,
+        finished_at_ms: 2,
+        attempt: SeedAttemptState::None,
+        producer: producer.clone(),
+        packages: vec![SeedPackage {
+            name: "cfg-if".to_owned(),
+            target: "cfg_if".to_owned(),
+            version: "1.0.0".to_owned(),
+            source: "registry+https://github.com/rust-lang/crates.io-index".to_owned(),
+            checksum: Some(checksum.clone()),
+            unique: true,
+            leaf: true,
+            source_root: SeedSourceRoot {
+                kind: SeedSourceKind::Registry,
+                digest: source_root_digest.clone(),
+            },
+            units: vec![SeedUnit {
+                fingerprint_dir: fingerprint.to_owned(),
+                role: SeedRole::Lib,
+                target: "cfg_if".to_owned(),
+                join: SeedJoin {
+                    path: dep.to_owned(),
+                    targets: vec![
+                        dep.to_owned(),
+                        artifact.to_owned(),
+                        "/fixture/src/lib.rs".to_owned(),
+                    ],
+                    inputs: vec!["/fixture/src/lib.rs".to_owned()],
+                    digest: digest(&join),
+                },
+                files: files
+                    .iter()
+                    .map(|(path, content)| SeedFile {
+                        path: path.clone(),
+                        size: content.len() as u64,
+                        mtime_ms: 0,
+                        digest: digest(content),
+                        kind: if path == dep {
+                            SeedFileKind::DepInfo
+                        } else if path == artifact {
+                            SeedFileKind::Artifact
+                        } else {
+                            SeedFileKind::Fingerprint
+                        },
+                    })
+                    .collect(),
+            }],
+        }],
+        rejected: Vec::new(),
+    };
+    publish_seed_catalog(&store.pool, &catalog).expect("publish catalog");
+    let origin = Built::Affine(donor_key.checkout.clone());
+    store.release(donor, Some(origin)).expect("donor release");
+
+    let held = seed_fixture_lease(&store, &key);
+    let lock = crate::seed_lock::analyze(
+        format!(
+            "version = 4\n[[package]]\nname = 'cfg-if'\nversion = '1.0.0'\n\
+             source = 'registry+https://github.com/rust-lang/crates.io-index'\n\
+             checksum = '{checksum}'\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let verified = crate::seed_plan::VerifiedSource {
+        package: lock.eligible[0].clone(),
+        tree_digest: source_root_digest,
+        kind: SeedSourceKind::Registry,
+        root: PathBuf::from("/fixture"),
+        verification_root: PathBuf::from("/fixture"),
+        proc_macro: false,
+    };
+    (root, store, held, producer, lock, vec![verified])
+}
+
+#[test]
+fn a_deadline_abandonment_is_a_command_fallback_not_a_seed_failure() {
+    use oxide_storage::lease::managed::{
+        held_seed_attempt, SeedAbandon, SeedAbandonReason, SeedAttemptState, SeedOutcome,
+        SeedRecipient,
+    };
+    let (root, store, held, producer, lock, sources) = seed_handoff_fixture();
+    let recipient = SeedRecipient {
+        slot_id: held.slot_id.clone(),
+        incarnation: held.incarnation.clone(),
+        lease_id: held.lease_id.clone(),
+    };
+    let outcome = store.seed_with(
+        &held,
+        &producer,
+        &lock,
+        |_| Ok(sources.clone()),
+        |_pool, request, _monitor| {
+            // The command path always plans the full cooperative budget.
+            assert_eq!(request.work_budget_ms, None);
+            assert_eq!(request.units.len(), 1);
+            Ok(SeedOutcome::Abandoned(SeedAbandon {
+                reason: SeedAbandonReason::WorkDeadline,
+                observation: None,
+            }))
+        },
+    );
+    // The command layer receives an outcome it can continue from, never the
+    // `cannot seed slot` error the deadline used to produce.
+    match outcome.expect("a work deadline is never a seed failure") {
+        SeedRun::Abandoned(reason) => {
+            assert_eq!(reason, SeedAbandonReason::WorkDeadline);
+            assert_eq!(reason.as_str(), "deadline");
+        }
+        SeedRun::Skipped(reason) => panic!("unexpected skip: {reason}"),
+        SeedRun::Seeded(..) => panic!("unexpected seed"),
+    }
+    // The attempt records abandoned-and-not-repaired, so the released
+    // generation is never reused as warm.
+    assert_eq!(
+        held_seed_attempt(&store.pool, &recipient).unwrap(),
+        SeedAttemptState::Reset
+    );
+    store.release(held, None).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_time_bounded_seed_reaches_the_command_as_a_published_prefix() {
+    use oxide_storage::lease::managed::{
+        held_seed_attempt, SeedAttemptState, SeedObservation, SeedOutcome, SeedReceipt,
+        SeedRecipient, SeedWalkLimits,
+    };
+    use oxide_storage::lease::seed::{
+        SEED_WALK_MAX_DEPTH, SEED_WALK_MAX_ELAPSED_MS, SEED_WALK_MAX_ENTRIES,
+    };
+    let (root, store, held, producer, lock, sources) = seed_handoff_fixture();
+    let recipient = SeedRecipient {
+        slot_id: held.slot_id.clone(),
+        incarnation: held.incarnation.clone(),
+        lease_id: held.lease_id.clone(),
+    };
+    let receipt = SeedReceipt {
+        donor_slot: "1".to_owned(),
+        donor_incarnation: "incarnation".to_owned(),
+        units: 1,
+        planned_units: 2,
+        files: 5,
+        logical_bytes: 32,
+        catalog_digest: "c".repeat(64),
+        observation: SeedObservation {
+            store_id: held.store_id.clone(),
+            slot_id: held.slot_id.clone(),
+            incarnation: held.incarnation.clone(),
+            lease_id: held.lease_id.clone(),
+            entries: 6,
+            logical_bytes: 32,
+            allocated_bytes: 4096,
+            gap: None,
+            limits: SeedWalkLimits {
+                max_entries: SEED_WALK_MAX_ENTRIES,
+                max_depth: SEED_WALK_MAX_DEPTH,
+                max_elapsed_ms: SEED_WALK_MAX_ELAPSED_MS,
+            },
+            elapsed_ms: 1,
+        },
+        elapsed_ms: 1_050,
+    };
+    let expected_note = receipt.truncation_note();
+    assert!(expected_note.is_some());
+    let outcome = store.seed_with(
+        &held,
+        &producer,
+        &lock,
+        |_| Ok(sources),
+        move |_pool, _request, _monitor| Ok(SeedOutcome::Seeded(receipt)),
+    );
+    match outcome.expect("a stopped seed is a published seed") {
+        SeedRun::Seeded(receipt, last) => {
+            assert_eq!(receipt.units, 1);
+            assert_eq!(receipt.planned_units, 2);
+            assert_eq!(receipt.truncation_note(), expected_note);
+            // The recorded seed and the printed summary cover the prefix, not
+            // the whole plan.
+            assert_eq!(last.units, 1);
+            assert_eq!(last.files, 5);
+            assert_eq!(last.slot_id, held.slot_id);
+        }
+        SeedRun::Skipped(reason) => panic!("unexpected skip: {reason}"),
+        SeedRun::Abandoned(reason) => panic!("unexpected abandon: {}", reason.as_str()),
+    }
+    assert_eq!(
+        held_seed_attempt(&store.pool, &recipient).unwrap(),
+        SeedAttemptState::Seeded
+    );
+    store.release(held, None).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn a_removable_store_without_its_registration_refuses_its_start_gate() {
     // §8.3: the removable start gate re-verifies the registration's
