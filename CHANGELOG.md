@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-24
+
+### Added
+- - Removable pool and outputs directories can be nested under the volume root, for example `builds/oxide/pool` and `builds/oxide/outputs`, via `oxide pool register-removable --payload-dir --outputs-dir`. Registrations are now version 3; version 1 and 2 registrations keep the `oxide-pool` and `oxide-outputs` layout.
+- Add `oxide pool relocate` to move a quiet removable pool and its owned outputs to a new volume-relative layout.
+- Add `oxide pool upgrade-legacy` to adopt live legacy outputs and clear abandoned slot and output directories before relocation.
+- Add the macOS session broker foundation and protocol for nested Oxide sessions and permit borrowing.
+- - On macOS, nested leased Oxide commands share the outer host build permit, keep their own slots, and inherit the tighter command deadline.
+- On macOS, idle `oxide exec` sessions yield their host build permit while keeping their slot. Nested Oxide builds borrow one shared permit on demand, and `oxide status` shows when it is borrowed.
+- On Linux, nested Oxide commands join their outer session, inherit its tighter deadline and share or lend its host build permit, matching macOS.
+- Added GitHub Actions CI (macOS and Linux) and explicit `workflow_dispatch` binary release workflows for macOS and Linux tarballs with SHA-256 checksums, and updated release and installation documentation.
+
+### Fixed
+- Fix the two Linux `-D warnings` dead-code errors with exact `cfg` gates (`PhysicalCoreCount::Available` and `MAX_ANCESTORS`), isolate Cargo stderr test assertions from `CARGO_TERM_COLOR=always` environments, move the CI and release workflows to `actions/checkout@v7`, and harden the timing-sensitive CI tests (launch-check limit margin, atime-prune precondition retries, cargo-cache frequency-gate retries) so the macOS suite passes reliably on loaded CI runners.
+- Skip Barge-held idle slots under the second-slot rule, keep blocked waiters from head-of-line blocking unrelated checkouts in the queue, and surface both in `oxide status` and wait notices.
+- Fixed `--canary --format-change` failing when a removable pool is registered: the internal-pool copy and its canary crate now live on the internal pool's volume (`--scratch-root`, or the pool's sibling `scratch/` by default) instead of the removable volume's `suggested_scratch_root`, which the staged binary refuses as an explicit internal pool on an external volume.
+- Fixed `oxide pool relocate` refusing nested paths under a user-owned readable shared parent: intermediate directories such as `0755 builds/` now pass a not-group-or-world-writable check, while the payload and outputs directories themselves stay owner-only (`0700`). Group- or world-writable parents still refuse.
+- Fixed `--canary --format-change` refusing Barge-backed internal pools with `unknown_accounting`: the scratch document copy now carries an empty owner-only `payload/slots/` directory, so the staged binary opens the copied `config.json`, `ledger.json` and `oxide-managed/state.json`, initializes the copy's own Barge state, and upgrades the copied control state, all without writing the live pool.
+- Fixed `effigy oxide:canary` failing on the nested removable layout: the live-canary scratch check now accepts a registered payload strictly beneath the mounted volume (such as `<mount>/builds/oxide/pool`) instead of only a flat `<mount>` child, while still refusing a payload equal to, outside, or escaping the mount.
+- Update Barge to remove its root marker last during trash purges.
+- Stop the 5 s cold-seed work budget from aborting the user's build: when it expires at a complete unit-directory boundary the verified prefix is published and the remaining units build cold, and when it expires inside a unit the attempt is abandoned and the command cold-builds in a newly admitted slot. Safety refusals, the reserve stop, an incomplete recipient walk and the admission budget still refuse as before.
+- Bound the Barge slot label length by the pool's slots directory path so `<slots>/<label>-<16 hex>/scratch` fits within the 91-byte Unix-socket bound: a 38-byte nested slots dir like `/Volumes/Stash/builds/oxide/pool/slots` now yields at most a 27-byte label instead of 32. The 91-byte constant lives in the lease library with the child-temporary decision mirroring it, and the fallback label is truncated to fit tiny budgets. Existing longer labels still validate and are never renamed.
+- Oxide now exits successfully when a consumer closes its stdout pipe.
+
 ## [0.2.0] - 2026-11-21
 
 ### Added

@@ -1,1 +1,0 @@
-- On macOS, nested leased Oxide commands share the outer host build permit, keep their own slots, and inherit the tighter command deadline.

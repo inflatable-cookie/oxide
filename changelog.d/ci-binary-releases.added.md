@@ -1,1 +1,0 @@
-Added GitHub Actions CI (macOS and Linux) and explicit `workflow_dispatch` binary release workflows for macOS and Linux tarballs with SHA-256 checksums, and updated release and installation documentation.

@@ -1,1 +1,0 @@
-- Removable pool and outputs directories can be nested under the volume root, for example `builds/oxide/pool` and `builds/oxide/outputs`, via `oxide pool register-removable --payload-dir --outputs-dir`. Registrations are now version 3; version 1 and 2 registrations keep the `oxide-pool` and `oxide-outputs` layout.
