@@ -6,6 +6,23 @@
 //! directory. A checkout may take another checkout's idle compatible slot
 //! only through the freshness gate. Plain `cargo` behavior is untouched.
 
+#[cfg(not(test))]
+macro_rules! print {
+    ($($arg:tt)*) => {
+        crate::stdout::print(format_args!($($arg)*))
+    };
+}
+
+#[cfg(not(test))]
+macro_rules! println {
+    () => {
+        crate::stdout::println(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        crate::stdout::println(format_args!($($arg)*))
+    };
+}
+
 mod adopt;
 mod budget;
 mod capacity;
@@ -39,6 +56,7 @@ mod seed_sources;
 mod seed_summary;
 mod session_broker;
 mod status;
+mod stdout;
 mod store;
 mod version;
 mod watchdog;
@@ -153,6 +171,9 @@ fn main() -> ExitCode {
         let refusal = oxide_storage::lease::LeaseError::WriterUpdated;
         eprintln!("oxide: {refusal}");
         return ExitCode::from(refusal.exit_code());
+    }
+    if stdout::broken_pipe() {
+        return ExitCode::SUCCESS;
     }
     match result {
         Ok(code) => ExitCode::from(code),

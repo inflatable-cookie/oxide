@@ -569,6 +569,34 @@ fn run_keeps_draining_after_a_closed_stdout() {
     );
 }
 
+/// `oxide status | head` must close cleanly without changing SIGPIPE for
+/// socket writes handled by the session broker.
+#[test]
+fn status_exits_cleanly_after_stdout_closes() {
+    use std::os::unix::io::FromRawFd;
+
+    let scratch = Scratch::new();
+    let bin = scratch.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let pool = scratch.path().join("fixture-pool");
+    let mut fds = [0; 2];
+    // SAFETY: `pipe` writes two owned descriptors into `fds`.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: closing the only read end makes writes to the pipe return EPIPE.
+    unsafe { libc::close(fds[0]) };
+    // SAFETY: the write end is transferred to the child exactly once.
+    let closed = unsafe { std::process::Stdio::from_raw_fd(fds[1]) };
+
+    let output = private_env(scratch.path(), &bin, &pool)
+        .arg("status")
+        .stdout(closed)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "oxide status failed: {stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
 /// A signal that arrives while Cargo runs ends the command and never launches
 /// the program. Counterfactual: the release-then-exec hand-off ran the program
 /// anyway and returned its exit code.
