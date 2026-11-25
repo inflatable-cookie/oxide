@@ -32,7 +32,9 @@ Oxide refuses these before doing anything, because it places build output itself
 | `debug` | Stepping through code in a debugger | Full debug info for every unit, including build scripts. |
 | `release` | Production builds | Your project's own `release` profile. |
 
-`quick` and `debug` set Cargo's `dev` profile through environment variables only. Your `Cargo.toml` is not changed. Output lands in `target/debug/`, as with plain Cargo. `test` uses the same recipe. `bench` keeps Cargo's release-based default unless you pass a quick or debug profile.
+`quick` and `debug` set Cargo's `dev` profile through environment variables. Output lands in `target/debug/`, and `test` inherits the recipe. `bench` keeps Cargo's release-based default unless you select a quick or debug recipe explicitly.
+
+Use `oxide build --no-dep-debug` to keep workspace file and line numbers while omitting dependency debug information. Dependency frames can still appear, but may lose source locations. The flag works on `quick` leased Cargo commands. External Cargo subcommands need to accept and apply Cargo's `--config` option. `--profile debug`, `--profile release`, `--release` and `oxide exec` refuse the flag. The opt-in has its own build slots and still writes final outputs to `target/debug/`.
 
 The older `--cargo-profile oxide-quick` and `--cargo-profile oxide-debug` still build but are deprecated. Drop the flag and use `--profile` instead.
 

@@ -223,7 +223,7 @@ impl Production {
                 rustc_version: &rustc,
                 rustc: compiler.as_deref(),
                 target: &target,
-                recipe: invocation.profile.recipe_key(),
+                recipe: invocation.recipe_key(),
                 backend: store.backend.tag(),
                 cargo_home: &cargo_home,
                 command: &invocation.command,

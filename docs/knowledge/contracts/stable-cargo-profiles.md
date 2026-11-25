@@ -1,11 +1,26 @@
 # Opt-in stable Cargo development profiles
 
-This contract owns Oxide's own opt-in Cargo profiles for everyday Rust
-feedback: `oxide-light` and its explicit control, `oxide-full-debug`. They are
-named per invocation on the pinned stable toolchain (`rust-toolchain.toml`,
-channel 1.100.0). They do not change the default `dev`, `test` or `release`
-profiles, any consumer, global Cargo configuration or the toolchain, and nothing
-selects them automatically.
+This contract covers the `quick` dependency debug opt-in and Oxide's named
+Cargo profiles for everyday Rust feedback. `oxide-light` and its explicit
+control, `oxide-full-debug`, are selected per invocation on the pinned stable
+toolchain (`rust-toolchain.toml`, channel 1.100.0).
+
+## Quick without dependency debug information
+
+`oxide build --no-dep-debug` adds `--config 'profile.dev.package."*".debug=0'`
+for that `quick` invocation. The wildcard applies to packages outside the
+workspace. Cargo's normal profile precedence still applies, including named
+package overrides. Workspace units keep the quick `line-tables-only` recipe.
+Dependency backtraces may lose file and line information, and dependency
+types and variables may be unavailable in a debugger. Use `oxide build
+--profile debug` for full debug information.
+
+Cargo 1.100.0 has no environment variable for the wildcard package override.
+The option is for leased Cargo commands under `quick`, including Clippy and
+external subcommands that accept and apply `--config`. `oxide exec`, `debug`
+and `release` refuse it. Cargo 1.100.0 fixtures exercise `check`, `build`,
+`run` and `test`, including the workspace backtrace, unwinding, debug
+assertions and overflow checks described below.
 
 ## Declared profiles
 

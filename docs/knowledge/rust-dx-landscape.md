@@ -2,7 +2,7 @@
 
 Read-only research findings and candidate remedies for Rust build, check and test feedback in Oxide's development workflow. This file owns the sourced findings, their evidence limits and the candidate remedies that remain open. [Vision](vision.md) owns the desired experience. Queue and Nucleus own plans, briefs and execution. [Workflow](contracts/workflow.md) owns the shipped command contracts, and [qualification readiness](qualification-readiness.md) owns the storage correctness findings.
 
-Findings are dated 2026-10-09 to 2026-11-12 and apply to Cargo 1.97.1 on macOS arm64 unless stated. The repository's own toolchain is now 1.100.0 ([toolchain and quality](rust-toolchain-and-quality.md)); re-check a finding on the pinned version before adopting anything, since no cited measurement was taken on that release. No candidate here is a selected default or permission to change a repository.
+Findings are dated 2026-10-09 to 2026-11-25 and apply to Cargo 1.97.1 on macOS arm64 unless stated. Re-check older findings on the pinned 1.100.0 toolchain before adopting them. The [workflow contract](contracts/workflow.md) records the recipes Oxide ships.
 
 ## Evidence limits
 
@@ -63,7 +63,7 @@ A front door handles the experience, and inner hooks keep execution in Oxide-own
 
 ## Stable profile and backend eligibility
 
-- Cargo's build-performance guide suggests workspace line tables, dependency debug disabled, and an explicit full-debug route as a possible faster or smaller trade-off. The light build loses dependency debugging. This is a candidate to measure, not a benefit proven on every project.
+- Cargo's build-performance guide suggests workspace line tables, dependency debug disabled, and an explicit full-debug route for projects where debug information carries a cost. [Q-009 measured this trade-off](#q-009-fast-feedback-measurements-2026-11-25) on Oxide and Nucleus.
 - Cargo's [profile override rules](https://doc.rust-lang.org/cargo/reference/profiles.html#overrides) make `package."*"` apply to non-workspace members. Named overrides, build overrides, configuration and environment precedence still matter.
 - A light profile can keep dev, test and release defaults intact while preserving incremental compilation, assertions, overflow checks and unwinding. A full-debug profile must resolve full debug for every unit. A profile name alone is not proof. Recipes are owned by [stable Cargo profiles](contracts/stable-cargo-profiles.md).
 - Cranelift's [JIT mode](https://github.com/rust-lang/rustc_codegen_cranelift/blob/main/docs/usage.md#jit-mode) rules out a drop-in replacement for an unwind-dependent test loop. A narrower run-only experiment remains possible.
@@ -175,8 +175,24 @@ Source and probe findings for sccache 0.18.0. Compatibility is unknown and benef
 
 - Cargo 1.98 stabilised nothing relevant. New Clippy lints can fail `-D warnings` runners.
 - Cargo 1.99 adds a built-in `debug` profile that matches `dev` for now, as preparation for moving `dev` away from full debugging. Incremental compilation is off by default when `CI` is set. There are no build-dir, GC, linking or debug-info default changes.
-- Cargo 1.100 (2026-11-12) makes the new build-dir layout the default. That unblocks artifact GC and cross-workspace caching, and Oxide's stray detection depends on it. Oxide has not qualified it.
+- Cargo 1.100 (2026-11-12) makes the new build-dir layout the default. That unblocks artifact GC and cross-workspace caching, and Oxide's stray detection depends on it. See the [Cargo version matrix](contracts/workflow.md#cargo-version-matrix) for current support.
 - Each rustc change gives every slot a new compatibility key, so a toolchain bump costs a cold cycle. Moving from 1.97 to 1.99 brings no measured speed or disk benefit. A single bump straight to 1.100 costs one cold cycle instead of two.
+
+## Q-009 fast-feedback measurements (2026-11-25)
+
+Oxide#379, Nucleus lane `oxide-fast-feedback-1-100` v5, measured Rust and Cargo
+1.100.0 with Cargo's layout v2 on Oxide and the eight-member Nucleus engine
+workspace.
+
+| Decision | Observation | Scope |
+| --- | --- | --- |
+| Go for an opt-in dependency debug override | Cold build-directory bytes fell 9.5% in Oxide and 15.9% in Nucleus. | Workspace file and line numbers, `catch_unwind`, debug assertions and overflow checks were preserved. Dependency source locations can be lost. |
+| Keep the default `quick` recipe | Unpacked split debug info, line tables and Apple `ld` remained the best default in the measured workloads. | No default switch to packed debug info, a codegen-unit override or another linker. |
+| No-go for `oxide exec` | Cargo 1.100.0 requires the dotted `--config` argument for `profile.dev.package."*".debug=0`. | There is no equivalent environment override for an opaque tool's Cargo invocation. |
+
+These are cold build-directory size observations from two workspaces. The
+[quick profile contract](contracts/stable-cargo-profiles.md#quick-without-dependency-debug-information)
+describes the shipped opt-in.
 
 ## Product assessment
 

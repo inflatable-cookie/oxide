@@ -11,6 +11,9 @@
 #[path = "cli_papercuts/nested_sessions.rs"]
 mod nested_sessions;
 
+#[path = "cli_papercuts/no_dep_debug.rs"]
+mod no_dep_debug;
+
 use serde_json::{json, Value};
 use sha2::Digest;
 use std::ffi::{CStr, CString};
@@ -161,20 +164,27 @@ fn help_is_cargos_help_without_a_slot_or_pool() {
             "help touched the private home"
         );
     }
-    // Oxide's own budget options are not Cargo's, so they are dropped from a
-    // forwarded help request; the rest of the request is kept.
+    // Oxide's own options are dropped from a forwarded help request; the
+    // rest of the request is kept.
     let _ = fs::remove_file(&log);
     let output = private_env(scratch.path(), &bin, &pool)
         .current_dir(manifest.parent().unwrap())
-        .args(["build", "--admission-budget", "30s", "--help"])
+        .args([
+            "build",
+            "--admission-budget",
+            "30s",
+            "--no-dep-debug",
+            "--help",
+        ])
         .output()
         .unwrap();
     assert!(
         output.status.success(),
-        "oxide build --admission-budget 30s --help: {}",
+        "oxide build --admission-budget 30s --no-dep-debug --help: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(fs::read_to_string(&log).unwrap(), "build --help\n");
+    assert!(!pool.exists(), "help with --no-dep-debug created a pool");
 
     // `oxide help <cmd>` is the existing plain passthrough: Cargo's help with
     // no pool either.

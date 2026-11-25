@@ -46,6 +46,11 @@ and equal. Missing, malformed or unknown is never assumed equal.
 - The producer context digest (section 2.1), and the compiler, wrapper and flag
   facts below.
 
+`quick --no-dep-debug` records a distinct Oxide recipe, so it can seed only
+from matching opt-in donors. Its generated Cargo override is represented by
+that recipe key. The rule below still applies to every caller-supplied
+`--config` argument.
+
 Skipped, with a named reason and a cold build:
 
 - a configured compiler (`build.rustc`, `CARGO_BUILD_RUSTC`);
