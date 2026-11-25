@@ -118,7 +118,20 @@ digest and the receipt digest are reported under separate labels.
   changes. Final binaries land in `target/debug/` as with plain Cargo, and the
   latest build wins. `quick` clears the build-override debug setting, so an
   outer `debug` setting never reaches a nested quick build. Dependencies keep
-  line tables under `quick`.
+  line tables under default `quick`.
+- `--no-dep-debug` is an opt-in `quick` recipe. Oxide consumes the flag and
+  passes `--config 'profile.dev.package."*".debug=0'` to the Cargo build
+  command before any `--`. `run` applies it to its build step. For Cargo
+  subcommands implemented by external tools, the tool must accept and apply
+  the forwarded `--config`. Workspace line tables stay available while
+  dependency source locations can be lost. See the
+  [Cargo profile contract](stable-cargo-profiles.md#quick-without-dependency-debug-information)
+  for the override's scope and debugging tradeoff.
+- The opt-in has a distinct slot and donor recipe key. A caller-supplied
+  `--config`, even with the same value, still disables cold-slot seeding.
+  `debug`, `release` and `exec` refuse `--no-dep-debug` before a lease. Cargo
+  has no environment override for this setting that `exec` could pass to the
+  tool. Help forwards without the Oxide flag and takes no lease.
 - Oxide keeps this `dev` environment recipe for `--profile debug` on Cargo
   1.100.0 (`3acc79c0c`) as well as on older verified Cargo releases (such as
   1.97.1). Verified on `cargo 1.100.0` vs `cargo 1.97.1`:
@@ -137,9 +150,10 @@ digest and the receipt digest are reported under separate labels.
     `[profile.test]` inheritance, `oxide exec --profile debug`, and uniform
     compatibility across Cargo 1.95.0–1.100.0.
 - `test` inherits the recipe. `bench` keeps its release-based default. An
-  explicit quick or debug `bench` passes `--profile dev`.
-- External tools receive the quick recipe through the inherited `dev` settings,
-  with no flag. Use `oxide nextest run` for that.
+  explicit quick or debug `bench`, including `bench --no-dep-debug`, passes
+  `--profile dev`.
+- External tools receive the default quick recipe through the inherited `dev`
+  settings. Use `oxide nextest run` for that.
 - Cargo's own `--profile debug` is not Oxide's `debug`. A tool argument such as
   `--cargo-profile debug` passes through and selects Cargo's profile. On Cargo
   1.97.1 and 1.98.1 Cargo itself rejects `--profile debug`; on Cargo 1.99.1 and

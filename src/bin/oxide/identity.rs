@@ -866,6 +866,22 @@ mod tests {
         assert_eq!(key(""), key(""));
     }
 
+    #[test]
+    fn no_dep_debug_has_a_distinct_quick_slot_key() {
+        let key = |args: &[OsString]| {
+            let invocation = crate::cli::parse_leased("build", args).unwrap();
+            compatibility_key(
+                "repo",
+                invocation.recipe_key(),
+                "compiler",
+                "target",
+                "",
+                "",
+            )
+        };
+        assert_ne!(key(&[]), key(&[OsString::from("--no-dep-debug")]));
+    }
+
     /// A real final-output destination is part of the compatibility key; an
     /// empty one leaves the key exactly as it was.
     #[test]

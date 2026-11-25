@@ -172,7 +172,9 @@ pub struct Invocation {
     pub command: String,
     /// Slot profile; building passthrough uses quick unless a built-in names one.
     pub profile: Profile,
-    /// Arguments after `cargo`, starting with the subcommand.
+    /// Whether the quick Cargo recipe omits dependency debuginfo.
+    pub no_dep_debug: bool,
+    /// Arguments after `cargo`, excluding the recipe's dependency override.
     pub cargo_args: Vec<OsString>,
     /// `run` only: arguments for the built program.
     pub program_args: Vec<OsString>,
@@ -184,8 +186,8 @@ pub struct Invocation {
     /// Every `--target` value before `--`, in order: each one selects a
     /// profile output member (`<triple>/debug` or `<triple>/release`).
     pub targets: Vec<String>,
-    /// Whether the caller named a profile; `bench` without one builds the
-    /// release-based bench profile, whose output directory is `release`.
+    /// Whether the caller selected a recipe explicitly, including via
+    /// `--no-dep-debug`. `bench` otherwise uses its release-based profile.
     pub explicit_profile: bool,
     /// `exec` only: every `--output <member>` declaration, in order. The
     /// caller declares the tool's complete profile-output set.
@@ -197,6 +199,38 @@ pub struct Invocation {
     /// `run` only: the caller's `-p`/`--package` selection, used to pick a
     /// binary once the budget clock exists.
     pub package: Option<String>,
+}
+
+pub(crate) const NO_DEP_DEBUG: &str = "--no-dep-debug";
+pub(crate) const NO_DEP_DEBUG_CONFIG: &str = r#"profile.dev.package."*".debug=0"#;
+const NO_DEP_DEBUG_QUICK_ONLY: &str = "--no-dep-debug applies only to quick Cargo commands";
+
+impl Invocation {
+    /// Use the same effective recipe for slot compatibility and cold seeding.
+    pub fn recipe_key(&self) -> &'static str {
+        if self.no_dep_debug {
+            "quick:dev-recipe-2:no-dep-debug"
+        } else {
+            self.profile.recipe_key()
+        }
+    }
+}
+
+/// Remove the Oxide flag from Cargo options while preserving all trailing args.
+pub(crate) fn take_no_dep_debug(args: &mut Vec<OsString>) -> bool {
+    let mut before_separator = true;
+    let mut found = false;
+    args.retain(|arg| {
+        if arg == "--" {
+            before_separator = false;
+        }
+        if before_separator && arg == NO_DEP_DEBUG {
+            found = true;
+            return false;
+        }
+        true
+    });
+    found
 }
 
 pub const EXEC_USAGE: &str = "\
@@ -247,6 +281,11 @@ pub fn parse_exec(args: &[OsString]) -> Result<Option<Invocation>, String> {
         }
         if text == "-h" || text == "--help" {
             return Ok(None);
+        }
+        if text == NO_DEP_DEBUG {
+            return Err(format!(
+                "{NO_DEP_DEBUG_QUICK_ONLY}; Cargo has no environment override that oxide exec could pass to the tool"
+            ));
         }
         let mut value = |flag: &str| -> Result<Option<String>, String> {
             if text == flag {
@@ -305,6 +344,7 @@ pub fn parse_exec(args: &[OsString]) -> Result<Option<Invocation>, String> {
     Ok(Some(Invocation {
         command: "exec".to_owned(),
         profile: profile.unwrap_or(Profile::Quick),
+        no_dep_debug: false,
         cargo_args: Vec::new(),
         program_args: Vec::new(),
         json_messages: false,
@@ -321,7 +361,8 @@ pub fn parse_exec(args: &[OsString]) -> Result<Option<Invocation>, String> {
 
 /// Parse a leased command (`Modelled` or `Building`).
 pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, String> {
-    let (budget, args) = budget::scan(args)?;
+    let (budget, mut args) = budget::scan(args)?;
+    let no_dep_debug = take_no_dep_debug(&mut args);
     let args = &args[..];
     refuse_storage_overrides(args)?;
     let package = package_selection(args);
@@ -330,12 +371,24 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
     let target = targets.first().cloned();
     let modelled = classify(command) == Class::Modelled;
     if !modelled && !is_building_builtin(command) {
-        // External and unknown subcommands receive their arguments untouched.
+        if no_dep_debug
+            && (flag_values(args, "--profile")
+                .iter()
+                .any(|profile| matches!(profile.as_str(), "debug" | "release"))
+                || args
+                    .iter()
+                    .take_while(|argument| *argument != "--")
+                    .any(|argument| argument == "--release" || argument == "-r"))
+        {
+            return Err(NO_DEP_DEBUG_QUICK_ONLY.to_owned());
+        }
+        // The external subcommand still owns the remaining arguments.
         let mut cargo_args = vec![OsString::from(command)];
         cargo_args.extend_from_slice(args);
         return Ok(Invocation {
             command: command.to_owned(),
             profile: Profile::Quick,
+            no_dep_debug,
             cargo_args,
             program_args: Vec::new(),
             json_messages: false,
@@ -420,6 +473,10 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
     } else {
         selected.unwrap_or(Profile::Quick)
     };
+    if no_dep_debug && profile != Profile::Quick {
+        return Err(NO_DEP_DEBUG_QUICK_ONLY.to_owned());
+    }
+    let explicit_profile = selected.is_some() || no_dep_debug;
     // Oxide consumes its own `--profile` and never forwards `quick` or
     // `debug` as a Cargo profile name. Even on Cargo 1.99.1 / 1.100.0 where
     // `--profile debug` is accepted into `target/debug/`, Cargo's `debug`
@@ -430,7 +487,7 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
     // explicit quick or debug profile passes `--profile dev`).
     let flags = match profile {
         Profile::Release => vec![OsString::from("--release")],
-        Profile::Quick | Profile::Debug if command == "bench" && selected.is_some() => {
+        Profile::Quick | Profile::Debug if command == "bench" && explicit_profile => {
             vec![OsString::from("--profile"), OsString::from("dev")]
         }
         _ => Vec::new(),
@@ -451,13 +508,14 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
     Ok(Invocation {
         command: command.to_owned(),
         profile,
+        no_dep_debug,
         cargo_args,
         program_args,
         json_messages: message_format.is_some(),
         manifest_path,
         target,
         targets,
-        explicit_profile: selected.is_some(),
+        explicit_profile,
         declared_outputs: Vec::new(),
         tool: Vec::new(),
         budget,
@@ -706,6 +764,48 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn no_dep_debug_is_consumed_as_an_explicit_quick_recipe() {
+        let build = parse_leased("build", &args(&["--profile=quick", NO_DEP_DEBUG])).unwrap();
+        assert_eq!(build.profile, Profile::Quick);
+        assert!(build.no_dep_debug);
+        assert_eq!(build.cargo_args, args(&["build"]));
+        assert_ne!(build.recipe_key(), Profile::Quick.recipe_key());
+
+        let bench = parse_leased("bench", &args(&[NO_DEP_DEBUG])).unwrap();
+        assert!(bench.explicit_profile);
+        assert_eq!(bench.cargo_args, args(&["bench", "--profile", "dev"]));
+
+        let tool_arg = parse_leased("test", &args(&["--", NO_DEP_DEBUG])).unwrap();
+        assert!(!tool_arg.no_dep_debug);
+        assert_eq!(tool_arg.cargo_args, args(&["test", "--", NO_DEP_DEBUG]));
+    }
+
+    #[test]
+    fn no_dep_debug_refuses_non_quick_profiles_and_exec() {
+        for command in ["check", "doc", "custom-tool"] {
+            for profile in [
+                &["--profile", "debug"][..],
+                &["--profile", "release"],
+                &["--profile=release"],
+                &["--release"],
+                &["-r"],
+            ] {
+                let mut given = args(profile);
+                given.push(OsString::from(NO_DEP_DEBUG));
+                let error = parse_leased(command, &given).unwrap_err();
+                assert_eq!(error, NO_DEP_DEBUG_QUICK_ONLY, "{command} {given:?}");
+            }
+        }
+        let error = parse_exec(&args(&[NO_DEP_DEBUG, "--", "tool"])).unwrap_err();
+        assert!(error.contains(NO_DEP_DEBUG_QUICK_ONLY));
+        assert!(error.contains("Cargo has no environment override"));
+        let exec = parse_exec(&args(&["--", "tool", NO_DEP_DEBUG]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(exec.tool, args(&["tool", NO_DEP_DEBUG]));
     }
 
     #[test]

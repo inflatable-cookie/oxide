@@ -78,7 +78,7 @@ const USAGE: &str = "\
 oxide: Cargo with managed build storage and profiles
 
 USAGE:
-    oxide <check|test|clippy|build|run> [budget options] [--profile quick|debug|release] [cargo args] [-- args]
+    oxide <check|test|clippy|build|run> [budget options] [--profile quick|debug|release] [--no-dep-debug] [cargo args] [-- args]
     oxide <other cargo command> [args]   passed to Cargo; leased when it can build
     oxide exec [budget options] [--manifest-path <Cargo.toml>] [--profile quick|debug|release] [--output <member>]... -- <command> [args]
                                          run a tool that calls Cargo itself, leased
@@ -235,10 +235,13 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
     {
         // Oxide's leading budget options are Oxide's, not Cargo's, so a help
         // request drops them. Malformed ones keep the old answer: Cargo's help.
-        let kept = match budget::scan(rest) {
+        let mut kept = match budget::scan(rest) {
             Ok((_, kept)) => kept,
             Err(_) => rest.to_vec(),
         };
+        if matches!(class, Class::Modelled | Class::Building) {
+            cli::take_no_dep_debug(&mut kept);
+        }
         let mut forwarded = Vec::with_capacity(kept.len() + 1);
         forwarded.push(first.clone());
         forwarded.extend(kept);

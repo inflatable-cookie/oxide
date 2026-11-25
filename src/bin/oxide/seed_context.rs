@@ -47,6 +47,7 @@ pub(crate) struct ProducerFacts<'a> {
     pub rustc_version: &'a str,
     pub rustc: Option<&'a OsStr>,
     pub target: &'a str,
+    /// Effective Oxide recipe, including its own dependency debug override.
     pub recipe: &'a str,
     pub backend: &'a str,
     pub cargo_home: &'a Path,
@@ -810,5 +811,35 @@ mod tests {
         assert_ne!(first.digest, second.digest);
         assert_ne!(first.flags_digest, second.flags_digest);
         assert_ne!(absent.flags_digest, first.flags_digest);
+    }
+
+    #[test]
+    fn no_dep_debug_enters_seed_compatibility_as_a_recipe() {
+        let tree = Tree::new();
+        let cwd = tree.path("home/work/ws/member");
+        let home = tree.path("home/cargo-home");
+        let seed = |args: &[OsString]| {
+            let invocation = crate::cli::parse_leased("check", args).unwrap();
+            let context = collect(&cwd, &home, &invocation.cargo_args, &[])?;
+            producer(
+                ProducerFacts {
+                    recipe: invocation.recipe_key(),
+                    ..facts()
+                },
+                context,
+            )
+        };
+        let quick = seed(&[]).unwrap();
+        let no_dep_debug = seed(&[OsString::from(crate::cli::NO_DEP_DEBUG)]).unwrap();
+        assert_ne!(quick.recipe, no_dep_debug.recipe);
+        assert_eq!(quick.context_digest, no_dep_debug.context_digest);
+        assert_eq!(
+            seed(&[
+                OsString::from("--config"),
+                OsString::from(crate::cli::NO_DEP_DEBUG_CONFIG)
+            ])
+            .err(),
+            Some("unsupported config argument")
+        );
     }
 }

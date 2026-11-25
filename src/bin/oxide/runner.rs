@@ -457,7 +457,7 @@ fn prepare_invocation(invocation: &mut Invocation) -> Result<Step<PreparedInvoca
     let incremental_key = prep!({ incremental::key_component(&checkout, invocation) });
     let key = prep!(SlotKey::resolve_in(
         &checkout,
-        invocation.profile.recipe_key(),
+        invocation.recipe_key(),
         invocation.target.as_deref(),
         &destination,
         &incremental_key,
@@ -678,6 +678,24 @@ fn seed_recipient(
     }))
 }
 
+fn cargo_build_command(invocation: &Invocation) -> Command {
+    let mut cargo = Command::new(CARGO);
+    let args = &invocation.cargo_args;
+    let separator = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let (options, trailing) = args.split_at(separator);
+    cargo.args(options);
+    // Keep this recipe override out of caller config analysis and put it after
+    // the subcommand so external Cargo tools such as Clippy receive it too.
+    if invocation.no_dep_debug {
+        cargo.args(["--config", cli::NO_DEP_DEBUG_CONFIG]);
+    }
+    cargo.args(trailing);
+    cargo
+}
+
 fn prepare_primary_command(
     prepared: &PreparedInvocation,
     invocation: &Invocation,
@@ -699,11 +717,7 @@ fn prepare_primary_command(
             tool.args(args).stdin(exec_stdin());
             tool
         }
-        None => {
-            let mut cargo = Command::new(CARGO);
-            cargo.args(&invocation.cargo_args);
-            cargo
-        }
+        None => cargo_build_command(invocation),
     };
     apply_storage(
         &mut cargo,
@@ -2206,6 +2220,53 @@ mod tests {
     use std::ffi::OsStr;
 
     #[test]
+    fn no_dep_debug_config_reaches_cargo_before_trailing_args() {
+        for (command, given, before, after) in [
+            ("check", &[][..], &["check"][..], &[][..]),
+            ("build", &[], &["build"], &[]),
+            (
+                "clippy",
+                &["--", "-Dwarnings"],
+                &["clippy"],
+                &["--", "-Dwarnings"],
+            ),
+            ("doc", &[], &["doc"], &[]),
+            ("bench", &[], &["bench", "--profile", "dev"], &[]),
+            ("nextest", &["run"], &["nextest", "run"], &[]),
+            (
+                "test",
+                &["--", "--exact", cli::NO_DEP_DEBUG],
+                &["test"],
+                &["--", "--exact", cli::NO_DEP_DEBUG],
+            ),
+            (
+                "run",
+                &["--", cli::NO_DEP_DEBUG],
+                &["build", "--message-format=json-render-diagnostics"],
+                &[],
+            ),
+        ] {
+            let given = [cli::NO_DEP_DEBUG]
+                .into_iter()
+                .chain(given.iter().copied())
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+            let invocation = cli::parse_leased(command, &given).unwrap();
+            let cargo = cargo_build_command(&invocation);
+            let expected = before
+                .iter()
+                .copied()
+                .chain(["--config", r#"profile.dev.package."*".debug=0"#])
+                .chain(after.iter().copied())
+                .collect::<Vec<_>>();
+            assert_eq!(cargo.get_args().collect::<Vec<_>>(), expected, "{command}");
+            if command == "run" {
+                assert_eq!(invocation.program_args, [cli::NO_DEP_DEBUG]);
+            }
+        }
+    }
+
+    #[test]
     fn lease_grant_limit_is_retained_across_admission_passes() {
         let mut grants = LeaseGrants::new();
         assert!(grants.share);
@@ -2761,6 +2822,7 @@ mod tests {
         Invocation {
             command: "run".to_owned(),
             profile: Profile::Quick,
+            no_dep_debug: false,
             cargo_args: Vec::new(),
             program_args: Vec::new(),
             json_messages: false,
