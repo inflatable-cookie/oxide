@@ -877,7 +877,7 @@ fn an_unfinished_legacy_transition_preserves_existing_barge_pins() {
 }
 
 #[test]
-fn held_eviction_distinguishes_a_held_root_from_a_failed_trash_delete() {
+fn held_eviction_refuses_a_held_root_and_deletes_an_owner_locked_child() {
     use std::os::unix::fs::PermissionsExt;
 
     let fixture = Fixture::new("held-eviction-failure");
@@ -901,42 +901,99 @@ fn held_eviction_distinguishes_a_held_root_from_a_failed_trash_delete() {
     assert!(path.is_dir());
     drop(leased);
 
-    // Unlinking a file from a non-writable directory fails for the pool's
-    // ordinary owner. Privileged users bypass this permission on both hosts.
-    if super::current_uid() == 0 {
-        return;
-    }
     let protected = path.join("protected");
     fs::create_dir(&protected).unwrap();
-    fs::write(protected.join("file"), b"kept after failed unlink").unwrap();
-    fs::set_permissions(&protected, fs::Permissions::from_mode(0o500)).unwrap();
-    let failure = managed::evict_held_slot(&pool, &slot, &lease_id);
-    let retained_path = if path.exists() {
-        path.clone()
-    } else {
-        let trash = path.parent().unwrap().join(".trash");
-        fs::read_dir(trash).unwrap().next().unwrap().unwrap().path()
-    };
-    fs::set_permissions(
-        retained_path.join("protected"),
-        fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
-
-    let error = failure.unwrap_err();
-    assert!(
-        matches!(error, super::HeldEvictionFailure::PostCommit(_)),
-        "{error}"
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("evicted root remains in trash at"),
-        "{error}"
-    );
+    fs::write(protected.join("file"), b"removed with owner-locked parent").unwrap();
+    fs::set_permissions(&protected, fs::Permissions::from_mode(0o000)).unwrap();
+    managed::evict_held_slot(&pool, &slot, &lease_id)
+        .expect("Barge repairs owner permissions inside its own trash");
     assert!(!path.exists());
-    assert!(retained_path.join("protected/file").is_file());
+    let trash = path.parent().unwrap().join(".trash");
+    assert!(fs::read_dir(trash).unwrap().next().is_none());
     assert!(managed::snapshot(&pool).unwrap().slots.is_empty());
+}
+
+#[test]
+fn held_eviction_reports_a_postcommit_immutable_file() {
+    #[cfg(not(target_os = "macos"))]
+    {
+        eprintln!("skipped: UF_IMMUTABLE post-commit failure coverage requires macOS");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        if super::current_uid() == 0 {
+            eprintln!("skipped: root can clear UF_IMMUTABLE during trash deletion");
+            return;
+        }
+
+        fn set_immutable(path: &std::path::Path, immutable: bool) -> std::io::Result<()> {
+            let path = CString::new(path.as_os_str().as_bytes())
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            let flags = if immutable { libc::UF_IMMUTABLE } else { 0 };
+            // SAFETY: `path` is a valid NUL-terminated pathname for the duration of the call.
+            if unsafe { libc::chflags(path.as_ptr(), flags) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+
+        let fixture = Fixture::new("held-eviction-immutable-file");
+        let pool = fixture.pool();
+        let project = fixture.dir("project");
+        let leased = managed::lease(request(&pool, &project, &project, "held")).unwrap();
+        let slot = leased.grant.slot_id.clone();
+        let lease_id = leased.grant.lease_id.clone();
+        let path = leased
+            .grant
+            .env
+            .cargo_build_build_dir
+            .parent()
+            .unwrap()
+            .to_owned();
+        drop(leased);
+
+        let protected = path.join("protected");
+        fs::create_dir(&protected).unwrap();
+        let file = protected.join("file");
+        fs::write(&file, b"immutable until the test clears its flag").unwrap();
+        set_immutable(&file, true).expect("set UF_IMMUTABLE on the fixture file");
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let failure = managed::evict_held_slot(&pool, &slot, &lease_id);
+        let retained_path = if path.exists() {
+            path.clone()
+        } else {
+            fs::read_dir(path.parent().unwrap().join(".trash"))
+                .unwrap()
+                .next()
+                .expect("failed deletion leaves the renamed root in trash")
+                .unwrap()
+                .path()
+        };
+        set_immutable(&retained_path.join("protected/file"), false)
+            .expect("clear UF_IMMUTABLE before fixture cleanup");
+
+        let error = failure.unwrap_err();
+        assert!(
+            matches!(error, super::HeldEvictionFailure::PostCommit(_)),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("evicted root remains in trash at"),
+            "{error}"
+        );
+        assert!(!path.exists());
+        assert!(retained_path.join("protected/file").is_file());
+        assert!(managed::snapshot(&pool).unwrap().slots.is_empty());
+    }
 }
 
 #[test]

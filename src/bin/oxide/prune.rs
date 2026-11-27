@@ -2182,37 +2182,76 @@ mod plan_identity_tests {
     /// count the still-present trash copy as freed.
     #[test]
     fn a_root_moved_to_trash_is_settled_and_not_counted_as_freed() {
-        // SAFETY: geteuid has no preconditions and cannot fail. Root deletes
-        // through an unwritable directory, so the failure cannot be forced.
-        if unsafe { libc::geteuid() } == 0 {
-            return;
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("skipped: UF_IMMUTABLE PostCommit coverage requires macOS");
         }
-        let Fixture {
-            _temp,
-            control,
-            area,
-            original,
-            mut registry,
-            plan,
-        } = fixture();
-        let protected = original.path.join("protected");
-        fs::create_dir(&protected).unwrap();
-        fs::write(protected.join("file"), b"kept after failed unlink").unwrap();
-        fs::set_permissions(&protected, fs::Permissions::from_mode(0o500)).unwrap();
 
-        let not_freed = execute_plan(&control, &mut registry, &plan).unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
 
-        assert_eq!(not_freed, 1);
-        assert!(!original.path.exists());
-        assert!(area.resolve(&original.id).is_err());
-        let settled = ready_registry(&control)
-            .unwrap()
-            .rows
-            .into_iter()
-            .find(|row| row.root == original.path)
-            .unwrap();
-        assert!(settled.pruned_ms.is_some());
-        make_writable(_temp.path());
+            fn set_immutable(path: &Path, immutable: bool) -> std::io::Result<()> {
+                let path = CString::new(path.as_os_str().as_bytes()).map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+                })?;
+                let flags = if immutable { libc::UF_IMMUTABLE } else { 0 };
+                // SAFETY: `path` is a valid NUL-terminated pathname for the duration of the call.
+                if unsafe { libc::chflags(path.as_ptr(), flags) } == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            }
+
+            // SAFETY: geteuid has no preconditions and cannot fail. Root can clear
+            // a user immutable flag during deletion, so it cannot force this failure.
+            if unsafe { libc::geteuid() } == 0 {
+                eprintln!("skipped: root can clear UF_IMMUTABLE during trash deletion");
+                return;
+            }
+            let Fixture {
+                _temp,
+                control,
+                area,
+                original,
+                mut registry,
+                plan,
+            } = fixture();
+            let protected = original.path.join("protected");
+            fs::create_dir(&protected).unwrap();
+            let file = protected.join("file");
+            fs::write(&file, b"immutable until the test clears its flag").unwrap();
+            set_immutable(&file, true).expect("set UF_IMMUTABLE on the fixture file");
+            fs::set_permissions(&protected, fs::Permissions::from_mode(0o500)).unwrap();
+
+            let not_freed = execute_plan(&control, &mut registry, &plan).unwrap();
+            let retained_path = if original.path.exists() {
+                original.path.clone()
+            } else {
+                fs::read_dir(original.path.parent().unwrap().join(".trash"))
+                    .unwrap()
+                    .next()
+                    .expect("failed deletion leaves the renamed root in trash")
+                    .unwrap()
+                    .path()
+            };
+            set_immutable(&retained_path.join("protected/file"), false)
+                .expect("clear UF_IMMUTABLE before fixture cleanup");
+
+            assert_eq!(not_freed, 1);
+            assert!(!original.path.exists());
+            assert!(area.resolve(&original.id).is_err());
+            let settled = ready_registry(&control)
+                .unwrap()
+                .rows
+                .into_iter()
+                .find(|row| row.root == original.path)
+                .unwrap();
+            assert!(settled.pruned_ms.is_some());
+            make_writable(_temp.path());
+        }
     }
 
     /// A root Barge keeps (here: held) is not freed, and the plan says so.
