@@ -33,7 +33,7 @@ into six classes; the exact lists are in [`cli.rs`](../../../src/bin/oxide/cli.r
 | Class | Commands | Behaviour |
 | --- | --- | --- |
 | Modelled | `check`, `test`, `clippy`, `build`, `run` | Profile-aware and leased. Slot chosen by identity and freshness. |
-| Building passthrough | `doc`, `bench`, `rustc`, `rustdoc`, `fix`, and every unknown or external subcommand (for example `nextest`, `llvm-cov`) | Cargo's command under a lease, with storage and profile definitions injected. Unknown commands count as building. |
+| Building passthrough | `doc`, `bench`, `rustc`, `rustdoc`, `fix`, and every unknown or external subcommand (for example `nextest`, `llvm-cov`) | Cargo's command under a lease, with storage and profile definitions injected. Unknown commands are leased as building passthrough; the summary uses `tool` unless Oxide recognizes the invocation's execution or build behavior. |
 | Plain passthrough | Non-building built-ins such as `fmt`, `tree`, `metadata`, `add`, `update`, `fetch`, `locate-project`, `help`, `package`, `publish`, `install` | Plain Cargo, no lease. |
 | Exact passthrough | `deny`, `audit`, `outdated`, `machete` | Oxide replaces itself with the caller's Cargo: same arguments, directory, environment, streams and exit status. No slot, pool, adoption or recipe. |
 | Extended built-ins | `init`, `new`, `clean` | Cargo's command plus Oxide's step. See [adoption](#adoption-oxide-init-and-oxide-new) and [clean](#clean). |
@@ -313,7 +313,12 @@ oxide exec --execution-budget 300s -- npm run tauri build
    pruning on warm layout-v2 slots after a clean build while still holding the
    slot's exclusive Barge hold, release the lease and print
    one summary line: profile, strategy, slot, warm or cold, elapsed time, the
-   pool's soft budget and backend. `OXIDE_TRACE_RELEASE=1` adds phase lines on
+   pool's soft budget and backend. The strategy is `build+execute` for Cargo
+   `run`, `test` and `bench`, `exec`, `nextest run`/`r`, `llvm-cov`'s default,
+   `test`, `run` and `nextest`, and `miri run`/`test`. It is `build` for known
+   compilation commands and reporting commands such as `nextest list` and
+   `llvm-cov report`/`show`; unclassified leased tools say `tool`.
+   `OXIDE_TRACE_RELEASE=1` adds phase lines on
    stderr for closeout diagnosis.
 
 ## Cross-checkout freshness
