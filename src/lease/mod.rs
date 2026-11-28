@@ -22,7 +22,6 @@ pub mod seed;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -1215,12 +1214,9 @@ fn open_control_admission(control: &Path, create: bool) -> Result<File, LeaseErr
             "control admission lock must be a private regular file",
         ));
     }
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::WouldBlock {
-            return Err(LeaseError::WriterFenceBusy);
-        }
-        return Err(io_error(error));
+    match crate::lock_retry::exclusive(&file).map_err(io_error)? {
+        true => {}
+        false => return Err(LeaseError::WriterFenceBusy),
     }
     Ok(file)
 }

@@ -4,6 +4,10 @@
 #[cfg(all(test, unix))]
 mod test_fs;
 
+#[cfg(unix)]
+#[doc(hidden)]
+pub mod lock_retry;
+
 /// Opt-in diagnostics for lease closeout.
 pub mod release_trace;
 

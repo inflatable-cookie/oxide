@@ -1845,7 +1845,7 @@ enum DonorLock {
 }
 
 /// The donor's front-door record lock, taken non-blocking with
-/// `create: false`. A missing or held lock is a skip, never a wait.
+/// `create: false`. A missing or persistently held lock is a skip.
 fn probe_donor_lock(path: &Path) -> Result<DonorLock, LeaseError> {
     if path.as_os_str().as_bytes().len() > MAX_PATH_BYTES {
         return Err(LeaseError::InvalidInput(
@@ -1873,15 +1873,11 @@ fn probe_donor_lock(path: &Path) -> Result<DonorLock, LeaseError> {
             "the donor record lock is not a private owned regular file",
         ));
     }
-    // SAFETY: the descriptor is live for the call.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(DonorLock::Taken(file));
+    if crate::lock_retry::exclusive(&file).map_err(io_error)? {
+        Ok(DonorLock::Taken(file))
+    } else {
+        Ok(DonorLock::Held)
     }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        return Ok(DonorLock::Held);
-    }
-    Err(io_error(error))
 }
 
 fn catalog_path(pool_root: &Path, slot_id: u64) -> PathBuf {

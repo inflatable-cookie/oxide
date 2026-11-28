@@ -27,8 +27,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use super::control_io::{
-    bounded_read, ensure_private_dir, flock_nonblocking, lease_error, open_admission_file,
-    probe_lock, Probe,
+    bounded_read, ensure_private_dir, lease_error, open_admission_file, probe_lock, Probe,
 };
 use super::status::{Observation, ObservationSource};
 
@@ -684,7 +683,9 @@ impl Store {
         fn try_lock(control: &Path) -> Result<Option<File>, String> {
             let file = open_admission_file(control)?
                 .ok_or_else(|| format!("{} does not exist", control.display()))?;
-            Ok(flock_nonblocking(&file)?.then_some(file))
+            Ok(oxide_storage::lock_retry::exclusive(&file)
+                .map_err(|error| format!("cannot lock the control file: {error}"))?
+                .then_some(file))
         }
 
         let internal = if let Some(sibling) = self.sibling.as_ref().filter(|s| s.barrier) {
