@@ -12,7 +12,23 @@ const RETRY_DELAY: Duration = Duration::from_millis(2);
 /// Try an exclusive flock, allowing a bounded spawn window to close.
 #[doc(hidden)]
 pub fn exclusive(file: &File) -> io::Result<bool> {
-    retry(file, || std::thread::sleep(RETRY_DELAY))
+    retry(file, || {
+        #[cfg(test)]
+        if TEST_WAIT.with(|hook| {
+            hook.borrow_mut().as_mut().is_some_and(|wait| {
+                wait();
+                true
+            })
+        }) {
+            return;
+        }
+        std::thread::sleep(RETRY_DELAY);
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_WAIT: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn retry(file: &File, mut wait: impl FnMut()) -> io::Result<bool> {
@@ -38,6 +54,7 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
@@ -51,16 +68,14 @@ mod tests {
 
     #[test]
     fn retries_until_spawned_child_exec_closes_inherited_lock() {
-        let path = std::env::temp_dir().join(format!("oxide-spawn-lock-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oxide-spawn-lock-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("admission.lock");
         let holder = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
-            .open(&path)
-            .unwrap();
-        let contender = OpenOptions::new()
-            .read(true)
-            .write(true)
+            .mode(0o600)
             .open(&path)
             .unwrap();
         assert!(exclusive(&holder).unwrap());
@@ -90,19 +105,24 @@ mod tests {
         ready_read.read_exact(&mut byte).unwrap();
         drop(holder);
         let mut spawn = Some(spawn);
-        let mut waits = 0;
-        assert!(retry(&contender, || {
-            waits += 1;
-            release_write.write_all(&[1]).unwrap();
-            assert!(spawn.take().unwrap().join().unwrap().success());
-        })
-        .unwrap());
+        let waits = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = waits.clone();
+        TEST_WAIT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                observed.set(observed.get() + 1);
+                release_write.write_all(&[1]).unwrap();
+                assert!(spawn.take().unwrap().join().unwrap().success());
+            }))
+        });
+        let contender = crate::lease::test_open_control_admission(&dir).unwrap();
+        TEST_WAIT.with(|hook| *hook.borrow_mut() = None);
         assert_eq!(
-            waits, 1,
+            waits.get(),
+            1,
             "the inherited descriptor must hold the first attempt"
         );
         drop(contender);
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

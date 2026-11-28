@@ -191,7 +191,7 @@ impl Directory {
 }
 
 fn lock(file: File, path: &Path) -> Result<File, String> {
-    if !crate::store::flock_nonblocking(&file)? {
+    if !oxide_storage::lock_retry::exclusive(&file).map_err(|error| at(path, error))? {
         return Err(at(path, "lock is held"));
     }
     Ok(file)

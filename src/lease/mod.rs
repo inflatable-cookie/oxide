@@ -1195,6 +1195,11 @@ fn reserve_eviction_fence(control: &Path) -> Result<Option<File>, LeaseError> {
     Ok(Some(admission))
 }
 
+#[cfg(test)]
+pub(crate) fn test_open_control_admission(control: &Path) -> Result<File, LeaseError> {
+    open_control_admission(control, false)
+}
+
 fn open_control_admission(control: &Path, create: bool) -> Result<File, LeaseError> {
     let path = control.join("admission.lock");
     let mut options = OpenOptions::new();

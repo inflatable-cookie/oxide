@@ -279,7 +279,8 @@ impl Pool {
             let folder = slot.area_folder();
             if held_by_area
                 .get(&folder)
-                .is_some_and(|ids: &std::collections::BTreeSet<String>| ids.contains(root))
+                .and_then(|ids: &Option<std::collections::BTreeSet<String>>| ids.as_ref())
+                .is_some_and(|ids| ids.contains(root))
             {
                 barge_held.get_or_insert(slot.id);
                 continue;
@@ -311,9 +312,7 @@ impl Pool {
                             }
                             let candidate_folder = candidate.area_folder();
                             if !held_by_area.contains_key(&candidate_folder) {
-                                let held = storage
-                                    .held_root_ids_in(candidate_folder)
-                                    .map_err(LeaseError::Barge)?;
+                                let held = storage.held_root_ids_in(candidate_folder).ok();
                                 held_by_area.insert(candidate_folder, held);
                             }
                         }
