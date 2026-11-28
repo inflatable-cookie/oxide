@@ -66,8 +66,10 @@ fn the_real_launch_keeps_the_lease_hold_until_the_child_exits() {
     };
     // The real launch route: the store made the hold inheritable in
     // `attempt`, so this child keeps the root held across exec.
-    let mut command = std::process::Command::new("/bin/sleep");
-    command.arg("0.6");
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .args(["-c", "read release"])
+        .stdin(std::process::Stdio::piped());
     let mut group = crate::process::spawn_group(&mut command).expect("launch");
     // The launcher drops its own copy; only the child's inherited
     // descriptor holds the root now.
@@ -96,6 +98,14 @@ fn the_real_launch_keeps_the_lease_hold_until_the_child_exits() {
         area.evict_any(&pinned.id).is_err(),
         "the pin keeps the root"
     );
+    use std::io::Write as _;
+    group
+        .child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"release\n")
+        .unwrap();
     assert!(group.child.wait().unwrap().success(), "the child exited");
     assert!(
         area.try_hold_in(None, &info.id).unwrap().is_some(),
