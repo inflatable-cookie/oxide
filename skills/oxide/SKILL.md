@@ -81,11 +81,14 @@ After each building command, one stderr line:
 `oxide: quick profile, build strategy, slot 3 warm, 4.2s, pool 210 MiB allocated of 95367 MiB budget (directory-budget-v1, budget-only)`.
 The pool's soft budget (100 GB by default) steers admission and eviction but
 is not a ceiling: a running build may pass it.
-The strategy is how Oxide met the profile (`build`, or `build+execute` for
-`run` and `test`). Cold means the slot was rebuilt; that is normal after
-`oxide clean`. A new worktree of the same repository usually starts warm on
-another checkout's idle slot: the line then adds what the freshness gate
-refreshed and that inputs outside Git or ignored by it are not checked. If
+The strategy is how Oxide met the profile: `build+execute` for Cargo `run`,
+`test` and `bench`, `exec`, and recognized execution subcommands of `nextest`,
+`llvm-cov` (including its default) and `miri`; `build` for known compilation
+and reporting commands; `tool` when Oxide cannot classify an external tool
+invocation. Cold means the slot was rebuilt; that is normal after `oxide clean`.
+A new worktree of the same repository usually starts warm on another
+checkout's idle slot: the line then adds what the freshness gate refreshed and
+that inputs outside Git or ignored by it are not checked. If
 Oxide says the gate refused a slot, it builds cold instead; that is safe.
 
 If admission waited, Oxide prints `oxide: waited …; slot ready` after the

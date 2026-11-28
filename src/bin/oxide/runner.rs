@@ -1998,10 +1998,7 @@ fn run_artifact(line: &str, selection: Option<&str>) -> Option<(String, PathBuf,
 /// library's reuse walk of that exact slot generation, never a walk after
 /// release, when another command may hold the slot.
 fn print_summary(ctx: &SummaryContext<'_>) {
-    let strategy = match ctx.invocation.command.as_str() {
-        "run" | "test" | "exec" => "build+execute",
-        _ => "build",
-    };
+    let strategy = summary_strategy(&ctx.invocation);
     let size = leased_size(ctx.measured, ctx.warm);
     let pool = format!(
         "{size}, {} MiB budget, pool total: see oxide status",
@@ -2026,6 +2023,35 @@ fn print_summary(ctx: &SummaryContext<'_>) {
         if ctx.warm { "warm" } else { "cold" },
         ctx.started.elapsed().as_secs_f64()
     );
+}
+
+/// Describe whether a leased invocation only builds, runs built code, or is
+/// an external tool whose behavior Oxide cannot classify.
+fn summary_strategy(invocation: &Invocation) -> &'static str {
+    let subcommand = invocation
+        .cargo_args
+        .get(1)
+        .and_then(|argument| argument.to_str())
+        .filter(|argument| !argument.starts_with('-'));
+    match invocation.command.as_str() {
+        "run" | "test" | "bench" | "exec" => "build+execute",
+        "check" | "build" | "clippy" | "doc" | "rustc" | "rustdoc" | "fix" => "build",
+        "nextest" => match subcommand {
+            Some("run" | "r") => "build+execute",
+            Some("list") => "build",
+            _ => "tool",
+        },
+        "llvm-cov" => match subcommand {
+            None | Some("test" | "run" | "nextest") => "build+execute",
+            Some("report" | "show") => "build",
+            _ => "tool",
+        },
+        "miri" => match subcommand {
+            Some("run" | "test") => "build+execute",
+            _ => "tool",
+        },
+        _ => "tool",
+    }
 }
 
 /// An acquisition without a walk has no fresh size, even on warm reuse.
@@ -2218,6 +2244,46 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::ffi::OsStr;
+
+    #[test]
+    fn summary_strategy_classifies_leased_commands_and_tools() {
+        for (command, args, expected) in [
+            ("run", &[][..], "build+execute"),
+            ("test", &[][..], "build+execute"),
+            ("exec", &[][..], "build+execute"),
+            ("bench", &[][..], "build+execute"),
+            ("check", &[][..], "build"),
+            ("build", &[][..], "build"),
+            ("clippy", &[][..], "build"),
+            ("doc", &[][..], "build"),
+            ("rustc", &[][..], "build"),
+            ("rustdoc", &[][..], "build"),
+            ("fix", &[][..], "build"),
+            ("nextest", &["run"][..], "build+execute"),
+            ("nextest", &["r"][..], "build+execute"),
+            ("nextest", &["list"][..], "build"),
+            ("llvm-cov", &[][..], "build+execute"),
+            ("llvm-cov", &["--workspace"][..], "build+execute"),
+            ("llvm-cov", &["--html"][..], "build+execute"),
+            ("llvm-cov", &["test"][..], "build+execute"),
+            ("llvm-cov", &["run"][..], "build+execute"),
+            ("llvm-cov", &["nextest"][..], "build+execute"),
+            ("llvm-cov", &["report"][..], "build"),
+            ("llvm-cov", &["show"][..], "build"),
+            ("miri", &["run"][..], "build+execute"),
+            ("miri", &["test"][..], "build+execute"),
+            ("nextest", &["unknown"][..], "tool"),
+            ("unclassified-tool", &[][..], "tool"),
+        ] {
+            let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+            let invocation = cli::parse_leased(command, &args).unwrap();
+            assert_eq!(
+                summary_strategy(&invocation),
+                expected,
+                "{command} {args:?}"
+            );
+        }
+    }
 
     #[test]
     fn no_dep_debug_config_reaches_cargo_before_trailing_args() {
