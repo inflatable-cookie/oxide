@@ -16,7 +16,7 @@ scope. This contract states no measured speed, reach or disk saving.
 
 - It runs once per command, after a new slot is leased and its output binding
   is complete, and before any child temporary directory or Cargo start. It adds
-  no lease grant, no retry and no admission budget.
+  no lease grant or admission budget.
 - It applies only to a new slot: `Prior::Fresh`, with `<slot>/build` empty.
 - It copies the classified dependency files of one donor catalog (plain
   registry library compile units, see section 3) with `clonefile`. There is no
@@ -299,7 +299,7 @@ control record under the locks. Nothing is recovered to make a donor eligible.
 - Control record is `Idle`, with no holder, no pending recovery, no retired or
   lost marker, and no recorded `oxide clean` for its checkout.
 - The donor's record lock file exists and is free. A missing, held or recovering
-  donor is skipped, never waited for.
+  donor is skipped after bounded nonblocking retries for transient spawn inheritance.
 - Donor and recipient payload roots are real owner-only directories under the
   same root, on the same device. On the removable pool, the volume binding must
   also match.

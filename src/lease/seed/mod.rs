@@ -1591,10 +1591,8 @@ fn now() -> Instant {
 }
 
 /// Debug builds only, absent from release: a thread-scoped clock reading for
-/// fixtures that prove catalog pinning and completion rather than a work
-/// deadline (oxide#224). It is thread-local, so a fixture that freezes its own
-/// thread cannot change another test's clock, and every regression that
-/// exercises the five-second bound keeps the real clock.
+/// fixtures that prove catalog pinning, completion and work deadlines
+/// (oxide#224). It is thread-local and cannot change another test's clock.
 #[cfg(debug_assertions)]
 pub mod test_clock {
     use std::cell::RefCell;
@@ -1606,6 +1604,17 @@ pub mod test_clock {
 
     pub(super) fn frozen() -> Option<Instant> {
         FROZEN.with(|cell| *cell.borrow())
+    }
+
+    #[cfg(test)]
+    pub(super) fn advance(duration: std::time::Duration) {
+        FROZEN.with(|cell| {
+            let mut clock = cell.borrow_mut();
+            let current = clock
+                .as_mut()
+                .expect("seed clock is frozen before advancing");
+            *current += duration;
+        });
     }
 
     /// Freeze this thread's seed clock at its current reading until the guard
@@ -1845,7 +1854,7 @@ enum DonorLock {
 }
 
 /// The donor's front-door record lock, taken non-blocking with
-/// `create: false`. A missing or held lock is a skip, never a wait.
+/// `create: false`. A missing or persistently held lock is a skip.
 fn probe_donor_lock(path: &Path) -> Result<DonorLock, LeaseError> {
     if path.as_os_str().as_bytes().len() > MAX_PATH_BYTES {
         return Err(LeaseError::InvalidInput(
@@ -1873,15 +1882,11 @@ fn probe_donor_lock(path: &Path) -> Result<DonorLock, LeaseError> {
             "the donor record lock is not a private owned regular file",
         ));
     }
-    // SAFETY: the descriptor is live for the call.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(DonorLock::Taken(file));
+    if crate::lock_retry::exclusive(&file).map_err(io_error)? {
+        Ok(DonorLock::Taken(file))
+    } else {
+        Ok(DonorLock::Held)
     }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        return Ok(DonorLock::Held);
-    }
-    Err(io_error(error))
 }
 
 fn catalog_path(pool_root: &Path, slot_id: u64) -> PathBuf {

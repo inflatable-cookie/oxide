@@ -265,6 +265,7 @@ impl Pool {
         project: &Path,
         profile: Profile,
     ) -> Result<IdleCompatible, LeaseError> {
+        let mut held_by_area = BTreeMap::new();
         let mut barge_held = None;
         for slot in &self.ledger.slots {
             if !(slot.is_idle() && slot.owned && slot.project == project && slot.profile == profile)
@@ -275,8 +276,17 @@ impl Pool {
                 continue;
             };
             let storage = self.storage.as_ref().ok_or(LeaseError::UnknownAccounting)?;
+            let folder = slot.area_folder();
+            if held_by_area
+                .get(&folder)
+                .and_then(|ids: &Option<std::collections::BTreeSet<String>>| ids.as_ref())
+                .is_some_and(|ids| ids.contains(root))
+            {
+                barge_held.get_or_insert(slot.id);
+                continue;
+            }
             match storage
-                .try_hold_in(slot.area_folder(), root)
+                .try_hold_in(folder, root)
                 .map_err(LeaseError::Barge)?
             {
                 Some(hold) => {
@@ -284,10 +294,29 @@ impl Pool {
                         slot_id: slot.id,
                         incarnation: slot.incarnation,
                         hold: Box::new(hold),
-                    });
+                    })
                 }
                 None => {
                     barge_held.get_or_insert(slot.id);
+                    // The first refusal gets the spawn retry; use a single-attempt
+                    // snapshot to skip other holders rather than waiting per row.
+                    if held_by_area.is_empty() {
+                        for candidate in &self.ledger.slots {
+                            if !(candidate.is_idle()
+                                && candidate.owned
+                                && candidate.project == project
+                                && candidate.profile == profile
+                                && candidate.root.is_some())
+                            {
+                                continue;
+                            }
+                            let candidate_folder = candidate.area_folder();
+                            if !held_by_area.contains_key(&candidate_folder) {
+                                let held = storage.held_root_ids_in(candidate_folder).ok();
+                                held_by_area.insert(candidate_folder, held);
+                            }
+                        }
+                    }
                 }
             }
         }

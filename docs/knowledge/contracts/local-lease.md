@@ -16,6 +16,15 @@ The library supports `directory-budget-v1` and `apfs-volume-v1` pools. Older ima
 formats refuse before any write. The `oxide` front door supplies Cargo identity,
 profile, checkout, budget and registered-volume policy.
 
+Recovery scans first use Barge's single-attempt held listing, then take a
+retried hold only for a potentially abandoned root. Compatible-slot selection
+retries its first contested candidate, then skips roots observed held in a
+listing; a listing refusal keeps recovery conservative and selection falls back
+to individual holds. A transiently held snapshot may skip a free later candidate
+until the next attempt. These metadata-only listings do not walk slot payloads.
+Capacity decisions take a fresh listing: Barge pins and holds can change after
+the recovery snapshot, and deferred eviction must not rely on stale protection.
+
 Each successful lease returns the Barge root hold. The caller must keep it for the
 whole use. An independent replay by the same holder is refused rather than
 granted without a hold.

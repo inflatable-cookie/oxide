@@ -91,6 +91,7 @@ impl Pool {
             return Ok(());
         };
         let mut changed = false;
+        let mut held_by_area = BTreeMap::new();
         for slot in &mut self.ledger.slots {
             if slot.state != SlotPersistState::Held || releasing == slot.lease_id.as_deref() {
                 continue;
@@ -109,8 +110,14 @@ impl Pool {
                 .as_deref()
                 .and_then(|dir| dir.split_once('/'))
                 .map(|(folder, _)| folder.to_owned());
-            // The probe is one non-blocking `flock`, never a byte walk: it
-            // must not be reported as one (oxide#337).
+            // A held snapshot is conservative; only potentially abandoned
+            // rows need the retried hold that proves recovery is safe.
+            let held = held_by_area
+                .entry(project.clone())
+                .or_insert_with(|| storage.held_root_ids_in(project.as_deref()).ok());
+            if held.as_ref().is_none_or(|ids| ids.contains(&root)) {
+                continue;
+            }
             if let Ok(Some(hold)) = storage.try_hold_in(project.as_deref(), &root) {
                 drop(hold);
                 slot.state = SlotPersistState::Idle;

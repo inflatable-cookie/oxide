@@ -618,6 +618,19 @@ pub(crate) fn count_pool_walks<T>(action: impl FnOnce() -> T) -> (T, Vec<PoolWal
     (result, walks)
 }
 
+#[cfg(test)]
+thread_local! {
+    static HOLD_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_hold_attempts<T>(action: impl FnOnce() -> T) -> (T, usize) {
+    HOLD_ATTEMPTS.with(|count| count.set(0));
+    let result = action();
+    let count = HOLD_ATTEMPTS.with(std::cell::Cell::get);
+    (result, count)
+}
+
 /// One pool's storage: its own Barge account, its volume and its
 /// `oxide/pool` area.
 ///
@@ -936,9 +949,29 @@ impl PoolStorage {
         id: &str,
     ) -> Result<Option<Hold>, String> {
         let area = self.area_for(project_folder)?;
+        #[cfg(test)]
+        HOLD_ATTEMPTS.with(|count| count.set(count.get() + 1));
         admission_cost::opaque_listing();
         area.try_hold(id, Mode::Exclusive)
             .map_err(|error| format!("cannot test slot root {id}: {error}"))
+    }
+
+    /// Snapshot held root IDs with Barge's single-attempt listing probes.
+    pub(crate) fn held_root_ids_in(
+        &self,
+        project_folder: Option<&str>,
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        let listing = self
+            .area_for(project_folder)?
+            .list_without_bytes()
+            .map_err(|error| format!("cannot inspect slot holds: {error}"))?;
+        admission_cost::listed(listing.roots.len() + listing.stragglers.len());
+        Ok(listing
+            .roots
+            .into_iter()
+            .filter(|root| root.held)
+            .map(|root| root.id)
+            .collect())
     }
 
     /// Evict one root in the given project folder.
