@@ -1591,10 +1591,8 @@ fn now() -> Instant {
 }
 
 /// Debug builds only, absent from release: a thread-scoped clock reading for
-/// fixtures that prove catalog pinning and completion rather than a work
-/// deadline (oxide#224). It is thread-local, so a fixture that freezes its own
-/// thread cannot change another test's clock, and every regression that
-/// exercises the five-second bound keeps the real clock.
+/// fixtures that prove catalog pinning, completion and work deadlines
+/// (oxide#224). It is thread-local and cannot change another test's clock.
 #[cfg(debug_assertions)]
 pub mod test_clock {
     use std::cell::RefCell;
@@ -1606,6 +1604,17 @@ pub mod test_clock {
 
     pub(super) fn frozen() -> Option<Instant> {
         FROZEN.with(|cell| *cell.borrow())
+    }
+
+    #[cfg(test)]
+    pub(super) fn advance(duration: std::time::Duration) {
+        FROZEN.with(|cell| {
+            let mut clock = cell.borrow_mut();
+            let current = clock
+                .as_mut()
+                .expect("seed clock is frozen before advancing");
+            *current += duration;
+        });
     }
 
     /// Freeze this thread's seed clock at its current reading until the guard

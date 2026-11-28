@@ -35,6 +35,7 @@ thread_local! {
     static BREAK_DONOR: Cell<Option<usize>> = const { Cell::new(None) };
     static PLANT_SYMLINK: Cell<bool> = const { Cell::new(false) };
     static TAMPER_LEDGER: Cell<bool> = const { Cell::new(false) };
+    static ADVANCE_SEED_CLOCK: Cell<bool> = const { Cell::new(false) };
     static VERIFY_DELAY_MS: Cell<Option<u64>> = const { Cell::new(None) };
     static CLONE_DELAY_AT: Cell<Option<(usize, u64)>> = const { Cell::new(None) };
     static CLONE_VERIFY_HOLD_AT: Cell<Option<(usize, u64)>> = const { Cell::new(None) };
@@ -100,6 +101,7 @@ fn reset_hooks() {
     BREAK_DONOR.with(|cell| cell.set(None));
     PLANT_SYMLINK.with(|cell| cell.set(false));
     TAMPER_LEDGER.with(|cell| cell.set(false));
+    ADVANCE_SEED_CLOCK.with(|cell| cell.set(false));
     VERIFY_DELAY_MS.with(|cell| cell.set(None));
     CLONE_DELAY_AT.with(|cell| cell.set(None));
     CLONE_VERIFY_HOLD_AT.with(|cell| cell.set(None));
@@ -116,10 +118,20 @@ fn reset_hooks() {
     HOLD_CHECK_DONE.with(|cell| cell.set(false));
 }
 
+fn seed_test_delay(ms: u64) {
+    if ADVANCE_SEED_CLOCK.with(Cell::get) {
+        test_clock::advance(Duration::from_millis(ms));
+    } else {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
 pub(super) fn inject(point: TestPoint<'_>) {
     match point {
         TestPoint::BeforeVerify { .. } => {
-            sleep_opt(VERIFY_DELAY_MS.with(Cell::get));
+            if let Some(ms) = VERIFY_DELAY_MS.with(Cell::get) {
+                seed_test_delay(ms);
+            }
         }
         TestPoint::BeforeClone {
             index,
@@ -157,14 +169,14 @@ pub(super) fn inject(point: TestPoint<'_>) {
             // budget can expire with the clone's metadata already observable.
             if let Some((at, ms)) = CLONE_VERIFY_HOLD_AT.with(Cell::get) {
                 if at == index {
-                    std::thread::sleep(Duration::from_millis(ms));
+                    seed_test_delay(ms);
                 }
             }
         }
         TestPoint::DuringClone { index, path } => {
             if let Some((at, ms)) = CLONE_DELAY_AT.with(Cell::get) {
                 if at == index {
-                    std::thread::sleep(Duration::from_millis(ms));
+                    seed_test_delay(ms);
                 }
             }
             if UNREADABLE_CLONE.with(Cell::get) == Some(index) {
@@ -1898,6 +1910,8 @@ fn seed_skips_on_the_work_deadline_before_the_first_write() {
     let (grant, recipient) = lease_recipient(&rig, "a");
     let mut request = donor.request(&recipient);
     request.work_budget_ms = Some(1);
+    let _clock = test_clock::freeze();
+    ADVANCE_SEED_CLOCK.with(|cell| cell.set(true));
     VERIFY_DELAY_MS.with(|cell| cell.set(Some(25)));
     let outcome = seed(&rig.pool, &request).expect("seed");
     assert_eq!(
@@ -1918,11 +1932,12 @@ fn assert_the_work_budget_publishes_the_verified_prefix(layout: SeedLayout, labe
     let (grant, recipient) = lease_recipient(&rig, "a");
     let (donor, mut request) = two_unit_donor(&rig, "a", &recipient, layout);
     let (files, boundary) = two_unit_split(layout);
-    // A generous-enough budget that the pre-clone revalidation cannot
-    // plausibly exhaust it, then a delay after the first unit's last verified
-    // clone: the loop meets the deadline at the second unit's first file,
+    // Advance the seed clock after the first unit's last verified clone:
+    // the loop meets the deadline at the second unit's first file,
     // which is a complete unit-directory boundary.
     request.work_budget_ms = Some(1_000);
+    let _clock = test_clock::freeze();
+    ADVANCE_SEED_CLOCK.with(|cell| cell.set(true));
     CLONE_DELAY_AT.with(|cell| cell.set(Some((boundary - 1, 1_200))));
     let outcome = seed(&rig.pool, &request).expect("the work budget never fails a build");
     let SeedOutcome::Seeded(receipt) = outcome else {
@@ -1980,6 +1995,8 @@ fn assert_the_work_budget_abandons_a_partly_written_unit(layout: SeedLayout, lab
     // The delay lands after the second unit's first verified clone, so the
     // deadline expires with that unit directory only partly written.
     request.work_budget_ms = Some(1_000);
+    let _clock = test_clock::freeze();
+    ADVANCE_SEED_CLOCK.with(|cell| cell.set(true));
     CLONE_DELAY_AT.with(|cell| cell.set(Some((boundary, 1_200))));
     let outcome = seed(&rig.pool, &request).expect("the work budget never fails a build");
     let SeedOutcome::Abandoned(abandon) = outcome else {
@@ -2034,6 +2051,8 @@ fn the_work_budget_refuses_a_clone_whose_metadata_is_already_wrong() {
     // The observable safety fault still refuses: a deadline never downgrades
     // it to a cold fallback.
     TAMPER_CLONE.with(|cell| cell.set(Some(1)));
+    let _clock = test_clock::freeze();
+    ADVANCE_SEED_CLOCK.with(|cell| cell.set(true));
     CLONE_VERIFY_HOLD_AT.with(|cell| cell.set(Some((1, 1_200))));
     let refused = seed(&rig.pool, &request);
     assert!(
@@ -2080,6 +2099,8 @@ fn a_seed_that_verified_every_clone_publishes_despite_a_tiny_overrun() {
     // The overrun happens after the final clone has been hashed: every clone
     // exists and matches its recorded digest when the budget expires, so
     // nothing remains for the deadline to protect.
+    let _clock = test_clock::freeze();
+    ADVANCE_SEED_CLOCK.with(|cell| cell.set(true));
     CLONE_DELAY_AT.with(|cell| cell.set(Some((default_files().len() - 1, 1_200))));
     let outcome = seed(&rig.pool, &request).expect("seed");
     assert!(
