@@ -2031,7 +2031,8 @@ fn summary_strategy(invocation: &Invocation) -> &'static str {
     let subcommand = invocation
         .cargo_args
         .get(1)
-        .and_then(|argument| argument.to_str());
+        .and_then(|argument| argument.to_str())
+        .filter(|argument| !argument.starts_with('-'));
     match invocation.command.as_str() {
         "run" | "test" | "bench" | "exec" => "build+execute",
         "check" | "build" | "clippy" | "doc" | "rustc" | "rustdoc" | "fix" => "build",
@@ -2262,6 +2263,8 @@ mod tests {
             ("nextest", &["r"][..], "build+execute"),
             ("nextest", &["list"][..], "build"),
             ("llvm-cov", &[][..], "build+execute"),
+            ("llvm-cov", &["--workspace"][..], "build+execute"),
+            ("llvm-cov", &["--html"][..], "build+execute"),
             ("llvm-cov", &["test"][..], "build+execute"),
             ("llvm-cov", &["run"][..], "build+execute"),
             ("llvm-cov", &["nextest"][..], "build+execute"),
