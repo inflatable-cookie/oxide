@@ -1128,6 +1128,9 @@ fn probing_an_abandoned_hold_is_not_reported_as_a_byte_walk() {
     let project = fixture.dir("project");
     let workspace = fixture.dir("workspace");
     let held = managed::lease(request(&pool, &project, &workspace, "gone")).unwrap();
+    let (live, attempts) = crate::storage::count_hold_attempts(|| managed::prepare_pool(&pool));
+    assert_eq!(live.unwrap().slots[0].state, SlotOccupancy::Held);
+    assert_eq!(attempts, 0, "live held rows use the single-attempt listing");
     // The command died: its root hold went with it and the row still says Held.
     drop(held);
     let view = managed::prepare_pool(&pool).unwrap();
@@ -1399,7 +1402,7 @@ fn admission_cost_and_protection_at_the_256_slot_ceiling() {
     );
     assert_eq!(walks, [PoolWalk::Inventory]);
     let (refused_us, walked, listed, opaque) = admission_cost::latest(&pool);
-    assert_eq!((walked, listed, opaque), (0, 256, true));
+    assert_eq!((walked, listed, opaque), (0, 512, false));
 
     let ((), walks) = count_pool_walks(|| {
         assert_eq!(managed::status(&pool).unwrap().slots.len(), 256);
@@ -1409,7 +1412,7 @@ fn admission_cost_and_protection_at_the_256_slot_ceiling() {
         );
         let history = admission_cost::recorded(&pool).unwrap().unwrap();
         assert!(
-            history.contains("explicit inventory entries 256"),
+            history.contains("explicit inventory entries 512"),
             "{history}"
         );
         assert!(
@@ -1424,7 +1427,7 @@ fn admission_cost_and_protection_at_the_256_slot_ceiling() {
         "{durations:?}"
     );
     writeln!(std::io::stderr().lock(),
-        "256 slots, lock µs and root counts: adoption max {max_prepare_us} (8 rows per batch, 0 walks, marker count unavailable), warm {warm_us} (0 walks, marker count unavailable), reserve {reserve_us} (0 roots), eviction {eviction_us} (1 walk, marker count unavailable), refusal {refused_us} (0 walks, 256 explicit inventory entries, marker count unavailable), status 0 roots, warm and eviction summaries disclosed the unavailable listing count"
+        "256 slots, lock µs and root counts: adoption max {max_prepare_us} (8 rows per batch, 0 walks, marker count unavailable), warm {warm_us} (0 walks, marker count unavailable), reserve {reserve_us} (0 roots), eviction {eviction_us} (1 walk, marker count unavailable), refusal {refused_us} (0 walks, 512 explicit inventory entries), status 0 roots, warm and eviction summaries disclosed the unavailable listing count"
     ).unwrap();
 }
 
@@ -1978,7 +1981,11 @@ fn idle_reuse_skips_barge_held_slot_and_surfaces_barge_held_when_none_is_free() 
         .try_hold(&second_root)
         .unwrap()
         .expect("free second");
-    let err = managed::lease(request(&pool, &project, &workspace, "fourth")).unwrap_err();
+    let (result, attempts) = crate::storage::count_hold_attempts(|| {
+        managed::lease(request(&pool, &project, &workspace, "fourth"))
+    });
+    assert_eq!(attempts, 1, "only the first held candidate needs a retry");
+    let err = result.unwrap_err();
     assert_eq!(err, LeaseError::BargeHeld(1), "{err:?}");
     assert_eq!(err.reason(), "barge_held");
     assert_eq!(err.exit_code(), 2);
